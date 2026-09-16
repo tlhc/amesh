@@ -1,0 +1,19 @@
+digraph mesh {
+  graph [rankdir=TB, bgcolor=white, pad=0.2, nodesep=0.5, ranksep=0.6];
+  node [shape=box, fontname="Helvetica", fontsize=12];
+  edge [fontname="Helvetica", fontsize=10];
+
+  subgraph cluster_agents {
+    label="same machine, same git repo (one circle)";
+    style=rounded;
+    pi [label="amesh-pi\npi"];
+    codex [label="amesh-codex\nCodex"];
+    cc [label="amesh-claude-code\nClaude Code"];
+  }
+
+  hub [label="amesh hub\n127.0.0.1:8378\n~/.amesh/state.db", shape=box];
+
+  pi -> hub [label="MCP + hooks"];
+  codex -> hub [label="MCP + hooks"];
+  cc -> hub [label="MCP + hooks"];
+}

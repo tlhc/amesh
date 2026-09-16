@@ -1,0 +1,18 @@
+@startuml
+skinparam shadowing false
+skinparam backgroundColor white
+skinparam sequenceMessageAlign center
+
+participant "amesh-pi\n(pi)" as pi
+participant "hub\n127.0.0.1:8378" as hub
+participant "amesh-claude-code\n(Claude Code)" as cc
+
+pi -> hub : amesh_ask(amesh-claude-code, query)
+hub -> hub : persist ask in inbox
+hub --> pi : correlation_id
+hub -> cc : WS / hook deliver
+cc -> cc : do the work
+cc -> hub : amesh_ack(correlation_id, result)
+hub -> hub : close ask
+hub --> pi : reply (wait / inbox)
+@enduml

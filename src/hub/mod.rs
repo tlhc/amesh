@@ -1,0 +1,3426 @@
+use rusqlite::{params, Connection};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use axum::extract::{
+    ws::{Message, WebSocket, WebSocketUpgrade},
+    DefaultBodyLimit, Multipart, Path as AxumPath, Query, State,
+};
+
+use axum::body::Body;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::Response;
+use axum::routing::{delete, get, post};
+use axum::{Json, Router};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, Mutex};
+use uuid::Uuid;
+
+#[derive(Clone)]
+struct App {
+    inner: Arc<Mutex<Hub>>,
+    token: Option<String>,
+    state_path: PathBuf,
+}
+
+struct Hub {
+    db: Connection,
+    peers: HashMap<String, Peer>,
+    asks: HashMap<String, Ask>,
+    jobs: HashMap<String, Job>,
+    schedules: HashMap<String, Schedule>,
+    sockets: HashMap<String, (u64, mpsc::UnboundedSender<Value>)>,
+    /* recv_live: peers whose current connection acknowledges every frame with a recv, so
+    the inbox is the record of what they are owed and a send is only a copy of it.
+    recv_known: every peer that ever made that promise; persisted, so what they are owed
+    is never evicted, not while they are away and not across a hub restart */
+    recv_live: HashSet<String>,
+    recv_known: HashSet<String>,
+    owed: HashMap<String, Owed>,
+    inbox: HashMap<String, Vec<Value>>,
+    conn_gen: u64,
+    events: Vec<Value>,
+    batches: HashMap<String, Vec<String>>,
+    mcp_servers: HashMap<String, Vec<Value>>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Peer {
+    peer_id: String,
+    name: String,
+    path: String,
+    backend: String,
+    circle: String,
+    status: String,
+    description: String,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    last_seen: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Ask {
+    correlation_id: String,
+    from_peer: String,
+    to_peer: String,
+    to_peer_id: String,
+    text: String,
+    open: bool,
+    reply: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Job {
+    job_id: String,
+    title: String,
+    prompt: String,
+    path: String,
+    backend: String,
+    assigned_peer: Option<String>,
+    state: String,
+    result_summary: Option<String>,
+    #[serde(default)]
+    circle: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Schedule {
+    schedule_id: String,
+    from_peer: String,
+    to_peer: String,
+    text: String,
+    kind: String,
+    fire_at: u64,
+    every_seconds: Option<u64>,
+    #[serde(default)]
+    circle: String,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct DiskState {
+    peers: HashMap<String, Peer>,
+    asks: HashMap<String, Ask>,
+    jobs: HashMap<String, Job>,
+    schedules: HashMap<String, Schedule>,
+    inbox: HashMap<String, Vec<Value>>,
+    #[serde(default)]
+    mcp_servers: HashMap<String, Vec<Value>>,
+    #[serde(default)]
+    recv_peers: HashSet<String>,
+    #[serde(default)]
+    owed: HashMap<String, Owed>,
+}
+
+/* a backlog whose peer row was pruned: it waits for the session that owned it, and no
+other session may take the name or the records while it waits */
+#[derive(Clone, Serialize, Deserialize, Default)]
+struct Owed {
+    since: u64,
+    owner: String,
+}
+
+const OWED_TTL_SECS: u64 = 86400;
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn normalize_backend(raw: &str) -> Option<&'static str> {
+    match raw {
+        "pi" => Some("pi"),
+        "codex" => Some("codex"),
+        "claude" | "claude-code" => Some("claude-code"),
+        _ => None,
+    }
+}
+
+const SCHEMA: &str = "
+CREATE TABLE IF NOT EXISTS peers (
+  peer_id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  path TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  circle TEXT NOT NULL,
+  status TEXT NOT NULL,
+  description TEXT NOT NULL,
+  session_id TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS asks (
+  correlation_id TEXT PRIMARY KEY,
+  from_peer TEXT NOT NULL,
+  to_peer TEXT NOT NULL,
+  to_peer_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  open INTEGER NOT NULL,
+  reply TEXT
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  path TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  assigned_peer TEXT,
+  state TEXT NOT NULL,
+  result_summary TEXT,
+  circle TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS schedules (
+  schedule_id TEXT PRIMARY KEY,
+  from_peer TEXT NOT NULL,
+  to_peer TEXT NOT NULL,
+  text TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  fire_at INTEGER NOT NULL,
+  every_seconds INTEGER,
+  circle TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS inbox (
+  peer_id TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (peer_id, seq)
+);
+CREATE TABLE IF NOT EXISTS recv_peers (
+  peer_id TEXT PRIMARY KEY,
+  pruned_at INTEGER NOT NULL DEFAULT 0,
+  owner TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS mcp_servers (
+  peer_id TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  PRIMARY KEY (peer_id)
+);
+";
+
+fn state_path() -> PathBuf {
+    if let Ok(p) = std::env::var("AMESH_STATE") {
+        if !p.is_empty() {
+            let p = PathBuf::from(p);
+            if p.extension().and_then(|e| e.to_str()) == Some("json") {
+                return p.with_extension("db");
+            }
+            return p;
+        }
+    }
+    dirs_home().join(".amesh").join("state.db")
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/* attachments live next to the state file, so a daemon on its own AMESH_STATE, and every
+test with a temporary one, keeps its uploads to itself instead of the operator's home */
+fn attachments_dir(app: &App) -> PathBuf {
+    app.state_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| dirs_home().join(".amesh"))
+        .join("attachments")
+}
+
+fn open_db(path: &Path) -> Result<Connection, String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let db = Connection::open(path).map_err(|e| e.to_string())?;
+    db.busy_timeout(Duration::from_millis(5000))
+        .map_err(|e| e.to_string())?;
+    db.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| e.to_string())?;
+    db.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    let _ = db.execute(
+        "ALTER TABLE peers ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = db.execute(
+        "ALTER TABLE peers ADD COLUMN last_seen INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = db.execute(
+        "ALTER TABLE recv_peers ADD COLUMN pruned_at INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    let _ = db.execute(
+        "ALTER TABLE recv_peers ADD COLUMN owner TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = db.execute(
+        "ALTER TABLE jobs ADD COLUMN circle TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    let _ = db.execute(
+        "ALTER TABLE schedules ADD COLUMN circle TEXT NOT NULL DEFAULT ''",
+        [],
+    );
+    Ok(db)
+}
+
+fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
+    let tx = db.transaction().map_err(|e| e.to_string())?;
+    tx.execute_batch(
+        "DELETE FROM peers; DELETE FROM asks; DELETE FROM jobs; DELETE FROM schedules; DELETE FROM inbox; DELETE FROM mcp_servers; DELETE FROM recv_peers;",
+    )
+    .map_err(|e| e.to_string())?;
+    for p in disk.peers.values() {
+        tx.execute(
+            "INSERT INTO peers(peer_id,name,path,backend,circle,status,description,session_id,last_seen) VALUES (?,?,?,?,?,?,?,?,?)",
+            params![p.peer_id, p.name, p.path, p.backend, p.circle, p.status, p.description, p.session_id, p.last_seen as i64],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for a in disk.asks.values() {
+        tx.execute(
+            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply) VALUES (?,?,?,?,?,?,?)",
+            params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for j in disk.jobs.values() {
+        tx.execute(
+            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle) VALUES (?,?,?,?,?,?,?,?,?)",
+            params![j.job_id, j.title, j.prompt, j.path, j.backend, j.assigned_peer, j.state, j.result_summary, j.circle],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for s in disk.schedules.values() {
+        tx.execute(
+            "INSERT INTO schedules(schedule_id,from_peer,to_peer,text,kind,fire_at,every_seconds,circle) VALUES (?,?,?,?,?,?,?,?)",
+            params![s.schedule_id, s.from_peer, s.to_peer, s.text, s.kind, s.fire_at as i64, s.every_seconds.map(|v| v as i64), s.circle],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for (peer_id, events) in &disk.inbox {
+        for (seq, payload) in events.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO inbox(peer_id,seq,payload) VALUES (?,?,?)",
+                params![peer_id, seq as i64, payload.to_string()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    for peer_id in &disk.recv_peers {
+        let owed = disk.owed.get(peer_id);
+        tx.execute(
+            "INSERT INTO recv_peers(peer_id,pruned_at,owner) VALUES (?,?,?)",
+            params![
+                peer_id,
+                owed.map(|o| o.since as i64).unwrap_or(0),
+                owed.map(|o| o.owner.as_str()).unwrap_or("")
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    for (peer_id, servers) in &disk.mcp_servers {
+        tx.execute(
+            "INSERT INTO mcp_servers(peer_id,payload) VALUES (?,?)",
+            params![
+                peer_id,
+                serde_json::to_string(servers).unwrap_or_else(|_| "[]".into())
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
+    let mut disk = DiskState::default();
+    let mut stmt = db
+        .prepare("SELECT peer_id,name,path,backend,circle,status,description,session_id,last_seen FROM peers")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Peer {
+                peer_id: r.get(0)?,
+                name: r.get(1)?,
+                path: r.get(2)?,
+                backend: r.get(3)?,
+                circle: r.get(4)?,
+                status: r.get(5)?,
+                description: r.get(6)?,
+                session_id: r.get(7).unwrap_or_default(),
+                last_seen: r.get::<_, i64>(8).unwrap_or(0) as u64,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let p = row.map_err(|e| e.to_string())?;
+        disk.peers.insert(p.peer_id.clone(), p);
+    }
+    let mut stmt = db
+        .prepare("SELECT correlation_id,from_peer,to_peer,to_peer_id,text,open,reply FROM asks")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Ask {
+                correlation_id: r.get(0)?,
+                from_peer: r.get(1)?,
+                to_peer: r.get(2)?,
+                to_peer_id: r.get(3)?,
+                text: r.get(4)?,
+                open: r.get::<_, i32>(5)? != 0,
+                reply: r.get(6)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let a = row.map_err(|e| e.to_string())?;
+        disk.asks.insert(a.correlation_id.clone(), a);
+    }
+    let mut stmt = db
+        .prepare("SELECT job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle FROM jobs")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Job {
+                job_id: r.get(0)?,
+                title: r.get(1)?,
+                prompt: r.get(2)?,
+                path: r.get(3)?,
+                backend: r.get(4)?,
+                assigned_peer: r.get(5)?,
+                state: r.get(6)?,
+                result_summary: r.get(7)?,
+                circle: r.get(8).unwrap_or_default(),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let j = row.map_err(|e| e.to_string())?;
+        disk.jobs.insert(j.job_id.clone(), j);
+    }
+    let mut stmt = db
+        .prepare("SELECT schedule_id,from_peer,to_peer,text,kind,fire_at,every_seconds,circle FROM schedules")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(Schedule {
+                schedule_id: r.get(0)?,
+                from_peer: r.get(1)?,
+                to_peer: r.get(2)?,
+                text: r.get(3)?,
+                kind: r.get(4)?,
+                fire_at: r.get::<_, i64>(5)? as u64,
+                every_seconds: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                circle: r.get(7).unwrap_or_default(),
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let s = row.map_err(|e| e.to_string())?;
+        disk.schedules.insert(s.schedule_id.clone(), s);
+    }
+    let mut stmt = db
+        .prepare("SELECT peer_id,seq,payload FROM inbox ORDER BY peer_id, seq")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (peer_id, _, payload) = row.map_err(|e| e.to_string())?;
+        let value = serde_json::from_str(&payload).unwrap_or(Value::String(payload));
+        disk.inbox.entry(peer_id).or_default().push(value);
+    }
+    let mut stmt = db
+        .prepare("SELECT peer_id,payload FROM mcp_servers")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (peer_id, payload) = row.map_err(|e| e.to_string())?;
+        let servers: Vec<Value> = serde_json::from_str(&payload).unwrap_or_default();
+        disk.mcp_servers.insert(peer_id, servers);
+    }
+    let mut stmt = db
+        .prepare("SELECT peer_id,pruned_at,owner FROM recv_peers")
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1).unwrap_or(0) as u64,
+                r.get::<_, String>(2).unwrap_or_default(),
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+    for row in rows {
+        let (peer_id, pruned_at, owner) = row.map_err(|e| e.to_string())?;
+        if pruned_at > 0 {
+            disk.owed.insert(
+                peer_id.clone(),
+                Owed {
+                    since: pruned_at,
+                    owner,
+                },
+            );
+        }
+        disk.recv_peers.insert(peer_id);
+    }
+    /* a backlog may outlive its peer row only while a session is still expected back for it */
+    disk.owed.retain(|peer_id, owed| {
+        !disk.peers.contains_key(peer_id)
+            && !owed.owner.is_empty()
+            && disk
+                .inbox
+                .get(peer_id)
+                .map(|q| !q.is_empty())
+                .unwrap_or(false)
+    });
+    disk.inbox
+        .retain(|peer_id, _| disk.peers.contains_key(peer_id) || disk.owed.contains_key(peer_id));
+    disk.recv_peers
+        .retain(|peer_id| disk.peers.contains_key(peer_id) || disk.owed.contains_key(peer_id));
+    Ok(disk)
+}
+
+fn apply_disk(hub: &mut Hub, disk: DiskState) {
+    hub.peers = disk.peers;
+    hub.asks = disk.asks;
+    hub.jobs = disk.jobs;
+    hub.schedules = disk.schedules;
+    hub.inbox = disk.inbox;
+    hub.mcp_servers = disk.mcp_servers;
+}
+
+impl Hub {
+    fn open(path: &Path) -> Result<Self, String> {
+        let mut db = open_db(path)?;
+        let count: i64 = db
+            .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
+            .unwrap_or(0);
+        if count == 0 {
+            let json_path = path.with_extension("json");
+            if json_path.is_file() {
+                if let Ok(bytes) = fs::read(&json_path) {
+                    if let Ok(disk) = serde_json::from_slice::<DiskState>(&bytes) {
+                        write_snapshot(&mut db, &disk)?;
+                    }
+                }
+            }
+        }
+        let disk = read_snapshot(&db)?;
+        /* pings refresh last_seen in memory only, so the persisted value is as old as the
+        last mutation; without a fresh stamp the first read after a restart would prune
+        every peer before its drainer reconnects, and the drainer's announce would then
+        rebuild the record without its session */
+        let loaded_at = now_unix();
+        let mut peers = disk.peers;
+        for peer in peers.values_mut() {
+            peer.last_seen = loaded_at;
+        }
+        Ok(Hub {
+            db,
+            peers,
+            asks: disk.asks,
+            jobs: disk.jobs,
+            schedules: disk.schedules,
+            inbox: disk.inbox,
+            sockets: HashMap::new(),
+            recv_live: HashSet::new(),
+            recv_known: disk.recv_peers,
+            owed: disk.owed,
+            conn_gen: 0,
+            events: Vec::new(),
+            batches: HashMap::new(),
+            mcp_servers: disk.mcp_servers,
+        })
+    }
+}
+
+fn load_hub(path: &Path) -> Hub {
+    Hub::open(path).unwrap_or_else(|e| panic!("amesh state {path}: {e}", path = path.display()))
+}
+
+fn persist(hub: &mut Hub) -> Result<(), String> {
+    let disk = DiskState {
+        peers: hub.peers.clone(),
+        asks: hub.asks.clone(),
+        jobs: hub.jobs.clone(),
+        schedules: hub.schedules.clone(),
+        inbox: hub.inbox.clone(),
+        mcp_servers: hub.mcp_servers.clone(),
+        recv_peers: hub.recv_known.clone(),
+        owed: hub.owed.clone(),
+    };
+    write_snapshot(&mut hub.db, &disk)
+}
+
+fn persist_ok(hub: &mut Hub) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Err(e) = persist(hub) {
+        if let Ok(disk) = read_snapshot(&hub.db) {
+            apply_disk(hub, disk);
+        }
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))));
+    }
+    Ok(())
+}
+
+fn auth_headers(app: &App) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    if let Some(token) = app.token.as_deref() {
+        if let Ok(value) = format!("Bearer {token}").parse() {
+            headers.insert(axum::http::header::AUTHORIZATION, value);
+        }
+    }
+    headers
+}
+
+fn resolve<'a>(hub: &'a Hub, name: &str) -> Option<&'a Peer> {
+    if let Some(p) = hub.peers.get(name) {
+        return Some(p);
+    }
+    hub.peers.values().find(|p| p.name == name)
+}
+
+/* liveness must follow activity, not just the socket: a peer whose WS died is still
+alive as long as it keeps calling us, and probe_peers would otherwise prune it */
+fn touch_peer(hub: &mut Hub, name: &str) {
+    if name.is_empty() || name == "anonymous" {
+        return;
+    }
+    let Some(id) = resolve(hub, name).map(|peer| peer.peer_id.clone()) else {
+        return;
+    };
+    if let Some(peer) = hub.peers.get_mut(&id) {
+        peer.last_seen = now_unix();
+    }
+}
+
+fn circles_differ(hub: &Hub, from: Option<&str>, to: &str) -> bool {
+    let Some(tp) = resolve(hub, to) else {
+        return false;
+    };
+    let Some(from) = from.filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let Some(fp) = resolve(hub, from) else {
+        return false;
+    };
+    fp.circle != tp.circle
+}
+
+fn require_cross_circle(
+    hub: &Hub,
+    from: Option<&str>,
+    to: &str,
+    explicit: bool,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if !explicit && circles_differ(hub, from, to) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "cross-circle requires cross_circle"})),
+        ));
+    }
+    Ok(())
+}
+
+const INBOX_MAX: usize = 50;
+const DISPLACED: &str = "displaced";
+
+/* a peer that acknowledges frames refers to them by id, so every event it is owed needs one */
+fn with_event_id(mut event: Value) -> Value {
+    let missing = event["id"].as_str().map(str::is_empty).unwrap_or(true);
+    if missing {
+        event["id"] = json!(format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]));
+    }
+    event
+}
+
+fn queue_inbox(hub: &mut Hub, peer_id: &str, events: impl IntoIterator<Item = Value>) {
+    /* what an acknowledging peer is owed is never evicted: the cap would silently take back
+    the at-least-once promise, and pruning the peer is the only bound on that queue */
+    let owed = hub.recv_known.contains(peer_id);
+    let queue = hub.inbox.entry(peer_id.to_string()).or_default();
+    for event in events {
+        /* only an ask leaves someone blocked on an answer, so chatter gives way to it and a
+        queue of nothing but asks is allowed past the cap rather than strand an asker */
+        while !owed && queue.len() >= INBOX_MAX {
+            let Some(chatter) = queue.iter().position(|held| held["type"] != "ask") else {
+                break;
+            };
+            queue.remove(chatter);
+        }
+        queue.push(event);
+    }
+}
+
+/* A dropped link strands whatever the socket task had already taken off the channel.
+Those events are owed to the peer, not to the connection, so hand them to whoever
+holds the socket now and fall back to the inbox when nobody does. Returns whether
+hub state changed and needs persisting. */
+fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Value>) -> bool {
+    /* the notice belongs to one connection; replaying it would evict its successor */
+    let owed: Vec<Value> = undelivered
+        .into_iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) != Some(DISPLACED))
+        .collect();
+    if owed.is_empty() {
+        return false;
+    }
+    if !hub.peers.contains_key(peer_id) {
+        return false;
+    }
+    let Some(successor) = hub.sockets.get(peer_id).map(|(_, tx)| tx.clone()) else {
+        queue_inbox(hub, peer_id, owed);
+        return true;
+    };
+    let mut owed = owed.into_iter();
+    for event in owed.by_ref() {
+        if let Err(rejected) = successor.send(event) {
+            /* the successor died too; keep its payload and stop trying the dead channel */
+            let stranded = std::iter::once(rejected.0).chain(owed);
+            queue_inbox(hub, peer_id, stranded);
+            hub.sockets.remove(peer_id);
+            return true;
+        }
+    }
+    false
+}
+
+fn persist_then_deliver(
+    hub: &mut Hub,
+    to: &str,
+    event: Value,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    /* an inbox keyed by anything other than a live peer_id is never collected: the prune
+    path only drops the inbox of peers it removes. Callers that cannot check the target
+    themselves, an ack replying to a departed asker and a schedule firing at one, would
+    leave a queue that outlives every peer and later replays onto whoever takes the name */
+    let Some(key) = resolve(hub, to).map(|p| p.peer_id.clone()) else {
+        eprintln!("amesh: dropping {} for unknown peer {to}", event["type"]);
+        return persist_ok(hub);
+    };
+    /* a peer that acknowledges, or one that did and is away right now, is owed a record it
+    can name by id. Only an attached client of the old kind takes the old path, since it
+    would never acknowledge and its own replay drains what it is sent. */
+    let acknowledging = hub.recv_live.contains(&key)
+        || (hub.recv_known.contains(&key) && !hub.sockets.contains_key(&key));
+    if acknowledging {
+        /* the inbox is the record of what this peer is owed; what goes down the socket is a
+        copy, and only the peer's recv for this id takes the record away */
+        let event = with_event_id(event);
+        queue_inbox(hub, &key, [event.clone()]);
+        push_event(hub, event.clone());
+        persist_ok(hub)?;
+        if let Some((_, tx)) = hub.sockets.get(&key) {
+            let _ = tx.send(event);
+        }
+        return Ok(());
+    }
+    let live = hub.sockets.get(&key).map(|(_, tx)| tx.clone());
+    if let Some(tx) = live {
+        persist_ok(hub)?;
+        if tx.send(event.clone()).is_ok() {
+            return Ok(());
+        }
+        hub.sockets.remove(&key);
+    }
+    queue_inbox(hub, &key, [event.clone()]);
+    push_event(hub, event);
+    persist_ok(hub)
+}
+
+fn deliver_notify(
+    hub: &mut Hub,
+    to: &str,
+    message: String,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if to.is_empty() || resolve(hub, to).is_none() {
+        persist_ok(hub)?;
+        return Ok(());
+    }
+    persist_then_deliver(
+        hub,
+        to,
+        json!({
+            "type": "notify",
+            "id": format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]),
+            "from_peer": "amesh",
+            "to_peer": to,
+            "message": message,
+        }),
+    )
+}
+
+#[derive(Deserialize)]
+struct RegisterReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    circle: Option<String>,
+    #[serde(default)]
+    peer_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AskReq {
+    #[serde(default)]
+    from_peer: Option<String>,
+    to_peer: String,
+    #[serde(alias = "query", alias = "message")]
+    text: String,
+    #[serde(default)]
+    attachments: Option<Value>,
+    #[serde(default)]
+    cross_circle: bool,
+}
+
+#[derive(Deserialize)]
+struct AckReq {
+    correlation_id: String,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NotifyReq {
+    #[serde(default)]
+    from_peer: Option<String>,
+    to_peer: String,
+    message: String,
+    #[serde(default)]
+    cross_circle: bool,
+}
+
+#[derive(Deserialize)]
+struct JobCreateReq {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    prompt: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    backend: Option<String>,
+    #[serde(default)]
+    assigned_peer: Option<String>,
+    #[serde(default)]
+    from_peer: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct JobUpdateReq {
+    state: String,
+    #[serde(default)]
+    result_summary: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ScheduleCreateReq {
+    to_peer: String,
+    text: String,
+    #[serde(default)]
+    from_peer: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    in_seconds: Option<u64>,
+    #[serde(default)]
+    fire_at: Option<u64>,
+    #[serde(default)]
+    every_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct RpcReq {
+    jsonrpc: Option<String>,
+    id: Option<Value>,
+    method: Option<String>,
+    #[serde(default)]
+    params: Value,
+}
+
+pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+    let bind: SocketAddr = std::env::var("AMESH_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:8378".into())
+        .parse()
+        .map_err(|error| format!("invalid AMESH_BIND: {error}"))?;
+    let token = std::env::var("AMESH_TOKEN").ok().filter(|s| !s.is_empty());
+    /* the port decides who the daemon is. Take it before touching the state file, so a
+    second starter that loses the race exits without having opened, migrated or created
+    anything, and before any background task exists that could persist on its behalf */
+    let listener = match tokio::net::TcpListener::bind(bind).await {
+        Ok(listener) => listener,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            return Err(format!(
+                "{bind} already in use. Daemon already running? Try: amesh status"
+            )
+            .into());
+        }
+        Err(error) => return Err(format!("bind {bind}: {error}").into()),
+    };
+    if !bind.ip().is_loopback() && token.is_none() {
+        eprintln!(
+            "amesh: warning: bound {bind} without AMESH_TOKEN; any client that can reach this port can read and write the mesh"
+        );
+    }
+    let state_path = state_path();
+    let app = App {
+        inner: Arc::new(Mutex::new(load_hub(&state_path))),
+        token,
+        state_path,
+    };
+    let sched_app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tick_schedules(&sched_app).await;
+        }
+    });
+    let sweep_app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            sweep_runtime_files(&sweep_app).await;
+        }
+    });
+    eprintln!("amesh http://{bind} state {}", app.state_path.display());
+    axum::serve(listener, router(app)).await?;
+    Ok(())
+}
+
+fn router(app: App) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/peers", get(list_peers).post(register_peer))
+        .route("/peer/register", post(register_peer))
+        .route("/ask", post(open_ask))
+        .route("/ack", post(ack_ask))
+        .route("/notify", post(notify))
+        .route("/broadcast", post(broadcast))
+        .route("/asks/pending", get(pending_asks))
+        .route("/jobs", get(list_jobs).post(create_job))
+        .route(
+            "/jobs/{id}",
+            get(show_job).patch(update_job).delete(delete_job),
+        )
+        .route("/jobs/{id}/cancel", post(cancel_job))
+        .route("/schedules", get(list_schedules).post(create_schedule))
+        .route("/schedules/{id}", delete(delete_schedule))
+        .route("/mcp", post(mcp))
+        .route("/ask-many", post(ask_many))
+        .route("/ask-many/{id}", get(ask_many_result))
+        .route("/asks/{id}/wait", post(wait_ask))
+        .route("/questions/ask-blocking", post(ask_blocking))
+        .route("/answer", post(ack_ask))
+        .route("/attachments", post(upload_attachment))
+        .route("/attachments/form", post(upload_form))
+        .route("/attachments/{id}", get(get_attachment))
+        .route("/events", get(list_events))
+        .route("/events/chat", post(ingest_chat))
+        .route("/events/chat_delta", post(ingest_chat_delta))
+        .route("/peers/{name}/timeline", get(peer_timeline))
+        .route("/peers/{name}/transcript", get(peer_timeline))
+        .route("/deliveries/pending", get(pending_asks))
+        .route("/sessions/{id}/controls/notify", post(session_notify))
+        .route("/sessions/{id}/controls/resume", post(session_notify))
+        .route("/sessions/resume", post(session_resume))
+        .route("/peers/{name}/mcp", get(list_peer_mcp).post(add_peer_mcp))
+        .route("/peers/{name}/mcp/{server}", delete(remove_peer_mcp))
+        .route("/ws", get(ws_upgrade))
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .with_state(app)
+}
+
+fn unauthorized() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": "unauthorized"})),
+    )
+}
+
+fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(want) = app.token.as_deref() else {
+        return Ok(());
+    };
+    let got = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let got = got.strip_prefix("Bearer ").unwrap_or(got);
+    if got == want {
+        Ok(())
+    } else {
+        Err(unauthorized())
+    }
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({"ok": true, "name": "amesh", "version": "0.1.0"}))
+}
+
+fn folder_name(path: &str) -> String {
+    let raw = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("peer");
+    let mut out = String::new();
+    let mut dash = false;
+    for ch in raw.chars() {
+        let ok = ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-');
+        if ok {
+            out.push(ch);
+            dash = false;
+        } else if !dash {
+            out.push('-');
+            dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "peer".into()
+    } else {
+        trimmed.into()
+    }
+}
+
+fn allocate_peer_id(
+    hub: &Hub,
+    path: &str,
+    backend: &str,
+    session: &str,
+    claimed: Option<String>,
+) -> String {
+    if let Some(id) = claimed {
+        return id;
+    }
+    /* one session_id keeps peer_id+circle; cwd changes do not split */
+    if !session.is_empty() {
+        if let Some(peer) = hub.peers.values().find(|peer| peer.session_id == session) {
+            return peer.peer_id.clone();
+        }
+        /* the row was pruned but a backlog is waiting for exactly this session: it gets its
+        name back along with what it is owed */
+        if let Some((id, _)) = hub.owed.iter().find(|(_, owed)| owed.owner == session) {
+            return id.clone();
+        }
+    }
+    let base = format!("{}-{backend}", folder_name(path));
+    /* a socketless record with the same path+backend and no session is the previous
+    incarnation of this runtime (KeepAlive restarts it within a second, long before
+    the 30s prune); hand the name straight back instead of drifting to -2 */
+    if session.is_empty() {
+        if let Some(prev) = hub
+            .peers
+            .get(&base)
+            .or_else(|| hub.peers.values().find(|peer| peer.name == base))
+        {
+            /* a concurrent sibling in the same path is still "online" from its own registration
+            even before its drainer connects; a dead predecessor was flipped to "offline" by
+            the socket handler on the way out. status is what tells them apart. */
+            if prev.session_id.is_empty()
+                && prev.path == path
+                && prev.backend == backend
+                && prev.status == "offline"
+                && !hub.sockets.contains_key(&prev.peer_id)
+            {
+                return prev.peer_id.clone();
+            }
+        }
+    }
+    /* a name whose backlog is waiting for its owner is not free: a newcomer in the same
+    folder gets the next suffix instead of inheriting another session's messages */
+    let taken = |id: &str| {
+        hub.peers.contains_key(id)
+            || hub.peers.values().any(|peer| peer.name == id)
+            || hub.owed.contains_key(id)
+    };
+    if !taken(&base) {
+        return base;
+    }
+    let mut n = 2;
+    loop {
+        let id = format!("{base}-{n}");
+        if !taken(&id) {
+            return id;
+        }
+        n += 1;
+    }
+}
+
+async fn register_peer(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<RegisterReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    /* a dead peer still holds its name until a read path prunes it; reclaim it here so a
+    restarted runtime gets its own name back instead of drifting to -2, -3, ... */
+    probe_peers(&mut hub)?;
+    let backend = match req.backend.as_deref() {
+        None | Some("") => "pi",
+        Some(raw) => normalize_backend(raw).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "backend must be pi, codex, or claude-code"})),
+            )
+        })?,
+    };
+    let path = req.path.clone().unwrap_or_default();
+    let session = req.session_id.clone().unwrap_or_default();
+    let peer_id = allocate_peer_id(
+        &hub,
+        &path,
+        backend,
+        &session,
+        req.peer_id.filter(|s| !s.is_empty()),
+    );
+    let name = if req.name.is_empty() {
+        peer_id.clone()
+    } else {
+        req.name
+    };
+    if hub
+        .peers
+        .values()
+        .any(|p| p.name == name && p.peer_id != peer_id)
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "name already registered"})),
+        ));
+    }
+    let description = hub
+        .peers
+        .get(&peer_id)
+        .map(|peer| peer.description.clone())
+        .unwrap_or_default();
+    let circle = hub
+        .peers
+        .get(&peer_id)
+        .map(|peer| peer.circle.clone())
+        .or(req.circle)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".into());
+    /* a re-register that carries no session, such as the drainer announcing itself,
+    must not erase the session the hook bound this peer to */
+    let session_id = req
+        .session_id
+        .filter(|value| !value.is_empty())
+        .or_else(|| hub.peers.get(&peer_id).map(|peer| peer.session_id.clone()))
+        .unwrap_or_default();
+    let peer = Peer {
+        peer_id: peer_id.clone(),
+        name,
+        path,
+        backend: backend.into(),
+        circle,
+        status: "online".into(),
+        description,
+        session_id,
+        last_seen: now_unix(),
+    };
+    /* a backlog left behind for a session: that session adopts it on the way back in; a
+    registration that claims the name outright with a different session throws it away
+    rather than inherit another session's messages; one with no session leaves it waiting */
+    /* copies that may go down an attached acknowledging socket, but only once the records
+    they stand for are on disk: what is sent must never be something a crash can forget */
+    let mut to_push: Vec<Value> = Vec::new();
+    if let Some(owed) = hub.owed.get(&peer_id).cloned() {
+        if !peer.session_id.is_empty() {
+            hub.owed.remove(&peer_id);
+            if peer.session_id == owed.owner {
+                if let Some(queue) = hub.inbox.get_mut(&peer_id) {
+                    for record in queue.iter_mut() {
+                        if record["id"].as_str().map(str::is_empty).unwrap_or(true) {
+                            *record = with_event_id(record.take());
+                        }
+                    }
+                    to_push = queue.clone();
+                }
+            } else {
+                eprintln!("amesh: dropping backlog of {peer_id}: it belongs to another session");
+                hub.inbox.remove(&peer_id);
+                hub.recv_known.remove(&peer_id);
+            }
+        }
+    }
+    /* the session came back under another name: what was left behind for it follows the
+    session, not the name. Records are matched by id so nothing is delivered twice, open
+    asks are re-pointed so the new name sees them as pending, and no peer_id changes. */
+    if !peer.session_id.is_empty() {
+        let left_behind: Vec<String> = hub
+            .owed
+            .iter()
+            .filter(|(id, owed)| **id != peer_id && owed.owner == peer.session_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for old in left_behind {
+            hub.owed.remove(&old);
+            hub.recv_known.remove(&old);
+            let moved = hub.inbox.remove(&old).unwrap_or_default();
+            let target = hub.inbox.entry(peer_id.clone()).or_default();
+            let present: HashSet<String> = target
+                .iter()
+                .filter_map(|held| held["id"].as_str().map(str::to_string))
+                .collect();
+            for record in moved {
+                let record = with_event_id(record);
+                let id = record["id"].as_str().unwrap_or_default().to_string();
+                if present.contains(&id) {
+                    continue;
+                }
+                target.push(record.clone());
+                to_push.push(record);
+            }
+            if hub.inbox.get(&peer_id).map(Vec::is_empty).unwrap_or(true) {
+                hub.inbox.remove(&peer_id);
+            } else {
+                hub.recv_known.insert(peer_id.clone());
+            }
+            for ask in hub.asks.values_mut() {
+                if ask.open && ask.to_peer_id == old {
+                    ask.to_peer_id = peer_id.clone();
+                }
+            }
+        }
+    }
+    hub.peers.insert(peer_id.clone(), peer.clone());
+    persist_ok(&mut hub)?;
+    if !to_push.is_empty() && hub.recv_live.contains(&peer_id) {
+        if let Some((_, tx)) = hub.sockets.get(&peer_id) {
+            for record in to_push {
+                let _ = tx.send(record);
+            }
+        }
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "peer_id": peer.peer_id,
+        "display_name": peer.name,
+        "circle": peer.circle,
+        "role": "agent"
+    })))
+}
+
+const PEER_ONLINE_SECS: u64 = 30;
+
+fn refresh_peers(hub: &mut Hub) -> bool {
+    let now = now_unix();
+    let mut changed = false;
+    let closed: Vec<String> = hub
+        .sockets
+        .iter()
+        .filter(|(_, (_, tx))| tx.is_closed())
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &closed {
+        hub.sockets.remove(id);
+        changed = true;
+    }
+    let drop: Vec<String> = hub
+        .peers
+        .keys()
+        .filter(|id| {
+            if hub.sockets.contains_key(*id) {
+                return false;
+            }
+            now.saturating_sub(hub.peers.get(*id).map(|peer| peer.last_seen).unwrap_or(0))
+                > PEER_ONLINE_SECS
+        })
+        .cloned()
+        .collect();
+    for id in &drop {
+        let session = hub
+            .peers
+            .get(id)
+            .map(|p| p.session_id.clone())
+            .unwrap_or_default();
+        hub.peers.remove(id);
+        hub.mcp_servers.remove(id);
+        /* what an acknowledging, session-bound peer is still owed stays behind for that
+        session; a peer with no session has nobody to hand it to, so it goes as before */
+        let holds_backlog = hub.recv_known.contains(id)
+            && hub.inbox.get(id).map(|q| !q.is_empty()).unwrap_or(false);
+        if holds_backlog && !session.is_empty() {
+            hub.owed.entry(id.clone()).or_insert(Owed {
+                since: now,
+                owner: session,
+            });
+        } else {
+            hub.inbox.remove(id);
+            hub.recv_known.remove(id);
+            hub.owed.remove(id);
+        }
+        changed = true;
+    }
+    /* the owner never came back: the backlog is not a promise anyone can still keep */
+    let expired: Vec<String> = hub
+        .owed
+        .iter()
+        .filter(|(_, owed)| now.saturating_sub(owed.since) > OWED_TTL_SECS)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &expired {
+        hub.owed.remove(id);
+        hub.inbox.remove(id);
+        hub.recv_known.remove(id);
+        changed = true;
+    }
+    changed
+}
+
+fn probe_peers(hub: &mut Hub) -> Result<(), (StatusCode, Json<Value>)> {
+    if refresh_peers(hub) {
+        persist_ok(hub)?;
+    }
+    Ok(())
+}
+
+async fn list_peers(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    probe_peers(&mut hub)?;
+    Ok(Json(json!(hub.peers.values().cloned().collect::<Vec<_>>())))
+}
+
+async fn open_ask(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<AskReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
+    let Some(target) = resolve(&hub, &req.to_peer) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown peer"})),
+        ));
+    };
+    require_cross_circle(
+        &hub,
+        req.from_peer.as_deref(),
+        &req.to_peer,
+        req.cross_circle,
+    )?;
+    let to_peer_id = target.peer_id.clone();
+    let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let ask = Ask {
+        correlation_id: cid.clone(),
+        from_peer: req.from_peer.unwrap_or_else(|| "anonymous".into()),
+        to_peer: req.to_peer.clone(),
+        to_peer_id: to_peer_id.clone(),
+        text: req.text.clone(),
+        open: true,
+        reply: None,
+    };
+    hub.asks.insert(cid.clone(), ask.clone());
+    let mut event = json!({
+        "type": "ask",
+        "correlation_id": cid,
+        "from_peer": ask.from_peer,
+        "to_peer": ask.to_peer,
+        "text": ask.text,
+    });
+    if let Some(attachments) = req.attachments {
+        event["attachments"] = attachments;
+    }
+    persist_then_deliver(&mut hub, &to_peer_id, event)?;
+    Ok(Json(json!({"correlation_id": cid, "ok": true})))
+}
+
+async fn ack_ask(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<AckReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    let Some(ask) = hub.asks.get(&req.correlation_id).cloned() else {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown ask"}))));
+    };
+    if !ask.open {
+        /* a retry of the same answer is idempotent, but a different one would be
+        written nowhere and delivered to nobody, so refuse instead of dropping it */
+        if req.message.is_some() && req.message != ask.reply {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "ask already answered",
+                    "correlation_id": req.correlation_id,
+                    "reply": ask.reply
+                })),
+            ));
+        }
+        return Ok(Json(json!({
+            "ok": true,
+            "correlation_id": req.correlation_id,
+            "reply": ask.reply
+        })));
+    }
+    if let Some(row) = hub.asks.get_mut(&req.correlation_id) {
+        row.open = false;
+        row.reply = req.message.clone();
+    }
+    let event = json!({
+        "type": "ack",
+        "correlation_id": req.correlation_id,
+        "from_peer": ask.to_peer,
+        "to_peer": ask.from_peer,
+        "message": req.message,
+    });
+    persist_then_deliver(&mut hub, &ask.from_peer, event)?;
+    Ok(Json(
+        json!({"ok": true, "correlation_id": req.correlation_id}),
+    ))
+}
+
+async fn notify(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<NotifyReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
+    if resolve(&hub, &req.to_peer).is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown peer"})),
+        ));
+    }
+    require_cross_circle(
+        &hub,
+        req.from_peer.as_deref(),
+        &req.to_peer,
+        req.cross_circle,
+    )?;
+    let id = format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let event = json!({
+        "type": "notify",
+        "id": id,
+        "from_peer": req.from_peer,
+        "to_peer": req.to_peer,
+        "message": req.message,
+    });
+    persist_then_deliver(&mut hub, &req.to_peer, event)?;
+    Ok(Json(json!({"ok": true, "id": id})))
+}
+
+#[derive(Deserialize)]
+struct BroadcastReq {
+    #[serde(default)]
+    from_peer: Option<String>,
+    #[serde(default)]
+    circle: Option<String>,
+    #[serde(alias = "text")]
+    message: String,
+    #[serde(default)]
+    cross_circle: bool,
+}
+
+async fn broadcast(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<BroadcastReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    if req.message.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "message required"})),
+        ));
+    }
+    let mut hub = app.inner.lock().await;
+    let from = req
+        .from_peer
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "anonymous".into());
+    /* touch before probe, or this very call prunes the peer that just proved it is alive */
+    touch_peer(&mut hub, &from);
+    probe_peers(&mut hub)?;
+    let Some(sender) = resolve(&hub, &from) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown sender"})),
+        ));
+    };
+    let from_id = sender.peer_id.clone();
+    let own = sender.circle.clone();
+    let circle = req
+        .circle
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| own.clone());
+    if circle != own && !req.cross_circle {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "cross-circle requires cross_circle"})),
+        ));
+    }
+    let targets: Vec<String> = hub
+        .peers
+        .values()
+        .filter(|p| p.peer_id != from_id && p.name != from && p.circle == circle)
+        .map(|p| p.peer_id.clone())
+        .collect();
+    let id = format!("bcast-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let mut sent_to = Vec::new();
+    let mut failed = Vec::new();
+    for to in targets {
+        let event = json!({
+            "type": "broadcast",
+            "id": id,
+            "from_peer": from,
+            "to_peer": to,
+            "message": req.message,
+        });
+        match persist_then_deliver(&mut hub, &to, event) {
+            Ok(()) => sent_to.push(to),
+            Err((_, Json(err))) => failed.push(json!({"peer": to, "error": err})),
+        }
+    }
+    Ok(Json(
+        json!({"ok": true, "id": id, "sent_to": sent_to, "failed": failed}),
+    ))
+}
+
+#[derive(Deserialize)]
+struct PendingQuery {
+    peer_id: Option<String>,
+}
+
+async fn pending_asks(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<PendingQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let Some(peer_id) = q.peer_id.filter(|s| !s.is_empty()) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Must provide peer_id"})),
+        ));
+    };
+    let mut hub = app.inner.lock().await;
+    let open: Vec<Ask> = hub
+        .asks
+        .values()
+        .filter(|a| a.open && a.to_peer_id == peer_id)
+        .cloned()
+        .collect();
+    /* with an acknowledging connection attached, the inbox holds copies already on the
+    socket and waiting for recv; handing them out here as well would deliver them twice.
+    Only the peer's recv retires those. With nobody attached the hook is the delivery. */
+    /* an unsettled backlog is held the same way: the hook must not leak it to whoever holds
+    the name before a session has proved it is the owner */
+    let attached = hub.recv_live.contains(&peer_id) || hub.owed.contains_key(&peer_id);
+    let inbox = if attached {
+        Vec::new()
+    } else {
+        hub.inbox.remove(&peer_id).unwrap_or_default()
+    };
+    if let Err(e) = persist_ok(&mut hub) {
+        if !attached {
+            hub.inbox.insert(peer_id, inbox);
+        }
+        return Err(e);
+    }
+    Ok(Json(json!({"asks": open, "inbox": inbox})))
+}
+
+#[derive(Deserialize)]
+struct AskManyReq {
+    #[serde(default)]
+    from_peer: Option<String>,
+    to_peers: Vec<String>,
+    #[serde(alias = "query", alias = "message")]
+    text: String,
+    #[serde(default)]
+    cross_circle: bool,
+}
+
+#[derive(Deserialize)]
+struct WaitReq {
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ChatReq {
+    #[serde(default)]
+    peer: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Deserialize)]
+struct AttachReq {
+    filename: String,
+    #[serde(default)]
+    content_base64: String,
+}
+
+#[derive(Deserialize)]
+struct McpServerReq {
+    name: String,
+    #[serde(default)]
+    command: Option<String>,
+}
+
+fn push_event(hub: &mut Hub, mut event: Value) {
+    let fields = match event["type"].as_str() {
+        Some("chat" | "chat_turn_delta") => [("from_circle", "peer"), ("to_circle", "peer")],
+        _ => [("from_circle", "from_peer"), ("to_circle", "to_peer")],
+    };
+    for (label, field) in fields {
+        let circle = event[field]
+            .as_str()
+            .and_then(|peer| resolve(hub, peer))
+            .map(|peer| peer.circle.clone());
+        if let Some(object) = event.as_object_mut() {
+            object.remove(label);
+            if let Some(circle) = circle {
+                object.insert(label.into(), json!(circle));
+            }
+        }
+    }
+    hub.events.push(event);
+    if hub.events.len() > 500 {
+        hub.events.remove(0);
+    }
+}
+
+async fn ask_many(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<AskManyReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    if req.to_peers.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "to_peers required"})),
+        ));
+    }
+    let parent = format!("batch-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let mut cids = Vec::new();
+    for to in &req.to_peers {
+        let (st, body) = {
+            let res = open_ask(
+                State(app.clone()),
+                headers.clone(),
+                Json(AskReq {
+                    from_peer: req.from_peer.clone(),
+                    to_peer: to.clone(),
+                    text: req.text.clone(),
+                    attachments: None,
+                    cross_circle: req.cross_circle,
+                }),
+            )
+            .await;
+            match res {
+                Ok(Json(v)) => (StatusCode::OK, v),
+                Err((st, Json(v))) => (st, v),
+            }
+        };
+        if st != StatusCode::OK {
+            return Err((st, Json(body)));
+        }
+        if let Some(cid) = body.get("correlation_id").and_then(Value::as_str) {
+            cids.push(cid.to_string());
+        }
+    }
+    let mut hub = app.inner.lock().await;
+    hub.batches.insert(parent.clone(), cids.clone());
+    Ok(Json(json!({"ok": true, "parent_id": parent, "asks": cids})))
+}
+
+async fn ask_many_result(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let hub = app.inner.lock().await;
+    let Some(cids) = hub.batches.get(&id).cloned() else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown batch"})),
+        ));
+    };
+    let asks: Vec<Ask> = cids
+        .iter()
+        .filter_map(|c| hub.asks.get(c).cloned())
+        .collect();
+    Ok(Json(json!({"parent_id": id, "asks": asks})))
+}
+
+async fn wait_ask(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<WaitReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut wait = req.timeout_seconds.unwrap_or(45);
+    if wait > 50 {
+        wait = 50;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    loop {
+        {
+            let hub = app.inner.lock().await;
+            if let Some(ask) = hub.asks.get(&id) {
+                if !ask.open {
+                    return Ok(Json(json!(ask)));
+                }
+            } else {
+                return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown ask"}))));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let hub = app.inner.lock().await;
+            return Ok(Json(json!(hub.asks.get(&id))));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn ask_blocking(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let prompt = body
+        .get("prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if prompt.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "prompt is required"})),
+        ));
+    }
+    let mut cid = body
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if cid.is_empty() {
+        let to = body
+            .get("to_peer")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if to.is_empty() {
+            return Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": "to_peer or correlation_id required"})),
+            ));
+        }
+        let opened = open_ask(
+            State(app.clone()),
+            headers.clone(),
+            Json(AskReq {
+                from_peer: body
+                    .get("from_peer")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                to_peer: to,
+                text: prompt,
+                attachments: None,
+                cross_circle: body
+                    .get("cross_circle")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            }),
+        )
+        .await?;
+        cid = opened.0["correlation_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+    }
+    wait_ask(
+        State(app),
+        headers,
+        AxumPath(cid),
+        Json(WaitReq {
+            timeout_seconds: body.get("timeout_seconds").and_then(Value::as_u64),
+        }),
+    )
+    .await
+}
+
+async fn list_events(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<HashMap<String, String>>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let hub = app.inner.lock().await;
+    let mut events = if let Some(since) = q.get("since").filter(|s| !s.is_empty()) {
+        hub.events
+            .iter()
+            .skip_while(|e| e.get("id").and_then(Value::as_str) != Some(since.as_str()))
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        hub.events.clone()
+    };
+    if let Some(circle) = q.get("circle").filter(|s| !s.is_empty()) {
+        events.retain(|event| {
+            event["from_circle"].as_str() == Some(circle.as_str())
+                || event["to_circle"].as_str() == Some(circle.as_str())
+        });
+    }
+    Ok(Json(json!(events)))
+}
+
+async fn ingest_chat(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<ChatReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    let id = format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    push_event(
+        &mut hub,
+        json!({"id": id, "type": "chat", "peer": req.peer, "role": req.role, "text": req.text}),
+    );
+    if !req.peer.is_empty() {
+        deliver_notify(&mut hub, &req.peer, req.text)?;
+    }
+    Ok(Json(json!({"ok": true, "id": id})))
+}
+
+async fn ingest_chat_delta(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<ChatReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    let id = format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    push_event(
+        &mut hub,
+        json!({"id": id, "type": "chat_turn_delta", "peer": req.peer, "role": req.role, "text": req.text}),
+    );
+    Ok(Json(json!({"ok": true, "id": id})))
+}
+
+async fn peer_timeline(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let hub = app.inner.lock().await;
+    let events: Vec<Value> = hub
+        .events
+        .iter()
+        .filter(|e| e.get("peer").and_then(Value::as_str) == Some(name.as_str()))
+        .cloned()
+        .collect();
+    let asks: Vec<Ask> = hub
+        .asks
+        .values()
+        .filter(|a| a.from_peer == name || a.to_peer == name || a.to_peer_id == name)
+        .cloned()
+        .collect();
+    Ok(Json(json!({"peer": name, "events": events, "asks": asks})))
+}
+
+async fn upload_attachment(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<AttachReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let raw = base64_decode(&req.content_base64)
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(json!({"error": e}))))?;
+    if raw.len() > 10 * 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "max 10MB"})),
+        ));
+    }
+    let id = Uuid::new_v4().simple().to_string();
+    let dir = attachments_dir(&app);
+    fs::create_dir_all(&dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    let path = dir.join(&id);
+    fs::write(&path, raw).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(
+        json!({"id": id, "filename": req.filename, "path": path}),
+    ))
+}
+
+async fn upload_form(
+    State(app): State<App>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut filename = String::from("file");
+    let mut raw = Vec::new();
+    while let Some(field) = multipart.next_field().await.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+    })? {
+        if field.file_name().is_some() || field.name() == Some("file") {
+            if let Some(name) = field.file_name() {
+                filename = name.to_string();
+            }
+            raw = field
+                .bytes()
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": e.to_string()})),
+                    )
+                })?
+                .to_vec();
+        }
+    }
+    if raw.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "file field required"})),
+        ));
+    }
+    if raw.len() > 10 * 1024 * 1024 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "max 10MB"})),
+        ));
+    }
+    let id = Uuid::new_v4().simple().to_string();
+    let dir = attachments_dir(&app);
+    fs::create_dir_all(&dir).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    let path = dir.join(&id);
+    fs::write(&path, raw).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(json!({"id": id, "filename": filename, "path": path})))
+}
+
+async fn get_attachment(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let path = attachments_dir(&app).join(&id);
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "missing"}))));
+    }
+    let data = fs::read(&path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .body(Body::from(data))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    fn val(c: u8) -> Option<u8> {
+        match c {
+            b'A'..=b'Z' => Some(c - b'A'),
+            b'a'..=b'z' => Some(c - b'a' + 26),
+            b'0'..=b'9' => Some(c - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut buf = 0u32;
+    let mut n = 0;
+    for &c in bytes {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        let Some(v) = val(c) else {
+            return Err("invalid base64".into());
+        };
+        buf = (buf << 6) | u32::from(v);
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((buf >> n) as u8);
+        }
+    }
+    Ok(out)
+}
+
+fn session_peer_id(hub: &Hub, id: &str) -> String {
+    if resolve(hub, id).is_some() {
+        return id.to_string();
+    }
+    hub.peers
+        .values()
+        .find(|p| p.session_id == id || p.peer_id.ends_with(id) || p.name == id)
+        .map(|p| p.peer_id.clone())
+        .unwrap_or_else(|| id.to_string())
+}
+
+async fn session_notify(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let message = body
+        .get("message")
+        .or(body.get("text"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("resume")
+        .to_string();
+    let to_peer = {
+        let hub = app.inner.lock().await;
+        body.get("to_peer")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| session_peer_id(&hub, &id))
+    };
+    notify(
+        State(app),
+        headers,
+        Json(NotifyReq {
+            from_peer: body
+                .get("from_peer")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            to_peer,
+            message,
+            cross_circle: body
+                .get("cross_circle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        }),
+    )
+    .await
+}
+
+async fn session_resume(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let id = body
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if id.is_empty() {
+        return Err((
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error": "session_id is required"})),
+        ));
+    }
+    session_notify(State(app), headers, AxumPath(id), Json(body)).await
+}
+
+async fn list_peer_mcp(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let hub = app.inner.lock().await;
+    let key = resolve(&hub, &name)
+        .map(|p| p.peer_id.clone())
+        .unwrap_or(name);
+    Ok(Json(
+        json!({"servers": hub.mcp_servers.get(&key).cloned().unwrap_or_default()}),
+    ))
+}
+
+async fn add_peer_mcp(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(name): AxumPath<String>,
+    Json(req): Json<McpServerReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    let key = resolve(&hub, &name)
+        .map(|p| p.peer_id.clone())
+        .unwrap_or(name);
+    hub.mcp_servers
+        .entry(key.clone())
+        .or_default()
+        .push(json!({"name": req.name, "command": req.command}));
+    persist_ok(&mut hub)?;
+    Ok(Json(
+        json!({"ok": true, "servers": hub.mcp_servers.get(&key)}),
+    ))
+}
+
+async fn remove_peer_mcp(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath((name, server)): AxumPath<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    let key = resolve(&hub, &name)
+        .map(|p| p.peer_id.clone())
+        .unwrap_or(name);
+    if let Some(list) = hub.mcp_servers.get_mut(&key) {
+        list.retain(|s| s.get("name").and_then(Value::as_str) != Some(server.as_str()));
+    }
+    persist_ok(&mut hub)?;
+    Ok(Json(json!({"ok": true})))
+}
+
+fn stamp_job_circle(
+    hub: &Hub,
+    from_peer: Option<&str>,
+    assigned_peer: Option<&str>,
+) -> Result<String, (StatusCode, Json<Value>)> {
+    if let Some(id) = from_peer.filter(|s| !s.is_empty()) {
+        return resolve(hub, id)
+            .map(|peer| peer.circle.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "unknown caller"})),
+                )
+            });
+    }
+    if let Some(id) = assigned_peer.filter(|s| !s.is_empty()) {
+        return resolve(hub, id)
+            .map(|peer| peer.circle.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "unknown peer"})),
+                )
+            });
+    }
+    Ok(String::new())
+}
+
+async fn create_job(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<JobCreateReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let backend = match req.backend.as_deref() {
+        None | Some("") => "pi",
+        Some(raw) => normalize_backend(raw).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "backend must be pi, codex, or claude-code"})),
+            )
+        })?,
+    };
+    let job_id = format!("job-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let mut hub = app.inner.lock().await;
+    let circle = stamp_job_circle(&hub, req.from_peer.as_deref(), req.assigned_peer.as_deref())?;
+    let job = Job {
+        job_id: job_id.clone(),
+        title: req.title,
+        prompt: req.prompt,
+        path: req.path,
+        backend: backend.into(),
+        assigned_peer: req.assigned_peer,
+        state: "queued".into(),
+        result_summary: None,
+        circle,
+    };
+    hub.jobs.insert(job_id.clone(), job.clone());
+    if let Some(to) = job.assigned_peer.as_deref().filter(|id| !id.is_empty()) {
+        deliver_notify(
+            &mut hub,
+            to,
+            format!("job {} {} {}", job.job_id, job.title, job.state),
+        )?;
+    } else {
+        persist_ok(&mut hub)?;
+    }
+    Ok(Json(json!(job)))
+}
+
+async fn list_jobs(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let hub = app.inner.lock().await;
+    Ok(Json(json!(hub.jobs.values().cloned().collect::<Vec<_>>())))
+}
+
+async fn show_job(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let hub = app.inner.lock().await;
+    hub.jobs
+        .get(&id)
+        .cloned()
+        .map(|j| Json(json!(j)))
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))))
+}
+
+async fn update_job(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<JobUpdateReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let allowed = ["queued", "running", "done", "failed", "cancelled"];
+    if !allowed.contains(&req.state.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "bad job state"})),
+        ));
+    }
+    let mut hub = app.inner.lock().await;
+    let Some(job) = hub.jobs.get_mut(&id) else {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
+    };
+    job.state = req.state;
+    if req.result_summary.is_some() {
+        job.result_summary = req.result_summary;
+    }
+    let job = job.clone();
+    if let Some(to) = job.assigned_peer.as_deref().filter(|id| !id.is_empty()) {
+        deliver_notify(
+            &mut hub,
+            to,
+            format!("job {} {} {}", job.job_id, job.title, job.state),
+        )?;
+    } else {
+        persist_ok(&mut hub)?;
+    }
+    Ok(Json(json!(job)))
+}
+
+async fn cancel_job(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    update_job(
+        State(app),
+        headers,
+        AxumPath(id),
+        Json(JobUpdateReq {
+            state: "cancelled".into(),
+            result_summary: None,
+        }),
+    )
+    .await
+}
+
+async fn delete_job(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    if hub.jobs.remove(&id).is_none() {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
+    }
+    persist_ok(&mut hub)?;
+    match headers
+        .get("x-amesh-operator")
+        .and_then(|value| value.to_str().ok())
+        .filter(|op| !op.is_empty())
+    {
+        Some(op) => eprintln!("amesh: deleted job {id} by {op:?}"),
+        None => eprintln!("amesh: deleted job {id}"),
+    }
+    Ok(Json(json!({"ok": true, "job_id": id})))
+}
+
+async fn create_schedule(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<ScheduleCreateReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let kind = req.kind.as_deref().unwrap_or("notify");
+    if kind != "notify" && kind != "ask" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "kind must be notify or ask"})),
+        ));
+    }
+    let mut hub = app.inner.lock().await;
+    touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
+    let Some(target) = resolve(&hub, &req.to_peer) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown peer"})),
+        ));
+    };
+    let to_peer = target.peer_id.clone();
+    let circle = if let Some(id) = req.from_peer.as_deref().filter(|s| !s.is_empty()) {
+        resolve(&hub, id)
+            .map(|peer| peer.circle.clone())
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": "unknown caller"})),
+                )
+            })?
+    } else {
+        target.circle.clone()
+    };
+    let fire_at = req
+        .fire_at
+        .unwrap_or_else(|| now_unix() + req.in_seconds.unwrap_or(0));
+    let schedule_id = format!("sched-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let sched = Schedule {
+        schedule_id: schedule_id.clone(),
+        from_peer: req.from_peer.unwrap_or_else(|| "anonymous".into()),
+        to_peer,
+        text: req.text,
+        kind: kind.into(),
+        fire_at,
+        every_seconds: req.every_seconds,
+        circle,
+    };
+    hub.schedules.insert(schedule_id.clone(), sched.clone());
+    persist_ok(&mut hub)?;
+    Ok(Json(json!(sched)))
+}
+
+async fn list_schedules(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let hub = app.inner.lock().await;
+    Ok(Json(json!(hub
+        .schedules
+        .values()
+        .cloned()
+        .collect::<Vec<_>>())))
+}
+
+async fn delete_schedule(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    if hub.schedules.remove(&id).is_none() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown schedule"})),
+        ));
+    }
+    persist_ok(&mut hub)?;
+    Ok(Json(json!({"ok": true, "schedule_id": id})))
+}
+
+/* Every peer the hub still knows keeps its stamp and log. What is left over belongs to
+drainers that are gone, and the gc command's own tests decide whether a pid is really
+dead, so the daemon never reaches a different verdict than a hand-run gc would. The
+attachments and the state files are never touched from here. */
+async fn sweep_runtime_files(app: &App) {
+    let Some(dir) = app.state_path.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let keep: HashSet<String> = app.inner.lock().await.peers.keys().cloned().collect();
+    let targets = tokio::task::spawn_blocking(move || {
+        let targets = crate::cli::gc_candidates(&dir, &keep, true, None);
+        crate::cli::cap_runtime_logs(&dir);
+        targets
+    })
+    .await
+    .unwrap_or_default();
+    for path in targets {
+        if let Err(error) = fs::remove_file(&path) {
+            eprintln!("amesh sweep: {}: {error}", path.display());
+        }
+    }
+}
+
+async fn tick_schedules(app: &App) {
+    {
+        let mut hub = app.inner.lock().await;
+        if refresh_peers(&mut hub) {
+            let _ = persist(&mut hub);
+        }
+    }
+    let now = now_unix();
+    let due: Vec<Schedule> = {
+        let hub = app.inner.lock().await;
+        hub.schedules
+            .values()
+            .filter(|s| s.fire_at <= now)
+            .cloned()
+            .collect()
+    };
+    for sched in due {
+        let mut hub = app.inner.lock().await;
+        if resolve(&hub, &sched.to_peer).is_none() {
+            continue;
+        }
+        let (to, event) = if sched.kind == "ask" {
+            let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let to_peer_id = resolve(&hub, &sched.to_peer)
+                .map(|p| p.peer_id.clone())
+                .unwrap_or_else(|| sched.to_peer.clone());
+            let ask = Ask {
+                correlation_id: cid.clone(),
+                from_peer: sched.from_peer.clone(),
+                to_peer: sched.to_peer.clone(),
+                to_peer_id: to_peer_id.clone(),
+                text: sched.text.clone(),
+                open: true,
+                reply: None,
+            };
+            hub.asks.insert(cid.clone(), ask.clone());
+            (
+                to_peer_id,
+                json!({
+                    "type": "ask",
+                    "correlation_id": cid,
+                    "from_peer": ask.from_peer,
+                    "to_peer": ask.to_peer,
+                    "text": ask.text,
+                }),
+            )
+        } else {
+            (
+                sched.to_peer.clone(),
+                json!({
+                    "type": "notify",
+                    "id": format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]),
+                    "from_peer": sched.from_peer,
+                    "to_peer": sched.to_peer,
+                    "message": sched.text,
+                }),
+            )
+        };
+        if let Some(every) = sched.every_seconds {
+            if let Some(row) = hub.schedules.get_mut(&sched.schedule_id) {
+                row.fire_at = now + every;
+            }
+        } else {
+            hub.schedules.remove(&sched.schedule_id);
+        }
+        if let Err((_, Json(err))) = persist_then_deliver(&mut hub, &to, event) {
+            eprintln!("amesh persist: {err}");
+        }
+    }
+}
+
+async fn mcp(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<RpcReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let id = req.id.clone();
+    let method = req.method.as_deref().unwrap_or("");
+    let result = match method {
+        "initialize" => json!({
+            "protocolVersion": "2024-11-05",
+            "serverInfo": {"name": "amesh", "version": "0.1.0"},
+            "capabilities": {"tools": {}}
+        }),
+        "tools/list" => json!({"tools": mcp_tools()}),
+        "tools/call" => mcp_call(&app, req.params).await?,
+        "notifications/initialized" => {
+            return Ok(Json(
+                json!({"jsonrpc": req.jsonrpc, "id": id, "result": null}),
+            ));
+        }
+        _ => {
+            return Ok(Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32601, "message": format!("unknown method {method}")}
+            })));
+        }
+    };
+    Ok(Json(json!({"jsonrpc": "2.0", "id": id, "result": result})))
+}
+
+fn mcp_scope(hub: &Hub, args: &Value) -> Result<Option<String>, (StatusCode, Json<Value>)> {
+    let own = args
+        .get("from_peer")
+        .and_then(Value::as_str)
+        .filter(|caller| !caller.is_empty())
+        .and_then(|caller| resolve(hub, caller).map(|peer| peer.circle.clone()))
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "unknown caller"})),
+            )
+        })?;
+    let circle = args
+        .get("circle")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
+    let cross = args
+        .get("cross_circle")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if circle.is_some_and(|c| c != own) && !cross {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "cross-circle requires cross_circle"})),
+        ));
+    }
+    Ok(circle
+        .map(str::to_string)
+        .or_else(|| (!cross).then_some(own)))
+}
+
+fn mcp_tools() -> Vec<Value> {
+    let obj = |desc: &str, props: Value, required: &[&str]| {
+        json!({
+            "description": desc,
+            "inputSchema": {
+                "type": "object",
+                "properties": props,
+                "required": required,
+            }
+        })
+    };
+    vec![
+        {
+            let mut t = obj(
+                "Open a tracked ask. Same-circle by default; set cross_circle for another circle.",
+                json!({
+                    "peer_name": {"type": "string"},
+                    "to_peer": {"type": "string"},
+                    "query": {"type": "string"},
+                    "from_peer": {"type": "string"},
+                    "cross_circle": {"type": "boolean"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_ask");
+            t
+        },
+        {
+            let mut t = obj(
+                "Close an ask",
+                json!({
+                    "correlation_id": {"type": "string"},
+                    "message": {"type": "string"}
+                }),
+                &["correlation_id"],
+            );
+            t["name"] = json!("amesh_ack");
+            t
+        },
+        {
+            let mut t = obj("Fire-and-forget notify. Same-circle by default; set cross_circle for another circle.", json!({
+                "peer_name": {"type": "string"},
+                "to_peer": {"type": "string"},
+                "message": {"type": "string"},
+                "from_peer": {"type": "string"},
+                "cross_circle": {"type": "boolean"}
+            }), &["message"]);
+            t["name"] = json!("amesh_notify_peer");
+            t
+        },
+        {
+            let mut t = obj("Broadcast in a circle. Default: caller's circle. Other circle: set circle and cross_circle.", json!({
+                "message": {"type": "string"},
+                "circle": {"type": "string"},
+                "cross_circle": {"type": "boolean"},
+                "from_peer": {"type": "string"}
+            }), &["message"]);
+            t["name"] = json!("amesh_broadcast");
+            t
+        },
+        {
+            let mut t = obj(
+                "List peers in your circle; cross_circle without circle lists all",
+                json!({
+                    "circle": {"type": "string"},
+                    "cross_circle": {"type": "boolean"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_list_peers");
+            t
+        },
+        {
+            let mut t = obj(
+                "Caller identity",
+                json!({
+                    "peer_id": {"type": "string"},
+                    "from_peer": {"type": "string"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_whoami");
+            t
+        },
+        {
+            let mut t = obj(
+                "Create a job ledger row",
+                json!({
+                    "title": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "path": {"type": "string"},
+                    "backend": {"type": "string"},
+                    "assigned_peer": {"type": "string"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_job_create");
+            t
+        },
+        {
+            let mut t = obj(
+                "List jobs in your circle; cross_circle without circle lists all",
+                json!({
+                    "circle": {"type": "string"},
+                    "cross_circle": {"type": "boolean"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_job_list");
+            t
+        },
+        {
+            let mut t = obj(
+                "Show a job",
+                json!({"job_id": {"type": "string"}}),
+                &["job_id"],
+            );
+            t["name"] = json!("amesh_job_status");
+            t
+        },
+        {
+            let mut t = obj(
+                "Update job state",
+                json!({
+                    "job_id": {"type": "string"},
+                    "state": {"type": "string"},
+                    "result_summary": {"type": "string"}
+                }),
+                &["job_id", "state"],
+            );
+            t["name"] = json!("amesh_job_update");
+            t
+        },
+        {
+            let mut t = obj(
+                "Cancel a job",
+                json!({"job_id": {"type": "string"}}),
+                &["job_id"],
+            );
+            t["name"] = json!("amesh_job_cancel");
+            t
+        },
+        {
+            let mut t = obj(
+                "Delete a job",
+                json!({"job_id": {"type": "string"}}),
+                &["job_id"],
+            );
+            t["name"] = json!("amesh_job_delete");
+            t
+        },
+        {
+            let mut t = obj(
+                "Create a schedule",
+                json!({
+                    "to_peer": {"type": "string"},
+                    "peer_name": {"type": "string"},
+                    "text": {"type": "string"},
+                    "from_peer": {"type": "string"},
+                    "kind": {"type": "string"},
+                    "in_seconds": {"type": "integer"},
+                    "fire_at": {"type": "integer"},
+                    "every_seconds": {"type": "integer"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_schedule_create");
+            t
+        },
+        {
+            let mut t = obj(
+                "List schedules in your circle; cross_circle without circle lists all",
+                json!({
+                    "circle": {"type": "string"},
+                    "cross_circle": {"type": "boolean"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_schedule_list");
+            t
+        },
+        {
+            let mut t = obj(
+                "Delete a schedule",
+                json!({"schedule_id": {"type": "string"}}),
+                &["schedule_id"],
+            );
+            t["name"] = json!("amesh_schedule_delete");
+            t
+        },
+        {
+            let mut t = obj(
+                "Ask many peers",
+                json!({
+                    "to_peers": {"type": "array", "items": {"type": "string"}},
+                    "text": {"type": "string"},
+                    "from_peer": {"type": "string"}
+                }),
+                &["to_peers", "text"],
+            );
+            t["name"] = json!("amesh_ask_many");
+            t
+        },
+        {
+            let mut t = obj(
+                "Wait for an ask ack",
+                json!({
+                    "correlation_id": {"type": "string"},
+                    "timeout_seconds": {"type": "integer"}
+                }),
+                &["correlation_id"],
+            );
+            t["name"] = json!("amesh_wait");
+            t
+        },
+        {
+            let mut t = obj(
+                "List recent events in your circle; cross_circle without circle lists all",
+                json!({
+                    "since": {"type": "string"},
+                    "circle": {"type": "string"},
+                    "cross_circle": {"type": "boolean"}
+                }),
+                &[],
+            );
+            t["name"] = json!("amesh_events");
+            t
+        },
+    ]
+}
+
+async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<Value>)> {
+    let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    if let Some(caller) = args.get("from_peer").and_then(Value::as_str) {
+        let mut hub = app.inner.lock().await;
+        touch_peer(&mut hub, caller);
+    }
+    let text = match name {
+        "amesh_whoami" => args
+            .get("peer_id")
+            .or(args.get("from_peer"))
+            .and_then(Value::as_str)
+            .unwrap_or("amesh anonymous")
+            .to_string(),
+        "amesh_list_peers" => {
+            let mut hub = app.inner.lock().await;
+            probe_peers(&mut hub)?;
+            let filter = mcp_scope(&hub, &args)?;
+            hub.peers
+                .values()
+                .filter(|peer| filter.as_deref().is_none_or(|circle| peer.circle == circle))
+                .map(|p| {
+                    format!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        p.peer_id, p.name, p.circle, p.backend, p.status
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        "amesh_ask" => {
+            let to = args
+                .get("peer_name")
+                .or(args.get("to_peer"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let query = args
+                .get("query")
+                .or(args.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let res = open_ask(
+                State(app.clone()),
+                auth_headers(app),
+                Json(AskReq {
+                    from_peer: args
+                        .get("from_peer")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string()),
+                    to_peer: to.into(),
+                    text: query.into(),
+                    attachments: None,
+                    cross_circle: args
+                        .get("cross_circle")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_ack" => {
+            let cid = args
+                .get("correlation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let msg = args
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let res = ack_ask(
+                State(app.clone()),
+                auth_headers(app),
+                Json(AckReq {
+                    correlation_id: cid.into(),
+                    message: msg,
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_notify_peer" => {
+            let to = args
+                .get("peer_name")
+                .or(args.get("to_peer"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let message = args.get("message").and_then(Value::as_str).unwrap_or("");
+            let res = notify(
+                State(app.clone()),
+                auth_headers(app),
+                Json(NotifyReq {
+                    from_peer: args
+                        .get("from_peer")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string()),
+                    to_peer: to.into(),
+                    message: message.into(),
+                    cross_circle: args
+                        .get("cross_circle")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_broadcast" => {
+            let res = broadcast(
+                State(app.clone()),
+                auth_headers(app),
+                Json(BroadcastReq {
+                    from_peer: args
+                        .get("from_peer")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string()),
+                    circle: args
+                        .get("circle")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string()),
+                    message: args
+                        .get("message")
+                        .or(args.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    cross_circle: args
+                        .get("cross_circle")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_job_create" => {
+            let res = create_job(
+                State(app.clone()),
+                auth_headers(app),
+                Json(JobCreateReq {
+                    title: args
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    prompt: args
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    path: args
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    backend: args
+                        .get("backend")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    assigned_peer: args
+                        .get("assigned_peer")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    from_peer: args
+                        .get("from_peer")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_job_list" => {
+            let hub = app.inner.lock().await;
+            let filter = mcp_scope(&hub, &args)?;
+            serde_json::to_string(
+                &hub.jobs
+                    .values()
+                    .filter(|job| filter.as_deref().is_none_or(|circle| job.circle == circle))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_default()
+        }
+        "amesh_job_status" => {
+            let id = args
+                .get("job_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let res = show_job(State(app.clone()), auth_headers(app), AxumPath(id)).await?;
+            res.0.to_string()
+        }
+        "amesh_job_update" => {
+            let id = args
+                .get("job_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let res = update_job(
+                State(app.clone()),
+                auth_headers(app),
+                AxumPath(id),
+                Json(JobUpdateReq {
+                    state: args
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    result_summary: args
+                        .get("result_summary")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_job_cancel" => {
+            let id = args
+                .get("job_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let res = cancel_job(State(app.clone()), auth_headers(app), AxumPath(id)).await?;
+            res.0.to_string()
+        }
+        "amesh_job_delete" => {
+            let id = args
+                .get("job_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let mut headers = auth_headers(app);
+            if let Some(op) = args
+                .get("from_peer")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                if let Ok(value) = axum::http::HeaderValue::from_str(op) {
+                    headers.insert("x-amesh-operator", value);
+                }
+            }
+            let res = delete_job(State(app.clone()), headers, AxumPath(id)).await?;
+            res.0.to_string()
+        }
+        "amesh_schedule_create" => {
+            let res = create_schedule(
+                State(app.clone()),
+                auth_headers(app),
+                Json(ScheduleCreateReq {
+                    to_peer: args
+                        .get("to_peer")
+                        .or(args.get("peer_name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    text: args
+                        .get("text")
+                        .or(args.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    from_peer: args
+                        .get("from_peer")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
+                    in_seconds: args.get("in_seconds").and_then(Value::as_u64),
+                    fire_at: args.get("fire_at").and_then(Value::as_u64),
+                    every_seconds: args.get("every_seconds").and_then(Value::as_u64),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_schedule_list" => {
+            let hub = app.inner.lock().await;
+            let filter = mcp_scope(&hub, &args)?;
+            serde_json::to_string(
+                &hub.schedules
+                    .values()
+                    .filter(|sched| {
+                        filter
+                            .as_deref()
+                            .is_none_or(|circle| sched.circle == circle)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_default()
+        }
+        "amesh_schedule_delete" => {
+            let id = args
+                .get("schedule_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let res = delete_schedule(State(app.clone()), auth_headers(app), AxumPath(id)).await?;
+            res.0.to_string()
+        }
+        "amesh_ask_many" => {
+            let tos = args
+                .get("to_peers")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let res = ask_many(
+                State(app.clone()),
+                auth_headers(app),
+                Json(AskManyReq {
+                    from_peer: args
+                        .get("from_peer")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    to_peers: tos,
+                    text: args
+                        .get("text")
+                        .or(args.get("query"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .into(),
+                    cross_circle: args
+                        .get("cross_circle")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_wait" => {
+            let id = args
+                .get("correlation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let res = wait_ask(
+                State(app.clone()),
+                auth_headers(app),
+                AxumPath(id),
+                Json(WaitReq {
+                    timeout_seconds: args.get("timeout_seconds").and_then(Value::as_u64),
+                }),
+            )
+            .await?;
+            res.0.to_string()
+        }
+        "amesh_events" => {
+            let mut q = HashMap::new();
+            let own = {
+                let hub = app.inner.lock().await;
+                args.get("from_peer")
+                    .and_then(Value::as_str)
+                    .filter(|caller| !caller.is_empty())
+                    .and_then(|caller| resolve(&hub, caller))
+                    .map(|peer| peer.circle.clone())
+                    .ok_or_else(|| {
+                        (
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": "unknown caller"})),
+                        )
+                    })?
+            };
+            let circle = args
+                .get("circle")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty());
+            let cross = args
+                .get("cross_circle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if circle.is_some_and(|circle| circle != own) && !cross {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "cross-circle requires cross_circle"})),
+                ));
+            }
+            if let Some(circle) = circle.or_else(|| (!cross).then_some(own.as_str())) {
+                q.insert("circle".into(), circle.to_string());
+            }
+            if let Some(since) = args.get("since").and_then(Value::as_str) {
+                q.insert("since".into(), since.to_string());
+            }
+            let res = list_events(State(app.clone()), auth_headers(app), Query(q)).await?;
+            res.0.to_string()
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "unknown tool"})),
+            ))
+        }
+    };
+    Ok(json!({"content": [{"type": "text", "text": text}]}))
+}
+
+#[derive(Deserialize)]
+struct ConnectReq {
+    #[serde(rename = "type")]
+    kind: String,
+    peer_id: Option<String>,
+    name: Option<String>,
+    auth_token: Option<String>,
+    /* a client that sets this promises a {"type":"recv","id":..} for every frame it takes;
+    until then the frame stays in its inbox and comes back on the next connection */
+    #[serde(default)]
+    recv: bool,
+}
+
+async fn ws_upgrade(
+    State(app): State<App>,
+    ws: WebSocketUpgrade,
+) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| ws_loop(app, socket))
+}
+
+async fn ws_loop(app: App, mut socket: WebSocket) {
+    let Some(Ok(Message::Text(raw))) = socket.recv().await else {
+        return;
+    };
+    let Ok(req) = serde_json::from_str::<ConnectReq>(&raw) else {
+        let _ = socket
+            .send(Message::Text(
+                json!({"error":"first message must be connect"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    };
+    if req.kind != "connect" {
+        let _ = socket
+            .send(Message::Text(
+                json!({"error":"first message must be connect"})
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+        return;
+    }
+    if let Some(want) = app.token.as_deref() {
+        if req.auth_token.as_deref() != Some(want) {
+            let _ = socket
+                .send(Message::Text(
+                    json!({"error":"unauthorized"}).to_string().into(),
+                ))
+                .await;
+            return;
+        }
+    }
+    let key = req
+        .peer_id
+        .filter(|s| !s.is_empty())
+        .or(req.name.filter(|s| !s.is_empty()));
+    let Some(key) = key else {
+        let _ = socket
+            .send(Message::Text(
+                json!({"error":"peer_id required"}).to_string().into(),
+            ))
+            .await;
+        return;
+    };
+    let recv = req.recv;
+    let (peer_id, name, gen, mut rx, drained) = {
+        let mut hub = app.inner.lock().await;
+        let Some(peer) = resolve(&hub, &key).cloned() else {
+            drop(hub);
+            let _ = socket
+                .send(Message::Text(
+                    json!({"error":"unknown peer"}).to_string().into(),
+                ))
+                .await;
+            return;
+        };
+        hub.conn_gen += 1;
+        let gen = hub.conn_gen;
+        let (tx, rx) = mpsc::unbounded_channel();
+        /* tell the incumbent it lost the peer, otherwise it cannot tell displacement
+        from a dropped link and a reconnecting client would fight us for the socket */
+        if let Some((_, previous)) = hub.sockets.get(&peer.peer_id) {
+            let _ = previous.send(json!({"type": DISPLACED, "peer_id": peer.peer_id}));
+        }
+        hub.sockets.insert(peer.peer_id.clone(), (gen, tx));
+        if let Some(p) = hub.peers.get_mut(&peer.peer_id) {
+            p.status = "online".into();
+            p.last_seen = now_unix();
+        }
+        let mut drained = if recv {
+            /* an acknowledging client gets copies of everything it is still owed; the
+            records stay until its recv for each id, so a drop mid-replay loses nothing */
+            hub.recv_live.insert(peer.peer_id.clone());
+            hub.recv_known.insert(peer.peer_id.clone());
+            if hub.owed.contains_key(&peer.peer_id) {
+                /* whose backlog this is has not been settled yet: the row came back without
+                a session, so nothing is replayed until one proves it is the owner */
+                Vec::new()
+            } else {
+                /* records queued before this peer ever promised to acknowledge carry no id;
+                the peer cannot name them, so they get one now, before persist and replay */
+                let owed = hub.inbox.entry(peer.peer_id.clone()).or_default();
+                for record in owed.iter_mut() {
+                    if record["id"].as_str().map(str::is_empty).unwrap_or(true) {
+                        *record = with_event_id(record.take());
+                    }
+                }
+                let owed = owed.clone();
+                if owed.is_empty() {
+                    hub.inbox.remove(&peer.peer_id);
+                }
+                owed
+            }
+        } else {
+            hub.recv_live.remove(&peer.peer_id);
+            let mut taken = hub.inbox.remove(&peer.peer_id).unwrap_or_default();
+            taken.extend(hub.inbox.remove(&peer.name).unwrap_or_default());
+            taken
+        };
+        if persist_ok(&mut hub).is_err() {
+            drained.clear();
+        }
+        (peer.peer_id, peer.name, gen, rx, drained)
+    };
+    let _ = socket
+        .send(Message::Text(
+            json!({"type":"connected","peer_id":peer_id,"name":name})
+                .to_string()
+                .into(),
+        ))
+        .await;
+    let mut remain = 0;
+    while remain < drained.len() {
+        if socket
+            .send(Message::Text(drained[remain].to_string().into()))
+            .await
+            .is_err()
+        {
+            close_connection(&app, &peer_id, gen, recv, rx, drained[remain..].to_vec()).await;
+            return;
+        }
+        remain += 1;
+    }
+    let mut undelivered = Vec::new();
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    None | Some(Err(_)) => break,
+                    Some(Ok(Message::Text(text))) => {
+                        let mut hub = app.inner.lock().await;
+                        if let Some(peer) = hub.peers.get_mut(&peer_id) {
+                            peer.last_seen = now_unix();
+                        }
+                        let frame: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                        if recv && frame["type"] == "recv" {
+                            if let Some(id) = frame["id"].as_str() {
+                                /* persist_ok reloads the disk copy when the write fails, so a
+                                   recv that could not be recorded leaves the record owed */
+                                if acknowledge_event(&mut hub, &peer_id, id) {
+                                    if let Err((_, Json(err))) = persist_ok(&mut hub) {
+                                        eprintln!("amesh persist: {err}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(_))) => {
+                        let mut hub = app.inner.lock().await;
+                        if let Some(peer) = hub.peers.get_mut(&peer_id) {
+                            peer.last_seen = now_unix();
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+            event = rx.recv() => {
+                match event {
+                    Some(v) => {
+                        if socket.send(Message::Text(v.to_string().into())).await.is_err() {
+                            undelivered.push(v);
+                            break;
+                        }
+                    }
+                    None => break,
+                }
+            }
+        }
+    }
+    close_connection(&app, &peer_id, gen, recv, rx, undelivered).await;
+}
+
+/* the peer took the frame: the record it refers to is no longer owed. Unknown or repeated
+ids are a no-op so a client may safely acknowledge more than once. */
+fn acknowledge_event(hub: &mut Hub, peer_id: &str, id: &str) -> bool {
+    let Some(queue) = hub.inbox.get_mut(peer_id) else {
+        return false;
+    };
+    let before = queue.len();
+    queue.retain(|held| held["id"].as_str() != Some(id));
+    if queue.is_empty() {
+        hub.inbox.remove(peer_id);
+    }
+    before != hub.inbox.get(peer_id).map(Vec::len).unwrap_or(0)
+}
+
+/* Unhook this connection before looking for anywhere to put what it owes: while the map
+still points at our own sender, handing the events back would post them into the channel
+we are about to drop and lose them where a plain disconnect is the common case. Nobody
+can send while we hold the lock, so draining after the removal closes the last window. */
+async fn close_connection(
+    app: &App,
+    peer_id: &str,
+    gen: u64,
+    recv: bool,
+    mut rx: mpsc::UnboundedReceiver<Value>,
+    mut undelivered: Vec<Value>,
+) {
+    let mut hub = app.inner.lock().await;
+    let mut dirty = false;
+    if hub.sockets.get(peer_id).map(|(g, _)| *g) == Some(gen) {
+        hub.sockets.remove(peer_id);
+        hub.recv_live.remove(peer_id);
+        if let Some(peer) = hub.peers.get_mut(peer_id) {
+            peer.status = "offline".into();
+        }
+        dirty = true;
+    }
+    while let Ok(event) = rx.try_recv() {
+        undelivered.push(event);
+    }
+    /* an acknowledging connection only ever carried copies; the records are still in the
+    inbox and the next connection replays them, so there is nothing to hand back */
+    if !recv {
+        dirty |= return_undelivered(&mut hub, peer_id, undelivered);
+    }
+    if dirty {
+        if let Err(e) = persist(&mut hub) {
+            eprintln!("amesh persist: {e}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod event_visibility_tests;
+
+#[cfg(test)]
+mod tests;
