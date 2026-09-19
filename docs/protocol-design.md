@@ -14,7 +14,7 @@ If `AMESH_TOKEN` is set at `serve` start, HTTP needs `Authorization: Bearer <tok
 
 ## Roster
 
-`POST /peers` registers (alias `POST /peer/register`). `GET /peers` probes sockets, then drops peers with no live WebSocket and `last_seen` older than 30s (`PEER_ONLINE_SECS`), and may persist.
+`POST /peers` registers (alias `POST /peer/register`); `peer_id`, `name` and `circle` must be 1-128 characters of `[A-Za-z0-9._-]`, anything else is 400. An omitted `name` keeps the stored one, else defaults to `peer_id`. `GET /peers` probes sockets, then drops peers with no live WebSocket and `last_seen` older than 30s (`PEER_ONLINE_SECS`), and may persist.
 
 ## Ask
 

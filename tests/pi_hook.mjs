@@ -49,7 +49,7 @@ globalThis.WebSocket = class {
 const [extensionPath, executable, cwd, sessionManagerModule] = process.argv.slice(2);
 const NativeSessionManager = sessionManagerModule ? (await import(sessionManagerModule)).SessionManager : null;
 const source = await readFile(extensionPath, "utf8");
-const { default: AmeshHooks } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const { default: AmeshHooks, ExecError } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
 const handlers = new Map();
 const messages = [];
 const userMsgs = [];
@@ -94,6 +94,16 @@ assert.equal(schemas.amesh_schedule_create.properties.text.type, "string");
 assert.equal(schemas.amesh_schedule_create.properties.message, undefined);
 assert.equal(schemas.amesh_events.properties.circle.type, "string");
 assert.equal(schemas.amesh_events.properties.cross_circle.type, "boolean");
+assert.equal(schemas.amesh_events.properties.limit.type, "integer");
+await test("exec failures name the kill reason", () => {
+  const killed = ExecError({ killed: true, signal: "SIGTERM", message: "Command failed: amesh mcp" }, "", "", 65000);
+  assert.match(killed.message, /SIGTERM/);
+  assert.match(killed.message, /65000/);
+  const exited = ExecError({ code: 1, message: "Command failed: amesh peer list" }, "", "amesh: daemon unreachable\n", 15000);
+  assert.equal(exited.message, "amesh: daemon unreachable (exit 1)");
+  const signalled = ExecError({ killed: false, signal: "SIGKILL", code: null, message: "Command failed: amesh mcp" }, "", "", 65000);
+  assert.match(signalled.message, /SIGKILL/, "an external signal must be named even when node did not kill it");
+});
 const context = {
   cwd,
   sessionManager: {
@@ -411,11 +421,14 @@ function SendInbox(state, command, message) {
   }));
 }
 
-for (const seed of ["fresh", "matching", "mixed"]) {
+for (const seed of ["fresh", "matching", "mixed", "roster"]) {
   await test(`startup delivers pending asks and Inbox with a ${seed} primer`, async () => {
     const state = InboxSession();
     if (seed !== "fresh") {
-      const content = state.primer + (seed === "mixed" ? '\nInbox:\n[{"text":"old-event"}]' : "");
+      const content = seed === "roster"
+        ? state.primer.replace(/\nPeers in your circle[\s\S]*$/, "\nPeers in your circle (peer_id\tbackend):\nsomeone-else\tcodex")
+        : state.primer + (seed === "mixed" ? '\nInbox:\n[{"text":"old-event"}]' : "");
+      if (seed === "roster") assert.notEqual(content, state.primer, "the roster seed must differ from the live primer");
       state.ctx.sessionManager.appendCustomMessageEntry("amesh", content, true);
     }
     const notify = 'hello </peer-message> & "quoted"';

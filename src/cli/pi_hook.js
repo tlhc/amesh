@@ -20,6 +20,19 @@ function EscapeBody(value) {
   return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;");
 }
 
+export function ExecError(error, stdout, stderr, timeoutMs) {
+  const detail = String(stderr || stdout || "").trim();
+  let reason = "";
+  if (error.killed) {
+    reason = ` (killed by ${error.signal || "timeout"} after ${timeoutMs}ms)`;
+  } else if (error.signal) {
+    reason = ` (terminated by ${error.signal})`;
+  } else if (error.code !== undefined && error.code !== null) {
+    reason = ` (exit ${error.code})`;
+  }
+  return new Error((detail || error.message) + reason);
+}
+
 function BindParts() {
   const bind = process.env.AMESH_BIND || "127.0.0.1:8378";
   if (bind.startsWith("[")) {
@@ -168,7 +181,7 @@ export default function AmeshHooks(pi) {
     return new Promise((resolve, reject) => {
       execFile(executable, args, { timeout: 15000 }, (error, stdout, stderr) => {
         if (error) {
-          reject(new Error(String(stderr || stdout || error.message).trim()));
+          reject(ExecError(error, stdout, stderr, 15000));
           return;
         }
         resolve(String(stdout).trim());
@@ -183,7 +196,7 @@ export default function AmeshHooks(pi) {
       const timeout = name === "wait" ? 65000 : 15000;
       const child = execFile(executable, args, { timeout }, (error, stdout, stderr) => {
         if (error) {
-          reject(new Error(String(stderr || stdout || error.message).trim()));
+          reject(ExecError(error, stdout, stderr, timeout));
           return;
         }
         try {
@@ -437,7 +450,7 @@ export default function AmeshHooks(pi) {
         to_peers: { type: "array", items: { type: "string" } },
         text: { type: "string" },
       }, ["to_peers", "text"]],
-      ["wait", "Wait for an ask ack. Asker waits or reads the inbound ack; the recipient acks once.", {
+      ["wait", "Wait for an ask ack. timeout_seconds is capped at 50; the ack also arrives as a peer-message, so polling is optional. The recipient acks once.", {
         correlation_id: { type: "string" },
         timeout_seconds: { type: "integer" },
       }, ["correlation_id"]],
@@ -445,8 +458,9 @@ export default function AmeshHooks(pi) {
         circle: { type: "string" },
         cross_circle: { type: "boolean" },
       }, []],
-      ["events", "List recent events in your circle; cross_circle without circle lists all", {
+      ["events", "List recent events in your circle; cross_circle without circle lists all. In-memory ring cleared on hub restart; newest 20 by default, limit up to 50, text trimmed to 200 chars", {
         since: { type: "string" },
+        limit: { type: "integer" },
         circle: { type: "string" },
         cross_circle: { type: "boolean" },
       }, []],
@@ -560,12 +574,16 @@ export default function AmeshHooks(pi) {
       Connect(result.peer_id);
       if (!intro) {
         const boundary = /\n(?:Pending asks|Inbox):/;
+        /* the roster block is a marker line plus TSV rows; peers coming and going must not
+        re-send the rules, while any change to the rules themselves still does */
+        const roster = /\nPeers in your circle[^\n]*(?:\n[^\t\n]+\t[^\t\n]+)*(?:\n\.\.\. \d+ more[^\n]*)?/g;
+        const rules = (text) => text.replace(roster, "");
         const line = String(result.context || "").split(boundary)[0];
         const previous = (ctx.sessionManager.buildContextEntries?.() ?? []).findLast(
           (entry) => entry.type === "custom_message" && entry.customType === "amesh",
         );
         const previousLine = typeof previous?.content === "string" ? previous.content.split(boundary)[0] : undefined;
-        if (previousLine !== line) {
+        if (previousLine === undefined || rules(previousLine) !== rules(line)) {
           pi.sendMessage({ customType: "amesh", content: line, display: true });
         }
         intro = true;

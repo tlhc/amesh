@@ -72,7 +72,7 @@ codex --remote unix:// -C "$PWD" resume --last
 
 `-C "$PWD"` is required for a new session and for `resume --last`: the App Server cwd is `/`, so without `-C` the latest thread is not this repo. `amesh hook ws` connects to that socket. Set `CODEX_THREAD_ID` when the process already knows its thread.
 
-Override the install root with `--home DIR`. Override the advertised name with `--peer-id ID` or `AMESH_PEER_ID`. Default name is `{folder}-{backend}`, then `-2`, `-3` if taken.
+Override the install root with `--home DIR`. Override the advertised name with `--peer-id ID` or `AMESH_PEER_ID`; ids and circle names are 1-128 characters of `[A-Za-z0-9._-]`, the hub rejects anything else. Default name is `{folder}-{backend}`, then `-2`, `-3` if taken.
 
 `amesh mcp` / `amesh hook` (and the pi extension) start `amesh serve` when the hub is down and `AMESH_BIND` is loopback or unspecified (`0.0.0.0` / `::`). `status`, `doctor`, and `peer` do not. Log: `serve.log` next to the state file (default `~/.amesh/serve.log`).
 
@@ -92,6 +92,8 @@ A **circle** is one git repo (`project-` plus a short hash of the git common dir
 | `amesh_job_*` / `amesh_schedule_*` | job ledger / timed notify or ask |
 
 CLI mirrors this under `amesh peer`, `amesh jobs`, `amesh schedule`. `amesh --help` is the flag list.
+
+MCP `amesh_wait` caps `timeout_seconds` at 50 (Codex callers default to 8, inside the exec budget) and returns status fields plus the reply (`open`, `timed_out`, `reply`, `timeout_seconds`), never the question text. MCP `amesh_events` returns the newest 20 entries (`limit` up to 50) with text trimmed to 200 chars; HTTP routes return full records. The SessionStart context lists the online peers of the circle, and an `unknown peer` error names them too.
 
 MCP `amesh_list_peers` / `amesh_job_list` / `amesh_schedule_list` / `amesh_events` are circle-scoped. CLI `peer list` is all peers unless `--cwd` or `--circle`. HTTP `GET /peers`, `GET /jobs`, `GET /schedules`, `GET /events` default to the full set; `GET /events?circle=NAME` filters.
 
@@ -116,6 +118,7 @@ If `AMESH_BIND` is not loopback and `AMESH_TOKEN` is empty, `serve` still starts
 
 - `GET /peers` (and therefore `amesh status` / `peer list`) probes sockets, drops closed ones, then removes peers with no live WebSocket and `last_seen` older than 30s, and may persist. `gc` dry-run can hit this path too; `--home` skips the probe.
 - Event ring keeps the last 500 entries and clears on restart. It is not an audit log.
+- On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.
 - `gc` and `uninstall` are dry-run until `--apply true`. Attachments are left alone unless `--attachments-days N`.
 

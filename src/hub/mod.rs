@@ -134,6 +134,36 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+const PEER_ID_MAX: usize = 128;
+
+/* ids are echoed into every circle mate's trusted context (roster, error candidates), so
+they carry no control or markup characters and no more length than a folder name with
+suffixes needs */
+fn peer_id_chars_ok(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+pub(crate) fn valid_peer_id(id: &str) -> bool {
+    peer_id_chars_ok(id) && id.len() <= PEER_ID_MAX
+}
+
+/* every field here is printed into trusted primers, so none may carry control or markup
+characters; the length cap binds any value a request introduces, and only a value carried
+over unchanged from what is persisted (kept, per field) escapes it */
+fn clean_identity(peer: &Peer, kept: [bool; 3]) -> bool {
+    [
+        peer.peer_id.as_str(),
+        peer.name.as_str(),
+        peer.circle.as_str(),
+    ]
+    .into_iter()
+    .zip(kept)
+    .all(|(value, kept)| peer_id_chars_ok(value) && (kept || value.len() <= PEER_ID_MAX))
+}
+
 fn normalize_backend(raw: &str) -> Option<&'static str> {
     match raw {
         "pi" => Some("pi"),
@@ -477,6 +507,34 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
         }
         disk.recv_peers.insert(peer_id);
     }
+    /* rows that predate the character rule are dropped rather than replayed into a
+    primer, along with anything keyed by them */
+    let mut dropped = HashSet::new();
+    disk.peers.retain(|id, peer| {
+        let clean = clean_identity(peer, [true; 3]);
+        if !clean {
+            eprintln!("amesh: dropping legacy peer {id:?}: invalid characters");
+            dropped.insert(id.clone());
+        }
+        clean
+    });
+    disk.owed.retain(|id, _| {
+        let clean = peer_id_chars_ok(id);
+        if !clean {
+            dropped.insert(id.clone());
+        }
+        clean
+    });
+    /* an ask routed to a recipient that is gone and can never register again would stay
+    open forever; close it and say why */
+    for ask in disk.asks.values_mut() {
+        if ask.open && (dropped.contains(&ask.to_peer_id) || !peer_id_chars_ok(&ask.to_peer_id)) {
+            ask.open = false;
+            ask.reply = Some(
+                "amesh: recipient dropped at upgrade, its identity had invalid characters".into(),
+            );
+        }
+    }
     /* a backlog may outlive its peer row only while a session is still expected back for it */
     disk.owed.retain(|peer_id, owed| {
         !disk.peers.contains_key(peer_id)
@@ -637,6 +695,35 @@ fn require_cross_circle(
 
 const INBOX_MAX: usize = 50;
 const DISPLACED: &str = "displaced";
+const PEER_HINTS: usize = 8;
+
+/* a mistyped target should correct itself: the caller's online circle mates are the
+names it meant, so the error carries them instead of costing a list_peers round trip.
+Without a resolvable caller there is no circle to scope by, and offering every peer would
+hand other circles' rosters to whoever asks */
+fn unknown_peer(hub: &Hub, from: Option<&str>) -> (StatusCode, Json<Value>) {
+    let mut names: Vec<&str> = from
+        .and_then(|name| resolve(hub, name))
+        .map(|me| {
+            hub.peers
+                .values()
+                .filter(|peer| {
+                    peer.status == "online"
+                        && peer.circle == me.circle
+                        && peer.peer_id != me.peer_id
+                        && valid_peer_id(&peer.peer_id)
+                })
+                .map(|peer| peer.peer_id.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    names.sort_unstable();
+    names.truncate(PEER_HINTS);
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({"error": "unknown peer", "peers": names})),
+    )
+}
 
 /* a peer that acknowledges frames refers to them by id, so every event it is owed needs one */
 fn with_event_id(mut event: Value) -> Value {
@@ -976,6 +1063,10 @@ async fn health() -> Json<Value> {
     Json(json!({"ok": true, "name": "amesh", "version": "0.1.0"}))
 }
 
+/* a folder name is at most this long inside a derived id, so backend and numeric
+suffixes always fit under PEER_ID_MAX */
+pub(crate) const FOLDER_MAX: usize = 100;
+
 fn folder_name(path: &str) -> String {
     let raw = Path::new(path)
         .file_name()
@@ -994,6 +1085,10 @@ fn folder_name(path: &str) -> String {
         }
     }
     let trimmed = out.trim_matches('-');
+    let trimmed = trimmed
+        .get(..FOLDER_MAX)
+        .unwrap_or(trimmed)
+        .trim_end_matches('-');
     if trimmed.is_empty() {
         "peer".into()
     } else {
@@ -1093,8 +1188,12 @@ async fn register_peer(
         &session,
         req.peer_id.filter(|s| !s.is_empty()),
     );
+    /* a reconnect that names nothing keeps the name it had, custom or not */
     let name = if req.name.is_empty() {
-        peer_id.clone()
+        hub.peers
+            .get(&peer_id)
+            .map(|old| old.name.clone())
+            .unwrap_or_else(|| peer_id.clone())
     } else {
         req.name
     };
@@ -1138,6 +1237,25 @@ async fn register_peer(
         session_id,
         last_seen: now_unix(),
     };
+    /* a backlog waiting for this very session lends its name back, and only to it */
+    let old = hub.peers.get(&peer_id);
+    let reclaiming = hub
+        .owed
+        .get(&peer_id)
+        .is_some_and(|owed| owed.owner == peer.session_id);
+    let kept = [
+        old.is_some() || reclaiming,
+        old.is_some_and(|row| row.name == peer.name) || (reclaiming && peer.name == peer.peer_id),
+        old.is_some_and(|row| row.circle == peer.circle),
+    ];
+    if !clean_identity(&peer, kept) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": "peer_id, name and circle must be 1-128 characters of [A-Za-z0-9._-]"}),
+            ),
+        ));
+    }
     /* a backlog left behind for a session: that session adopts it on the way back in; a
     registration that claims the name outright with a different session throws it away
     rather than inherit another session's messages; one with no session leaves it waiting */
@@ -1314,10 +1432,7 @@ async fn open_ask(
     let mut hub = app.inner.lock().await;
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
     let Some(target) = resolve(&hub, &req.to_peer) else {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "unknown peer"})),
-        ));
+        return Err(unknown_peer(&hub, req.from_peer.as_deref()));
     };
     require_cross_circle(
         &hub,
@@ -1370,7 +1485,8 @@ async fn ack_ask(
                 Json(json!({
                     "error": "ask already answered",
                     "correlation_id": req.correlation_id,
-                    "reply": ask.reply
+                    "reply": ask.reply,
+                    "hint": "the ask is closed; send follow-ups with amesh_notify_peer"
                 })),
             ));
         }
@@ -1406,10 +1522,7 @@ async fn notify(
     let mut hub = app.inner.lock().await;
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
     if resolve(&hub, &req.to_peer).is_none() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({"error": "unknown peer"})),
-        ));
+        return Err(unknown_peer(&hub, req.from_peer.as_deref()));
     }
     require_cross_circle(
         &hub,
@@ -1591,6 +1704,42 @@ struct McpServerReq {
     command: Option<String>,
 }
 
+const EVENTS_DEFAULT: usize = 20;
+const EVENTS_MAX: usize = 50;
+const EVENT_TEXT_CHARS: usize = 200;
+
+/* the ring is for orientation: the newest few entries, each cut to a line, is what a
+model can use; the full ring stays on the HTTP route */
+fn trim_events(events: Value, limit: Option<u64>, from_cursor: bool) -> Value {
+    let limit = limit
+        .map(|n| n as usize)
+        .unwrap_or(EVENTS_DEFAULT)
+        .clamp(1, EVENTS_MAX);
+    let rows = events.as_array().cloned().unwrap_or_default();
+    /* a cursor pages forward from the oldest unread entry so nothing is skipped; without
+    one, the newest entries are what orient a model */
+    let window = if from_cursor {
+        &rows[..rows.len().min(limit)]
+    } else {
+        &rows[rows.len().saturating_sub(limit)..]
+    };
+    let trimmed = window.iter().cloned().map(|mut event| {
+        if let Some(object) = event.as_object_mut() {
+            for field in ["text", "message"] {
+                let cut = object.get(field).and_then(Value::as_str).and_then(|text| {
+                    (text.chars().count() > EVENT_TEXT_CHARS)
+                        .then(|| text.chars().take(EVENT_TEXT_CHARS).collect::<String>() + "...")
+                });
+                if let Some(cut) = cut {
+                    object.insert(field.into(), json!(cut));
+                }
+            }
+        }
+        event
+    });
+    Value::Array(trimmed.collect())
+}
+
 fn push_event(hub: &mut Hub, mut event: Value) {
     let fields = match event["type"].as_str() {
         Some("chat" | "chat_turn_delta") => [("from_circle", "peer"), ("to_circle", "peer")],
@@ -1679,6 +1828,34 @@ async fn ask_many_result(
     Ok(Json(json!({"parent_id": id, "asks": asks})))
 }
 
+const WAIT_MAX_SECS: u64 = 50;
+const WAIT_DEFAULT_SECS: u64 = 45;
+/* Codex runs MCP calls inside an exec script whose synchronous budget is about 10s;
+anything longer is parked in a background cell and the answer never reaches the model */
+const CODEX_WAIT_SECS: u64 = 8;
+
+fn wait_default_secs(backend: Option<&str>) -> u64 {
+    if backend == Some("codex") {
+        CODEX_WAIT_SECS
+    } else {
+        WAIT_DEFAULT_SECS
+    }
+}
+
+/* the asker wrote the question, so echoing it back on every poll only doubled the payload */
+fn wait_summary(ask: &Value, timeout: u64) -> Value {
+    let open = ask["open"].as_bool().unwrap_or(false);
+    json!({
+        "correlation_id": ask["correlation_id"],
+        "from_peer": ask["from_peer"],
+        "to_peer": ask["to_peer"],
+        "open": open,
+        "timed_out": open,
+        "reply": ask["reply"],
+        "timeout_seconds": timeout,
+    })
+}
+
 async fn wait_ask(
     State(app): State<App>,
     headers: HeaderMap,
@@ -1686,10 +1863,10 @@ async fn wait_ask(
     Json(req): Json<WaitReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
-    let mut wait = req.timeout_seconds.unwrap_or(45);
-    if wait > 50 {
-        wait = 50;
-    }
+    let wait = req
+        .timeout_seconds
+        .unwrap_or(WAIT_DEFAULT_SECS)
+        .min(WAIT_MAX_SECS);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
     loop {
         {
@@ -2747,7 +2924,7 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Wait for an ask ack",
+                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; Codex callers default to 8 because the exec budget is about 10s). The ack also arrives as a peer-message, so polling is optional.",
                 json!({
                     "correlation_id": {"type": "string"},
                     "timeout_seconds": {"type": "integer"}
@@ -2759,9 +2936,10 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "List recent events in your circle; cross_circle without circle lists all",
+                "List recent events in your circle; cross_circle without circle lists all. In-memory ring cleared on hub restart; newest 20 by default, limit up to 50, text trimmed to 200 chars",
                 json!({
                     "since": {"type": "string"},
+                    "limit": {"type": "integer"},
                     "circle": {"type": "string"},
                     "cross_circle": {"type": "boolean"}
                 }),
@@ -3114,16 +3292,29 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
+            let timeout = match args.get("timeout_seconds").and_then(Value::as_u64) {
+                Some(secs) => secs,
+                None => {
+                    let hub = app.inner.lock().await;
+                    let backend = args
+                        .get("from_peer")
+                        .and_then(Value::as_str)
+                        .and_then(|caller| resolve(&hub, caller))
+                        .map(|peer| peer.backend.clone());
+                    wait_default_secs(backend.as_deref())
+                }
+            }
+            .min(WAIT_MAX_SECS);
             let res = wait_ask(
                 State(app.clone()),
                 auth_headers(app),
                 AxumPath(id),
                 Json(WaitReq {
-                    timeout_seconds: args.get("timeout_seconds").and_then(Value::as_u64),
+                    timeout_seconds: Some(timeout),
                 }),
             )
             .await?;
-            res.0.to_string()
+            wait_summary(&res.0, timeout).to_string()
         }
         "amesh_events" => {
             let mut q = HashMap::new();
@@ -3162,7 +3353,16 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 q.insert("since".into(), since.to_string());
             }
             let res = list_events(State(app.clone()), auth_headers(app), Query(q)).await?;
-            res.0.to_string()
+            let from_cursor = args
+                .get("since")
+                .and_then(Value::as_str)
+                .is_some_and(|since| !since.is_empty());
+            trim_events(
+                res.0,
+                args.get("limit").and_then(Value::as_u64),
+                from_cursor,
+            )
+            .to_string()
         }
         _ => {
             return Err((
