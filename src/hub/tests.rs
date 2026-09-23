@@ -3538,9 +3538,11 @@ fn tool_json(body: &Value) -> Value {
 
 #[tokio::test]
 async fn mcp_wait_reports_the_answer_without_the_question() {
-    let app = test_app();
+    let (app, inner) = test_app_with_hub();
     register(app.clone(), "boss", "pi", "one").await;
     register(app.clone(), "worker", "pi", "one").await;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    inner.lock().await.sockets.insert("boss".into(), (1, tx));
     let (_, ask) = json_req(
         app.clone(),
         "POST",
@@ -3566,6 +3568,11 @@ async fn mcp_wait_reports_the_answer_without_the_question() {
         open.get("text").is_none(),
         "the asker's own question must not be echoed: {open}"
     );
+    let hint = open["hint"].as_str().unwrap_or("");
+    assert!(
+        hint.contains("peer-message") && hint.contains("wait again only if"),
+        "an open wait must tell a connected asker the ack is normally pushed, with waiting as the fallback: {open}"
+    );
     assert!(body["result"]["content"][0]["text"].as_str().unwrap().len() < 300);
     let _ = json_req(
         app.clone(),
@@ -3587,6 +3594,10 @@ async fn mcp_wait_reports_the_answer_without_the_question() {
     assert_eq!(closed["from_peer"], "boss");
     assert_eq!(closed["to_peer"], "worker");
     assert!(closed.get("text").is_none(), "{closed}");
+    assert!(
+        closed.get("hint").is_none(),
+        "a closed ask needs no hint: {closed}"
+    );
     let (_, full) = json_req(
         app,
         "POST",
@@ -3599,6 +3610,64 @@ async fn mcp_wait_reports_the_answer_without_the_question() {
         600,
         "HTTP keeps the full record"
     );
+}
+
+#[tokio::test]
+async fn mcp_wait_hints_only_an_asker_the_ack_can_reach() {
+    let (app, inner) = test_app_with_hub();
+    for id in ["recv", "live", "bare", "drop", "worker"] {
+        register(app.clone(), id, "pi", "one").await;
+    }
+    let (tx, _rx) = mpsc::unbounded_channel();
+    {
+        let mut hub = inner.lock().await;
+        /* promised recv once, then its connection closed: acks only queue for it */
+        hub.recv_known.insert("recv".into());
+        hub.sockets.insert("live".into(), (1, tx.clone()));
+        hub.sockets.insert("drop".into(), (2, tx));
+    }
+    let mut asks = HashMap::new();
+    for asker in ["recv", "live", "bare", "drop"] {
+        let (_, ask) = json_req(
+            app.clone(),
+            "POST",
+            "/ask",
+            json!({"from_peer": asker, "to_peer": "worker", "text": "q"}),
+        )
+        .await;
+        asks.insert(asker, ask["correlation_id"].as_str().unwrap().to_string());
+    }
+    let mut wrong = Vec::new();
+    for (asker, caller, hinted) in [
+        ("live", "live", true),
+        ("recv", "recv", false),
+        ("bare", "bare", false),
+        ("recv", "live", false),
+        ("recv", "ghost", false),
+    ] {
+        let (_, body) = mcp_tool(
+            app.clone(),
+            "amesh_wait",
+            json!({"from_peer": caller, "correlation_id": asks[asker], "timeout_seconds": 0}),
+        )
+        .await;
+        let got = tool_json(&body);
+        if got.get("hint").is_some() != hinted {
+            wrong.push(format!("asker {asker} caller {caller}: {got}"));
+        }
+    }
+    let waiting = tokio::spawn(mcp_tool(
+        app.clone(),
+        "amesh_wait",
+        json!({"from_peer": "drop", "correlation_id": asks["drop"], "timeout_seconds": 1}),
+    ));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    inner.lock().await.sockets.remove("drop");
+    let got = tool_json(&waiting.await.unwrap().1);
+    if got.get("hint").is_some() {
+        wrong.push(format!("asker drop lost its socket mid-wait: {got}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[tokio::test]
@@ -3652,6 +3721,12 @@ async fn mcp_wait_defaults_to_the_codex_exec_budget() {
     assert!(
         description.contains("Codex"),
         "the codex budget must be stated: {description}"
+    );
+    assert!(
+        description.contains("When the result carries a hint")
+            && description.contains("pushed to you as a peer-message")
+            && description.contains("wait again only if"),
+        "the push is expected only under the hint, with waiting as the fallback: {description}"
     );
 }
 

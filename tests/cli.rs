@@ -2087,7 +2087,8 @@ fn hooks_emit_ask_completion_instructions() {
     let mut sandbox = Sandbox::new();
     sandbox.start();
     let clauses = [
-        "Before final, review all known pending asks routed to this peer.",
+        "Before final, review the pending asks already in your context",
+        "reviewing them takes no tool call",
         "Check permission under current user instructions separately.",
         "original correlation_id and actual result",
         "Confirm ok:true for that ID before claiming closure.",
@@ -4493,7 +4494,7 @@ fn hook_prompt_and_stop_carry_pending_asks_without_the_primer() {
     assert!(context.contains(cid), "{context}");
     assert!(context.contains("amesh_ack"), "{context}");
     assert!(
-        !context.contains("Before final, review all known pending asks"),
+        !context.contains("Before final, review the pending asks already in your context"),
         "the primer must not repeat on every prompt: {context}"
     );
     assert!(
@@ -4506,7 +4507,7 @@ fn hook_prompt_and_stop_carry_pending_asks_without_the_primer() {
     let reason = stop["reason"].as_str().unwrap();
     assert!(reason.contains(cid), "{reason}");
     assert!(
-        !reason.contains("Before final, review all known pending asks"),
+        !reason.contains("Before final, review the pending asks already in your context"),
         "{reason}"
     );
 }

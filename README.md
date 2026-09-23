@@ -93,7 +93,7 @@ A **circle** is one git repo (`project-` plus a short hash of the git common dir
 
 CLI mirrors this under `amesh peer`, `amesh jobs`, `amesh schedule`. `amesh --help` is the flag list.
 
-MCP `amesh_wait` caps `timeout_seconds` at 50 (Codex callers default to 8, inside the exec budget) and returns status fields plus the reply (`open`, `timed_out`, `reply`, `timeout_seconds`), never the question text. MCP `amesh_events` returns the newest 20 entries (`limit` up to 50) with text trimmed to 200 chars; HTTP routes return full records. The SessionStart context lists the online peers of the circle, and an `unknown peer` error names them too.
+MCP `amesh_wait` caps `timeout_seconds` at 50 (Codex default: 8) and returns status fields plus the reply (`open`, `timed_out`, `reply`, `timeout_seconds`), omitting the question text. For open asks, connected askers get a `hint`: the ack normally arrives as a peer-message, so keep working and wait again if it does not arrive. MCP `amesh_events` returns the newest 20 entries (`limit` up to 50) with text trimmed to 200 chars; HTTP routes return full records. The SessionStart context lists the online peers of the circle, and an `unknown peer` error names them too.
 
 MCP `amesh_list_peers` / `amesh_job_list` / `amesh_schedule_list` / `amesh_events` are circle-scoped. CLI `peer list` is all peers unless `--cwd` or `--circle`. HTTP `GET /peers`, `GET /jobs`, `GET /schedules`, `GET /events` default to the full set; `GET /events?circle=NAME` filters.
 

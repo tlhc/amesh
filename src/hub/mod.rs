@@ -1830,9 +1830,15 @@ async fn ask_many_result(
 
 const WAIT_MAX_SECS: u64 = 50;
 const WAIT_DEFAULT_SECS: u64 = 45;
-/* Codex runs MCP calls inside an exec script whose synchronous budget is about 10s;
-anything longer is parked in a background cell and the answer never reaches the model */
+/* Codex runs MCP calls inside an exec cell; a wait that outlasts the cell's yield is
+parked, and each later poll of the cell is one more model call. The yield is a Codex
+setting, so only the omitted default stays short and an explicit value stands */
 const CODEX_WAIT_SECS: u64 = 8;
+/* acks are pushed to the asker, so a poll loop only re-reads the context each turn. The
+hub sees its link to the drainer, not the drainer's hand-off to the model, so the hint
+states an expectation and keeps waiting as the fallback */
+const WAIT_OPEN_HINT: &str =
+    "still open; the ack is normally pushed to you as a peer-message, so keep working or end the turn and wait again only if it never arrives";
 
 fn wait_default_secs(backend: Option<&str>) -> u64 {
     if backend == Some("codex") {
@@ -1842,10 +1848,13 @@ fn wait_default_secs(backend: Option<&str>) -> u64 {
     }
 }
 
-/* the asker wrote the question, so echoing it back on every poll only doubled the payload */
-fn wait_summary(ask: &Value, timeout: u64) -> Value {
+/* the asker wrote the question, so echoing it back on every poll only doubled the payload.
+The ack goes to the asker alone and only a live socket carries it now; a recv peer that
+is away gets it on reconnect, which may never come, so only a connected asker gets the
+hint */
+fn wait_summary(ask: &Value, timeout: u64, pushed: bool) -> Value {
     let open = ask["open"].as_bool().unwrap_or(false);
-    json!({
+    let mut summary = json!({
         "correlation_id": ask["correlation_id"],
         "from_peer": ask["from_peer"],
         "to_peer": ask["to_peer"],
@@ -1853,7 +1862,11 @@ fn wait_summary(ask: &Value, timeout: u64) -> Value {
         "timed_out": open,
         "reply": ask["reply"],
         "timeout_seconds": timeout,
-    })
+    });
+    if open && pushed {
+        summary["hint"] = json!(WAIT_OPEN_HINT);
+    }
+    summary
 }
 
 async fn wait_ask(
@@ -2924,7 +2937,7 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; Codex callers default to 8 because the exec budget is about 10s). The ack also arrives as a peer-message, so polling is optional.",
+                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives.",
                 json!({
                     "correlation_id": {"type": "string"},
                     "timeout_seconds": {"type": "integer"}
@@ -3314,7 +3327,22 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 }),
             )
             .await?;
-            wait_summary(&res.0, timeout).to_string()
+            /* checked when the wait ends: a socket seen before the wait says nothing about
+            where the ack can go now */
+            let pushed = {
+                let hub = app.inner.lock().await;
+                let caller = args
+                    .get("from_peer")
+                    .and_then(Value::as_str)
+                    .and_then(|caller| resolve(&hub, caller));
+                let asker = res.0["from_peer"]
+                    .as_str()
+                    .and_then(|asker| resolve(&hub, asker));
+                caller.zip(asker).is_some_and(|(me, asker)| {
+                    me.peer_id == asker.peer_id && hub.sockets.contains_key(&me.peer_id)
+                })
+            };
+            wait_summary(&res.0, timeout, pushed).to_string()
         }
         "amesh_events" => {
             let mut q = HashMap::new();
