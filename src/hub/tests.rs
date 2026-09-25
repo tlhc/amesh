@@ -289,7 +289,7 @@ fn a_restart_gives_persisted_peers_a_reconnect_window() {
     }
     let mut hub = Hub::open(&path).unwrap();
     assert!(
-        !refresh_peers(&mut hub),
+        !refresh_peers(&mut hub).0,
         "a stale persisted last_seen must not prune a peer right after a restart"
     );
     assert_eq!(hub.peers["w"].session_id, "sess-w");
@@ -432,7 +432,7 @@ fn probe_prunes_stale_peers_before_list_or_broadcast() {
         "stale".into(),
         peer("stale", now.saturating_sub(PEER_ONLINE_SECS + 1)),
     );
-    assert!(refresh_peers(&mut hub));
+    assert!(refresh_peers(&mut hub).0);
     assert!(hub.peers.contains_key("live"));
     assert!(!hub.peers.contains_key("stale"));
     let _ = fs::remove_file(&path);
@@ -2037,6 +2037,41 @@ fn undelivered_events_for_an_unknown_peer_are_dropped() {
     );
 }
 
+fn check_queued_reply_after_socket_closes(acknowledging: bool) {
+    let mut hub = undelivered_hub();
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("worker".into(), (1, tx));
+    if acknowledging {
+        hub.recv_live.insert("worker".into());
+        hub.recv_known.insert("worker".into());
+    }
+    let queued = queue_replies(
+        &mut hub,
+        vec![json!({"type": "ack", "to_peer": "worker", "message": "expired"})],
+    );
+    let ack = queued[0].1.clone();
+    persist(&mut hub).unwrap();
+    drop(rx);
+    deliver_queued(&mut hub, queued);
+    assert!(
+        !hub.sockets.contains_key("worker"),
+        "the failed socket must be removed"
+    );
+    assert_eq!(hub.inbox["worker"], vec![ack.clone()]);
+    let disk = read_snapshot(&hub.db).unwrap();
+    assert_eq!(disk.inbox["worker"], vec![ack]);
+}
+
+#[test]
+fn queued_reply_survives_a_closed_acknowledging_socket() {
+    check_queued_reply_after_socket_closes(true);
+}
+
+#[test]
+fn queued_reply_survives_a_closed_legacy_socket() {
+    check_queued_reply_after_socket_closes(false);
+}
+
 #[test]
 fn undelivered_events_return_to_the_inbox() {
     let mut hub = undelivered_hub();
@@ -2382,7 +2417,7 @@ fn a_session_bound_backlog_outlives_its_pruned_row() {
     let path = std::env::temp_dir().join(format!("amesh-owed1-{}.db", Uuid::new_v4()));
     let mut hub = owed_hub(&path, "S1");
     let before = now_unix();
-    assert!(refresh_peers(&mut hub));
+    assert!(refresh_peers(&mut hub).0);
     assert!(
         !hub.peers.contains_key("tmp-pi"),
         "the row itself is pruned as before"
@@ -2399,7 +2434,7 @@ fn a_session_bound_backlog_outlives_its_pruned_row() {
     /* a peer that never bound a session has nobody to keep the backlog for */
     let sessionless = std::env::temp_dir().join(format!("amesh-owed1b-{}.db", Uuid::new_v4()));
     let mut hub = owed_hub(&sessionless, "");
-    assert!(refresh_peers(&mut hub));
+    assert!(refresh_peers(&mut hub).0);
     assert!(!hub.inbox.contains_key("tmp-pi"));
     assert!(!hub.owed.contains_key("tmp-pi"));
     let _ = fs::remove_file(&path);
@@ -2423,7 +2458,7 @@ fn a_pruned_backlog_keeps_its_clock_across_a_restart() {
     assert_eq!(reopened.inbox["tmp-pi"].len(), 2);
     assert!(reopened.recv_known.contains("tmp-pi"));
     assert!(
-        !refresh_peers(&mut reopened) || reopened.owed["tmp-pi"].since == since,
+        !refresh_peers(&mut reopened).0 || reopened.owed["tmp-pi"].since == since,
         "a refresh must not restart it either"
     );
     let _ = fs::remove_file(&path);
@@ -2450,6 +2485,763 @@ fn another_session_cannot_take_a_name_with_a_waiting_backlog() {
         "the owner gets its name back"
     );
     let _ = fs::remove_file(&path);
+}
+
+fn hook_row(session: &str) -> Value {
+    json!({"path": "/tmp", "backend": "codex", "circle": "c", "session_id": session})
+}
+
+/* a Codex thread's hook row has no drainer until its MCP binds, so once the row is pruned
+only its session vouches for what is still waiting on it */
+async fn pruned_hook_row(
+    tool: &str,
+    mut arguments: Value,
+    collected: bool,
+) -> (Router, Arc<Mutex<Hub>>) {
+    let (app, hub) = test_app_with_hub();
+    let boss = json!({"peer_id": "boss", "name": "boss", "backend": "pi", "circle": "c"});
+    let _ = json_req(app.clone(), "POST", "/peers", boss).await;
+    let (_, a) = json_req(app.clone(), "POST", "/peers", hook_row("A")).await;
+    assert_eq!(a["peer_id"], "tmp-codex");
+    arguments["from_peer"] = json!("boss");
+    arguments["peer_name"] = json!("tmp-codex");
+    let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": tool, "arguments": arguments}});
+    let (st, reply) = json_req(app.clone(), "POST", "/mcp", call).await;
+    assert_eq!(st, StatusCode::OK, "{reply}");
+    if collected {
+        let _ = json_req(
+            app.clone(),
+            "GET",
+            "/asks/pending?peer_id=tmp-codex",
+            json!({}),
+        )
+        .await;
+    }
+    hub.lock()
+        .await
+        .peers
+        .get_mut("tmp-codex")
+        .unwrap()
+        .last_seen = 1;
+    let _ = json_req(app.clone(), "GET", "/peers", json!({})).await;
+    (app, hub)
+}
+
+#[tokio::test]
+async fn a_pruned_hook_row_keeps_its_name_while_its_ask_is_open() {
+    /* its hook already showed the ask, so only the open ask still points at the name */
+    let (app, _) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let (_, b) = json_req(app.clone(), "POST", "/peers", hook_row("B")).await;
+    assert_eq!(b["peer_id"], "tmp-codex-2", "B must not inherit A's ask");
+    let (_, a) = json_req(app.clone(), "POST", "/peers", hook_row("A")).await;
+    assert_eq!(a["peer_id"], "tmp-codex");
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert_eq!(pending["asks"][0]["text"], "for A only", "{pending}");
+}
+
+#[tokio::test]
+async fn an_open_ask_keeps_the_pruned_name_owed_across_a_restart() {
+    let (_, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let path = hub.lock().await.db.path().unwrap().to_string();
+    let reopened = Hub::open(Path::new(&path)).unwrap();
+    assert_eq!(reopened.owed["tmp-codex"].owner, "A");
+    let _ = fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn an_ask_its_session_never_came_back_for_is_closed_not_handed_on() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    hub.lock().await.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
+    let (_, b) = json_req(app.clone(), "POST", "/peers", hook_row("B")).await;
+    assert_eq!(b["peer_id"], "tmp-codex", "the name is free again");
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert!(pending["asks"].as_array().unwrap().is_empty(), "{pending}");
+    let hub = hub.lock().await;
+    let ask = hub.asks.values().next().unwrap();
+    assert!(!ask.open);
+    assert!(
+        ask.reply.as_deref().unwrap().contains("did not come back"),
+        "{:?}",
+        ask.reply
+    );
+}
+
+#[tokio::test]
+async fn ownership_expiry_notifies_the_connected_asker_after_commit() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let mut rx = {
+        let mut hub = hub.lock().await;
+        let rx = recv_peer(&mut hub, "boss");
+        hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
+        persist(&mut hub).unwrap();
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+        rx
+    };
+    let (status, _) = json_req(app.clone(), "GET", "/peers", json!({})).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        rx.try_recv().is_err(),
+        "an uncommitted expiry must not be delivered"
+    );
+    {
+        let hub = hub.lock().await;
+        assert!(hub.asks.values().next().unwrap().open);
+        assert!(!hub.inbox.contains_key("boss"));
+        hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
+    }
+    let (status, _) = json_req(app, "GET", "/peers", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let ack = rx.try_recv().expect("the asker must receive the expiry");
+    assert_eq!(ack["type"], "ack");
+    let hub = hub.lock().await;
+    let disk = read_snapshot(&hub.db).unwrap();
+    let ask = disk.asks.values().next().unwrap();
+    assert!(!ask.open);
+    assert_eq!(ack["correlation_id"], ask.correlation_id);
+    assert_eq!(ack["message"], ask.reply.as_deref().unwrap());
+    assert!(ack["message"]
+        .as_str()
+        .unwrap()
+        .contains("did not come back"));
+    assert_eq!(disk.inbox["boss"][0], ack);
+}
+
+#[tokio::test]
+async fn ownership_expiry_retains_the_offline_askers_ack_across_restart() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let path = {
+        let mut hub = hub.lock().await;
+        hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
+        hub.db.path().unwrap().to_string()
+    };
+    let (status, _) = json_req(app, "GET", "/peers", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let reopened = Hub::open(Path::new(&path)).unwrap();
+    let ask = reopened.asks.values().next().unwrap();
+    let ack = &reopened
+        .inbox
+        .get("boss")
+        .expect("the offline asker must retain its expiry")[0];
+    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack["correlation_id"], ask.correlation_id);
+    assert_eq!(ack["message"], ask.reply.as_deref().unwrap());
+    assert!(!ask.open);
+}
+
+#[tokio::test]
+async fn ownership_expiry_sends_ack_from_the_schedule_tick() {
+    let (_, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let (mut rx, path) = {
+        let mut hub = hub.lock().await;
+        let rx = recv_peer(&mut hub, "boss");
+        hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
+        persist(&mut hub).unwrap();
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+        (rx, PathBuf::from(hub.db.path().unwrap()))
+    };
+    let app = App {
+        inner: hub.clone(),
+        token: None,
+        state_path: path,
+    };
+    tick_schedules(&app).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "an uncommitted expiry must not be delivered"
+    );
+    {
+        let hub = hub.lock().await;
+        assert!(hub.asks.values().next().unwrap().open);
+        hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
+    }
+    tick_schedules(&app).await;
+    let ack = rx
+        .try_recv()
+        .expect("the scheduler must deliver the expiry");
+    assert_eq!(ack["type"], "ack");
+    assert!(ack["message"]
+        .as_str()
+        .unwrap()
+        .contains("did not come back"));
+    let hub = hub.lock().await;
+    let disk = read_snapshot(&hub.db).unwrap();
+    assert_eq!(disk.inbox["boss"][0], ack);
+    drop(hub);
+    tick_schedules(&app).await;
+    assert!(rx.try_recv().is_err(), "an expiry is delivered once");
+}
+
+#[tokio::test]
+async fn a_pruned_hook_row_keeps_what_its_hook_has_not_collected() {
+    let (app, _) =
+        pruned_hook_row("amesh_notify_peer", json!({"message": "for A only"}), false).await;
+    let (_, b) = json_req(app.clone(), "POST", "/peers", hook_row("B")).await;
+    assert_eq!(
+        b["peer_id"], "tmp-codex-2",
+        "B must not inherit A's messages"
+    );
+    let (_, a) = json_req(app.clone(), "POST", "/peers", hook_row("A")).await;
+    assert_eq!(a["peer_id"], "tmp-codex");
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert_eq!(pending["inbox"][0]["message"], "for A only", "{pending}");
+}
+
+#[tokio::test]
+async fn ownership_expiry_write_failure_does_not_release_an_open_ask() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let cid = {
+        let mut hub = hub.lock().await;
+        hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
+        persist(&mut hub).unwrap();
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+        hub.asks.keys().next().unwrap().clone()
+    };
+    let (status, _) = json_req(app.clone(), "GET", "/peers", json!({})).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    hub.lock()
+        .await
+        .db
+        .execute_batch("DROP TRIGGER fail_write")
+        .unwrap();
+    let (status, b) = json_req(app.clone(), "POST", "/peers", hook_row("B")).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["peer_id"], "tmp-codex");
+    let (_, pending) = json_req(
+        app.clone(),
+        "GET",
+        "/asks/pending?peer_id=tmp-codex",
+        json!({}),
+    )
+    .await;
+    assert!(pending["asks"].as_array().unwrap().is_empty(), "{pending}");
+    let (_, waited) = json_req(
+        app,
+        "POST",
+        &format!("/asks/{cid}/wait"),
+        json!({"timeout_seconds": 0}),
+    )
+    .await;
+    assert_eq!(waited["open"], false, "{waited}");
+    assert!(waited["reply"]
+        .as_str()
+        .unwrap()
+        .contains("did not come back"));
+}
+
+#[tokio::test]
+async fn ownership_failed_claim_keeps_the_reservation_after_restart() {
+    let (app, hub) =
+        pruned_hook_row("amesh_notify_peer", json!({"message": "for A only"}), false).await;
+    let path = {
+        let hub = hub.lock().await;
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON recv_peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+        hub.db.path().unwrap().to_string()
+    };
+    let mut claim = hook_row("B");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    hub.lock()
+        .await
+        .db
+        .execute_batch("DROP TRIGGER fail_write")
+        .unwrap();
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert!(pending["inbox"].as_array().unwrap().is_empty(), "{pending}");
+    let reopened = Hub::open(Path::new(&path)).unwrap();
+    assert_eq!(
+        allocate_peer_id(&reopened, "/tmp", "codex", "B", None),
+        "tmp-codex-2"
+    );
+    assert_eq!(reopened.inbox["tmp-codex"][0]["message"], "for A only");
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn ownership_claimed_name_closes_previous_sessions_asks() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let cid = hub.lock().await.asks.keys().next().unwrap().clone();
+    let mut claim = hook_row("B");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, b) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["peer_id"], "tmp-codex");
+    let (_, pending) = json_req(
+        app.clone(),
+        "GET",
+        "/asks/pending?peer_id=tmp-codex",
+        json!({}),
+    )
+    .await;
+    assert!(pending["asks"].as_array().unwrap().is_empty(), "{pending}");
+    let (_, waited) = json_req(
+        app.clone(),
+        "POST",
+        &format!("/asks/{cid}/wait"),
+        json!({"timeout_seconds": 0}),
+    )
+    .await;
+    assert_eq!(waited["open"], false, "{waited}");
+    assert!(waited["reply"]
+        .as_str()
+        .unwrap()
+        .contains("session was replaced"));
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=boss", json!({})).await;
+    assert_eq!(pending["inbox"][0]["type"], "ack", "{pending}");
+    assert_eq!(pending["inbox"][0]["correlation_id"], cid);
+    assert_eq!(pending["inbox"][0]["message"], waited["reply"]);
+}
+
+#[tokio::test]
+async fn ownership_replacement_notifies_the_connected_asker_after_commit() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let mut rx = {
+        let mut hub = hub.lock().await;
+        let rx = recv_peer(&mut hub, "boss");
+        persist(&mut hub).unwrap();
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+        rx
+    };
+    let mut claim = hook_row("B");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim.clone()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        rx.try_recv().is_err(),
+        "a rolled-back closure must not be delivered"
+    );
+    {
+        let hub = hub.lock().await;
+        assert!(hub.asks.values().next().unwrap().open);
+        assert!(!hub.inbox.contains_key("boss"));
+        hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
+    }
+    let (status, _) = json_req(app, "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let ack = rx.try_recv().expect("the asker must receive the closure");
+    assert_eq!(ack["type"], "ack");
+    let hub = hub.lock().await;
+    let disk = read_snapshot(&hub.db).unwrap();
+    let ask = disk.asks.values().next().unwrap();
+    assert!(!ask.open);
+    assert_eq!(ack["correlation_id"], ask.correlation_id);
+    assert_eq!(ack["message"], ask.reply.as_deref().unwrap());
+    assert_eq!(disk.inbox["boss"][0], ack, "recv retires the durable copy");
+}
+
+#[tokio::test]
+async fn ownership_replacement_waits_for_the_askers_reserved_session() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let mut rx = {
+        let mut hub = hub.lock().await;
+        let rx = recv_peer(&mut hub, "boss");
+        hub.owed.insert(
+            "boss".into(),
+            Owed {
+                owner: "asker".into(),
+                since: now_unix(),
+            },
+        );
+        queue_inbox(
+            &mut hub,
+            "boss",
+            [json!({"type": "notify", "message": "held for asker"})],
+        );
+        persist(&mut hub).unwrap();
+        rx
+    };
+    let mut claim = hook_row("B");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        rx.try_recv().is_err(),
+        "the closure must wait for the asker's session"
+    );
+    assert_eq!(hub.lock().await.inbox["boss"][1]["type"], "ack");
+    let claim = json!({"peer_id": "boss", "backend": "pi", "session_id": "asker"});
+    let (status, _) = json_req(app, "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let bound = rx
+        .try_recv()
+        .expect("binding precedes the reserved replies");
+    assert_eq!(bound["type"], "bound");
+    assert_eq!(bound["session_id"], "asker");
+    assert_eq!(rx.try_recv().unwrap()["type"], "notify");
+    let ack = rx.try_recv().unwrap();
+    assert_eq!(ack["type"], "ack");
+    assert!(ack["message"]
+        .as_str()
+        .unwrap()
+        .contains("session was replaced"));
+}
+
+#[tokio::test]
+async fn ownership_replacement_delivers_once_to_a_legacy_asker() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let mut rx = {
+        let mut hub = hub.lock().await;
+        let rx = recv_peer(&mut hub, "boss");
+        hub.recv_live.remove("boss");
+        hub.recv_known.remove("boss");
+        persist(&mut hub).unwrap();
+        rx
+    };
+    let mut claim = hook_row("B");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app, "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let ack = rx
+        .try_recv()
+        .expect("the legacy asker must receive the closure");
+    assert_eq!(ack["type"], "ack");
+    let hub = hub.lock().await;
+    assert!(!hub.inbox.contains_key("boss"));
+    assert!(!read_snapshot(&hub.db).unwrap().inbox.contains_key("boss"));
+}
+
+#[tokio::test]
+async fn ownership_disconnected_live_name_closes_previous_sessions_asks() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), false).await;
+    let (status, _) = json_req(app.clone(), "POST", "/peers", hook_row("A")).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut claim = hook_row("B");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert!(pending["asks"].as_array().unwrap().is_empty(), "{pending}");
+    assert!(pending["inbox"].as_array().unwrap().is_empty(), "{pending}");
+    let hub = hub.lock().await;
+    let ask = hub.asks.values().next().unwrap();
+    assert!(!ask.open);
+    assert!(ask
+        .reply
+        .as_deref()
+        .unwrap()
+        .contains("session was replaced"));
+}
+
+#[tokio::test]
+async fn ownership_session_change_closes_asks_even_when_the_pin_is_connected() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), false).await;
+    let (status, _) = json_req(app.clone(), "POST", "/peers", hook_row("A")).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut claim = hook_row("");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let hub = hub.lock().await;
+        assert_eq!(hub.peers["tmp-codex"].session_id, "A");
+        assert!(hub.asks.values().next().unwrap().open);
+    }
+    let mut rx = {
+        let mut hub = hub.lock().await;
+        let rx = recv_peer(&mut hub, "tmp-codex");
+        hub.peers.get_mut("tmp-codex").unwrap().session_id = "A".into();
+        persist(&mut hub).unwrap();
+        rx
+    };
+    claim["session_id"] = json!("A");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let hub = hub.lock().await;
+        assert_eq!(hub.peers["tmp-codex"].session_id, "A");
+        assert!(hub.asks.values().next().unwrap().open);
+        assert!(rx.try_recv().is_err());
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+    }
+    claim["session_id"] = json!("B");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim.clone()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        rx.try_recv().is_err(),
+        "a failed claim must not displace the owner"
+    );
+    {
+        let hub = hub.lock().await;
+        assert_eq!(hub.peers["tmp-codex"].session_id, "A");
+        assert!(hub.asks.values().next().unwrap().open);
+        hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
+    }
+    let (status, _) = json_req(app, "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let notice = rx
+        .try_recv()
+        .expect("the connection must learn that its session changed");
+    assert_eq!(notice["type"], "replaced");
+    assert_eq!(notice["session_id"], "B");
+    let hub = hub.lock().await;
+    let ask = hub.asks.values().next().unwrap();
+    assert!(
+        !ask.open,
+        "changing sessions retires the old ask even with a socket"
+    );
+    assert!(!hub.inbox.contains_key("tmp-codex"));
+    assert_eq!(hub.inbox["boss"][0]["correlation_id"], ask.correlation_id);
+    assert_eq!(
+        hub.inbox["boss"][0]["message"],
+        ask.reply.as_deref().unwrap()
+    );
+    assert!(hub.sockets.contains_key("tmp-codex"));
+    assert!(hub.recv_known.contains("tmp-codex"));
+}
+
+#[tokio::test]
+async fn ownership_expired_reservation_keeps_the_live_receivers_receipts() {
+    let (app, hub) =
+        pruned_hook_row("amesh_notify_peer", json!({"message": "for A only"}), false).await;
+    let mut claim = hook_row("");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app, "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let mut hub = hub.lock().await;
+    let _rx = recv_peer(&mut hub, "tmp-codex");
+    hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
+    assert!(refresh_peers(&mut hub).0);
+    assert!(!hub.owed.contains_key("tmp-codex"));
+    assert!(!hub.inbox.contains_key("tmp-codex"));
+    queue_inbox(
+        &mut hub,
+        "tmp-codex",
+        (0..=INBOX_MAX).map(|id| json!({"type": "notify", "id": id})),
+    );
+    assert_eq!(hub.inbox["tmp-codex"].len(), INBOX_MAX + 1);
+}
+
+#[test]
+fn ownership_legacy_retry_discards_frames_before_the_last_replacement() {
+    let path = std::env::temp_dir().join(format!("amesh-replaced-{}.db", Uuid::new_v4()));
+    let mut hub = Hub::open(&path).unwrap();
+    let mut rx = recv_peer(&mut hub, "w");
+    return_undelivered(
+        &mut hub,
+        "w",
+        vec![
+            json!({"type": "notify", "message": "A"}),
+            json!({"type": "replaced"}),
+            json!({"type": "notify", "message": "B"}),
+            json!({"type": "replaced"}),
+            json!({"type": "notify", "message": "C"}),
+            json!({"type": "bound", "session_id": "C"}),
+            json!({"type": "notify", "message": "C after binding"}),
+        ],
+    );
+    assert_eq!(rx.try_recv().unwrap()["message"], "C");
+    assert_eq!(rx.try_recv().unwrap()["message"], "C after binding");
+    assert!(rx.try_recv().is_err());
+    let _ = fs::remove_file(&path);
+}
+
+#[tokio::test]
+async fn ownership_legacy_retry_waits_for_the_reserved_session() {
+    let (_, hub) =
+        pruned_hook_row("amesh_notify_peer", json!({"message": "for A only"}), false).await;
+    let mut hub = hub.lock().await;
+    let mut rx = recv_peer(&mut hub, "tmp-codex");
+    assert!(return_undelivered(
+        &mut hub,
+        "tmp-codex",
+        vec![json!({"type": "notify", "message": "late A"})]
+    ));
+    assert!(
+        rx.try_recv().is_err(),
+        "a successor socket still has to prove the reserved session"
+    );
+    assert_eq!(hub.inbox["tmp-codex"].last().unwrap()["message"], "late A");
+    hub.peers.remove("tmp-codex");
+    hub.sockets.remove("tmp-codex");
+    assert!(return_undelivered(
+        &mut hub,
+        "tmp-codex",
+        vec![json!({"type": "notify", "message": "later A"})]
+    ));
+    assert_eq!(hub.inbox["tmp-codex"].last().unwrap()["message"], "later A");
+}
+
+#[tokio::test]
+async fn ownership_same_session_claim_keeps_open_asks() {
+    let (app, _) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), false).await;
+    let mut claim = hook_row("A");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert_eq!(pending["asks"][0]["text"], "for A only", "{pending}");
+    assert_eq!(pending["inbox"][0]["text"], "for A only", "{pending}");
+}
+
+#[tokio::test]
+async fn ownership_first_session_binding_keeps_queued_asks() {
+    let (app, hub) = test_app_with_hub();
+    let (status, _) = json_req(app.clone(), "POST", "/peers", hook_row("")).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"to_peer": "tmp-codex", "text": "waiting for binding"}),
+    )
+    .await;
+    assert_eq!(ask["ok"], true, "{ask}");
+    let mut rx = recv_peer(&mut *hub.lock().await, "tmp-codex");
+    let mut claim = hook_row("A");
+    claim["peer_id"] = json!("tmp-codex");
+    {
+        let mut hub = hub.lock().await;
+        persist(&mut hub).unwrap();
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+    }
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim.clone()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(
+        rx.try_recv().is_err(),
+        "a failed binding cannot change the stream session"
+    );
+    hub.lock()
+        .await
+        .db
+        .execute_batch("DROP TRIGGER fail_write")
+        .unwrap();
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let bound = rx
+        .try_recv()
+        .expect("first binding names the stream session");
+    assert_eq!(bound["type"], "bound");
+    assert_eq!(bound["session_id"], "A");
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert_eq!(
+        pending["asks"][0]["text"], "waiting for binding",
+        "{pending}"
+    );
+    assert_eq!(
+        hub.lock().await.inbox["tmp-codex"][0]["text"],
+        "waiting for binding"
+    );
+}
+
+#[tokio::test]
+async fn ownership_unproven_socket_closes_old_asks_on_a_different_session() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), false).await;
+    let mut claim = hook_row("");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let _rx = {
+        let mut hub = hub.lock().await;
+        let rx = recv_peer(&mut hub, "tmp-codex");
+        persist(&mut hub).unwrap();
+        rx
+    };
+    let mut claim = hook_row("B");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert!(pending["asks"].as_array().unwrap().is_empty(), "{pending}");
+    let hub = hub.lock().await;
+    assert!(!hub.inbox.contains_key("tmp-codex"));
+    assert!(hub.recv_known.contains("tmp-codex"));
+}
+
+#[test]
+fn ownership_rollback_keeps_the_live_receivers_unacknowledged_queue() {
+    let path = std::env::temp_dir().join(format!("amesh-live-rollback-{}.db", Uuid::new_v4()));
+    let mut hub = Hub::open(&path).unwrap();
+    let _rx = recv_peer(&mut hub, "w");
+    /* the peer row predates this connection's first promise to acknowledge */
+    hub.recv_known.remove("w");
+    persist(&mut hub).unwrap();
+    hub.recv_known.insert("w".into());
+    hub.db.execute_batch(
+        "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+    ).unwrap();
+    assert!(persist_ok(&mut hub).is_err());
+    hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
+    queue_inbox(
+        &mut hub,
+        "w",
+        (0..=INBOX_MAX).map(|n| json!({"type": "notify", "id": n})),
+    );
+    assert_eq!(hub.inbox["w"].len(), INBOX_MAX + 1);
+    let _ = fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn ownership_rollback_keeps_an_unproven_rows_reservation() {
+    let (app, hub) =
+        pruned_hook_row("amesh_notify_peer", json!({"message": "for A only"}), false).await;
+    let mut claim = hook_row("");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let hub = hub.lock().await;
+        assert_eq!(hub.owed["tmp-codex"].owner, "A");
+        hub.db.execute_batch(
+            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        ).unwrap();
+    }
+    let (status, _) = json_req(
+        app.clone(),
+        "GET",
+        "/asks/pending?peer_id=tmp-codex",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    hub.lock()
+        .await
+        .db
+        .execute_batch("DROP TRIGGER fail_write")
+        .unwrap();
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert!(pending["inbox"].as_array().unwrap().is_empty(), "{pending}");
+    let hub = hub.lock().await;
+    let reopened = Hub::open(Path::new(hub.db.path().unwrap())).unwrap();
+    assert_eq!(reopened.owed["tmp-codex"].owner, "A");
+    assert_eq!(reopened.inbox["tmp-codex"][0]["message"], "for A only");
+}
+
+#[tokio::test]
+async fn ownership_pruning_an_unproven_row_keeps_its_previous_owner() {
+    let (app, hub) = pruned_hook_row("amesh_ask", json!({"query": "for A only"}), true).await;
+    let mut claim = hook_row("");
+    claim["peer_id"] = json!("tmp-codex");
+    let (status, _) = json_req(app.clone(), "POST", "/peers", claim).await;
+    assert_eq!(status, StatusCode::OK);
+    hub.lock()
+        .await
+        .peers
+        .get_mut("tmp-codex")
+        .unwrap()
+        .last_seen = 1;
+    let (status, b) = json_req(app.clone(), "POST", "/peers", hook_row("B")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(b["peer_id"], "tmp-codex-2");
+    let (status, a) = json_req(app.clone(), "POST", "/peers", hook_row("A")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(a["peer_id"], "tmp-codex");
+    let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
+    assert_eq!(pending["asks"][0]["text"], "for A only", "{pending}");
 }
 
 #[tokio::test]
@@ -2529,13 +3321,10 @@ async fn the_owner_session_comes_back_to_its_backlog() {
     ))
     .await
     .unwrap();
-    assert!(r
-        .next()
-        .await
-        .unwrap()
-        .unwrap()
-        .to_string()
-        .contains("connected"));
+    let connected: Value =
+        serde_json::from_str(&r.next().await.unwrap().unwrap().to_string()).unwrap();
+    assert_eq!(connected["type"], "connected");
+    assert_eq!(connected["session_id"], "S1");
     let mut got = Vec::new();
     for _ in 0..2 {
         let frame = tokio::time::timeout(Duration::from_secs(3), r.next())
@@ -2571,6 +3360,15 @@ async fn the_owner_session_comes_back_to_its_backlog() {
 
 #[tokio::test]
 async fn an_unproven_row_gets_no_replay_and_no_hook_leak_until_its_session_proves_it() {
+    unproven_connection_waits_for_its_session(true).await;
+}
+
+#[tokio::test]
+async fn ownership_unproven_legacy_connection_keeps_reserved_messages() {
+    unproven_connection_waits_for_its_session(false).await;
+}
+
+async fn unproven_connection_waits_for_its_session(recv: bool) {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
@@ -2620,7 +3418,9 @@ async fn an_unproven_row_gets_no_replay_and_no_hook_leak_until_its_session_prove
     let (socket, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
     let (mut w, mut r) = socket.split();
     w.send(WsMsg::Text(
-        r#"{"type":"connect","peer_id":"tmp-pi","recv":true}"#.into(),
+        json!({"type": "connect", "peer_id": "tmp-pi", "recv": recv})
+            .to_string()
+            .into(),
     ))
     .await
     .unwrap();
@@ -2637,6 +3437,20 @@ async fn an_unproven_row_gets_no_replay_and_no_hook_leak_until_its_session_prove
         "nothing is replayed before the owner is proved: {nothing:?}"
     );
     assert_eq!(state.inner.lock().await.inbox["tmp-pi"].len(), 2);
+    {
+        let mut hub = state.inner.lock().await;
+        persist_then_deliver(
+            &mut hub,
+            "tmp-pi",
+            json!({"type": "notify", "message": "still for S1"}),
+        )
+        .unwrap();
+    }
+    let nothing = tokio::time::timeout(Duration::from_millis(200), r.next()).await;
+    assert!(
+        nothing.is_err(),
+        "new messages must also wait for the owner: {nothing:?}"
+    );
     /* the hook binds the session on the first turn: the owner is proved while attached */
     let (status, _) = json_req(
         router(state.clone()),
@@ -2646,8 +3460,16 @@ async fn an_unproven_row_gets_no_replay_and_no_hook_leak_until_its_session_prove
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let bound = tokio::time::timeout(Duration::from_secs(3), r.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let bound: Value = serde_json::from_str(&bound.to_string()).unwrap();
+    assert_eq!(bound["type"], "bound");
+    assert_eq!(bound["session_id"], "S1");
     let mut ids = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let frame = tokio::time::timeout(Duration::from_secs(3), r.next())
             .await
             .unwrap()
@@ -2656,12 +3478,14 @@ async fn an_unproven_row_gets_no_replay_and_no_hook_leak_until_its_session_prove
         let v: Value = serde_json::from_str(&frame.to_string()).unwrap();
         ids.push(v["id"].as_str().unwrap().to_string());
     }
-    for id in &ids {
-        w.send(WsMsg::Text(
-            json!({"type": "recv", "id": id}).to_string().into(),
-        ))
-        .await
-        .unwrap();
+    if recv {
+        for id in &ids {
+            w.send(WsMsg::Text(
+                json!({"type": "recv", "id": id}).to_string().into(),
+            ))
+            .await
+            .unwrap();
+        }
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while state.inner.lock().await.inbox.contains_key("tmp-pi") {
@@ -2866,7 +3690,7 @@ fn a_backlog_nobody_returns_for_expires() {
     let mut hub = owed_hub(&path, "S1");
     refresh_peers(&mut hub);
     hub.owed.get_mut("tmp-pi").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
-    assert!(refresh_peers(&mut hub));
+    assert!(refresh_peers(&mut hub).0);
     assert!(!hub.owed.contains_key("tmp-pi"));
     assert!(
         !hub.inbox.contains_key("tmp-pi"),

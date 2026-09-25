@@ -388,14 +388,15 @@ function InboxSession() {
   return { ctx, id: registered.peer_id, primer: registered.context };
 }
 
-function InboxInstance(state, failPrimer = false) {
+function InboxInstance(state, failPrimer = false, hooks = AmeshHooks) {
   const handlers = new Map();
   const primers = [];
   const users = [];
   const order = [];
   const sockets = [];
+  let failUser = false;
   socketSink = sockets;
-  AmeshHooks({
+  hooks({
     on(event, handler) { handlers.set(event, handler); },
     sendMessage(message) {
       if (failPrimer) {
@@ -407,12 +408,22 @@ function InboxInstance(state, failPrimer = false) {
       state.ctx.sessionManager.appendCustomMessageEntry(message.customType, message.content, message.display);
     },
     sendUserMessage(content, options) {
+      if (failUser) {
+        failUser = false;
+        throw new Error("user-write-fault");
+      }
       users.push({ content, options });
       order.push("user");
     },
     registerTool() {},
   });
-  return { handlers, primers, users, order, sockets };
+  return { handlers, primers, users, order, sockets, failNextUser() { failUser = true; } };
+}
+
+async function PinnedInbox(state) {
+  const pinned = source.replace(/^const peerId = .*;$/m, `const peerId = ${JSON.stringify(state.id)};`);
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(pinned).toString("base64")}`);
+  return InboxInstance(state, false, hooks);
 }
 
 function SendInbox(state, command, message) {
@@ -420,6 +431,240 @@ function SendInbox(state, command, message) {
     encoding: "utf8",
   }));
 }
+
+await test("replacement drops pending messages and keeps the socket", async () => {
+  const state = InboxSession();
+  const instance = InboxInstance(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const socket = instance.sockets[0];
+    fire(socket, { type: "notify", message: "already accepted" });
+    fire(socket, { type: "ask", message: "old queued ask", correlation_id: "old-ask" });
+    fire(socket, { type: "notify", message: "old queued notify" });
+    assert.equal(instance.users.length, 1);
+    fire(socket, { type: "replaced", peer_id: state.id });
+    fire(socket, { type: "notify", message: "new session message" });
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 2);
+    assert.match(instance.users[1].content, /new session message/);
+    assert.doesNotMatch(instance.users[1].content, /old queued/);
+    assert.equal(socket.readyState, 1);
+    assert.equal(instance.sockets.length, 1);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("reconnect keeps the new session's HTTP inbox", async () => {
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    fire(instance.sockets[0], { type: "notify", message: "A accepted", id: "accept-a" });
+    fire(instance.sockets[0], { type: "notify", message: "A queued", id: "queued-a" });
+    instance.sockets[0].close();
+    execFileSync(executable, ["hook", "session", "--backend=pi", "--peer-id", a.id], {
+      input: JSON.stringify({ cwd, session_id: b.ctx.sessionManager.getSessionId() }),
+    });
+    SendInbox(a, "notify", "B HTTP inbox");
+    await instance.handlers.get("session_start")({}, b.ctx);
+    await waitCount(instance.sockets, 2, 2000);
+    fire(instance.sockets[1], { type: "connected", session_id: b.ctx.sessionManager.getSessionId() });
+    await instance.handlers.get("agent_settled")({}, b.ctx);
+    assert.equal(instance.users.length, 2);
+    assert.match(instance.users[1].content, /B HTTP inbox/);
+    assert.doesNotMatch(instance.users[1].content, /A queued/);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("a delayed old frame cannot enter the new local session", async () => {
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const socket = instance.sockets[0];
+    fire(socket, { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    const starting = instance.handlers.get("session_start")({}, b.ctx);
+    fire(socket, { type: "notify", message: "A during startup", id: "startup-a" });
+    const duringStartup = instance.users.length;
+    await starting;
+    assert.equal(duringStartup, 0);
+    fire(socket, { type: "notify", message: "A in transit", id: "late-a" });
+    assert.equal(instance.users.length, 0);
+    fire(socket, { type: "replaced", session_id: b.ctx.sessionManager.getSessionId() });
+    fire(socket, { type: "notify", message: "B current", id: "current-b" });
+    assert.equal(instance.users.length, 1);
+    assert.match(instance.users[0].content, /B current/);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+for (const kind of ["connected", "bound"]) {
+  await test(`an unbound queue waits for ${kind} and is then delivered`, async () => {
+    const state = InboxSession();
+    const instance = InboxInstance(state);
+    try {
+      await instance.handlers.get("session_start")({}, state.ctx);
+      await waitCount(instance.sockets, 1, 2000);
+      let socket = instance.sockets[0];
+      const session = state.ctx.sessionManager.getSessionId();
+      fire(socket, { type: "connected", session_id: session });
+      fire(socket, { type: "notify", message: "in flight" });
+      fire(socket, { type: "connected", session_id: "" });
+      fire(socket, { type: "notify", message: "unbound pending", id: "unbound" });
+      await instance.handlers.get("agent_settled")({}, state.ctx);
+      assert.equal(instance.users.length, 1, "unbound messages must wait");
+      if (kind === "connected") {
+        socket.close();
+        await waitCount(instance.sockets, 2, 2500);
+        socket = instance.sockets[1];
+      }
+      fire(socket, { type: kind, session_id: session });
+      assert.equal(instance.users.length, 2, "binding must flush the retained message");
+      assert.match(instance.users[1].content, /unbound pending/);
+    } finally {
+      await instance.handlers.get("session_shutdown")({}, state.ctx);
+    }
+  });
+}
+
+await test("a legacy greeting clears the previous inbound session", async () => {
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    await instance.handlers.get("session_start")({}, b.ctx);
+    instance.sockets[0].close();
+    await waitCount(instance.sockets, 2, 2500);
+    fire(instance.sockets[1], { type: "connected" });
+    fire(instance.sockets[1], { type: "notify", message: "B legacy message", id: "legacy-b" });
+    assert.equal(instance.users.length, 1, "the legacy message must reach the current session");
+    assert.match(instance.users[0].content, /B legacy message/);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("replacement keeps a new session's earlier HTTP inbox", async () => {
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const socket = instance.sockets[0];
+    fire(socket, { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    fire(socket, { type: "notify", message: "A in flight" });
+    fire(socket, { type: "notify", message: "A stale pending" });
+    execFileSync(executable, ["hook", "session", "--backend=pi", "--peer-id", a.id], {
+      input: JSON.stringify({ cwd, session_id: b.ctx.sessionManager.getSessionId() }),
+    });
+    SendInbox(a, "notify", "B HTTP before replacement");
+    await instance.handlers.get("session_start")({}, b.ctx);
+    fire(socket, { type: "replaced", session_id: b.ctx.sessionManager.getSessionId() });
+    await instance.handlers.get("agent_settled")({}, b.ctx);
+    assert.equal(instance.users.length, 2);
+    assert.match(instance.users[1].content, /B HTTP before replacement/);
+    assert.doesNotMatch(instance.users[1].content, /A stale pending/);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("a local session switch does not claim the earlier unbound queue", async () => {
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const socket = instance.sockets[0];
+    fire(socket, { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    fire(socket, { type: "notify", message: "A in flight" });
+    fire(socket, { type: "connected", session_id: "" });
+    fire(socket, { type: "notify", message: "old unbound message" });
+    await instance.handlers.get("session_start")({}, b.ctx);
+    fire(socket, { type: "bound", session_id: b.ctx.sessionManager.getSessionId() });
+    await instance.handlers.get("agent_settled")({}, b.ctx);
+    assert.equal(instance.users.length, 1, "the local switch must discard the old unbound message");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("an unbound queue claimed for another session waits for that local session", async () => {
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const socket = instance.sockets[0];
+    fire(socket, { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    fire(socket, { type: "notify", message: "A in flight" });
+    fire(socket, { type: "connected", session_id: "" });
+    fire(socket, { type: "notify", message: "message for the next owner" });
+    fire(socket, { type: "bound", session_id: b.ctx.sessionManager.getSessionId() });
+    await instance.handlers.get("agent_settled")({}, a.ctx);
+    assert.equal(instance.users.length, 1, "B's message must not enter A");
+    await instance.handlers.get("session_start")({}, b.ctx);
+    assert.equal(instance.users.length, 2);
+    assert.match(instance.users[1].content, /message for the next owner/);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("a failed injection keeps its session across reconnect", async () => {
+  const state = InboxSession();
+  const instance = InboxInstance(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const session = state.ctx.sessionManager.getSessionId();
+    fire(instance.sockets[0], { type: "connected", session_id: session });
+    instance.failNextUser();
+    fire(instance.sockets[0], { type: "notify", message: "same session retry" });
+    assert.equal(instance.users.length, 0);
+    instance.sockets[0].close();
+    await waitCount(instance.sockets, 2, 2500);
+    fire(instance.sockets[1], { type: "connected", session_id: session });
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 1);
+    assert.match(instance.users[0].content, /same session retry/);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a local session switch drops the old failed injection", async () => {
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    instance.failNextUser();
+    fire(instance.sockets[0], { type: "notify", message: "old failed injection" });
+    await instance.handlers.get("session_start")({}, b.ctx);
+    assert.equal(instance.users.length, 0);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
 
 for (const seed of ["fresh", "matching", "mixed", "roster"]) {
   await test(`startup delivers pending asks and Inbox with a ${seed} primer`, async () => {

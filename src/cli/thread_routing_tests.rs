@@ -158,13 +158,16 @@ fn routing_session_lookup_subprocess() {
     let http = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let bind = http.local_addr().unwrap();
     std::env::set_var("AMESH_BIND", bind.to_string());
+    if case == "row-over-env" {
+        std::env::set_var("CODEX_THREAD_ID", "other");
+    }
     let body = match case.as_str() {
         "missing" => json!([]),
         "invalid" => json!([{"peer_id":"own","session_id":42}]),
         "empty" => json!([{"peer_id":"own","session_id":""}]),
         _ => json!([{"peer_id":"own","session_id":"target"}]),
     };
-    let http_task = if case == "env" {
+    let http_task = if case == "env" || case == "stream" {
         std::env::set_var("AMESH_BIND", "invalid-bind");
         if case == "env" {
             std::env::set_var("CODEX_THREAD_ID", "target");
@@ -225,7 +228,8 @@ fn routing_session_lookup_subprocess() {
                 }
             }
         });
-        let outcome = tokio::time::timeout(Duration::from_secs(3), app_connect("own"))
+        let stream = (case == "stream").then_some("target");
+        let outcome = tokio::time::timeout(Duration::from_secs(3), app_connect("own", stream))
             .await
             .unwrap();
         server.abort();
@@ -240,7 +244,9 @@ fn routing_session_lookup_subprocess() {
             outcome.is_none(),
             "confirmed empty session must wait for binding"
         ),
-        "env" | "bound" => assert_eq!(outcome.as_deref(), Some("target")),
+        "env" | "bound" | "stream" | "row-over-env" => {
+            assert_eq!(outcome.as_deref(), Some("target"))
+        }
         _ => assert!(
             outcome.is_none(),
             "identity failure must not select by cwd: {outcome:?}"
@@ -292,6 +298,16 @@ fn routing_confirmed_empty_session_waits_for_binding() {
 fn routing_env_identity_bypasses_failed_hub() {
     identity_case("env");
 }
+#[test]
+fn routing_row_session_outranks_the_thread_env() {
+    identity_case("row-over-env");
+}
+
+#[test]
+fn routing_stream_session_needs_no_hub() {
+    identity_case("stream");
+}
+
 #[test]
 fn routing_hub_identity_selects_exact_target() {
     identity_case("bound");

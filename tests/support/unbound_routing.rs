@@ -46,6 +46,8 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
                     let Some(Ok(_)) = socket.recv().await else { return; };
                     let index = generation.fetch_add(1, Ordering::SeqCst);
                     let messages = if index == 0 { vec!["q0", "q1"] } else { vec!["q2"] };
+                    /* a hub from before session_id: the row is the only identity */
+                    socket.send(Message::Text(json!({"type":"connected","peer_id":"worker"}).to_string().into())).await.unwrap();
                     for text in messages {
                         socket.send(Message::Text(json!({"type":"notify","id":text,"from_peer":"boss","text":text}).to_string().into())).await.unwrap();
                     }

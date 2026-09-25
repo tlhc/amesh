@@ -72,6 +72,10 @@ codex --remote unix:// -C "$PWD" resume --last
 
 `-C "$PWD"` is required for a new session and for `resume --last`: the App Server cwd is `/`, so without `-C` the latest thread is not this repo. `amesh hook ws` connects to that socket. Set `CODEX_THREAD_ID` when the process already knows its thread.
 
+Codex registers and starts its drainer after learning its thread from the App Server, `CODEX_THREAD_ID`, or a tool call. Resume reuses the thread's name, and its hooks join the same row. Without a startup thread ID or a matching probe, binding waits for the first tool call. An old Codex that supplies no thread uses a separate row; a pinned name supports outgoing calls, with pushed delivery starting once the thread is known.
+
+To pin a Codex name, pass `--peer-id` to `amesh setup codex`, which sets both the MCP and hooks. Setting `AMESH_PEER_ID` on the MCP alone leaves the hooks on a different peer.
+
 Override the install root with `--home DIR`. Override the advertised name with `--peer-id ID` or `AMESH_PEER_ID`; ids and circle names are 1-128 characters of `[A-Za-z0-9._-]`, the hub rejects anything else. Default name is `{folder}-{backend}`, then `-2`, `-3` if taken.
 
 `amesh mcp` / `amesh hook` (and the pi extension) start `amesh serve` when the hub is down and `AMESH_BIND` is loopback or unspecified (`0.0.0.0` / `::`). `status`, `doctor`, and `peer` do not. Log: `serve.log` next to the state file (default `~/.amesh/serve.log`).
@@ -116,7 +120,8 @@ If `AMESH_BIND` is not loopback and `AMESH_TOKEN` is empty, `serve` still starts
 
 ## Limits
 
-- `GET /peers` (and therefore `amesh status` / `peer list`) probes sockets, drops closed ones, then removes peers with no live WebSocket and `last_seen` older than 30s, and may persist. `gc` dry-run can hit this path too; `--home` skips the probe.
+- `GET /peers` (and therefore `amesh status` / `peer list`) probes sockets, drops closed ones, then removes peers with no live WebSocket and `last_seen` older than 30s, and may persist. A removed peer with a session keeps its name for that session while messages or open asks wait for it, up to 24h; then those asks close with a reason. `gc` dry-run can hit this path too; `--home` skips the probe.
+- A pinned name is for one session at a time. A different session claiming it closes pending asks, notifies their askers, and discards undelivered messages.
 - Event ring keeps the last 500 entries and clears on restart. It is not an audit log.
 - On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.

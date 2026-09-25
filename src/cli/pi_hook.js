@@ -175,6 +175,8 @@ export default function AmeshHooks(pi) {
   let dead = false;
   let inflight = false;
   let warned = false;
+  let localSession;
+  let inboundSessionId;
   const pending = [];
 
   function Cli(args) {
@@ -225,14 +227,24 @@ export default function AmeshHooks(pi) {
     return selfId ? ["--from-peer", selfId] : [];
   }
 
+  function UseSession(ctx) {
+    const session = ctx.sessionManager.getSessionId();
+    if (localSession !== session) {
+      KeepSession(session);
+      localSession = session;
+    }
+    return session;
+  }
+
   async function Invoke(event, ctx) {
-    const payload = JSON.stringify({ session_id: ctx.sessionManager.getSessionId(), cwd: ctx.cwd });
+    const session = UseSession(ctx);
+    const payload = JSON.stringify({ session_id: session, cwd: ctx.cwd });
     return new Promise((resolve, reject) => {
       const args = ["hook", event, "--backend=pi"];
       if (peerId) args.push("--peer-id", peerId);
       const child = execFile(executable, args, { timeout: 12000 }, (error, stdout) => {
         if (error) { reject(error); return; }
-        try { resolve(JSON.parse(stdout)); } catch (error) { reject(error); }
+        try { resolve({ ...JSON.parse(stdout), session_id: session }); } catch (error) { reject(error); }
       });
       child.stdin.end(payload);
     });
@@ -270,12 +282,14 @@ export default function AmeshHooks(pi) {
   }
 
   function Flush() {
-    if (dead || !intro || inflight || pending.length === 0) {
+    if (dead || !intro || inflight || pending.length === 0 || inboundSessionId === "") {
       return;
     }
     const steers = [];
     const follows = [];
-    for (const item of pending.splice(0)) {
+    const held = pending.findIndex((item) => item.session && localSession && item.session !== localSession);
+    if (held === 0) return;
+    for (const item of pending.splice(0, held < 0 ? pending.length : held)) {
       if (item.type === "broadcast") {
         follows.push(item);
       } else {
@@ -288,7 +302,7 @@ export default function AmeshHooks(pi) {
       if (pending.length <= 200) {
         warned = false;
       }
-      Start(batch.map((item) => item.text).join("\n\n"), "steer");
+      Start(batch, "steer");
       return;
     }
     const batch = Take(follows);
@@ -296,25 +310,25 @@ export default function AmeshHooks(pi) {
     if (pending.length <= 200) {
       warned = false;
     }
-    Start(batch.map((item) => item.text).join("\n\n"), "broadcast");
+    Start(batch, "broadcast");
   }
 
-  function Start(text, type) {
+  function Start(batch, type) {
     inflight = true;
     try {
-      pi.sendUserMessage(text, { deliverAs: type === "broadcast" ? "followUp" : "steer" });
+      pi.sendUserMessage(batch.map((item) => item.text).join("\n\n"), { deliverAs: type === "broadcast" ? "followUp" : "steer" });
     } catch (error) {
       inflight = false;
-      pending.unshift({ text, type });
+      pending.unshift(...batch);
       console.error(`[amesh] ${error.message}`);
     }
   }
 
-  function Inject(text, type) {
+  function Inject(text, type, session) {
     if (dead) {
       return false;
     }
-    pending.push({ text, type });
+    pending.push({ text, type, session });
     if (pending.length > 200) {
       if (!warned) {
         console.error("[amesh] inbound queue depth " + pending.length);
@@ -326,18 +340,40 @@ export default function AmeshHooks(pi) {
     return true;
   }
 
-  function Receive(body) {
+  function KeepSession(session) {
+    for (let i = pending.length - 1; i >= 0; i--) {
+      if (!session || pending[i].session !== session) pending.splice(i, 1);
+    }
+    if (pending.length <= 200) warned = false;
+  }
+
+  function Receive(body, session = inboundSessionId) {
+    if (["connected", "replaced", "bound"].includes(body?.type)) {
+      const next = typeof body.session_id === "string" ? body.session_id : undefined;
+      inboundSessionId = next;
+      if (body.type === "replaced") {
+        KeepSession(next);
+      } else if (next) {
+        for (const item of pending) {
+          if (!item.session) item.session = next;
+        }
+        KeepSession(next);
+      }
+      Flush();
+      return false;
+    }
     if (!body || !["ask", "notify", "broadcast", "ack"].includes(body.type)) {
       return false;
     }
+    if (session && localSession && session !== localSession) return true;
     const text = body.text || body.message || "";
-    return Inject(FormatPeer(body.from_peer || "unknown", body.type, text, body.correlation_id), body.type);
+    return Inject(FormatPeer(body.from_peer || "unknown", body.type, text, body.correlation_id), body.type, session);
   }
 
   function EnqueueInbox(result) {
     selfId = result.peer_id || selfId;
     for (const body of Array.isArray(result.inbox) ? result.inbox : []) {
-      Receive(body);
+      Receive(body, result.session_id);
     }
   }
 
@@ -560,6 +596,7 @@ export default function AmeshHooks(pi) {
   RegisterTools();
 
   pi.on("session_start", async (_event, ctx) => {
+    UseSession(ctx);
     try {
       await Ensure();
     } catch (error) {

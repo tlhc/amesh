@@ -535,15 +535,14 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
             );
         }
     }
-    /* a backlog may outlive its peer row only while a session is still expected back for it */
+    /* a sessionless row has not yet proved ownership of the reserved backlog */
     disk.owed.retain(|peer_id, owed| {
-        !disk.peers.contains_key(peer_id)
+        disk.peers
+            .get(peer_id)
+            .is_none_or(|peer| peer.session_id.is_empty())
             && !owed.owner.is_empty()
-            && disk
-                .inbox
-                .get(peer_id)
-                .map(|q| !q.is_empty())
-                .unwrap_or(false)
+            && (disk.inbox.get(peer_id).is_some_and(|q| !q.is_empty())
+                || has_open_ask(&disk.asks, peer_id))
     });
     disk.inbox
         .retain(|peer_id, _| disk.peers.contains_key(peer_id) || disk.owed.contains_key(peer_id));
@@ -559,6 +558,9 @@ fn apply_disk(hub: &mut Hub, disk: DiskState) {
     hub.schedules = disk.schedules;
     hub.inbox = disk.inbox;
     hub.mcp_servers = disk.mcp_servers;
+    hub.owed = disk.owed;
+    hub.recv_known = disk.recv_peers;
+    hub.recv_known.extend(hub.recv_live.iter().cloned());
 }
 
 impl Hub {
@@ -695,6 +697,7 @@ fn require_cross_circle(
 
 const INBOX_MAX: usize = 50;
 const DISPLACED: &str = "displaced";
+const REPLACED: &str = "replaced";
 const PEER_HINTS: usize = 8;
 
 /* a mistyped target should correct itself: the caller's online circle mates are the
@@ -757,13 +760,22 @@ Those events are owed to the peer, not to the connection, so hand them to whoeve
 holds the socket now and fall back to the inbox when nobody does. Returns whether
 hub state changed and needs persisting. */
 fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Value>) -> bool {
-    /* the notice belongs to one connection; replaying it would evict its successor */
+    let start = undelivered
+        .iter()
+        .rposition(|event| event["type"] == REPLACED)
+        .map_or(0, |index| index + 1);
+    /* a successor receives its own connection and binding notices */
     let owed: Vec<Value> = undelivered
         .into_iter()
-        .filter(|event| event.get("type").and_then(Value::as_str) != Some(DISPLACED))
+        .skip(start)
+        .filter(|event| event["type"] != DISPLACED && event["type"] != "bound")
         .collect();
     if owed.is_empty() {
         return false;
+    }
+    if hub.owed.contains_key(peer_id) {
+        queue_inbox(hub, peer_id, owed);
+        return true;
     }
     if !hub.peers.contains_key(peer_id) {
         return false;
@@ -801,7 +813,9 @@ fn persist_then_deliver(
     /* a peer that acknowledges, or one that did and is away right now, is owed a record it
     can name by id. Only an attached client of the old kind takes the old path, since it
     would never acknowledge and its own replay drains what it is sent. */
-    let acknowledging = hub.recv_live.contains(&key)
+    let unsettled = hub.owed.contains_key(&key);
+    let acknowledging = unsettled
+        || hub.recv_live.contains(&key)
         || (hub.recv_known.contains(&key) && !hub.sockets.contains_key(&key));
     if acknowledging {
         /* the inbox is the record of what this peer is owed; what goes down the socket is a
@@ -810,8 +824,10 @@ fn persist_then_deliver(
         queue_inbox(hub, &key, [event.clone()]);
         push_event(hub, event.clone());
         persist_ok(hub)?;
-        if let Some((_, tx)) = hub.sockets.get(&key) {
-            let _ = tx.send(event);
+        if !unsettled {
+            if let Some((_, tx)) = hub.sockets.get(&key) {
+                let _ = tx.send(event);
+            }
         }
         return Ok(());
     }
@@ -826,6 +842,65 @@ fn persist_then_deliver(
     queue_inbox(hub, &key, [event.clone()]);
     push_event(hub, event);
     persist_ok(hub)
+}
+
+fn close_open_asks(asks: &mut HashMap<String, Ask>, peer_id: &str, reason: &str) -> Vec<Value> {
+    let mut replies = Vec::new();
+    for ask in asks.values_mut() {
+        if ask.open && ask.to_peer_id == peer_id {
+            ask.open = false;
+            ask.reply = Some(reason.into());
+            replies.push(json!({
+                "type": "ack",
+                "correlation_id": ask.correlation_id,
+                "from_peer": ask.to_peer,
+                "to_peer": ask.from_peer,
+                "message": ask.reply,
+            }));
+        }
+    }
+    replies
+}
+
+fn queue_replies(hub: &mut Hub, replies: Vec<Value>) -> Vec<(String, Value)> {
+    let mut queued = Vec::new();
+    for event in replies {
+        let to = event["to_peer"].as_str().unwrap_or_default();
+        let Some(target) = resolve(hub, to).map(|peer| peer.peer_id.clone()) else {
+            eprintln!("amesh: dropping {} for unknown peer {to}", event["type"]);
+            continue;
+        };
+        let event = with_event_id(event);
+        queue_inbox(hub, &target, [event.clone()]);
+        push_event(hub, event.clone());
+        queued.push((target, event));
+    }
+    queued
+}
+
+/* callers persist the records and their state changes before sending any copy */
+fn deliver_queued(hub: &mut Hub, records: Vec<(String, Value)>) {
+    let mut retired = false;
+    for (target, event) in records {
+        if hub.owed.contains_key(&target) {
+            continue;
+        }
+        let Some((_, tx)) = hub.sockets.get(&target) else {
+            continue;
+        };
+        if tx.send(event.clone()).is_err() {
+            hub.sockets.remove(&target);
+            continue;
+        }
+        if !hub.recv_live.contains(&target) {
+            retired |= acknowledge_event(hub, &target, event["id"].as_str().unwrap());
+        }
+    }
+    if retired {
+        if let Err((_, Json(error))) = persist_ok(hub) {
+            eprintln!("amesh: could not retire delivered records: {error}");
+        }
+    }
 }
 
 fn deliver_notify(
@@ -1256,29 +1331,47 @@ async fn register_peer(
             ),
         ));
     }
-    /* a backlog left behind for a session: that session adopts it on the way back in; a
-    registration that claims the name outright with a different session throws it away
-    rather than inherit another session's messages; one with no session leaves it waiting */
+    /* an unsettled reservation belongs to its recorded session, even with a new row */
+    let previous_session = hub
+        .owed
+        .get(&peer_id)
+        .map(|owed| owed.owner.as_str())
+        .or_else(|| old.map(|peer| peer.session_id.as_str()))
+        .unwrap_or_default();
+    let mut replies = Vec::new();
+    let replaced = !peer.session_id.is_empty()
+        && !previous_session.is_empty()
+        && previous_session != peer.session_id;
+    let binding = !peer.session_id.is_empty() && old.is_some_and(|row| row.session_id.is_empty());
+    if replaced {
+        eprintln!("amesh: dropping backlog of {peer_id}: it belongs to another session");
+        hub.owed.remove(&peer_id);
+        hub.inbox.remove(&peer_id);
+        if !hub.recv_live.contains(&peer_id) {
+            hub.recv_known.remove(&peer_id);
+        }
+        replies = close_open_asks(
+            &mut hub.asks,
+            &peer_id,
+            "amesh: recipient's session was replaced under the same name",
+        );
+    }
     /* copies that may go down an attached acknowledging socket, but only once the records
     they stand for are on disk: what is sent must never be something a crash can forget */
     let mut to_push: Vec<Value> = Vec::new();
-    if let Some(owed) = hub.owed.get(&peer_id).cloned() {
-        if !peer.session_id.is_empty() {
-            hub.owed.remove(&peer_id);
-            if peer.session_id == owed.owner {
-                if let Some(queue) = hub.inbox.get_mut(&peer_id) {
-                    for record in queue.iter_mut() {
-                        if record["id"].as_str().map(str::is_empty).unwrap_or(true) {
-                            *record = with_event_id(record.take());
-                        }
-                    }
-                    to_push = queue.clone();
+    if hub
+        .owed
+        .get(&peer_id)
+        .is_some_and(|owed| owed.owner == peer.session_id)
+    {
+        hub.owed.remove(&peer_id);
+        if let Some(queue) = hub.inbox.get_mut(&peer_id) {
+            for record in queue.iter_mut() {
+                if record["id"].as_str().map(str::is_empty).unwrap_or(true) {
+                    *record = with_event_id(record.take());
                 }
-            } else {
-                eprintln!("amesh: dropping backlog of {peer_id}: it belongs to another session");
-                hub.inbox.remove(&peer_id);
-                hub.recv_known.remove(&peer_id);
             }
+            to_push = queue.clone();
         }
     }
     /* the session came back under another name: what was left behind for it follows the
@@ -1322,14 +1415,17 @@ async fn register_peer(
         }
     }
     hub.peers.insert(peer_id.clone(), peer.clone());
+    let mut replies = queue_replies(&mut hub, replies);
+    replies.extend(to_push.into_iter().map(|event| (peer_id.clone(), event)));
     persist_ok(&mut hub)?;
-    if !to_push.is_empty() && hub.recv_live.contains(&peer_id) {
+    if replaced || binding {
         if let Some((_, tx)) = hub.sockets.get(&peer_id) {
-            for record in to_push {
-                let _ = tx.send(record);
-            }
+            let kind = if replaced { REPLACED } else { "bound" };
+            let _ =
+                tx.send(json!({"type": kind, "peer_id": peer_id, "session_id": peer.session_id}));
         }
     }
+    deliver_queued(&mut hub, replies);
     Ok(Json(json!({
         "ok": true,
         "peer_id": peer.peer_id,
@@ -1341,9 +1437,10 @@ async fn register_peer(
 
 const PEER_ONLINE_SECS: u64 = 30;
 
-fn refresh_peers(hub: &mut Hub) -> bool {
+fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
     let now = now_unix();
     let mut changed = false;
+    let mut replies = Vec::new();
     let closed: Vec<String> = hub
         .sockets
         .iter()
@@ -1368,17 +1465,22 @@ fn refresh_peers(hub: &mut Hub) -> bool {
         .collect();
     for id in &drop {
         let session = hub
-            .peers
+            .owed
             .get(id)
-            .map(|p| p.session_id.clone())
+            .map(|owed| owed.owner.clone())
+            .or_else(|| hub.peers.get(id).map(|p| p.session_id.clone()))
             .unwrap_or_default();
         hub.peers.remove(id);
         hub.mcp_servers.remove(id);
-        /* what an acknowledging, session-bound peer is still owed stays behind for that
-        session; a peer with no session has nobody to hand it to, so it goes as before */
-        let holds_backlog = hub.recv_known.contains(id)
-            && hub.inbox.get(id).map(|q| !q.is_empty()).unwrap_or(false);
+        /* what a session-bound peer is still owed, a queued message or an ask it has not
+        answered, stays behind for that session, drainer or not: freed, the name would hand
+        it to the next session that takes it. A peer with no known session has nobody to
+        hand it to, so its backlog is dropped */
+        let holds_backlog =
+            hub.inbox.get(id).is_some_and(|q| !q.is_empty()) || has_open_ask(&hub.asks, id);
         if holds_backlog && !session.is_empty() {
+            /* an owed record is persisted with the recv_known row, drainer or not */
+            hub.recv_known.insert(id.clone());
             hub.owed.entry(id.clone()).or_insert(Owed {
                 since: now,
                 owner: session,
@@ -1400,15 +1502,34 @@ fn refresh_peers(hub: &mut Hub) -> bool {
     for id in &expired {
         hub.owed.remove(id);
         hub.inbox.remove(id);
-        hub.recv_known.remove(id);
+        if !hub.recv_live.contains(id) {
+            hub.recv_known.remove(id);
+        }
+        /* the name is free again, and an ask still waiting on it would reach whoever takes
+        it next; close it and say why */
+        replies.extend(close_open_asks(
+            &mut hub.asks,
+            id,
+            &format!(
+                "amesh: recipient's session did not come back within {}h",
+                OWED_TTL_SECS / 3600
+            ),
+        ));
         changed = true;
     }
-    changed
+    (changed, queue_replies(hub, replies))
+}
+
+fn has_open_ask(asks: &HashMap<String, Ask>, peer_id: &str) -> bool {
+    asks.values()
+        .any(|ask| ask.open && ask.to_peer_id == peer_id)
 }
 
 fn probe_peers(hub: &mut Hub) -> Result<(), (StatusCode, Json<Value>)> {
-    if refresh_peers(hub) {
+    let (changed, replies) = refresh_peers(hub);
+    if changed {
         persist_ok(hub)?;
+        deliver_queued(hub, replies);
     }
     Ok(())
 }
@@ -2601,8 +2722,9 @@ async fn sweep_runtime_files(app: &App) {
 async fn tick_schedules(app: &App) {
     {
         let mut hub = app.inner.lock().await;
-        if refresh_peers(&mut hub) {
-            let _ = persist(&mut hub);
+        if let Err((_, Json(error))) = probe_peers(&mut hub) {
+            eprintln!("amesh: could not refresh peers: {error}");
+            return;
         }
     }
     let now = now_unix();
@@ -3469,7 +3591,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
         return;
     };
     let recv = req.recv;
-    let (peer_id, name, gen, mut rx, drained) = {
+    let (peer_id, name, session_id, gen, mut rx, drained) = {
         let mut hub = app.inner.lock().await;
         let Some(peer) = resolve(&hub, &key).cloned() else {
             drop(hub);
@@ -3519,18 +3641,22 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
             }
         } else {
             hub.recv_live.remove(&peer.peer_id);
-            let mut taken = hub.inbox.remove(&peer.peer_id).unwrap_or_default();
-            taken.extend(hub.inbox.remove(&peer.name).unwrap_or_default());
-            taken
+            if hub.owed.contains_key(&peer.peer_id) {
+                Vec::new()
+            } else {
+                let mut taken = hub.inbox.remove(&peer.peer_id).unwrap_or_default();
+                taken.extend(hub.inbox.remove(&peer.name).unwrap_or_default());
+                taken
+            }
         };
         if persist_ok(&mut hub).is_err() {
             drained.clear();
         }
-        (peer.peer_id, peer.name, gen, rx, drained)
+        (peer.peer_id, peer.name, peer.session_id, gen, rx, drained)
     };
     let _ = socket
         .send(Message::Text(
-            json!({"type":"connected","peer_id":peer_id,"name":name})
+            json!({"type":"connected","peer_id":peer_id,"name":name,"session_id":session_id})
                 .to_string()
                 .into(),
         ))

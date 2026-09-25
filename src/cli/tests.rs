@@ -52,6 +52,73 @@ fn filter_peers_keeps_only_named_circle() {
 }
 
 #[test]
+fn codex_bind_step_answers_bind_probes_with_its_nonce_while_unbound() {
+    let identity = Mutex::new(None);
+    let probing = AtomicBool::new(true);
+    /* this cwd cannot be canonicalized, so every registration fails before any request */
+    let cwd = Path::new("/nonexistent/amesh-bind-step");
+    let whoami = |arguments: Value, meta: Value| {
+        let message = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "amesh_whoami", "arguments": arguments, "_meta": meta}});
+        codex_bind_step(&message, &identity, "n1", cwd, None, &probing)
+    };
+    let refused =
+        |reply: Option<Value>| reply.is_some_and(|reply| reply["error"]["code"] == -32000);
+    let own =
+        whoami(json!({"bind": "n1"}), Value::Null).expect("the own probe is answered locally");
+    assert_eq!(own["id"], 7);
+    assert_eq!(own["result"]["content"][0]["text"], "n1");
+    let other = whoami(json!({"bind": "n2"}), Value::Null)
+        .expect("while unnamed, another prober gets this nonce and cannot match");
+    assert_eq!(other["result"]["content"][0]["text"], "n1");
+    assert!(
+        refused(whoami(json!({}), Value::Null)),
+        "refused while the probe runs"
+    );
+    probing.store(false, Ordering::Relaxed);
+    assert!(
+        refused(whoami(json!({}), Value::Null)),
+        "a failed registration is refused"
+    );
+    assert!(
+        refused(whoami(json!({}), json!({"threadId": "t1"}))),
+        "so is one naming its thread"
+    );
+    assert!(
+        identity.lock().unwrap().is_none(),
+        "and stays unbound for the next call to retry"
+    );
+    *identity.lock().unwrap() = Some("amesh-codex".into());
+    assert!(
+        whoami(json!({"bind": "n1"}), Value::Null).is_none(),
+        "once named, the probe reaches the hub and reports the name"
+    );
+}
+
+#[test]
+fn codex_bind_step_lets_a_pin_speak_unregistered_only_without_a_thread() {
+    let identity = Mutex::new(None);
+    let probing = AtomicBool::new(false);
+    let cwd = Path::new("/nonexistent/amesh-bind-step");
+    let whoami = |meta: Value| {
+        let message = json!({"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "amesh_whoami", "arguments": {}, "_meta": meta}});
+        codex_bind_step(&message, &identity, "n1", cwd, Some("pinned"), &probing)
+    };
+    /* a CODEX_THREAD_ID inherited from a Codex shell names a thread for every call */
+    if codex_thread_env().is_none() {
+        assert!(
+            whoami(Value::Null).is_none(),
+            "a call naming no thread goes out under the pin"
+        );
+        assert!(identity.lock().unwrap().is_none(), "without registering");
+    }
+    let refused = whoami(json!({"threadId": "t1"}))
+        .expect("a named thread whose registration fails must not speak for the pin");
+    assert_eq!(refused["error"]["code"], -32000);
+}
+
+#[test]
 fn mesh_primer_names_tools_and_peer_message() {
     let text = mesh_primer("amesh-pi", "pi", "project-abc123def456");
     assert!(text.contains("you are amesh-pi in circle project-abc123def456"));

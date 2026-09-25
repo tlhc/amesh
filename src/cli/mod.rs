@@ -449,74 +449,43 @@ fn mcp(raw: &[String]) -> Result<()> {
         .filter(|id| !id.is_empty())
         .unwrap_or_else(|| "mcp".into());
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("peer"));
-    let mut claimed = claimed_peer_id(&args);
+    let claimed = claimed_peer_id(&args);
     let derived = derived_peer_id(&cwd, &backend);
-    /* Codex SessionStart waits for the first turn; MCP spawn is the TUI start signal */
-    let mut ws_child: Option<Child> = None;
-    let mut ws_id = claimed.clone();
-    if backend == "codex" {
-        if let Some(id) = announce_runtime_peer(&backend, &cwd, claimed.as_deref()) {
-            if claimed.is_none() {
-                claimed = Some(id.clone());
-            }
-            ws_id = Some(id.clone());
-            ws_child = spawn_peer_ws(&id, &backend);
-        }
-    }
-    let ws_child = Arc::new(Mutex::new(ws_child));
+    let deferred = backend == "codex";
+    /* an App Server can name the thread before any tool call; without one, the first tool
+    call's _meta names it */
+    let probing = Arc::new(AtomicBool::new(
+        deferred && codex_thread_env().is_none() && crate::bridge::app_server_socket().exists(),
+    ));
+    let identity = Arc::new(Mutex::new(if deferred { None } else { claimed.clone() }));
+    let nonce = format!("amesh:bind:{}", uuid::Uuid::new_v4().simple());
+    let ws_child = Arc::new(Mutex::new(None::<Child>));
     let stop = Arc::new(AtomicBool::new(false));
     let (wake_tx, wake_rx) = mpsc::channel::<()>();
     /* keeper is for Codex hook ws only; a one-shot Pi mcp with --peer-id would otherwise
     join a vacant 1s sleep on every tool call */
-    let keeper = match (backend == "codex", ws_id.clone()) {
-        (true, Some(id)) => {
-            let ws_child = ws_child.clone();
-            let stop = stop.clone();
-            let backend = backend.clone();
-            Some(std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let vacant = ws_child
-                        .lock()
-                        .ok()
-                        .map(|slot| slot.is_none())
-                        .unwrap_or(true);
-                    let need = if let Ok(mut slot) = ws_child.lock() {
-                        if let Some(child) = slot.as_mut() {
-                            if child.try_wait().ok().flatten().is_some() {
-                                *slot = None;
-                                !hook_ws_process_alive(&id)
-                            } else {
-                                false
-                            }
-                        } else {
-                            !hook_ws_process_alive(&id)
-                        }
-                    } else {
-                        false
-                    };
-                    if need && !stop.load(Ordering::Relaxed) {
-                        if let Ok(mut slot) = ws_child.lock() {
-                            if let Some(child) = spawn_peer_ws(&id, &backend) {
-                                *slot = Some(child);
-                            }
-                        }
-                    }
-                    let idle = if vacant || need {
-                        Duration::from_secs(1)
-                    } else {
-                        Duration::from_millis(200)
-                    };
-                    match wake_rx.recv_timeout(idle) {
-                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                }
-            }))
-        }
-        _ => {
-            drop(wake_rx);
-            None
-        }
+    let keeper = if deferred {
+        let (identity, nonce, cwd) = (identity.clone(), nonce.clone(), cwd.clone());
+        let (ws_child, stop, probing) = (ws_child.clone(), stop.clone(), probing.clone());
+        let claimed = claimed.clone();
+        let runtime = tokio::runtime::Handle::current();
+        Some(std::thread::spawn(move || {
+            let bound = bind_codex_thread(
+                &identity,
+                &nonce,
+                &cwd,
+                claimed.as_deref(),
+                &runtime,
+                &wake_rx,
+                &probing,
+            );
+            if let Some(id) = bound {
+                keep_drainer(&id, "codex", &ws_child, &stop, &wake_rx);
+            }
+        }))
+    } else {
+        drop(wake_rx);
+        None
     };
     let mut input = io::stdin().lock();
     let mut output = io::stdout().lock();
@@ -535,8 +504,23 @@ fn mcp(raw: &[String]) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let response = match serde_json::from_str(&line) {
-            Ok(message) => forward_mcp(message, claimed.as_deref(), &derived, &cwd, &backend),
+        let response = match serde_json::from_str::<Value>(&line) {
+            Ok(message) => deferred
+                .then(|| {
+                    codex_bind_step(
+                        &message,
+                        &identity,
+                        &nonce,
+                        &cwd,
+                        claimed.as_deref(),
+                        &probing,
+                    )
+                })
+                .flatten()
+                .or_else(|| {
+                    let me = current_peer(&identity).or_else(|| claimed.clone());
+                    forward_mcp(message, me.as_deref(), &derived, &cwd, &backend)
+                }),
             Err(error) => Some(rpc_error(Value::Null, -32700, &error.to_string())),
         };
         if let Some(response) = response {
@@ -557,6 +541,198 @@ fn mcp(raw: &[String]) -> Result<()> {
     }
     drop(wake_tx);
     result
+}
+
+fn keep_drainer(
+    id: &str,
+    backend: &str,
+    ws_child: &Mutex<Option<Child>>,
+    stop: &AtomicBool,
+    wake_rx: &mpsc::Receiver<()>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let vacant = ws_child
+            .lock()
+            .ok()
+            .map(|slot| slot.is_none())
+            .unwrap_or(true);
+        let need = if let Ok(mut slot) = ws_child.lock() {
+            if let Some(child) = slot.as_mut() {
+                if child.try_wait().ok().flatten().is_some() {
+                    *slot = None;
+                    hook_ws_absent(id)
+                } else {
+                    false
+                }
+            } else {
+                hook_ws_absent(id)
+            }
+        } else {
+            false
+        };
+        /* stop is read under the lock the exit path kills the child under, so a drainer is
+        never spawned after that kill */
+        if need {
+            if let Ok(mut slot) = ws_child.lock() {
+                if !stop.load(Ordering::Relaxed) {
+                    if let Some(child) = spawn_peer_ws(id, backend) {
+                        *slot = Some(child);
+                    }
+                }
+            }
+        }
+        let idle = if vacant || need {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_millis(200)
+        };
+        match wake_rx.recv_timeout(idle) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
+
+/* a Codex MCP starts without its thread id, and a name announced without one can only be
+a new name while the row of the thread's previous run still holds the old one. So the MCP
+registers only once it knows its thread, from CODEX_THREAD_ID, its own App Server probe
+or the _meta of a tool call, and the hub's same-session rule hands the old name back; the
+thread's hook meets it on the same row in either order. A pinned name registers the same
+way, since the pin's row still carries the session of its previous run until then. A
+Codex too old to stamp _meta that no probe can name gets a row of its own */
+const CODEX_BIND_SECS: u64 = 5;
+
+fn current_peer(identity: &Mutex<Option<String>>) -> Option<String> {
+    identity.lock().ok().and_then(|id| id.clone())
+}
+
+/* the probe and a tool call can both carry the thread; the first announce wins */
+fn bind_codex_peer(
+    identity: &Mutex<Option<String>>,
+    cwd: &Path,
+    claimed: Option<&str>,
+    thread: Option<&str>,
+) -> Option<String> {
+    let mut slot = identity.lock().ok()?;
+    if slot.is_none() {
+        *slot = announce_runtime_peer("codex", cwd, claimed, thread);
+    }
+    slot.clone()
+}
+
+/* before there is a name, a tool call that names its thread in _meta binds it, the probe
+for this process's own thread included, and CODEX_THREAD_ID stands in for a missing _meta.
+A bind probe is answered here: its own gets the nonce it looks for, which is all an App
+Server without _meta has to go on, and while there is no name any other gets this nonce
+too, so it can never match here. A call that names no thread comes from a Codex too old to
+stamp _meta: once no probe is pending it registers without one, unless the name is pinned,
+where it speaks for the pin without registering or draining. Until a name exists, any other
+tool call is refused rather than forwarded under a guessed one, and a failed registration
+stays unbound for the next call to retry */
+fn codex_bind_step(
+    message: &Value,
+    identity: &Mutex<Option<String>>,
+    nonce: &str,
+    cwd: &Path,
+    claimed: Option<&str>,
+    probing: &AtomicBool,
+) -> Option<Value> {
+    if message["method"] != "tools/call" || current_peer(identity).is_some() {
+        return None;
+    }
+    let params = &message["params"];
+    let probe = &params["arguments"]["bind"];
+    let is_probe = params["name"] == "amesh_whoami" && probe.is_string();
+    let thread = params["_meta"]["threadId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(codex_thread_env);
+    match thread.as_deref() {
+        Some(thread) => {
+            bind_codex_peer(identity, cwd, claimed, Some(thread));
+        }
+        None if claimed.is_none() && !is_probe && !probing.load(Ordering::Relaxed) => {
+            bind_codex_peer(identity, cwd, None, None);
+        }
+        None => {}
+    }
+    if is_probe {
+        return (probe == nonce || current_peer(identity).is_none()).then(|| {
+            json!({"jsonrpc": "2.0", "id": message["id"],
+                "result": {"content": [{"type": "text", "text": nonce}]}})
+        });
+    }
+    let pinned_without_thread = claimed.is_some() && thread.is_none();
+    (current_peer(identity).is_none() && !pinned_without_thread).then(|| {
+        rpc_error(
+            message["id"].clone(),
+            -32000,
+            "amesh has not bound this Codex session to its thread yet; retry shortly",
+        )
+    })
+}
+
+/* with an App Server, probes until this process's own thread answers its nonce. A thread
+it does not list (a sub-agent, or a TUI of its own) never answers: after CODEX_BIND_SECS,
+or with no App Server at all, this waits for the first tool call, which names it */
+fn bind_codex_thread(
+    identity: &Mutex<Option<String>>,
+    nonce: &str,
+    cwd: &Path,
+    claimed: Option<&str>,
+    runtime: &tokio::runtime::Handle,
+    wake_rx: &mpsc::Receiver<()>,
+    probing: &AtomicBool,
+) -> Option<String> {
+    if let Some(thread) = codex_thread_env() {
+        bind_codex_peer(identity, cwd, claimed, Some(&thread));
+    }
+    let deadline = Instant::now() + Duration::from_secs(CODEX_BIND_SECS);
+    let mut last = String::from("no probe answered");
+    while probing.load(Ordering::Relaxed) && current_peer(identity).is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            eprintln!("amesh mcp: no Codex thread after {CODEX_BIND_SECS}s ({last}); waiting for the first tool call");
+            break;
+        }
+        let probe = async {
+            tokio::time::timeout(left.min(Duration::from_secs(2)), probe_own_thread(nonce)).await
+        };
+        match runtime.block_on(probe) {
+            Ok(Ok(thread)) => {
+                bind_codex_peer(identity, cwd, claimed, Some(&thread));
+            }
+            Ok(Err(error)) => last = error.to_string(),
+            Err(_) => last = "probe timed out".into(),
+        }
+        if current_peer(identity).is_some() {
+            break;
+        }
+        if !matches!(
+            wake_rx.recv_timeout(Duration::from_millis(300)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            return None;
+        }
+    }
+    probing.store(false, Ordering::Relaxed);
+    loop {
+        if let Some(id) = current_peer(identity) {
+            return Some(id);
+        }
+        if !matches!(
+            wake_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ) {
+            return None;
+        }
+    }
+}
+
+async fn probe_own_thread(nonce: &str) -> Result<String> {
+    let (mut ws, mut rpc_id) = app_open().await.ok_or("App Server unavailable")?;
+    discover_app_thread(&mut ws, &mut rpc_id, nonce, &json!({"bind": nonce}), true).await
 }
 
 fn rpc_error(id: Value, code: i32, message: &str) -> Value {
@@ -688,23 +864,6 @@ fn claimed_peer_id(args: &Args) -> Option<String> {
     } else {
         Some(id)
     }
-}
-
-fn sole_online_peer(path: &Path, backend: &str) -> Option<String> {
-    let peers = request("GET", "/peers", None).ok()?;
-    let path = path.to_string_lossy();
-    let mut hits = Vec::new();
-    for peer in peers.as_array()? {
-        if peer.get("backend").and_then(Value::as_str) == Some(backend)
-            && peer.get("status").and_then(Value::as_str) == Some("online")
-            && peer.get("path").and_then(Value::as_str) == Some(path.as_ref())
-        {
-            if let Some(id) = peer.get("peer_id").and_then(Value::as_str) {
-                hits.push(id.to_string());
-            }
-        }
-    }
-    (hits.len() == 1).then(|| hits.pop().unwrap())
 }
 
 fn folder_name(path: &Path) -> String {
@@ -1218,9 +1377,17 @@ pub(crate) fn pid_confirmed_dead(pid: u32) -> bool {
     String::from_utf8_lossy(&output.stderr).contains("No such process")
 }
 
+/* a peer id may carry `.`, the one character it allows that an extended regex would
+not take literally, so a drainer is never matched under a neighbour's name */
+fn hook_ws_pattern(peer_id: &str) -> String {
+    format!("hook ws --peer-id {}($| )", peer_id.replace('.', "\\."))
+}
+
+/* only pgrep's "no match" proves a drainer gone; a query that fails proves nothing, so
+nothing is spawned beside or handed over from a drainer that may still run */
 pub(crate) fn hook_ws_absent(peer_id: &str) -> bool {
     let Ok(output) = Command::new("pgrep")
-        .args(["-f", &format!("hook ws --peer-id {peer_id}($| )")])
+        .args(["-f", &hook_ws_pattern(peer_id)])
         .output()
     else {
         return false;
@@ -2075,39 +2242,18 @@ fn session_from_peers(peers: &Value, peer_id: &str) -> Result<Option<String>> {
     Ok((!id.is_empty()).then(|| id.to_string()))
 }
 
-async fn app_connect(peer_id: &str) -> Option<AppSink> {
+async fn app_open() -> Option<(AppWs, u64)> {
     use futures_util::SinkExt;
     use tokio::net::UnixStream;
     use tokio_tungstenite::client_async;
     use tokio_tungstenite::tungstenite::Message;
-    let trusted_id = match std::env::var("CODEX_THREAD_ID") {
-        Ok(id) if !id.is_empty() => Some(id),
-        _ => match peer_identity(peer_id) {
-            Ok(peer) => {
-                let id = peer["session_id"].as_str().unwrap();
-                if id.is_empty() {
-                    if peer["backend"] != "codex" || peer["status"] != "online" {
-                        return None;
-                    }
-                    None
-                } else {
-                    Some(id.to_string())
-                }
-            }
-            Err(error) => {
-                eprintln!("amesh hook ws: cannot resolve session for {peer_id}: {error}");
-                return None;
-            }
-        },
-    };
     let stream = UnixStream::connect(crate::bridge::app_server_socket())
         .await
         .ok()?;
     let (mut ws, _) = client_async("ws://localhost/", stream).await.ok()?;
-    let mut rpc_id = 1u64;
     app_rpc(
         &mut ws,
-        rpc_id,
+        1,
         "initialize",
         json!({
             "clientInfo": {"name": "amesh", "title": "amesh", "version": "0.1.0"},
@@ -2116,7 +2262,6 @@ async fn app_connect(peer_id: &str) -> Option<AppSink> {
     )
     .await
     .ok()?;
-    rpc_id += 1;
     let _ = ws
         .send(Message::Text(
             json!({"method": "initialized", "params": {}})
@@ -2124,9 +2269,42 @@ async fn app_connect(peer_id: &str) -> Option<AppSink> {
                 .into(),
         ))
         .await;
+    Some((ws, 2))
+}
+
+async fn app_connect(peer_id: &str, stream: Option<&str>) -> Option<AppSink> {
+    /* the session the stream names holds the name for every frame after it. Without one,
+    from a hub that does not send it or a row that has none, the row's session decides, and
+    CODEX_THREAD_ID only stands in for a row that names none or a hub that cannot be asked,
+    so a drainer respawned under a thread that lost the name follows the name */
+    let trusted_id = if let Some(session) = stream.filter(|id| !id.is_empty()) {
+        Some(session.to_string())
+    } else {
+        let env = codex_thread_env();
+        match peer_identity(peer_id) {
+            Ok(peer) => {
+                let id = peer["session_id"].as_str().unwrap();
+                if !id.is_empty() {
+                    Some(id.to_string())
+                } else if env.is_some() {
+                    env
+                } else if peer["backend"] != "codex" || peer["status"] != "online" {
+                    return None;
+                } else {
+                    None
+                }
+            }
+            Err(_) if env.is_some() => env,
+            Err(error) => {
+                eprintln!("amesh hook ws: cannot resolve session for {peer_id}: {error}");
+                return None;
+            }
+        }
+    };
+    let (mut ws, mut rpc_id) = app_open().await?;
     let trusted_id = match trusted_id {
         Some(id) => id,
-        None => match discover_app_thread(&mut ws, &mut rpc_id, peer_id).await {
+        None => match discover_app_thread(&mut ws, &mut rpc_id, peer_id, &json!({}), false).await {
             Ok(id) => {
                 let bind = (|| -> Result<()> {
                     let mut peer = peer_identity(peer_id)?;
@@ -2223,7 +2401,15 @@ async fn loaded_app_threads(ws: &mut AppWs, rpc_id: &mut u64) -> Result<Vec<Stri
     Ok(ids)
 }
 
-async fn discover_app_thread(ws: &mut AppWs, rpc_id: &mut u64, peer_id: &str) -> Result<String> {
+/* a peer id may answer from more than one thread, so every thread is heard before one is
+chosen; a per-process nonce can only answer from its own, so the first match settles it */
+async fn discover_app_thread(
+    ws: &mut AppWs,
+    rpc_id: &mut u64,
+    expected: &str,
+    arguments: &Value,
+    first: bool,
+) -> Result<String> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -2232,7 +2418,7 @@ async fn discover_app_thread(ws: &mut AppWs, rpc_id: &mut u64, peer_id: &str) ->
             let id = *rpc_id;
             *rpc_id += 1;
             ws.send(Message::Text(json!({"id":id,"method":"mcpServer/tool/call",
-                "params":{"threadId":thread,"server":"amesh","tool":"amesh_whoami","arguments":{}}
+                "params":{"threadId":thread,"server":"amesh","tool":"amesh_whoami","arguments":arguments}
             }).to_string().into())).await?;
             pending.insert(id, thread);
         }
@@ -2276,7 +2462,10 @@ async fn discover_app_thread(ws: &mut AppWs, rpc_id: &mut u64, peer_id: &str) ->
                         && items[0]["text"].as_str().is_some_and(|s| !s.is_empty())
                         && response.pointer("/result/isError") != Some(&Value::Bool(true)) =>
                 {
-                    if items[0]["text"] == peer_id {
+                    if items[0]["text"] == expected {
+                        if first {
+                            return Ok(thread);
+                        }
                         matches.push(thread);
                     }
                 }
@@ -2382,8 +2571,18 @@ fn hook_ws_retry_secs() -> u64 {
         .unwrap_or(60)
 }
 
-fn enqueue_hook_inbound(queued: &mut VecDeque<String>, text: String, warned: &mut bool) {
-    queued.push_back(text);
+/* a queued inbound frame and the session it was received for, if the stream named one */
+type Queued = (Option<String>, String);
+
+/* what was queued for another session goes, and what the unbound name queued becomes this
+session's, so a later owner of the name never gets it */
+fn keep_for_thread(queued: &mut VecDeque<Queued>, thread: &str) {
+    queued
+        .retain_mut(|(held, _)| held.get_or_insert_with(|| thread.to_string()).as_str() == thread);
+}
+
+fn enqueue_hook_inbound<T>(queued: &mut VecDeque<T>, item: T, warned: &mut bool) {
+    queued.push_back(item);
     if queued.len() > 500 {
         if !*warned {
             eprintln!("amesh hook ws: inbound queue depth {}", queued.len());
@@ -2394,21 +2593,69 @@ fn enqueue_hook_inbound(queued: &mut VecDeque<String>, text: String, warned: &mu
     }
 }
 
+/* the same order and stop as flush_app_sink, against the session the stream named: a hub
+too old to name one leaves an earlier connection's frames waiting */
 fn flush_claude_inbox(
     socket: &str,
     token: Option<&str>,
-    queued: &mut VecDeque<String>,
+    queued: &mut VecDeque<Queued>,
+    owner: Option<&str>,
     inbox_fail: &mut u8,
 ) {
-    while let Some(text) = queued.pop_front() {
+    if owner == Some("") {
+        return;
+    }
+    while let Some((session, text)) = queued.pop_front() {
+        if session.is_some() && session.as_deref() != owner {
+            queued.push_front((session, text));
+            return;
+        }
         if let Err(error) = inject_claude_inbox(socket, token, &text) {
-            queued.push_front(text);
+            queued.push_front((session, text));
             *inbox_fail = inbox_fail.saturating_add(1);
             eprintln!("amesh hook ws: inbox inject failed ({inbox_fail}): {error}");
             return;
         }
         *inbox_fail = 0;
     }
+}
+
+/* nothing while nobody owns the name; otherwise sends in queue order up to the first frame
+queued for another session, which a sink picked from the row or CODEX_THREAD_ID for a hub
+too old to name the owner must not take. False once the sink is unusable */
+async fn flush_app_sink(
+    sink: &mut AppSink,
+    queued: &mut VecDeque<Queued>,
+    owner: Option<&str>,
+) -> bool {
+    if owner == Some("") {
+        return true;
+    }
+    let before = queued.len();
+    let mut usable = true;
+    while let Some((session, text)) = queued.pop_front() {
+        if session
+            .as_deref()
+            .is_some_and(|session| session != sink.thread_id)
+        {
+            queued.push_front((session, text));
+            break;
+        }
+        if let Err(error) = app_inject(sink, &text).await {
+            queued.push_front((session, text));
+            if error.to_string() == "thread busy" {
+                eprintln!("amesh hook ws: thread busy, queued={}", queued.len());
+            } else {
+                eprintln!("amesh hook ws: App Server inject failed: {error}");
+                usable = false;
+            }
+            break;
+        }
+    }
+    if queued.len() < before {
+        eprintln!("amesh hook ws: flushed, queued={}", queued.len());
+    }
+    usable
 }
 
 fn remember_hook_inbound(accepted: &mut VecDeque<String>, id: Option<&str>) {
@@ -2474,14 +2721,16 @@ async fn hook_ws_recv(
 async fn hook_ws_once(
     peer_id: &str,
     backend: &str,
-    queued: &mut VecDeque<String>,
+    queued: &mut VecDeque<Queued>,
     depth_warned: &mut bool,
     accepted: &mut VecDeque<String>,
 ) -> Result<bool> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let _ = announce_runtime_peer(backend, &cwd, Some(peer_id));
+    /* sessions are bound by the MCP and the hooks; a drainer only carries the name, so one
+    respawned under a thread that lost it cannot take the row back */
+    let _ = announce_runtime_peer(backend, &cwd, Some(peer_id), None);
     let bind = std::env::var("AMESH_BIND").unwrap_or_else(|_| "127.0.0.1:8378".into());
     let url = format!("ws://{bind}/ws");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
@@ -2505,15 +2754,13 @@ async fn hook_ws_once(
     let mut app_backoff = Duration::from_secs(10);
     let mut next_app_try = Instant::now();
     let uses_app_server = app_server_backend(backend);
-    let mut app = if uses_app_server {
-        app_connect(peer_id).await
-    } else {
-        None
-    };
-    if uses_app_server && app.is_none() {
-        next_app_try = Instant::now() + app_backoff;
-        app_backoff = (app_backoff * 2).min(Duration::from_secs(300));
-    }
+    /* the session the stream names owns what is queued from here on, and its thread is
+    looked up on the first frame after connected rather than here */
+    let mut app: Option<AppSink> = None;
+    let mut owner: Option<String> = None;
+    /* until connected names the session, nothing queued from an earlier connection may
+    be flushed: the heartbeat's first tick is ready before any frame */
+    let mut greeted = false;
     let mut warned = false;
     let mut beat = tokio::time::interval(Duration::from_secs(10));
     loop {
@@ -2528,6 +2775,24 @@ async fn hook_ws_once(
                 let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
                 if kind == "displaced" {
                     return Ok(true);
+                }
+                /* connected, replaced and bound name the session every later frame belongs
+                to, in the order the hub queued them. A replaced name ends everything queued
+                before it; a session keeps its own and claims what the unbound name queued.
+                An empty one means nobody owns the name, so nothing flushes until a session
+                binds it; only a hub too old to say falls back to the row and CODEX_THREAD_ID */
+                if matches!(kind, "connected" | "replaced" | "bound") {
+                    owner = event["session_id"].as_str().map(str::to_string);
+                    if kind == "replaced" {
+                        queued.clear();
+                    } else if let Some(id) = owner.as_deref().filter(|id| !id.is_empty()) {
+                        keep_for_thread(queued, id);
+                    }
+                    greeted = true;
+                    app = None;
+                    next_app_try = Instant::now();
+                    beat.reset_immediately();
+                    continue;
                 }
                 if !crate::bridge::is_inbound(kind) {
                     continue;
@@ -2582,31 +2847,23 @@ async fn hook_ws_once(
                         eprintln!("amesh hook ws: inbox socket gone, yield");
                         return Ok(true);
                     }
-                    if queued.is_empty() {
-                        if let Err(error) = inject_claude_inbox(&socket, token.as_deref(), &wrapped) {
-                            eprintln!("amesh hook ws: inbox inject failed: {error}");
-                            enqueue_hook_inbound(queued, wrapped, depth_warned);
-                            inbox_fail = inbox_fail.saturating_add(1);
-                        } else {
-                            inbox_fail = 0;
-                        }
-                    } else {
-                        enqueue_hook_inbound(queued, wrapped, depth_warned);
-                        flush_claude_inbox(&socket, token.as_deref(), queued, &mut inbox_fail);
-                    }
+                    let tag = owner.clone().filter(|id| !id.is_empty());
+                    enqueue_hook_inbound(queued, (tag, wrapped), depth_warned);
+                    flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
                     remember_hook_inbound(accepted, id);
                     if !hook_ws_recv(&mut ws, &event).await {
                         return Ok(false);
                     }
                     continue;
                 }
-                enqueue_hook_inbound(queued, wrapped, depth_warned);
+                let tag = owner.clone().filter(|id| !id.is_empty());
+                enqueue_hook_inbound(queued, (tag, wrapped), depth_warned);
                 remember_hook_inbound(accepted, id);
                 if !hook_ws_recv(&mut ws, &event).await {
                     return Ok(false);
                 }
                 if uses_app_server && app.is_none() && Instant::now() >= next_app_try {
-                    app = app_connect(peer_id).await;
+                    app = app_connect(peer_id, owner.as_deref()).await;
                     if app.is_none() {
                         next_app_try = Instant::now() + app_backoff;
                         app_backoff = (app_backoff * 2).min(Duration::from_secs(300));
@@ -2621,24 +2878,14 @@ async fn hook_ws_once(
                     }
                     continue;
                 };
-                let before = queued.len();
-                while let Some(text) = queued.pop_front() {
-                    if let Err(error) = app_inject(sink, &text).await {
-                        queued.push_front(text);
-                        if error.to_string() == "thread busy" {
-                            eprintln!("amesh hook ws: thread busy, queued={}", queued.len());
-                        } else {
-                            eprintln!("amesh hook ws: App Server inject failed: {error}");
-                            app = None;
-                        }
-                        break;
-                    }
-                }
-                if queued.len() < before {
-                    eprintln!("amesh hook ws: flushed, queued={}", queued.len());
+                if !flush_app_sink(sink, queued, owner.as_deref()).await {
+                    app = None;
                 }
             }
             _ = beat.tick() => {
+                if !greeted {
+                    continue;
+                }
                 if let Some(dir) = hook_ws_dir() {
                     cap_log(&dir.join(format!("hook-ws-{peer_id}.log")));
                 }
@@ -2648,13 +2895,13 @@ async fn hook_ws_once(
                         return Ok(true);
                     }
                     let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok();
-                    flush_claude_inbox(&socket, token.as_deref(), queued, &mut inbox_fail);
+                    flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
                 }
                 if ws.send(Message::Text(json!({"type": "ping"}).to_string().into())).await.is_err() {
                     return Ok(false);
                 }
                 if uses_app_server && app.is_none() && Instant::now() >= next_app_try {
-                    app = app_connect(peer_id).await;
+                    app = app_connect(peer_id, owner.as_deref()).await;
                     warned = false;
                     if app.is_none() {
                         next_app_try = Instant::now() + app_backoff;
@@ -2664,21 +2911,8 @@ async fn hook_ws_once(
                     }
                 }
                 if let Some(sink) = app.as_mut() {
-                    let before = queued.len();
-                    while let Some(text) = queued.pop_front() {
-                        if let Err(error) = app_inject(sink, &text).await {
-                            queued.push_front(text);
-                            if error.to_string() == "thread busy" {
-                                eprintln!("amesh hook ws: thread busy, queued={}", queued.len());
-                            } else {
-                                eprintln!("amesh hook ws: App Server inject failed: {error}");
-                                app = None;
-                            }
-                            break;
-                        }
-                    }
-                    if queued.len() < before {
-                        eprintln!("amesh hook ws: flushed, queued={}", queued.len());
+                    if !flush_app_sink(sink, queued, owner.as_deref()).await {
+                        app = None;
                     }
                 }
             }
@@ -2686,7 +2920,18 @@ async fn hook_ws_once(
     }
 }
 
-fn announce_runtime_peer(backend: &str, cwd: &Path, claimed: Option<&str>) -> Option<String> {
+fn codex_thread_env() -> Option<String> {
+    std::env::var("CODEX_THREAD_ID")
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
+fn announce_runtime_peer(
+    backend: &str,
+    cwd: &Path,
+    claimed: Option<&str>,
+    thread: Option<&str>,
+) -> Option<String> {
     let path = cwd.canonicalize().ok()?;
     let circle = std::env::var("AMESH_CIRCLE")
         .ok()
@@ -2698,10 +2943,8 @@ fn announce_runtime_peer(backend: &str, cwd: &Path, claimed: Option<&str>) -> Op
         "circle": circle,
     });
     if backend == "codex" {
-        if let Ok(session) = std::env::var("CODEX_THREAD_ID") {
-            if !session.is_empty() {
-                body["session_id"] = json!(session);
-            }
+        if let Some(thread) = thread.filter(|id| !id.is_empty()) {
+            body["session_id"] = json!(thread);
         }
     }
     if let Some(peer_id) = claimed.filter(|id| !id.is_empty()) {
@@ -2710,14 +2953,6 @@ fn announce_runtime_peer(backend: &str, cwd: &Path, claimed: Option<&str>) -> Op
     }
     let registered = request("POST", "/peers", Some(body)).ok()?;
     registered["peer_id"].as_str().map(str::to_string)
-}
-
-fn hook_ws_process_alive(peer_id: &str) -> bool {
-    Command::new("pgrep")
-        .args(["-f", &format!("hook ws --peer-id {peer_id}($| )")])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
 
 fn hook_ws_dir() -> Option<PathBuf> {
@@ -2760,7 +2995,7 @@ fn claude_inbox_path() -> Option<PathBuf> {
 
 fn kill_hook_ws(peer_id: &str) {
     let _ = Command::new("pkill")
-        .args(["-f", &format!("hook ws --peer-id {peer_id}($| )")])
+        .args(["-f", &hook_ws_pattern(peer_id)])
         .status();
 }
 
@@ -2809,6 +3044,24 @@ fn hook_ws_log(peer_id: &str) -> Stdio {
         .unwrap_or_else(|_| Stdio::null())
 }
 
+/* only a drainer stamped with this session's own messaging socket may carry the name on;
+any other takes whatever reaches the name into another process, so it must be known gone,
+not just signalled, before this session takes the name. False until pgrep confirms it */
+fn retire_foreign_claude_drainer(peer_id: &str) -> bool {
+    let want = claude_inbox_socket();
+    if hook_ws_absent(peer_id) || want.is_some() && stamped_inbox_socket(peer_id) == want {
+        return true;
+    }
+    kill_hook_ws(peer_id);
+    for _ in 0..20 {
+        if hook_ws_absent(peer_id) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
 fn spawn_peer_ws(peer_id: &str, backend: &str) -> Option<Child> {
     /* a drainer that would exit immediately is not worth spawning, and respawning one on
     every hook would churn a child per event */
@@ -2818,25 +3071,14 @@ fn spawn_peer_ws(peer_id: &str, backend: &str) -> Option<Child> {
     if backend == "claude-code" && claude_inbox_socket().is_none() {
         return None;
     }
-    if hook_ws_process_alive(peer_id) {
-        /* only a claude-code drainer is bound to a messaging socket, so only it can be
-        stale against one; reaping on a backend that never records a stamp would kill a
-        healthy codex drainer every time this runs under a Claude session */
-        if backend != "claude-code" {
-            return None;
-        }
-        let want = claude_inbox_socket();
-        let have = stamped_inbox_socket(peer_id);
-        if want.is_none() || have.as_deref() == want.as_deref() {
-            return None;
-        }
-        kill_hook_ws(peer_id);
-        for _ in 0..20 {
-            if !hook_ws_process_alive(peer_id) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    /* only a claude-code drainer is bound to a messaging socket, so only it can be stale
+    against one; reaping on a backend that never records a stamp would kill a healthy codex
+    drainer every time this runs under a Claude session */
+    if backend == "claude-code" {
+        retire_foreign_claude_drainer(peer_id);
+    }
+    if !hook_ws_absent(peer_id) {
+        return None;
     }
     let executable = std::env::current_exe().ok()?;
     Command::new(executable)
@@ -2958,15 +3200,21 @@ fn hook(raw: &[String]) -> Result<()> {
         .unwrap_or_else(|| project_circle(&path));
     let mut body =
         json!({"path": path, "backend": backend, "circle": circle, "session_id": session});
-    let mut claimed = claimed_peer_id(&args);
-    if claimed.is_none() && backend == "codex" {
-        claimed = sole_online_peer(&path, &backend);
-    }
-    if let Some(id) = claimed {
+    if let Some(id) = claimed_peer_id(&args) {
         body["peer_id"] = json!(id.clone());
         body["name"] = json!(id);
     }
     ensure_daemon();
+    let claude = backend == "claude-code";
+    /* every event registers the session, so any of them can move the name */
+    if let Some(id) = claimed_peer_id(&args).filter(|id| claude && crate::hub::valid_peer_id(id)) {
+        if !retire_foreign_claude_drainer(&id) {
+            return Err(format!(
+                "cannot confirm the previous Claude drainer for {id} has exited"
+            )
+            .into());
+        }
+    }
     let registered = request("POST", "/peers", Some(body))?;
     let peer_id = registered["peer_id"]
         .as_str()
@@ -2976,7 +3224,7 @@ fn hook(raw: &[String]) -> Result<()> {
         .as_str()
         .map(str::to_string)
         .unwrap_or(circle);
-    if backend == "claude-code" && (event == "SessionStart" || event == "UserPromptSubmit") {
+    if claude && (event == "SessionStart" || event == "UserPromptSubmit") {
         ensure_peer_ws(&peer_id, &backend);
     }
     let pending = request(
