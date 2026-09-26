@@ -4,6 +4,10 @@ Local hub that lets `pi`, Codex, and Claude Code sessions on one machine `ask` /
 
 One Rust binary, SQLite state, HTTP + WebSocket on `127.0.0.1:8378`. Each running session is a **peer**; peers in the same git repo share a **circle**.
 
+![demo](docs/demo.gif)
+
+`amesh tui` in the demo is optional and only watches. Without it the hub runs quietly in the background and relays asks, acks, notifies and jobs between agents on its own.
+
 ## How agents work together
 
 After `amesh setup`, each runtime calls the hub's tools through MCP (`amesh mcp`) and receives pushed messages over a WebSocket (`amesh hook ws`; the pi extension opens its own).
