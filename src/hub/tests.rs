@@ -4,8 +4,15 @@ use axum::http::Request;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+/* config.toml and attachments sit next to the state file, so each hub gets its own directory */
+fn temp_state(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("amesh-{name}-{}", Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    dir.join("state.db")
+}
+
 fn test_app() -> Router {
-    let path = std::env::temp_dir().join(format!("amesh-test-{}.db", Uuid::new_v4()));
+    let path = temp_state("test");
     router(App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -268,7 +275,7 @@ async fn session_id_reuse_keeps_peer_id_and_circle_when_cwd_changes() {
 
 #[test]
 fn a_restart_gives_persisted_peers_a_reconnect_window() {
-    let path = std::env::temp_dir().join(format!("amesh-restart-{}.db", Uuid::new_v4()));
+    let path = temp_state("restart");
     {
         let mut hub = Hub::open(&path).unwrap();
         hub.peers.insert(
@@ -297,7 +304,7 @@ fn a_restart_gives_persisted_peers_a_reconnect_window() {
 
 #[test]
 fn a_full_inbox_drops_chatter_before_an_ask() {
-    let path = std::env::temp_dir().join(format!("amesh-inbox-{}.db", Uuid::new_v4()));
+    let path = temp_state("inbox");
     let mut hub = Hub::open(&path).unwrap();
     queue_inbox(&mut hub, "w", [json!({"type": "ask", "id": "keep-me"})]);
     let chatter = (0..INBOX_MAX * 2).map(|n| json!({"type": "broadcast", "id": n}));
@@ -321,7 +328,7 @@ fn a_full_inbox_drops_chatter_before_an_ask() {
 
 #[test]
 fn a_restart_ignores_inbox_keys_without_a_peer() {
-    let path = std::env::temp_dir().join(format!("amesh-orphan-load-{}.db", Uuid::new_v4()));
+    let path = temp_state("orphan-load");
     let mut hub = Hub::open(&path).unwrap();
     hub.peers.insert(
         "offline".into(),
@@ -357,7 +364,7 @@ fn a_restart_ignores_inbox_keys_without_a_peer() {
 
 #[tokio::test]
 async fn a_reply_to_a_departed_peer_leaves_no_permanent_queue() {
-    let path = std::env::temp_dir().join(format!("amesh-orphan-{}.db", Uuid::new_v4()));
+    let path = temp_state("orphan");
     let mut hub = Hub::open(&path).unwrap();
     hub.peers.insert(
         "live".into(),
@@ -383,6 +390,8 @@ async fn a_reply_to_a_departed_peer_leaves_no_permanent_queue() {
             text: "q".into(),
             open: true,
             reply: None,
+            failed: false,
+            closed_at: None,
         },
     );
     persist(&mut hub).unwrap();
@@ -413,7 +422,7 @@ async fn a_reply_to_a_departed_peer_leaves_no_permanent_queue() {
 
 #[test]
 fn probe_prunes_stale_peers_before_list_or_broadcast() {
-    let path = std::env::temp_dir().join(format!("amesh-probe-{}.db", Uuid::new_v4()));
+    let path = temp_state("probe");
     let mut hub = Hub::open(&path).unwrap();
     let now = now_unix();
     let peer = |id: &str, seen: u64| Peer {
@@ -590,7 +599,7 @@ async fn mcp_ask_keeps_hidden_text_alias_and_prefers_query() {
 
 #[tokio::test]
 async fn mcp_schedule_hidden_message_alias_and_long_bodies_persist() {
-    let path = std::env::temp_dir().join(format!("amesh-long-{}.db", Uuid::new_v4()));
+    let path = temp_state("long");
     let app = router(App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -1080,7 +1089,7 @@ async fn mcp_schedule_list_stamps_creator_circle() {
 
 #[tokio::test]
 async fn schedule_circle_survives_restart_old_schema_and_missing_target() {
-    let path = std::env::temp_dir().join(format!("amesh-sched-mig-{}.db", Uuid::new_v4()));
+    let path = temp_state("sched-mig");
     {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(
@@ -1196,7 +1205,7 @@ async fn schedule_circle_survives_restart_old_schema_and_missing_target() {
 
 #[test]
 fn job_circle_survives_restart_and_old_schema() {
-    let path = std::env::temp_dir().join(format!("amesh-job-mig-{}.db", Uuid::new_v4()));
+    let path = temp_state("job-mig");
     {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(
@@ -1246,6 +1255,12 @@ fn job_circle_survives_restart_and_old_schema() {
                 state: "queued".into(),
                 result_summary: None,
                 circle: "one".into(),
+                depends_on: Vec::new(),
+                ask_id: None,
+                from_peer: String::new(),
+                dispatch: false,
+                nudge_at: None,
+                finished_at: None,
             },
         );
         persist(&mut hub).unwrap();
@@ -1341,7 +1356,7 @@ async fn ws_unicast_not_broadcast() {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let path = std::env::temp_dir().join(format!("amesh-ws-{}.db", Uuid::new_v4()));
+    let path = temp_state("ws");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -1413,7 +1428,7 @@ async fn ws_unicast_not_broadcast() {
 
 #[tokio::test]
 async fn jobs_persist_and_pending_is_id_only() {
-    let path = std::env::temp_dir().join(format!("amesh-persist-{}.db", Uuid::new_v4()));
+    let path = temp_state("persist");
     let app = router(App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -1499,7 +1514,7 @@ async fn inbox_caps_at_50() {
 
 #[tokio::test]
 async fn job_assigned_peer_and_chat_go_to_inbox() {
-    let app = test_app();
+    let (app, hub) = test_app_with_hub();
     let _ = json_req(
         app.clone(),
         "POST",
@@ -1516,6 +1531,7 @@ async fn job_assigned_peer_and_chat_go_to_inbox() {
     .await;
     assert_eq!(st, StatusCode::OK);
     let jid = job["job_id"].as_str().unwrap();
+    advance_jobs(&mut *hub.lock().await);
     let (_, pending) = json_req(
         app.clone(),
         "GET",
@@ -1525,8 +1541,8 @@ async fn job_assigned_peer_and_chat_go_to_inbox() {
     .await;
     let inbox = pending["inbox"].as_array().unwrap();
     assert_eq!(inbox.len(), 1);
-    assert_eq!(inbox[0]["type"], "notify");
-    assert!(inbox[0]["message"].as_str().unwrap().contains(jid));
+    assert_eq!(inbox[0]["type"], "ask");
+    assert!(inbox[0]["text"].as_str().unwrap().contains(jid));
     let (st, _) = json_req(
         app.clone(),
         "POST",
@@ -1559,7 +1575,7 @@ async fn job_assigned_peer_and_chat_go_to_inbox() {
 
 #[tokio::test]
 async fn job_notifies_pi_codex_and_claude_assignees() {
-    let app = test_app();
+    let (app, hub) = test_app_with_hub();
     for (id, backend) in [("p", "pi"), ("x", "codex"), ("c", "claude-code")] {
         let _ = json_req(
             app.clone(),
@@ -1577,6 +1593,7 @@ async fn job_notifies_pi_codex_and_claude_assignees() {
         .await;
         assert_eq!(st, StatusCode::OK, "{id}");
         let jid = job["job_id"].as_str().unwrap();
+        advance_jobs(&mut *hub.lock().await);
         let (_, pending) = json_req(
             app.clone(),
             "GET",
@@ -1586,8 +1603,8 @@ async fn job_notifies_pi_codex_and_claude_assignees() {
         .await;
         let inbox = pending["inbox"].as_array().unwrap();
         assert_eq!(inbox.len(), 1, "{id} {inbox:?}");
-        assert_eq!(inbox[0]["type"], "notify");
-        assert!(inbox[0]["message"].as_str().unwrap().contains(jid));
+        assert_eq!(inbox[0]["type"], "ask");
+        assert!(inbox[0]["text"].as_str().unwrap().contains(jid));
     }
 }
 
@@ -1764,7 +1781,7 @@ async fn attachment_get_returns_bytes() {
 
 #[tokio::test]
 async fn peer_mcp_survives_reopen() {
-    let path = std::env::temp_dir().join(format!("amesh-mcp-{}.db", Uuid::new_v4()));
+    let path = temp_state("mcp");
     {
         let app = router(App {
             inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
@@ -1909,7 +1926,7 @@ async fn health_register_alias_and_session_resume() {
 
 #[tokio::test]
 async fn a_dead_peer_name_is_reclaimed_on_reregister() {
-    let path = std::env::temp_dir().join(format!("amesh-reclaim-{}.db", Uuid::new_v4()));
+    let path = temp_state("reclaim");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -1932,7 +1949,7 @@ async fn a_dead_peer_name_is_reclaimed_on_reregister() {
 
 #[tokio::test]
 async fn a_socketless_predecessor_is_reclaimed_before_prune() {
-    let path = std::env::temp_dir().join(format!("amesh-reclaim2-{}.db", Uuid::new_v4()));
+    let path = temp_state("reclaim2");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -1983,7 +2000,7 @@ async fn a_socketless_predecessor_is_reclaimed_before_prune() {
 }
 #[tokio::test]
 async fn peer_list_drops_stale() {
-    let path = std::env::temp_dir().join(format!("amesh-stale-{}.db", Uuid::new_v4()));
+    let path = temp_state("stale");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -2007,7 +2024,7 @@ async fn peer_list_drops_stale() {
 }
 
 fn undelivered_hub() -> Hub {
-    let path = std::env::temp_dir().join(format!("amesh-undeliv-{}.db", Uuid::new_v4()));
+    let path = temp_state("undeliv");
     let mut hub = Hub::open(&path).unwrap();
     hub.peers.insert(
         "worker".into(),
@@ -2154,7 +2171,7 @@ fn displaced_notice_is_never_replayed() {
 
 #[tokio::test]
 async fn a_due_schedule_waits_for_an_absent_target() {
-    let path = std::env::temp_dir().join(format!("amesh-sched-{}.db", Uuid::new_v4()));
+    let path = temp_state("sched");
     let app_for = |hub: Hub| App {
         inner: Arc::new(Mutex::new(hub)),
         token: None,
@@ -2368,7 +2385,7 @@ fn owed_hub(path: &Path, session: &str) -> Hub {
 async fn a_runtime_that_restarts_with_its_session_keeps_its_name() {
     /* the old instance is still attached when the new one announces itself with the
     same session: the name must not drift to -2, the old socket is displaced later */
-    let path = std::env::temp_dir().join(format!("amesh-takeover-{}.db", Uuid::new_v4()));
+    let path = temp_state("takeover");
     let mut hub = Hub::open(&path).unwrap();
     let _old_rx = recv_peer(&mut hub, "tmp-codex");
     {
@@ -2414,7 +2431,7 @@ async fn a_runtime_that_restarts_with_its_session_keeps_its_name() {
 
 #[test]
 fn a_session_bound_backlog_outlives_its_pruned_row() {
-    let path = std::env::temp_dir().join(format!("amesh-owed1-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed1");
     let mut hub = owed_hub(&path, "S1");
     let before = now_unix();
     assert!(refresh_peers(&mut hub).0);
@@ -2432,7 +2449,7 @@ fn a_session_bound_backlog_outlives_its_pruned_row() {
     assert_eq!(owed.owner, "S1");
     assert!(owed.since >= before);
     /* a peer that never bound a session has nobody to keep the backlog for */
-    let sessionless = std::env::temp_dir().join(format!("amesh-owed1b-{}.db", Uuid::new_v4()));
+    let sessionless = temp_state("owed1b");
     let mut hub = owed_hub(&sessionless, "");
     assert!(refresh_peers(&mut hub).0);
     assert!(!hub.inbox.contains_key("tmp-pi"));
@@ -2443,7 +2460,7 @@ fn a_session_bound_backlog_outlives_its_pruned_row() {
 
 #[test]
 fn a_pruned_backlog_keeps_its_clock_across_a_restart() {
-    let path = std::env::temp_dir().join(format!("amesh-owed2-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed2");
     let mut hub = owed_hub(&path, "S1");
     refresh_peers(&mut hub);
     let since = now_unix() - 100;
@@ -2466,7 +2483,7 @@ fn a_pruned_backlog_keeps_its_clock_across_a_restart() {
 
 #[test]
 fn another_session_cannot_take_a_name_with_a_waiting_backlog() {
-    let path = std::env::temp_dir().join(format!("amesh-owed3-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed3");
     let mut hub = owed_hub(&path, "S1");
     refresh_peers(&mut hub);
     assert_eq!(
@@ -3026,7 +3043,7 @@ async fn ownership_expired_reservation_keeps_the_live_receivers_receipts() {
 
 #[test]
 fn ownership_legacy_retry_discards_frames_before_the_last_replacement() {
-    let path = std::env::temp_dir().join(format!("amesh-replaced-{}.db", Uuid::new_v4()));
+    let path = temp_state("replaced");
     let mut hub = Hub::open(&path).unwrap();
     let mut rx = recv_peer(&mut hub, "w");
     return_undelivered(
@@ -3164,7 +3181,7 @@ async fn ownership_unproven_socket_closes_old_asks_on_a_different_session() {
 
 #[test]
 fn ownership_rollback_keeps_the_live_receivers_unacknowledged_queue() {
-    let path = std::env::temp_dir().join(format!("amesh-live-rollback-{}.db", Uuid::new_v4()));
+    let path = temp_state("live-rollback");
     let mut hub = Hub::open(&path).unwrap();
     let _rx = recv_peer(&mut hub, "w");
     /* the peer row predates this connection's first promise to acknowledge */
@@ -3246,7 +3263,7 @@ async fn ownership_pruning_an_unproven_row_keeps_its_previous_owner() {
 
 #[tokio::test]
 async fn claiming_the_name_with_another_session_discards_the_backlog() {
-    let path = std::env::temp_dir().join(format!("amesh-owed3b-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed3b");
     let mut hub = owed_hub(&path, "S1");
     refresh_peers(&mut hub);
     let state = App {
@@ -3278,7 +3295,7 @@ async fn the_owner_session_comes_back_to_its_backlog() {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let path = std::env::temp_dir().join(format!("amesh-owed4-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed4");
     let mut hub = owed_hub(&path, "S1");
     refresh_peers(&mut hub);
     let state = App {
@@ -3373,7 +3390,7 @@ async fn unproven_connection_waits_for_its_session(recv: bool) {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let path = std::env::temp_dir().join(format!("amesh-owed5-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed5");
     let mut hub = owed_hub(&path, "S1");
     refresh_peers(&mut hub);
     let state = App {
@@ -3512,6 +3529,8 @@ fn abandoned_hub(path: &Path) -> Hub {
             text: "still open".into(),
             open: true,
             reply: None,
+            failed: false,
+            closed_at: None,
         },
     );
     persist_then_deliver(
@@ -3527,7 +3546,7 @@ fn abandoned_hub(path: &Path) -> Hub {
 
 #[tokio::test]
 async fn a_backlog_follows_its_session_to_a_new_name() {
-    let path = std::env::temp_dir().join(format!("amesh-follow-{}.db", Uuid::new_v4()));
+    let path = temp_state("follow");
     let state = App {
         inner: Arc::new(Mutex::new(abandoned_hub(&path))),
         token: None,
@@ -3598,7 +3617,7 @@ async fn a_backlog_follows_its_session_to_a_new_name() {
 
 #[tokio::test]
 async fn a_backlog_does_not_follow_another_session_or_no_session() {
-    let path = std::env::temp_dir().join(format!("amesh-nofollow-{}.db", Uuid::new_v4()));
+    let path = temp_state("nofollow");
     let state = App {
         inner: Arc::new(Mutex::new(abandoned_hub(&path))),
         token: None,
@@ -3624,7 +3643,7 @@ async fn a_backlog_does_not_follow_another_session_or_no_session() {
 
 #[tokio::test]
 async fn a_moved_backlog_is_deduplicated_by_id_and_only_the_new_part_is_pushed() {
-    let path = std::env::temp_dir().join(format!("amesh-dedupe-{}.db", Uuid::new_v4()));
+    let path = temp_state("dedupe");
     let mut hub = abandoned_hub(&path);
     let duplicate = hub.inbox["tmp-pi"][0].clone();
     /* the new name is already attached and acknowledging, with one record in flight and
@@ -3686,7 +3705,7 @@ async fn a_moved_backlog_is_deduplicated_by_id_and_only_the_new_part_is_pushed()
 
 #[test]
 fn a_backlog_nobody_returns_for_expires() {
-    let path = std::env::temp_dir().join(format!("amesh-owed6-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed6");
     let mut hub = owed_hub(&path, "S1");
     refresh_peers(&mut hub);
     hub.owed.get_mut("tmp-pi").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
@@ -3702,7 +3721,7 @@ fn a_backlog_nobody_returns_for_expires() {
 
 #[tokio::test]
 async fn the_hook_does_not_take_what_an_attached_acknowledger_is_still_owed() {
-    let path = std::env::temp_dir().join(format!("amesh-pending-{}.db", Uuid::new_v4()));
+    let path = temp_state("pending");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -3761,7 +3780,7 @@ async fn the_hook_does_not_take_what_an_attached_acknowledger_is_still_owed() {
 
 #[tokio::test]
 async fn a_closing_acknowledging_connection_hands_nothing_back() {
-    let path = std::env::temp_dir().join(format!("amesh-recvclose-{}.db", Uuid::new_v4()));
+    let path = temp_state("recvclose");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -3796,7 +3815,7 @@ async fn a_closing_acknowledging_connection_hands_nothing_back() {
 
 #[test]
 fn an_absent_acknowledging_peer_is_owed_records_it_can_name() {
-    let path = std::env::temp_dir().join(format!("amesh-absent-{}.db", Uuid::new_v4()));
+    let path = temp_state("absent");
     let mut hub = Hub::open(&path).unwrap();
     let _rx = recv_peer(&mut hub, "w");
     hub.sockets.remove("w");
@@ -3822,7 +3841,7 @@ async fn a_first_time_acknowledger_gets_ids_on_its_backlog() {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let path = std::env::temp_dir().join(format!("amesh-legacy-{}.db", Uuid::new_v4()));
+    let path = temp_state("legacy");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -3934,7 +3953,7 @@ fn recv_peer(hub: &mut Hub, id: &str) -> mpsc::UnboundedReceiver<Value> {
 
 #[test]
 fn an_acknowledging_peer_is_owed_every_event_until_it_says_recv() {
-    let path = std::env::temp_dir().join(format!("amesh-recv-{}.db", Uuid::new_v4()));
+    let path = temp_state("recv");
     let mut hub = Hub::open(&path).unwrap();
     let mut rx = recv_peer(&mut hub, "w");
     persist_then_deliver(&mut hub, "w", json!({"type": "ack", "message": "reply"})).unwrap();
@@ -3976,7 +3995,7 @@ fn an_acknowledging_peer_is_owed_every_event_until_it_says_recv() {
 
 #[test]
 fn what_an_acknowledging_peer_is_owed_is_never_evicted() {
-    let path = std::env::temp_dir().join(format!("amesh-owed-{}.db", Uuid::new_v4()));
+    let path = temp_state("owed");
     let mut hub = Hub::open(&path).unwrap();
     let _rx = recv_peer(&mut hub, "w");
     /* the peer drops off: no socket, no live promise, only the persisted one */
@@ -4017,7 +4036,7 @@ async fn a_reconnecting_acknowledging_client_gets_copies_not_duplicates() {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let path = std::env::temp_dir().join(format!("amesh-replay-{}.db", Uuid::new_v4()));
+    let path = temp_state("replay");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -4160,7 +4179,7 @@ async fn a_reconnecting_acknowledging_client_gets_copies_not_duplicates() {
 
 #[tokio::test]
 async fn a_dropped_link_owes_its_events_to_the_inbox_not_to_itself() {
-    let path = std::env::temp_dir().join(format!("amesh-drop-{}.db", Uuid::new_v4()));
+    let path = temp_state("drop");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -4224,7 +4243,7 @@ async fn second_connection_displaces_the_incumbent() {
     use tokio_tungstenite::connect_async;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let path = std::env::temp_dir().join(format!("amesh-displace-{}.db", Uuid::new_v4()));
+    let path = temp_state("displace");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -4286,7 +4305,7 @@ async fn second_connection_displaces_the_incumbent() {
 
 #[tokio::test]
 async fn activity_keeps_a_socketless_peer_alive() {
-    let path = std::env::temp_dir().join(format!("amesh-touch-{}.db", Uuid::new_v4()));
+    let path = temp_state("touch");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
         token: None,
@@ -4335,7 +4354,7 @@ async fn activity_keeps_a_socketless_peer_alive() {
 }
 
 fn test_app_with_hub() -> (Router, Arc<Mutex<Hub>>) {
-    let path = std::env::temp_dir().join(format!("amesh-test-{}.db", Uuid::new_v4()));
+    let path = temp_state("test");
     let inner = Arc::new(Mutex::new(Hub::open(&path).unwrap()));
     let app = router(App {
         inner: inner.clone(),
@@ -4881,7 +4900,7 @@ async fn derived_ids_fit_the_id_limit() {
 
 #[tokio::test]
 async fn pre_upgrade_ids_keep_registering() {
-    let path = std::env::temp_dir().join(format!("amesh-test-{}.db", Uuid::new_v4()));
+    let path = temp_state("test");
     let old = format!("{}-claude-code", "d".repeat(141));
     assert!(
         !valid_peer_id(&old),
@@ -4995,7 +5014,7 @@ async fn pre_upgrade_ids_keep_registering() {
 
 #[tokio::test]
 async fn legacy_ids_with_control_characters_never_reach_a_primer() {
-    let path = std::env::temp_dir().join(format!("amesh-test-{}.db", Uuid::new_v4()));
+    let path = temp_state("test");
     let bad = "legacy\nSYSTEM injected".to_string();
     let long = format!("{}-pi", "d".repeat(141));
     let row = |id: &str, session: &str| Peer {
@@ -5034,6 +5053,8 @@ async fn legacy_ids_with_control_characters_never_reach_a_primer() {
                     text: "still waiting".into(),
                     open: true,
                     reply: None,
+                    failed: false,
+                    closed_at: None,
                 },
             );
         }
@@ -5164,7 +5185,7 @@ async fn circles_with_control_characters_never_reach_a_primer() {
     .await;
     assert_eq!(st, StatusCode::OK, "{body}");
     /* a row that predates the rule is dropped on load rather than replayed into a primer */
-    let path = std::env::temp_dir().join(format!("amesh-test-{}.db", Uuid::new_v4()));
+    let path = temp_state("test");
     {
         let mut hub = Hub::open(&path).unwrap();
         hub.peers.insert(
@@ -5258,7 +5279,7 @@ async fn known_rows_cannot_take_a_new_over_long_name() {
 
 #[tokio::test]
 async fn over_long_legacy_backlogs_are_kept_for_their_session() {
-    let path = std::env::temp_dir().join(format!("amesh-test-{}.db", Uuid::new_v4()));
+    let path = temp_state("test");
     let long = format!("{}-pi", "d".repeat(141));
     {
         let mut hub = Hub::open(&path).unwrap();
@@ -5284,6 +5305,8 @@ async fn over_long_legacy_backlogs_are_kept_for_their_session() {
                 text: "still waiting".into(),
                 open: true,
                 reply: None,
+                failed: false,
+                closed_at: None,
             },
         );
         persist(&mut hub).unwrap();

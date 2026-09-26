@@ -53,7 +53,7 @@ mesh
   peer broadcast TEXT [--circle CIRCLE] [--cross-circle true] [--from-peer ID]
   peer ask-many TO[,TO...] TEXT [--from-peer ID]
   peer wait CORRELATION_ID [--timeout-seconds N]
-  peer ack CORRELATION_ID [--message TEXT]
+  peer ack CORRELATION_ID [--message TEXT] [--failed true] [--from-peer ID]
   peer events TEXT [--peer-id ID] [--role ROLE]
   peer attach FILE                  Upload a file using base64
   peer mcp list NAME
@@ -62,8 +62,10 @@ mesh
 
 jobs
   jobs create TITLE [--prompt TEXT] [--path PATH] [--backend BACKEND] [--assigned-peer ID]
+              [--depends-on ID,ID] [--from-peer ID]
   jobs list|show ID|cancel ID|delete ID
   jobs update ID --state queued|running|done|failed|cancelled [--result-summary TEXT]
+              [--assigned-peer ID] [--prompt TEXT]
   schedule create TO TEXT (--in-seconds N|--fire-at UNIX_SECONDS)
                   [--every-seconds N] [--kind notify|ask] [--from-peer ID]
   schedule list|delete ID
@@ -954,7 +956,7 @@ fn peer(raw: &[String]) -> Result<Value> {
         "ask" | "ask-many" | "notify" => &["from-peer", "cross-circle"],
         "broadcast" => &["from-peer", "circle", "cross-circle"],
         "wait" => &["timeout-seconds"],
-        "ack" => &["message"],
+        "ack" => &["message", "failed", "from-peer"],
         "events" => &["peer-id", "role"],
         "mcp" => &["command"],
         _ => return Err(format!("unknown peer command: {command}").into()),
@@ -1051,6 +1053,7 @@ fn peer(raw: &[String]) -> Result<Value> {
             args.count(1, 1)?;
             let mut body = json!({"correlation_id": args.pos[0]});
             args.copy(&mut body);
+            body["failed"] = json!(args.get("failed", "false") == "true");
             request("POST", "/ack", Some(body))
         }
         "events" => {
@@ -1136,8 +1139,15 @@ fn jobs(raw: &[String]) -> Result<Value> {
         .map(String::as_str)
         .ok_or("jobs requires a subcommand")?;
     let allowed: &[&str] = match command {
-        "create" => &["prompt", "path", "backend", "assigned-peer"],
-        "update" => &["state", "result-summary"],
+        "create" => &[
+            "prompt",
+            "path",
+            "backend",
+            "assigned-peer",
+            "depends-on",
+            "from-peer",
+        ],
+        "update" => &["state", "result-summary", "assigned-peer", "prompt"],
         "list" | "show" | "cancel" | "delete" => &[],
         _ => return Err(format!("unknown jobs command: {command}").into()),
     };
@@ -1151,6 +1161,17 @@ fn jobs(raw: &[String]) -> Result<Value> {
             args.count(1, usize::MAX)?;
             let mut body = json!({"title": args.pos.join(" ")});
             args.copy(&mut body);
+            let depends_on: Vec<&str> = args
+                .flags
+                .get("depends-on")
+                .map(|ids| {
+                    ids.split(',')
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            body["depends_on"] = json!(depends_on);
             request("POST", "/jobs", Some(body))
         }
         _ => {
@@ -1306,6 +1327,24 @@ fn home(args: &Args) -> Result<PathBuf> {
     Ok(PathBuf::from(path).canonicalize()?)
 }
 
+/* pi loads extensions and its MCP config from PI_CODING_AGENT_DIR when set, read the way
+pi-mcp-adapter's getAgentDir reads it; an explicit --home keeps everything under that root */
+fn pi_agent_dir(args: &Args, root: &Path) -> PathBuf {
+    let configured = std::env::var("PI_CODING_AGENT_DIR").unwrap_or_default();
+    let configured = configured.trim();
+    if configured.is_empty() || args.flags.contains_key("home") {
+        if !configured.is_empty() {
+            eprintln!("amesh: --home is set, so PI_CODING_AGENT_DIR={configured} is ignored");
+        }
+        return root.join(".pi/agent");
+    }
+    match configured.strip_prefix('~') {
+        Some("") => root.to_path_buf(),
+        Some(rest) if rest.starts_with('/') => root.join(&rest[1..]),
+        _ => PathBuf::from(configured),
+    }
+}
+
 fn available(binary: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path.join(binary).is_file()))
@@ -1327,11 +1366,15 @@ fn doctor(args: &Args) -> Result<Value> {
     }
     output["state"] = json!({"path": state, "ok": state.is_file()});
     for (backend, binary, path) in [
-        ("pi", "pi", ".pi/agent/extensions/amesh.ts"),
-        ("claude-code", "claude", ".claude/settings.json"),
-        ("codex", "codex", ".codex/hooks.json"),
+        (
+            "pi",
+            "pi",
+            pi_agent_dir(args, &root).join("extensions/amesh.ts"),
+        ),
+        ("claude-code", "claude", root.join(".claude/settings.json")),
+        ("codex", "codex", root.join(".codex/hooks.json")),
     ] {
-        let installed = fs::read_to_string(root.join(path)).is_ok_and(|text| {
+        let installed = fs::read_to_string(&path).is_ok_and(|text| {
             if backend == "pi" {
                 return text.contains(AMESH_PI_HOOK_MARK);
             }
@@ -1559,6 +1602,12 @@ fn gc(args: &Args) -> Result<Value> {
         }
         removed.push(json!(display));
     }
+    let state = match (home_set, daemon) {
+        (true, _) => json!("not run with --home"),
+        (false, false) => json!("not run: hub unreachable"),
+        (false, true) => request("POST", "/gc", Some(json!({"apply": apply})))
+            .unwrap_or_else(|error| json!({"error": error.to_string()})),
+    };
     Ok(json!({
         "ok": true,
         "dry_run": !apply,
@@ -1569,6 +1618,7 @@ fn gc(args: &Args) -> Result<Value> {
         "kept_peers": keep.len(),
         "attachments_days": days,
         "removed": removed,
+        "state": state,
     }))
 }
 
@@ -1580,22 +1630,35 @@ fn read_optional(path: &Path) -> Result<String> {
     }
 }
 
+/* a symlinked config, as in a dotfiles checkout, is written through to its target, even a
+target that does not exist yet; a file that exists keeps its mode, a new one is private */
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().ok_or("configuration path has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!(".amesh-{}.tmp", uuid::Uuid::new_v4()));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&temporary)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
-    Ok(())
+    let path = fs::canonicalize(path).unwrap_or_else(|_| match fs::read_link(path) {
+        Ok(link) => path.parent().unwrap_or(Path::new("")).join(link),
+        Err(_) => path.to_path_buf(),
+    });
+    let write = || -> io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("configuration path has no parent"))?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(".amesh-{}.tmp", uuid::Uuid::new_v4()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary)?;
+        if let Ok(existing) = fs::metadata(&path) {
+            file.set_permissions(existing.permissions())?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(temporary, &path)
+    };
+    write().map_err(|error| format!("{}: {error}", path.display()).into())
 }
 
 fn shell_quote(text: &str) -> String {
@@ -1631,10 +1694,9 @@ fn setup(args: &Args) -> Result<()> {
                     "__AMESH_PEER_ID__",
                     &serde_json::to_string(&args.flags.get("peer-id"))?,
                 );
-            write_atomic(
-                &root.join(".pi/agent/extensions/amesh.ts"),
-                script.as_bytes(),
-            )?;
+            let pi_dir = pi_agent_dir(args, &root);
+            write_atomic(&pi_dir.join("extensions/amesh.ts"), script.as_bytes())?;
+            disable_pi_mcp(&root, &pi_dir)?;
         } else {
             install_hooks(
                 &root,
@@ -1711,6 +1773,57 @@ fn install_claude_mcp(root: &Path, executable: &str, peer_id: Option<&str>) -> R
     }
     servers.insert("amesh".into(), entry);
     write_atomic(&path, &serde_json::to_vec_pretty(&settings)?)
+}
+
+/* pi reaches amesh through its extension. pi-mcp-adapter can also import another
+runtime's amesh MCP entry, and that shim would act under the other runtime's name, so a pi
+that has an MCP config gets the entry disabled in its own config, which outranks the
+shared ones. A config amesh cannot rewrite faithfully, one with comments or a shape the
+adapter ignores, is left alone */
+fn disable_pi_mcp(root: &Path, pi_dir: &Path) -> Result<()> {
+    let path = pi_dir.join("mcp.json");
+    let text = read_optional(&path)?;
+    let shared = [
+        ".config/mcp/mcp.json",
+        ".agents/mcp.json",
+        ".agents/mcp/mcp.json",
+    ]
+    .iter()
+    .any(|file| root.join(file).is_file());
+    if text.is_empty() && !shared {
+        return Ok(());
+    }
+    let skip = |reason: String| -> Result<()> {
+        eprintln!(
+            "amesh setup: {}: {reason}; left unchanged. Add \"amesh\": {{\"disabled\": true}} under mcpServers so pi-mcp-adapter does not load a second amesh",
+            path.display()
+        );
+        Ok(())
+    };
+    let mut config: Value = if text.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str(&text) {
+            Ok(config) => config,
+            Err(error) => return skip(error.to_string()),
+        }
+    };
+    let entry = config
+        .as_object_mut()
+        .map(|config| config.entry("mcpServers").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut)
+        .map(|servers| servers.entry("amesh").or_insert_with(|| json!({})))
+        .and_then(Value::as_object_mut);
+    let Some(entry) = entry else {
+        return skip("the config, its mcpServers or its amesh entry is not an object".into());
+    };
+    if entry.get("disabled") == Some(&json!(true)) {
+        return Ok(());
+    }
+    entry.insert("disabled".into(), json!(true));
+    write_atomic(&path, &serde_json::to_vec_pretty(&config)?)?;
+    println!("disabled amesh in {}", path.display());
+    Ok(())
 }
 
 fn install_hooks(
@@ -1948,7 +2061,7 @@ fn uninstall(args: &Args) -> Result<Value> {
     let mut deletes: Vec<PathBuf> = Vec::new();
 
     if runtimes.contains(&"pi") {
-        let path = root.join(".pi/agent/extensions/amesh.ts");
+        let path = pi_agent_dir(args, &root).join("extensions/amesh.ts");
         match fs::read_to_string(&path) {
             Ok(text) if text.contains(AMESH_PI_HOOK_MARK) => {
                 would_remove.push(json!({"path": path.display().to_string(), "kind": "file"}));
@@ -2810,18 +2923,23 @@ async fn hook_ws_once(
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if kind == "ask" && !cid.is_empty() {
-                    if let Ok(ask) = request(
+                    let stale = match request(
                         "POST",
                         &format!("/asks/{cid}/wait"),
                         Some(json!({"timeout_seconds": 0})),
                     ) {
-                        if ask.get("open") == Some(&json!(false)) {
-                            remember_hook_inbound(accepted, id);
-                            if !hook_ws_recv(&mut ws, &event).await {
-                                return Ok(false);
-                            }
-                            continue;
+                        Ok(ask) => ask.get("open") == Some(&json!(false)),
+                        Err(error) => {
+                            let error = error.to_string();
+                            error.contains("returned error: 404") && error.contains("unknown ask")
                         }
+                    };
+                    if stale {
+                        remember_hook_inbound(accepted, id);
+                        if !hook_ws_recv(&mut ws, &event).await {
+                            return Ok(false);
+                        }
+                        continue;
                     }
                 }
                 let body = event

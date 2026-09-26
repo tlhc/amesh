@@ -32,6 +32,7 @@ fn isolate_session_env<'a>(command: &'a mut Command, root: &Path) -> &'a mut Com
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
         .env_remove("CLAUDE_CODE_MESSAGING_TOKEN")
+        .env_remove("PI_CODING_AGENT_DIR")
         .env("CODEX_HOME", root.join(".codex"))
 }
 
@@ -1521,6 +1522,227 @@ fn setup_merges_hooks_and_preserves_existing_settings() {
 }
 
 #[test]
+fn setup_pi_disables_amesh_in_pi_mcp_config() {
+    use std::os::unix::fs::MetadataExt;
+    let sandbox = Sandbox::new();
+    let root = sandbox.root.to_str().unwrap();
+    let config = sandbox.root.join(".pi/agent/mcp.json");
+
+    /* a pi without an MCP config gets none */
+    assert!(sandbox
+        .run(&["setup", "pi", "--home", root], None)
+        .status
+        .success());
+    assert!(!config.exists());
+
+    fs::write(
+        &config,
+        json!({
+            "imports": ["claude-code"],
+            "mcpServers": {"context7": {"command": "context7-mcp", "env": {"KEY": "${KEY}"}}},
+            "settings": {"toolPrefix": "server"}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let output = sandbox.run(&["setup", "pi", "--home", root], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let written: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(written["mcpServers"]["amesh"], json!({"disabled": true}));
+    assert_eq!(written["mcpServers"]["context7"]["env"]["KEY"], "${KEY}");
+    assert_eq!(written["imports"], json!(["claude-code"]));
+    assert_eq!(written["settings"]["toolPrefix"], "server");
+
+    /* already disabled: the file is not rewritten */
+    let inode = fs::metadata(&config).unwrap().ino();
+    assert!(sandbox
+        .run(&["setup", "pi", "--home", root], None)
+        .status
+        .success());
+    assert_eq!(fs::metadata(&config).unwrap().ino(), inode);
+
+    /* an amesh entry the user wrote keeps its fields */
+    fs::write(
+        &config,
+        json!({"mcpServers": {"amesh": {"command": "amesh", "args": ["mcp"], "disabled": false}}})
+            .to_string(),
+    )
+    .unwrap();
+    assert!(sandbox
+        .run(&["setup", "pi", "--home", root], None)
+        .status
+        .success());
+    let written: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+    assert_eq!(
+        written["mcpServers"]["amesh"],
+        json!({"command": "amesh", "args": ["mcp"], "disabled": true})
+    );
+}
+
+#[test]
+fn setup_pi_leaves_an_unusable_mcp_config_alone() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root.to_str().unwrap();
+    let config = sandbox.root.join(".pi/agent/mcp.json");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    let mut failures = Vec::new();
+    for (name, text) in [
+        (
+            "comments",
+            "{\n  // pi-mcp-adapter accepts comments\n  \"imports\": [\"claude-code\"]\n}\n",
+        ),
+        ("servers not an object", "{\"mcpServers\": \"oops\"}"),
+        (
+            "amesh not an object",
+            "{\"mcpServers\": {\"amesh\": \"x\"}}",
+        ),
+        ("config not an object", "[1]"),
+    ] {
+        fs::write(&config, text).unwrap();
+        let output = sandbox.run(&["setup", "pi", "--home", root], None);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success()
+            || fs::read_to_string(&config).unwrap() != text
+            || !stderr.contains("\"disabled\": true")
+        {
+            failures.push(format!("{name}: {:?} {stderr}", output.status.code()));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(sandbox.root.join(".pi/agent/extensions/amesh.ts").exists());
+}
+
+#[test]
+fn setup_pi_writes_through_a_symlinked_mcp_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandbox = Sandbox::new();
+    let root = sandbox.root.to_str().unwrap();
+    let real = sandbox.root.join("dotfiles/mcp.json");
+    fs::create_dir_all(real.parent().unwrap()).unwrap();
+    fs::write(&real, "{\"imports\": [\"claude-code\"]}").unwrap();
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o644)).unwrap();
+    let link = sandbox.root.join(".pi/agent/mcp.json");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    assert!(sandbox
+        .run(&["setup", "pi", "--home", root], None)
+        .status
+        .success());
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let written: Value = serde_json::from_slice(&fs::read(&real).unwrap()).unwrap();
+    assert_eq!(written["mcpServers"]["amesh"], json!({"disabled": true}));
+    assert_eq!(
+        fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
+fn setup_pi_creates_the_target_of_a_dangling_mcp_link() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root.to_str().unwrap();
+    /* a dotfiles checkout whose mcp.json does not exist yet; a shared config makes setup
+    write one */
+    fs::create_dir_all(sandbox.root.join("dotfiles")).unwrap();
+    let link = sandbox.root.join(".pi/agent/mcp.json");
+    fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink("../../dotfiles/mcp.json", &link).unwrap();
+    let shared = sandbox.root.join(".config/mcp/mcp.json");
+    fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    fs::write(&shared, "{}").unwrap();
+
+    assert!(sandbox
+        .run(&["setup", "pi", "--home", root], None)
+        .status
+        .success());
+    assert!(fs::symlink_metadata(&link)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let written: Value =
+        serde_json::from_slice(&fs::read(sandbox.root.join("dotfiles/mcp.json")).unwrap()).unwrap();
+    assert_eq!(written["mcpServers"]["amesh"], json!({"disabled": true}));
+}
+
+#[test]
+fn setup_pi_disables_amesh_for_a_shared_mcp_config() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root.to_str().unwrap();
+    let shared = sandbox.root.join(".config/mcp/mcp.json");
+    fs::create_dir_all(shared.parent().unwrap()).unwrap();
+    let text = "{\"mcpServers\": {\"amesh\": {\"command\": \"amesh\", \"args\": [\"mcp\"]}}}";
+    fs::write(&shared, text).unwrap();
+
+    assert!(sandbox
+        .run(&["setup", "pi", "--home", root], None)
+        .status
+        .success());
+    let written: Value =
+        serde_json::from_slice(&fs::read(sandbox.root.join(".pi/agent/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        written,
+        json!({"mcpServers": {"amesh": {"disabled": true}}})
+    );
+    assert_eq!(fs::read_to_string(&shared).unwrap(), text);
+}
+
+#[test]
+fn setup_pi_follows_pi_coding_agent_dir() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.root.to_str().unwrap();
+    let mut failures = Vec::new();
+    for (name, configured, dir) in [
+        (
+            "absolute",
+            sandbox.root.join("alt").to_str().unwrap().to_string(),
+            sandbox.root.join("alt"),
+        ),
+        (
+            "tilde",
+            "~/tilde-alt".to_string(),
+            sandbox.root.join("tilde-alt"),
+        ),
+    ] {
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("mcp.json"), "{}").unwrap();
+        let env = [("HOME", home), ("PI_CODING_AGENT_DIR", configured.as_str())];
+        let setup = sandbox.run_text(&["setup", "pi"], "", &env);
+        let doctor = sandbox.run_text(&["doctor"], "", &env);
+        let report: Value = serde_json::from_slice(&doctor.stdout).unwrap_or(Value::Null);
+        let written: Value =
+            serde_json::from_slice(&fs::read(dir.join("mcp.json")).unwrap()).unwrap();
+        if !setup.status.success()
+            || !dir.join("extensions/amesh.ts").exists()
+            || written["mcpServers"]["amesh"] != json!({"disabled": true})
+            || report["runtimes"]["pi"]["hooks_installed"] != true
+        {
+            failures.push(name);
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+    assert!(
+        !sandbox.root.join(".pi").exists(),
+        "nothing lands under ~/.pi"
+    );
+
+    /* an explicit --home wins over the variable */
+    let env = [("PI_CODING_AGENT_DIR", "/nonexistent-pi-agent")];
+    let setup = sandbox.run_text(&["setup", "pi", "--home", home], "", &env);
+    assert!(setup.status.success());
+    assert!(sandbox.root.join(".pi/agent/extensions/amesh.ts").exists());
+    assert!(String::from_utf8_lossy(&setup.stderr).contains("PI_CODING_AGENT_DIR"));
+}
+
+#[test]
 fn uninstall_strips_owned_amesh_and_skips_foreign() {
     let sandbox = Sandbox::new();
     let root = sandbox.root.to_str().unwrap();
@@ -2042,6 +2264,147 @@ fn cli_routes_peer_jobs_and_schedule_to_the_daemon() {
         sandbox.json(&["doctor", "--home", sandbox.root.to_str().unwrap()], None)["daemon"]["ok"],
         true
     );
+}
+
+/* the daemon's own loop moves the jobs, and the CLI hands the hub the types it expects:
+an id list for --depends-on and a boolean for --failed */
+#[test]
+fn cli_jobs_dispatch_in_dependency_order() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    for id in ["boss", "worker"] {
+        sandbox.json(
+            &[
+                "peer",
+                "register",
+                "--name",
+                id,
+                "--backend",
+                "pi",
+                "--peer-id",
+                id,
+            ],
+            None,
+        );
+    }
+    let a = sandbox.json(
+        &[
+            "jobs",
+            "create",
+            "audit",
+            "--prompt",
+            "look",
+            "--assigned-peer",
+            "worker",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let a_id = a["job_id"].as_str().unwrap().to_string();
+    assert_eq!(a["dispatch"], true);
+    assert_eq!(a["from_peer"], "boss");
+    let b = sandbox.json(
+        &[
+            "jobs",
+            "create",
+            "fix",
+            "--assigned-peer",
+            "worker",
+            "--from-peer",
+            "boss",
+            "--depends-on",
+            &format!("{a_id}, {a_id}"),
+        ],
+        None,
+    );
+    let b_id = b["job_id"].as_str().unwrap().to_string();
+    assert_eq!(b["depends_on"], json!([a_id]));
+
+    let wait_state = |id: &str, want: &str| -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let job = sandbox.json(&["jobs", "show", id], None);
+            if job["state"] == want {
+                return job;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{id} never reached {want}: {job}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let first = wait_state(&a_id, "running")["ask_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(
+        sandbox.json(&["jobs", "show", &b_id], None)["state"],
+        "queued"
+    );
+
+    let refused = sandbox.run(
+        &[
+            "peer",
+            "ack",
+            &first,
+            "--message",
+            "mine",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert!(!refused.status.success(), "{said}");
+    assert!(said.contains("only the recipient can ack"), "{said}");
+
+    let acked = sandbox.json(
+        &[
+            "peer",
+            "ack",
+            &first,
+            "--message",
+            "no fixture",
+            "--failed",
+            "true",
+            "--from-peer",
+            "worker",
+        ],
+        None,
+    );
+    assert_eq!(acked["ok"], true);
+    assert_eq!(wait_state(&a_id, "failed")["result_summary"], "no fixture");
+    assert_eq!(
+        sandbox.json(&["jobs", "show", &b_id], None)["state"],
+        "queued"
+    );
+
+    sandbox.json(&["jobs", "update", &a_id, "--state", "queued"], None);
+    let second = wait_state(&a_id, "running")["ask_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(first, second);
+    sandbox.json(
+        &[
+            "peer",
+            "ack",
+            &second,
+            "--message",
+            "fixed",
+            "--from-peer",
+            "worker",
+        ],
+        None,
+    );
+    wait_state(&a_id, "done");
+    assert!(wait_state(&b_id, "running")["ask_id"].is_string());
 }
 
 #[test]
@@ -3056,6 +3419,7 @@ fn gc_defaults_to_dry_run_and_apply_deletes_cli_leftovers() {
     let home = sandbox.root.to_str().unwrap();
     let listed = sandbox.json(&["gc", "--home", home], None);
     assert_eq!(listed["dry_run"], true);
+    assert_eq!(listed["state"], "not run with --home");
     assert_eq!(listed["apply"], false);
     assert!(leftover.exists());
     assert!(keep.exists());
@@ -3306,6 +3670,7 @@ fn gc_reports_peer_probe_side_effect() {
     sandbox.start();
     let output = sandbox.json(&["gc"], None);
     assert_eq!(output["peers_probed"], true);
+    assert!(output["state"]["jobs"].is_array(), "{output}");
     assert!(output["note"]
         .as_str()
         .unwrap_or_default()

@@ -421,15 +421,18 @@ export default function AmeshHooks(pi) {
     );
     tool(
       "ack",
-      "Close an ask. Bare: amesh_ack(corr_id). Reply: amesh_ack(corr_id, message).",
+      "Close an ask. Bare: amesh_ack(corr_id). Reply: amesh_ack(corr_id, message). Set failed=true when you could not finish.",
       {
         correlation_id: { type: "string" },
         message: { type: "string", description: "Optional reply to the asker" },
+        failed: { type: "boolean" },
       },
       ["correlation_id"],
       (params) => {
         const args = ["peer", "ack", params.correlation_id];
         if (params.message) args.push("--message", params.message);
+        if (params.failed) args.push("--failed", "true");
+        args.push(...FromPeer());
         return Cli(args);
       },
     );
@@ -449,25 +452,29 @@ export default function AmeshHooks(pi) {
       },
     );
     const extra = [
-      ["job_create", "Create a job ledger row", {
+      ["job_create", "Create a job. With assigned_peer, the hub sends the prompt to that peer as a tracked ask once every depends_on job is done; the peer's ack completes the job and the reply becomes result_summary.", {
         title: { type: "string" },
         prompt: { type: "string" },
         path: { type: "string" },
         backend: { type: "string" },
         assigned_peer: { type: "string" },
+        depends_on: { type: "array", items: { type: "string" } },
       }, []],
       ["job_list", "List jobs in your circle; cross_circle without circle lists all", {
         circle: { type: "string" },
         cross_circle: { type: "boolean" },
       }, []],
-      ["job_status", "Show a job", { job_id: { type: "string" } }, ["job_id"]],
-      ["job_update", "Update job state", {
+      ["job_status", "Show a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
+      ["job_update", "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it); moving a running job to another state closes its open ask.", {
         job_id: { type: "string" },
         state: { type: "string" },
         result_summary: { type: "string" },
+        assigned_peer: { type: "string" },
+        prompt: { type: "string" },
+        cross_circle: { type: "boolean" },
       }, ["job_id", "state"]],
-      ["job_cancel", "Cancel a job", { job_id: { type: "string" } }, ["job_id"]],
-      ["job_delete", "Delete a job", { job_id: { type: "string" } }, ["job_id"]],
+      ["job_cancel", "Cancel a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
+      ["job_delete", "Delete a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
       ["schedule_create", "Create a schedule", {
         to_peer: { type: "string" },
         peer_name: { type: "string" },

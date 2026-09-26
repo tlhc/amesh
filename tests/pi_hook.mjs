@@ -95,6 +95,9 @@ assert.equal(schemas.amesh_schedule_create.properties.message, undefined);
 assert.equal(schemas.amesh_events.properties.circle.type, "string");
 assert.equal(schemas.amesh_events.properties.cross_circle.type, "boolean");
 assert.equal(schemas.amesh_events.properties.limit.type, "integer");
+assert.equal(schemas.amesh_ack.properties.failed.type, "boolean");
+assert.equal(schemas.amesh_job_create.properties.depends_on.type, "array");
+assert.equal(schemas.amesh_job_update.properties.assigned_peer.type, "string");
 await test("exec failures name the kill reason", () => {
   const killed = ExecError({ killed: true, signal: "SIGTERM", message: "Command failed: amesh mcp" }, "", "", 65000);
   assert.match(killed.message, /SIGTERM/);
