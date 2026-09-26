@@ -1713,3 +1713,812 @@ async fn unsettled_ack_and_new_dependency_keep_a_job() {
     let (_, applied) = f.request("POST", "/gc", json!({"apply": true})).await;
     assert_eq!(applied["jobs"], json!([]), "apply recomputes");
 }
+
+async fn snapshot_of(f: &Fixture, query: &str) -> Value {
+    let (status, body) = f
+        .request("GET", &format!("/snapshot{query}"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+#[tokio::test]
+async fn snapshot_returns_jobs_their_asks_and_peers() {
+    let f = team("c1", &["boss", "one", "two"]).await;
+    let a = f
+        .job(json!({"title": "a", "assigned_peer": "one", "from_peer": "boss"}))
+        .await;
+    let b = f
+        .job(json!({"title": "b", "assigned_peer": "two", "from_peer": "boss", "depends_on": [a]}))
+        .await;
+    f.advance().await;
+    f.open_ask("boss", "two").await;
+    let s = snapshot_of(&f, "").await;
+    assert_eq!(s["schema_version"], 1);
+    assert!(!s["hub_epoch"].as_str().unwrap().is_empty());
+    assert_eq!(s["capabilities"]["peer_activity"], true);
+    let jobs = s["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().all(|job| job["created_at"].is_u64()));
+    let row_a = jobs.iter().find(|job| job["job_id"] == a.as_str()).unwrap();
+    let row_b = jobs.iter().find(|job| job["job_id"] == b.as_str()).unwrap();
+    assert_eq!(row_b["depends_on"], json!([a]));
+    let cid = row_a["ask_id"].as_str().expect("a was dispatched");
+    let asks = s["asks"].as_array().unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0]["correlation_id"], cid);
+    assert_eq!(asks[0]["open"], true);
+    assert!(asks[0]["opened_at"].is_u64());
+    let peers: BTreeSet<&str> = s["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|peer| peer["peer_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(peers, BTreeSet::from(["boss", "one", "two"]));
+    assert_eq!(s["missing"], json!({"asks": [], "peers": []}));
+    {
+        let mut hub = f.0.inner.lock().await;
+        let job = hub.jobs.get_mut(&b).unwrap();
+        job.ask_id = Some("ask-gone".into());
+        job.assigned_peer = Some("ghost".into());
+    }
+    let s = snapshot_of(&f, "").await;
+    assert_eq!(
+        s["missing"],
+        json!({"asks": ["ask-gone"], "peers": ["ghost"]})
+    );
+}
+
+#[tokio::test]
+async fn snapshot_changes_nothing() {
+    let f = team("c1", &["boss", "one", "gone"]).await;
+    let a = f
+        .job(json!({"title": "a", "assigned_peer": "one", "from_peer": "boss"}))
+        .await;
+    f.advance().await;
+    let cid = f.ask_id(&a).await;
+    let (status, _) = f
+        .ack(&cid, json!({"message": "ok", "from_peer": "one"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = f
+        .request(
+            "POST",
+            "/notify",
+            json!({"from_peer": "boss", "to_peer": "one", "message": "hi"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    f.0.inner
+        .lock()
+        .await
+        .peers
+        .get_mut("gone")
+        .unwrap()
+        .last_seen = 0;
+    let (changes, events, inbox) = {
+        let hub = f.0.inner.lock().await;
+        (hub.db.total_changes(), hub.events.len(), hub.inbox.clone())
+    };
+    assert!(!inbox.is_empty());
+    for _ in 0..3 {
+        snapshot_of(&f, "").await;
+    }
+    let hub = f.0.inner.lock().await;
+    assert_eq!(
+        hub.db.total_changes(),
+        changes,
+        "a snapshot wrote to the database"
+    );
+    assert_eq!(hub.events.len(), events, "a snapshot recorded an event");
+    assert_eq!(hub.inbox, inbox, "a snapshot drained an inbox");
+    assert!(hub.peers.contains_key("gone"), "a snapshot pruned a peer");
+    assert_eq!(hub.jobs[&a].state, "running", "a snapshot settled a job");
+}
+
+#[tokio::test]
+async fn snapshot_filters_by_circle_and_cuts_previews() {
+    let f = team("c1", &["boss"]).await;
+    f.peer("far", "c2").await;
+    let a = f
+        .job(json!({"title": "a", "prompt": "x".repeat(1000), "from_peer": "boss"}))
+        .await;
+    let other = f.job(json!({"title": "o", "from_peer": "far"})).await;
+    let s = snapshot_of(&f, "?circle=c1").await;
+    let ids: Vec<&str> = s["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["job_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [a.as_str()]);
+    assert_eq!(
+        s["jobs"][0]["prompt"].as_str().unwrap().chars().count(),
+        PREVIEW_CHARS
+    );
+    assert_eq!(s["jobs"][0]["prompt_len"], 1000);
+    assert_eq!(s["detail"], Value::Null);
+    let s = snapshot_of(&f, &format!("?circle=c1&detail={a}")).await;
+    assert_eq!(s["detail"]["prompt"].as_str().unwrap().len(), 1000);
+    let mut keys: Vec<&str> = s["detail"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        ["job_id", "prompt", "result", "title"],
+        "a refresh carries what the card shows, nothing twice"
+    );
+    let s = snapshot_of(&f, &format!("?circle=c1&detail={other}")).await;
+    assert_eq!(s["detail"], Value::Null, "detail follows the circle filter");
+}
+
+#[tokio::test]
+async fn snapshot_needs_the_token() {
+    let f = Fixture::new();
+    let app = App {
+        token: Some("t".into()),
+        ..f.0.clone()
+    };
+    for (auth, want) in [
+        (None, StatusCode::UNAUTHORIZED),
+        (Some("Bearer t"), StatusCode::OK),
+    ] {
+        let mut request = Request::builder().method("GET").uri("/snapshot");
+        if let Some(auth) = auth {
+            request = request.header("authorization", auth);
+        }
+        let response = router(app.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), want);
+    }
+}
+
+#[tokio::test]
+async fn every_creation_path_stamps_its_time() {
+    let f = team("c1", &["boss", "one"]).await;
+    let j = f
+        .job(json!({"title": "a", "assigned_peer": "one", "from_peer": "boss"}))
+        .await;
+    assert!(f.row(&j).await.created_at.is_some(), "create_job");
+    f.advance().await;
+    assert!(
+        f.ask(&f.ask_id(&j).await).await.opened_at.is_some(),
+        "dispatch"
+    );
+    let cid = f.open_ask("boss", "one").await;
+    assert!(f.ask(&cid).await.opened_at.is_some(), "open_ask");
+    let (status, body) = f
+        .request(
+            "POST",
+            "/schedules",
+            json!({"from_peer": "boss", "to_peer": "one", "text": "tick", "kind": "ask", "fire_at": now_unix() - 5}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    tick_schedules(&f.0).await;
+    let hub = f.0.inner.lock().await;
+    let fired = hub
+        .asks
+        .values()
+        .find(|ask| ask.text == "tick")
+        .expect("the schedule fired");
+    assert!(fired.opened_at.is_some(), "schedule");
+}
+
+#[tokio::test]
+async fn a_database_without_the_time_columns_loads() {
+    let root = std::env::temp_dir().join(format!("amesh-times-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let state = root.join("state.db");
+    {
+        let f = Fixture::open(state.clone());
+        f.peer("boss", "c1").await;
+        f.peer("one", "c1").await;
+        f.job(json!({"title": "a", "assigned_peer": "one", "from_peer": "boss"}))
+            .await;
+        f.advance().await;
+        assert!(persist_ok(&mut *f.0.inner.lock().await).is_ok());
+    }
+    let db = Connection::open(&state).unwrap();
+    db.execute_batch(
+        "ALTER TABLE jobs DROP COLUMN created_at; ALTER TABLE asks DROP COLUMN opened_at;",
+    )
+    .unwrap();
+    drop(db);
+    let f = Fixture::open(state);
+    let hub = f.0.inner.lock().await;
+    assert_eq!((hub.jobs.len(), hub.asks.len()), (1, 1));
+    assert!(hub.jobs.values().all(|job| job.created_at.is_none()));
+    assert!(hub.asks.values().all(|ask| ask.opened_at.is_none()));
+}
+
+#[tokio::test]
+async fn times_survive_a_restart() {
+    let root = std::env::temp_dir().join(format!("amesh-times-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let state = root.join("state.db");
+    let job = {
+        let f = Fixture::open(state.clone());
+        f.peer("boss", "c1").await;
+        f.peer("one", "c1").await;
+        let job = f
+            .job(json!({"title": "a", "assigned_peer": "one", "from_peer": "boss"}))
+            .await;
+        f.advance().await;
+        assert!(persist_ok(&mut *f.0.inner.lock().await).is_ok());
+        job
+    };
+    let f = Fixture::open(state);
+    assert!(f.row(&job).await.created_at.is_some(), "created_at");
+    assert!(
+        f.ask(&f.ask_id(&job).await).await.opened_at.is_some(),
+        "opened_at"
+    );
+}
+
+async fn activity_of(f: &Fixture, peer: &str) -> Value {
+    let s = snapshot_of(f, "").await;
+    s["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["peer_id"] == peer)
+        .map(|p| p["activity"].clone())
+        .expect("the peer is named by a job")
+}
+
+async fn report(f: &Fixture, body: Value) -> (StatusCode, Value) {
+    f.request("POST", "/activity", body).await
+}
+
+#[tokio::test]
+async fn activity_is_reported_by_session_and_shown_in_the_snapshot() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    f.job(json!({"title": "a", "assigned_peer": "w"})).await;
+    assert_eq!(
+        activity_of(&f, "w").await,
+        Value::Null,
+        "unknown until reported"
+    );
+    let (status, body) = report(
+        &f,
+        json!({"session_id": "s1", "state": "work", "source": "claude-prompt"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["peer_id"], "w", "found by its session");
+    let first = activity_of(&f, "w").await;
+    assert_eq!(
+        (first["state"].as_str(), first["source"].as_str()),
+        (Some("work"), Some("claude-prompt"))
+    );
+    f.0.inner.lock().await.activity.get_mut("w").unwrap().since = 5;
+    report(&f, json!({"session_id": "s1", "state": "work"})).await;
+    assert_eq!(
+        activity_of(&f, "w").await["since"],
+        5,
+        "the same state keeps its start"
+    );
+    report(
+        &f,
+        json!({"peer_id": "w", "session_id": "s1", "state": "idle"}),
+    )
+    .await;
+    let idle = activity_of(&f, "w").await;
+    assert!(
+        idle["state"] == "idle" && idle["since"].as_u64().unwrap() > 5,
+        "{idle}"
+    );
+    for (body, want) in [
+        (
+            json!({"session_id": "s1", "state": "sleep"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (json!({"state": "work"}), StatusCode::BAD_REQUEST),
+        (
+            json!({"session_id": "nobody", "state": "work"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({"peer_id": "ghost", "state": "work"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({"peer_id": "w", "session_id": "s0", "state": "work"}),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"peer_id": "w", "state": "work"}),
+            StatusCode::CONFLICT,
+        ),
+    ] {
+        let (status, reply) = report(&f, body.clone()).await;
+        assert_eq!(status, want, "{body} -> {reply}");
+    }
+    assert_eq!(
+        activity_of(&f, "w").await["state"],
+        "idle",
+        "refused reports change nothing"
+    );
+    f.peer("bare", "c1").await;
+    let (status, reply) = report(&f, json!({"peer_id": "bare", "state": "work"})).await;
+    assert_eq!(status, StatusCode::OK, "a peer without a session: {reply}");
+}
+
+#[tokio::test]
+async fn a_tool_that_finishes_late_does_not_undo_a_stop() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    f.job(json!({"title": "a", "assigned_peer": "w"})).await;
+    let tool = json!({"session_id": "s1", "state": "work", "source": "claude-code-tool",
+                      "ends_wait": true});
+    report(&f, json!({"session_id": "s1", "state": "wait"})).await;
+    report(&f, tool.clone()).await;
+    assert_eq!(
+        activity_of(&f, "w").await["state"],
+        "work",
+        "a finished tool ends a wait"
+    );
+    report(
+        &f,
+        json!({"session_id": "s1", "state": "idle", "source": "claude-code-stop"}),
+    )
+    .await;
+    let (status, reply) = report(&f, tool).await;
+    assert_eq!(status, StatusCode::OK, "{reply}");
+    let now = activity_of(&f, "w").await;
+    assert_eq!(
+        (now["state"].as_str(), now["source"].as_str()),
+        (Some("idle"), Some("claude-code-stop")),
+        "the tool's report arrived after the stop: {now}"
+    );
+}
+
+#[tokio::test]
+async fn activity_resets_when_the_session_is_replaced_or_the_peer_leaves() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    f.job(json!({"title": "a", "assigned_peer": "w"})).await;
+    report(&f, json!({"session_id": "s1", "state": "work"})).await;
+    f.peer_in_session("w", "c1", "s2").await;
+    assert_eq!(
+        activity_of(&f, "w").await,
+        Value::Null,
+        "a new session starts unknown"
+    );
+
+    report(&f, json!({"session_id": "s2", "state": "work"})).await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    let gen = {
+        let mut hub = f.0.inner.lock().await;
+        hub.conn_gen += 1;
+        let gen = hub.conn_gen;
+        hub.sockets.insert("w".into(), (gen, tx));
+        gen
+    };
+    close_connection(&f.0, "w", gen, false, rx, Vec::new()).await;
+    assert_eq!(
+        activity_of(&f, "w").await,
+        Value::Null,
+        "offline is unknown"
+    );
+
+    report(&f, json!({"session_id": "s2", "state": "work"})).await;
+    f.0.inner.lock().await.peers.get_mut("w").unwrap().last_seen = 0;
+    let (status, _) = f.request("GET", "/peers", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let hub = f.0.inner.lock().await;
+    assert!(
+        !hub.peers.contains_key("w") && !hub.activity.contains_key("w"),
+        "a pruned peer takes its activity along"
+    );
+}
+
+#[tokio::test]
+async fn registering_can_carry_activity() {
+    let f = Fixture::new();
+    let reason = format!(
+        "Claude needs your permission to use Bash\u{1b}[31m{}",
+        "x".repeat(300)
+    );
+    let (status, body) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"name": "w", "peer_id": "w", "backend": "claude-code", "circle": "c1", "session_id": "s1",
+                   "activity": {"state": "wait", "source": "claude-notification", "reason": reason}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.job(json!({"title": "a", "assigned_peer": "w"})).await;
+    let wait = activity_of(&f, "w").await;
+    let shown = wait["reason"].as_str().unwrap();
+    assert_eq!(wait["state"], "wait");
+    assert!(
+        shown.starts_with("Claude needs your permission to use Bash[31m"),
+        "control characters dropped: {shown}"
+    );
+    assert_eq!(shown.chars().count(), 120, "reasons are cut");
+    let (status, _) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"name": "w", "peer_id": "w", "backend": "claude-code", "circle": "c1", "session_id": "s1",
+                   "activity": {"state": "napping"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        activity_of(&f, "w").await["state"],
+        "wait",
+        "a refused registration changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn activity_is_not_kept_across_a_restart() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    report(&f, json!({"session_id": "s1", "state": "work"})).await;
+    assert!(f.0.inner.lock().await.activity.contains_key("w"));
+    let again = Fixture::open(f.0.state_path.clone());
+    assert!(again.0.inner.lock().await.activity.is_empty());
+}
+
+#[tokio::test]
+async fn a_recipient_that_left_is_missing_even_if_its_name_was_taken() {
+    let f = team("c1", &["boss", "original"]).await;
+    let j = f
+        .job(json!({"title": "j", "from_peer": "boss", "assigned_peer": "original"}))
+        .await;
+    f.advance().await;
+    let cid = f.ask_id(&j).await;
+    f.ack(&cid, json!({"from_peer": "original", "message": "ok"}))
+        .await;
+    f.advance().await;
+    f.0.inner
+        .lock()
+        .await
+        .peers
+        .get_mut("original")
+        .unwrap()
+        .last_seen = 0;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"peer_id": "replacement", "name": "original", "circle": "c2", "backend": "pi"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let s = snapshot_of(&f, "?circle=c1").await;
+    assert_eq!(s["asks"][0]["to_peer_id"], "original");
+    assert!(
+        s["missing"]["peers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("original")),
+        "the recipient left: {s}"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_named_anonymous_is_still_returned() {
+    let f = team("c1", &["boss", "anonymous"]).await;
+    f.job(json!({"title": "j", "from_peer": "boss", "assigned_peer": "anonymous"}))
+        .await;
+    f.advance().await;
+    let s = snapshot_of(&f, "").await;
+    assert!(
+        s["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["peer_id"] == "anonymous"),
+        "{s}"
+    );
+    let f = team("c1", &["w"]).await;
+    f.job(json!({"title": "nobody sent this", "assigned_peer": "w"}))
+        .await;
+    f.advance().await;
+    let s = snapshot_of(&f, "").await;
+    assert_eq!(
+        s["asks"][0]["from_peer"], "anonymous",
+        "a job without a sender dispatches as anonymous"
+    );
+    assert_eq!(
+        s["missing"]["peers"],
+        json!([]),
+        "the sentinel for no sender is not a missing peer"
+    );
+}
+
+#[tokio::test]
+async fn titles_are_previewed_like_other_text() {
+    let f = Fixture::new();
+    let id = f.job(json!({"title": "t".repeat(5000)})).await;
+    let s = snapshot_of(&f, &format!("?detail={id}")).await;
+    assert_eq!(s["jobs"][0]["title"].as_str().unwrap().chars().count(), 400);
+    assert_eq!(s["jobs"][0]["title_len"], 5000);
+    assert_eq!(
+        s["detail"]["title"].as_str().unwrap().len(),
+        5000,
+        "the full title comes with detail"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_counts_its_running_jobs_in_every_circle() {
+    let f = Fixture::new();
+    f.peer("boss1", "c1").await;
+    f.peer("boss2", "c2").await;
+    f.peer("w", "c1").await;
+    f.job(json!({"title": "here", "from_peer": "boss1", "assigned_peer": "w"}))
+        .await;
+    f.0.inner.lock().await.peers.get_mut("w").unwrap().circle = "c2".into();
+    f.job(json!({"title": "there", "from_peer": "boss2", "assigned_peer": "w"}))
+        .await;
+    f.0.inner.lock().await.peers.get_mut("w").unwrap().circle = "c1".into();
+    f.advance().await;
+    let s = snapshot_of(&f, "?circle=c1").await;
+    assert_eq!(s["jobs"].as_array().unwrap().len(), 1, "{s}");
+    let w = s["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["peer_id"] == "w")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        w["running"], 1,
+        "c2's job is not dispatched while w sits in c1: {s}"
+    );
+    f.0.inner.lock().await.peers.get_mut("w").unwrap().circle = "c2".into();
+    f.advance().await;
+    let s = snapshot_of(&f, "?circle=c1").await;
+    let w = s["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["peer_id"] == "w")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        w["running"], 2,
+        "both jobs run on w; the c1 view counts the c2 one too: {s}"
+    );
+}
+
+#[tokio::test]
+async fn a_registration_that_fails_to_persist_leaves_no_activity_behind() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    f.job(json!({"title": "a", "assigned_peer": "w"})).await;
+    report(
+        &f,
+        json!({"session_id": "s1", "state": "work", "source": "s1"}),
+    )
+    .await;
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .execute_batch("CREATE TRIGGER deny_peer BEFORE INSERT ON peers BEGIN SELECT RAISE(FAIL, 'probe'); END;")
+        .unwrap();
+    let (status, _) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"name": "w", "peer_id": "w", "backend": "pi", "circle": "c1", "session_id": "s2",
+                   "activity": {"state": "idle", "source": "s2"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let hub = f.0.inner.lock().await;
+    assert_eq!(
+        hub.peers["w"].session_id, "s1",
+        "the peer rolled back to s1"
+    );
+    assert!(
+        hub.activity.get("w").is_none_or(|a| a.source != "s2"),
+        "s2's activity must not sit on s1"
+    );
+}
+
+#[tokio::test]
+async fn a_real_anonymous_recipient_that_left_is_missing() {
+    let f = team("c1", &["boss", "anonymous"]).await;
+    f.job(json!({"title": "j", "from_peer": "boss", "assigned_peer": "anonymous"}))
+        .await;
+    f.advance().await;
+    f.0.inner.lock().await.peers.remove("anonymous");
+    let s = snapshot_of(&f, "").await;
+    assert_eq!(s["asks"][0]["to_peer_id"], "anonymous");
+    assert!(
+        s["missing"]["peers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("anonymous")),
+        "{s}"
+    );
+}
+
+#[tokio::test]
+async fn reaping_a_closed_socket_clears_activity() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    report(&f, json!({"session_id": "s1", "state": "work"})).await;
+    let mut hub = f.0.inner.lock().await;
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("w".into(), (1, tx));
+    drop(rx);
+    refresh_peers(&mut hub);
+    assert!(!hub.sockets.contains_key("w") && !hub.activity.contains_key("w"));
+}
+
+#[tokio::test]
+async fn a_check_yields_to_work_reported_within_the_grace() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    report(&f, json!({"session_id": "s1", "state": "work"})).await;
+    let (status, body) = report(
+        &f,
+        json!({"session_id": "s1", "state": "idle", "check": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["state"], "work",
+        "a turn that just reported work may not have started yet"
+    );
+    f.0.inner
+        .lock()
+        .await
+        .activity
+        .get_mut("w")
+        .unwrap()
+        .observed_at -= CHECK_GRACE_SECS;
+    let (_, body) = report(
+        &f,
+        json!({"session_id": "s1", "state": "idle", "check": true}),
+    )
+    .await;
+    assert_eq!(
+        body["state"], "idle",
+        "work nobody repeated for the grace yields to the check"
+    );
+    report(&f, json!({"session_id": "s1", "state": "work"})).await;
+    let (_, body) = report(&f, json!({"session_id": "s1", "state": "idle"})).await;
+    assert_eq!(body["state"], "idle", "a plain report is never held back");
+}
+
+#[tokio::test]
+async fn a_job_run_by_hand_counts_for_its_assignee() {
+    let f = team("c1", &["boss", "w"]).await;
+    let by_hand = f.job(json!({"title": "legacy", "from_peer": "boss"})).await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        let job = hub.jobs.get_mut(&by_hand).unwrap();
+        job.assigned_peer = Some("w".into());
+        job.state = "running".into();
+    }
+    f.job(json!({"title": "dispatched", "from_peer": "boss", "assigned_peer": "w"}))
+        .await;
+    f.advance().await;
+    let s = snapshot_of(&f, "").await;
+    let w = s["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["peer_id"] == "w")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        w["running"], 2,
+        "the one run by hand has no ask and still counts: {s}"
+    );
+}
+
+/* who closed an ask is recorded when it closes, not guessed from the reply's text */
+#[tokio::test]
+async fn an_ask_records_how_it_closed() {
+    let root = std::env::temp_dir().join(format!("amesh-closed-{}", Uuid::new_v4()));
+    fs::create_dir_all(&root).unwrap();
+    let state = root.join("state.db");
+    let asks = {
+        let f = Fixture::open(state.clone());
+        f.peer("boss", "c1").await;
+        for id in ["one", "two", "three"] {
+            f.peer(id, "c1").await;
+        }
+        f.peer_in_session("four", "c1", "s1").await;
+        let mut jobs = Vec::new();
+        for (title, worker) in [("a", "one"), ("b", "two"), ("c", "three"), ("d", "four")] {
+            jobs.push(
+                f.job(json!({"title": title, "assigned_peer": worker, "from_peer": "boss"}))
+                    .await,
+            );
+        }
+        f.advance().await;
+        let mut asks = Vec::new();
+        for job in &jobs {
+            asks.push(f.ask_id(job).await);
+        }
+        let (status, _) = f
+            .ack(
+                &asks[0],
+                json!({"from_peer": "one", "message": "amesh: the worker's own words"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = f
+            .ack(&asks[1], json!({"message": "an operator's answer"}))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = f.set_state(&jobs[2], json!({"state": "done"})).await;
+        assert_eq!(status, StatusCode::OK);
+        f.peer_in_session("four", "c1", "s2").await;
+        let by = |ask: Ask| ask.closed_by;
+        assert_eq!(
+            by(f.ask(&asks[0]).await).as_deref(),
+            Some("recipient"),
+            "whatever the text says"
+        );
+        assert_eq!(
+            by(f.ask(&asks[1]).await).as_deref(),
+            Some("hand"),
+            "an unnamed ack"
+        );
+        assert_eq!(
+            by(f.ask(&asks[2]).await).as_deref(),
+            Some("hand"),
+            "a job set done by hand"
+        );
+        assert_eq!(
+            by(f.ask(&asks[3]).await).as_deref(),
+            Some("hub"),
+            "a replaced session"
+        );
+        let snap = snapshot_of(&f, "").await;
+        assert_eq!(snap["capabilities"]["ask_closed_by"], true);
+        let shown = snap["asks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["correlation_id"] == asks[0].as_str())
+            .unwrap()
+            .clone();
+        assert_eq!(shown["closed_by"], "recipient", "{shown}");
+        assert!(persist_ok(&mut *f.0.inner.lock().await).is_ok());
+        asks
+    };
+    let f = Fixture::open(state.clone());
+    assert_eq!(
+        f.ask(&asks[3]).await.closed_by.as_deref(),
+        Some("hub"),
+        "kept across a restart"
+    );
+    drop(f);
+    let db = Connection::open(&state).unwrap();
+    db.execute_batch("ALTER TABLE asks DROP COLUMN closed_by;")
+        .unwrap();
+    drop(db);
+    let f = Fixture::open(state);
+    assert!(
+        f.0.inner
+            .lock()
+            .await
+            .asks
+            .values()
+            .all(|ask| ask.closed_by.is_none()),
+        "a database from before the column loads, not knowing"
+    );
+}

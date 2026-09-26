@@ -204,6 +204,113 @@ await test("prompt Inbox waits for settled and pending asks are not redelivered"
   await handlers.get("agent_settled")({}, context);
   assert.equal(userMsgs.length, 1, "an open ask ledger entry is not a new event");
 });
+await test("a settled agent reports idle when pi still says so a second later", async () => {
+  execFileSync(executable, ["jobs", "create", "pi-activity", "--from-peer", peerId]);
+  const activity = async () => {
+    const response = await fetch(`http://${process.env.AMESH_BIND}/snapshot`, {
+      headers: { authorization: `Bearer ${process.env.AMESH_TOKEN}` },
+    });
+    const snapshot = await response.json();
+    return snapshot.peers.find((peer) => peer.peer_id === peerId)?.activity?.state;
+  };
+  /* a loaded machine can take seconds to spawn the hook and its curl */
+  const reaches = async (want) => {
+    for (let i = 0; i < 300 && (await activity()) !== want; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return activity();
+  };
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  /* a fresh instance per scenario: the earlier tests leave the shared one mid-run */
+  const instance = async (bin) => {
+    const text = source.split(JSON.stringify(executable)).join(JSON.stringify(bin));
+    if (bin !== executable) {
+      assert.notEqual(text, source, "the extension names its executable as a JSON string");
+    }
+    const { default: Hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+    const on = new Map();
+    Hooks({ on(event, handler) { on.set(event, handler); }, sendMessage() {}, sendUserMessage() {}, registerTool() {} });
+    return (event, ctx = context) => on.get(event)({}, ctx);
+  };
+  /* pi's own word on whether the agent streams or has prompts waiting */
+  const busy = { ...context, isIdle: () => false, hasPendingMessages: () => false };
+  const done = { ...context, isIdle: () => true, hasPendingMessages: () => false };
+  const waiting = { ...context, isIdle: () => true, hasPendingMessages: () => true };
+  const { writeFileSync, chmodSync, existsSync, readFileSync, rmSync } = await import("node:fs");
+  const real = JSON.stringify(executable);
+  const wrapper = (name, body) => {
+    const path = `${cwd}/${name}`;
+    writeFileSync(path, `#!/bin/sh\n${body}\nexec ${real} "$@"\n`);
+    chmodSync(path, 0o755);
+    return path;
+  };
+
+  const live = await instance(executable);
+  await live("before_agent_start");
+  assert.equal(await activity(), "work");
+  await live("agent_end");
+  assert.equal(await activity(), "work", "agent_end can still have steers queued");
+  await live("agent_settled", done);
+  assert.equal(await reaches("idle"), "idle");
+  await live("before_agent_start");
+  await live("before_agent_start");
+  await live("agent_settled", busy);
+  await live("agent_settled", waiting);
+  await sleep(1500);
+  assert.equal(await activity(), "work", "a settle while pi streams or has prompts waiting is not idle");
+  await live("agent_end");
+  await live("agent_settled", done);
+  assert.equal(await reaches("idle"), "idle", "idle once pi says so, however starts and ends paired");
+
+  /* measured on pi: its run flag is already down at agent_settled and a queued prompt starts
+  a run right after, so isIdle() alone reads idle mid-work */
+  const idles = `${cwd}/idle-reports`;
+  const counted = await instance(wrapper("counting-amesh", `[ "$2" = idle ] && echo idle >> ${JSON.stringify(idles)}`));
+  await counted("before_agent_start");
+  await counted("agent_settled", done);
+  await counted("agent_start");
+  await sleep(1500);
+  assert.ok(!existsSync(idles) || readFileSync(idles, "utf8") === "", "a run that starts within the second cancels the idle report");
+  assert.equal(await activity(), "work");
+  await counted("agent_settled", done);
+  assert.equal(await reaches("idle"), "idle");
+  await counted("agent_start");
+  assert.equal(await reaches("work"), "work", "a queued prompt's run, starting after the idle, reports work");
+
+  /* the idle report is held back and leaves a mark when it has landed, so the order is
+  checked after both reports, however slow the machine */
+  const landed = `${cwd}/slow-idle-landed`;
+  const late = await instance(
+    wrapper("slow-amesh", `if [ "$2" = idle ]; then sleep 0.4; ${real} "$@"; s=$?; touch ${JSON.stringify(landed)}; exit $s; fi`),
+  );
+  await late("before_agent_start");
+  await late("agent_end");
+  await late("agent_settled", done);
+  await sleep(1100);
+  await late("before_agent_start");
+  for (let i = 0; i < 300 && !existsSync(landed); i++) {
+    await sleep(50);
+  }
+  assert.ok(existsSync(landed), "the held idle report ran");
+  assert.equal(await activity(), "work", "a slow idle report still lands before the next prompt's");
+
+  /* a run that starts while the idle report is landing waits for it; a shutdown meanwhile
+  ends the session, so the run reports nothing */
+  const after = `${cwd}/reports-after-shutdown`;
+  for (const start of ["agent_start", "before_agent_start"]) {
+    const closing = await instance(
+      wrapper(`closing-${start}`, `[ "$2" = idle ] && sleep 0.7; [ "$2" != idle ] && echo "$2" >> ${JSON.stringify(after)}`),
+    );
+    await closing("before_agent_start");
+    await closing("agent_settled", done);
+    await sleep(1100);
+    rmSync(after, { force: true });
+    const run = closing(start);
+    await closing("session_shutdown");
+    await run;
+    assert.ok(!existsSync(after), `${start} reports nothing after the session shut down`);
+  }
+});
 execFileSync(executable, ["peer", "ack", promptAsk.correlation_id]);
 await handlers.get("agent_settled")({}, context);
 userMsgs.length = 0;

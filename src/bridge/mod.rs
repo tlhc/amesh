@@ -90,6 +90,17 @@ pub fn thread_is_idle(read: &Value) -> bool {
         == Some("idle")
 }
 
+/* no turn runs on the thread: idle, or systemError after a turn the server failed (Codex
+runs no Stop for either); any other or unknown status is left alone */
+pub fn turn_is_over(read: &Value) -> bool {
+    thread_is_idle(read)
+        || read
+            .pointer("/result/thread/status/type")
+            .or_else(|| read.pointer("/result/status/type"))
+            .and_then(Value::as_str)
+            == Some("systemError")
+}
+
 pub fn steer_has_no_turn(error: &Value) -> bool {
     error.to_string().contains("no active turn")
 }

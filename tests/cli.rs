@@ -2706,9 +2706,12 @@ fn installed_hooks_execute_against_the_daemon() {
         .env("AMESH_STATE", sandbox.root.join("state.json"))
         .output()
         .unwrap();
+    /* node:test names the failing subtest on stdout; stderr only carries the faults the
+    harness injects on purpose */
     assert!(
         result.status.success(),
-        "{}",
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(String::from_utf8_lossy(&result.stdout).contains("passed against the daemon"));
@@ -5496,9 +5499,12 @@ fn pi_session_start_registers_when_daemon_was_down() {
         .env("AMESH_STATE", sandbox.root.join("state.json"))
         .output()
         .unwrap();
+    /* node:test names the failing subtest on stdout; stderr only carries the faults the
+    harness injects on purpose */
     assert!(
         result.status.success(),
-        "{}",
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(String::from_utf8_lossy(&result.stdout).contains("passed against the daemon"));
@@ -5692,8 +5698,13 @@ fn app_server_capture_with(
                             "thread/loaded/list" => json!({"data": loaded}),
                             "thread/read" => {
                                 let thread = req["params"]["threadId"].as_str().unwrap_or("");
-                                let state = if busy.lock().unwrap().iter().any(|id| id == thread) {
+                                let busy = busy.lock().unwrap();
+                                /* "!id" is a thread whose last turn the server failed */
+                                let state = if busy.iter().any(|id| id == thread) {
                                     "active"
+                                } else if busy.iter().any(|id| id.strip_prefix('!') == Some(thread))
+                                {
+                                    "systemError"
                                 } else {
                                     "idle"
                                 };
@@ -6198,4 +6209,337 @@ fn setup_refuses_an_invalid_peer_id_before_writing_anything() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(extension.exists());
+}
+
+fn activity_of(sandbox: &Sandbox, peer: &str) -> Value {
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--noproxy",
+            "*",
+            "--header",
+            "Authorization: Bearer cli-test-token",
+            &format!("http://{}/snapshot", sandbox.bind),
+        ])
+        .output()
+        .unwrap();
+    let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
+    snapshot["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["peer_id"] == peer)
+        .map(|row| row["activity"].clone())
+        .unwrap_or(Value::Null)
+}
+
+#[test]
+fn hooks_report_what_the_runtime_is_doing() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let payload = json!({"session_id": "session-a", "cwd": sandbox.root});
+    let hook = |event: &str, backend: &str, extra: Value| {
+        let mut body = payload.clone();
+        for (key, value) in extra.as_object().unwrap() {
+            body[key] = value.clone();
+        }
+        let output = sandbox.run(&["hook", event, "--backend", backend], Some(body));
+        assert!(
+            output.status.success(),
+            "{event}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
+    };
+    hook("session", "claude-code", json!({}));
+    let peer = sandbox.json(&["peer", "list"], None)[0]["peer_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    sandbox.json(&["jobs", "create", "watch", "--from-peer", &peer], None);
+    let state = || {
+        activity_of(&sandbox, &peer)["state"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(state(), None, "unknown until the runtime says");
+
+    hook("prompt", "claude-code", json!({}));
+    assert_eq!(state().as_deref(), Some("work"));
+    hook(
+        "notification",
+        "claude-code",
+        json!({"notification_type": "permission_prompt", "message": "Claude needs your permission to use Bash"}),
+    );
+    let wait = activity_of(&sandbox, &peer);
+    assert_eq!(
+        (wait["state"].as_str(), wait["reason"].as_str()),
+        (
+            Some("wait"),
+            Some("Claude needs your permission to use Bash")
+        )
+    );
+    assert_eq!(
+        hook("tool", "claude-code", json!({"tool_name": "Bash"})),
+        "",
+        "the tool hook prints nothing"
+    );
+    hook(
+        "notification",
+        "claude-code",
+        json!({"notification_type": "permission_prompt", "message": "again"}),
+    );
+    let big =
+        json!({"tool_name": "Read", "tool_response": {"content": "x".repeat(3 * 1024 * 1024)}});
+    assert_eq!(
+        hook("tool", "claude-code", big),
+        "",
+        "a big tool output is streamed past, not refused"
+    );
+    assert_eq!(state().as_deref(), Some("work"));
+    assert_eq!(
+        state().as_deref(),
+        Some("work"),
+        "a finished tool ends the wait"
+    );
+    hook(
+        "notification",
+        "claude-code",
+        json!({"notification_type": "auth_success", "message": "x"}),
+    );
+    assert_eq!(
+        state().as_deref(),
+        Some("work"),
+        "other notifications change nothing"
+    );
+    assert_eq!(hook("stop", "claude-code", json!({})), "");
+    assert_eq!(state().as_deref(), Some("idle"));
+    hook("tool", "claude-code", json!({"tool_name": "Bash"}));
+    assert_eq!(
+        state().as_deref(),
+        Some("idle"),
+        "a tool reported after the stop does not undo it"
+    );
+
+    hook("prompt", "claude-code", json!({}));
+    sandbox.json(&["peer", "ask", &peer, "handle-this"], None);
+    assert!(hook("stop", "claude-code", json!({})).contains("block"));
+    assert_eq!(
+        state().as_deref(),
+        Some("work"),
+        "a blocked stop keeps Claude working"
+    );
+    hook("stop", "claude-code", json!({"stop_hook_active": true}));
+    assert_eq!(
+        state().as_deref(),
+        Some("idle"),
+        "the stop after a block is final"
+    );
+    hook(
+        "notification",
+        "claude-code",
+        json!({"notification_type": "idle_prompt", "message": "waiting"}),
+    );
+    assert_eq!(state().as_deref(), Some("idle"));
+
+    let pi = json!({"session_id": "pi-session"});
+    hook("prompt", "pi", pi.clone());
+    let pi_peer = sandbox
+        .json(&["peer", "list"], None)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["backend"] == "pi")
+        .map(|row| row["peer_id"].as_str().unwrap().to_string())
+        .unwrap();
+    sandbox.json(
+        &["jobs", "create", "pi-watch", "--from-peer", &pi_peer],
+        None,
+    );
+    let pi_state = || {
+        activity_of(&sandbox, &pi_peer)["state"]
+            .as_str()
+            .map(str::to_string)
+    };
+    assert_eq!(pi_state().as_deref(), Some("work"));
+    hook("stop", "pi", pi.clone());
+    assert_eq!(
+        pi_state().as_deref(),
+        Some("work"),
+        "agent_end can still have steers queued"
+    );
+    assert_eq!(
+        hook("idle", "pi", pi).trim(),
+        "{}",
+        "pi parses what the hook prints"
+    );
+    assert_eq!(pi_state().as_deref(), Some("idle"));
+}
+
+#[test]
+fn setup_installs_activity_hooks_for_claude_only() {
+    let sandbox = Sandbox::new();
+    let root = sandbox.root.to_str().unwrap();
+    let output = sandbox.run(&["setup", "--home", root], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let claude: Value =
+        serde_json::from_slice(&fs::read(sandbox.root.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        claude["hooks"]["Notification"][0]["matcher"],
+        "permission_prompt|idle_prompt"
+    );
+    let tool = &claude["hooks"]["PostToolUse"][0];
+    assert_eq!(tool["matcher"], "*");
+    assert_eq!(tool["hooks"][0]["async"], true, "Claude never waits for it");
+    assert!(tool["hooks"][0]["command"]
+        .as_str()
+        .unwrap()
+        .ends_with("hook tool --backend=claude-code"));
+    let codex: Value =
+        serde_json::from_slice(&fs::read(sandbox.root.join(".codex/hooks.json")).unwrap()).unwrap();
+    assert!(
+        codex["hooks"].get("PostToolUse").is_none() && codex["hooks"].get("Notification").is_none()
+    );
+    let uninstall = sandbox.run(&["uninstall", "--home", root, "--apply", "true"], None);
+    assert!(
+        uninstall.status.success(),
+        "{}",
+        String::from_utf8_lossy(&uninstall.stderr)
+    );
+    let claude: Value =
+        serde_json::from_slice(&fs::read(sandbox.root.join(".claude/settings.json")).unwrap())
+            .unwrap();
+    assert!(
+        claude["hooks"]
+            .get("PostToolUse")
+            .is_none_or(|groups| groups.as_array().unwrap().is_empty()),
+        "{claude}"
+    );
+}
+
+#[test]
+fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    pin_session(&sandbox, "A");
+    sandbox.json(&["jobs", "create", "watch", "--from-peer", "pinned"], None);
+    let codex_home = PathBuf::from(format!(
+        "/tmp/ai{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
+    let injected = app_server_capture_with(&codex_home, &["A"], busy.clone());
+    let prompt = sandbox.run(
+        &[
+            "hook",
+            "prompt",
+            "--backend",
+            "codex",
+            "--peer-id",
+            "pinned",
+        ],
+        Some(json!({"session_id": "A", "cwd": sandbox.root})),
+    );
+    assert!(
+        prompt.status.success(),
+        "{}",
+        String::from_utf8_lossy(&prompt.stderr)
+    );
+    let drainer = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", "pinned", "--backend", "codex"])
+            .env("CODEX_HOME", &codex_home)
+            .spawn()
+            .unwrap(),
+    ));
+    wait_for_drainer("pinned");
+    let state = || activity_of(&sandbox, "pinned");
+    std::thread::sleep(Duration::from_secs(12));
+    assert_eq!(
+        state()["state"],
+        "work",
+        "the thread is mid-turn: {}",
+        state()
+    );
+    /* the turn fails server-side: the thread sits in systemError and Codex runs no Stop */
+    *busy.lock().unwrap() = vec!["!A".to_string()];
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while state()["state"] != "idle" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let seen = state();
+    /* a failed turn must not hold back the next message: the drainer starts a turn */
+    sandbox.json(&["peer", "notify", "pinned", "after-failure"], None);
+    let delivered = injected.recv_timeout(Duration::from_secs(20));
+    drop(drainer);
+    let _ = fs::remove_dir_all(&codex_home);
+    let raw = delivered.expect("a thread in systemError takes the next message");
+    let start: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        start["method"], "turn/start",
+        "a new turn, not a steer: {start}"
+    );
+    assert!(
+        start["params"]["input"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("after-failure")),
+        "{start}"
+    );
+    assert_eq!(
+        (seen["state"].as_str(), seen["source"].as_str()),
+        (Some("idle"), Some("codex-check")),
+        "{seen}"
+    );
+}
+
+#[test]
+fn tui_takes_its_theme_from_the_amesh_directory() {
+    let sandbox = Sandbox::new();
+    let home = sandbox.root.join("home");
+    fs::create_dir_all(home.join(".amesh")).unwrap();
+    fs::write(home.join(".amesh/tui-theme.json"), r#"{"home": "red"}"#).unwrap();
+    let theme = sandbox.root.join("tui-theme.json");
+    fs::write(&theme, r#"{"glow": "red"}"#).unwrap();
+    let home = [("HOME", home.to_str().unwrap())];
+    let output = sandbox.run_text(&["tui", "--all"], "", &home);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success()
+            && stderr.contains(&format!("{}: unknown colour role glow", theme.display())),
+        "{stderr}"
+    );
+    let output = sandbox.run_text(&["tui", "--all", "--theme", "dark.json"], "", &home);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("unknown tui option --theme"), "{stderr}");
+}
+
+#[test]
+fn an_activity_report_gives_up_on_a_hub_that_does_not_answer() {
+    let sandbox = Sandbox::new();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let bind = listener.local_addr().unwrap().to_string();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            held.push(stream);
+        }
+    });
+    let started = Instant::now();
+    let output = sandbox.run_text(
+        &["hook", "idle", "--backend=pi"],
+        r#"{"session_id": "s1"}"#,
+        &[("AMESH_BIND", &bind)],
+    );
+    let took = started.elapsed();
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "{}");
+    assert!(
+        took < Duration::from_millis(2500),
+        "the report took {took:?}"
+    );
 }

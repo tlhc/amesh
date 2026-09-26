@@ -252,6 +252,7 @@ export default function AmeshHooks(pi) {
 
   function Drop() {
     dead = true;
+    clearTimeout(idleCheck);
     inflight = false;
     warned = false;
     pending.length = 0;
@@ -602,6 +603,36 @@ export default function AmeshHooks(pi) {
 
   RegisterTools();
 
+  /* the idle report of a settled agent must land before the next prompt reports work */
+  let settling = Promise.resolve();
+  let lastCtx = null;
+  let idleCheck = null;
+  const CancelIdle = () => {
+    clearTimeout(idleCheck);
+    idleCheck = null;
+  };
+  /* pi clears its run flag just before agent_settled and may start a queued prompt right
+  after it, so the idle report waits a second, re-reads pi's own state, and is dropped as
+  soon as a run starts. While pi stays busy (compacting, say) it looks again each second,
+  then every ten seconds, until pi is idle or a run starts */
+  const CheckIdle = (ctx, tries) => {
+    idleCheck = setTimeout(() => {
+      idleCheck = null;
+      if (dead) {
+        return;
+      }
+      const idle = typeof ctx.isIdle === "function" ? ctx.isIdle() && !ctx.hasPendingMessages?.() : true;
+      if (!idle) {
+        CheckIdle(ctx, tries - 1);
+        return;
+      }
+      settling = Invoke("idle", ctx).then(
+        () => {},
+        (error) => console.error(`[amesh] ${error.message}`),
+      );
+    }, tries > 0 ? 1000 : 10000);
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     UseSession(ctx);
     try {
@@ -642,8 +673,33 @@ export default function AmeshHooks(pi) {
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
+    lastCtx = ctx;
+    CancelIdle();
+    await settling;
+    /* the session can shut down while an idle report is still landing */
+    if (dead) {
+      return;
+    }
     try {
       EnqueueInbox(await Invoke("prompt", ctx));
+    } catch (error) {
+      console.error(`[amesh] ${error.message}`);
+    }
+  });
+
+  /* a queued prompt runs after the settle without a new before_agent_start */
+  pi.on("agent_start", async (_event, ctx) => {
+    CancelIdle();
+    const use = ctx ?? lastCtx;
+    if (!use || dead) {
+      return;
+    }
+    await settling;
+    if (dead) {
+      return;
+    }
+    try {
+      await Invoke("work", use);
     } catch (error) {
       console.error(`[amesh] ${error.message}`);
     }
@@ -657,9 +713,14 @@ export default function AmeshHooks(pi) {
     }
   });
 
-  pi.on("agent_settled", () => {
+  pi.on("agent_settled", (_event, ctx) => {
     inflight = false;
     Flush();
+    const use = ctx ?? lastCtx;
+    if (use && !dead) {
+      CancelIdle();
+      CheckIdle(use, 30);
+    }
   });
 
   pi.on("session_shutdown", () => {

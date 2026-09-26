@@ -49,6 +49,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - `assigned_peer` reassigns and `prompt` rewrites the next attempt; both are refused (409) while the new state is `running`
   - a dispatched job enters `running` only by being sent (409 otherwise)
 - `DELETE /jobs/{id}` is 409 while a queued or running job depends on it.
+- Jobs record `created_at` and asks `opened_at` and `closed_by` (`recipient`, `hand` or `hub`: who closed it); rows written before these fields existed leave them empty. A binary from before them rewrites the tables without them, so after a downgrade the times read as empty again.
 - MCP job tools that name a caller act only on jobs in the caller's circle unless `cross_circle` is set.
 - Cleanup, with both periods set in `config.toml` (default one hour):
   - a chain of jobs whose jobs all ended at least `job_keep_secs` ago is deleted
@@ -68,6 +69,30 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `GET /events` is the in-memory ring (last 500, cleared on restart):
   - `?since=<id>` starts after that id
   - `?circle=NAME` keeps events whose `from_circle` or `to_circle` matches
+
+## Snapshot
+
+- `GET /snapshot` is the read-only view for monitors such as `amesh tui`: the jobs, the asks they point at and the peers they name, copied under one lock.
+  - `?circle=NAME` filters the jobs; `?detail=JOB_ID` also returns that job's title, prompt and result in full.
+  - Text fields, titles included, are cut to 400 characters, with `*_len` giving the full length; references that no longer resolve are listed under `missing`.
+  - An ask's `to_peer_id` is matched by peer id only, so a recipient that left is listed under `missing` even when another peer has taken its name since. Assignees and senders are names, resolved the way the hub resolves them next.
+  - Each peer carries its `activity` (below), or null while unknown, and `running`: its running jobs in every circle, counted by recipient (a job run by hand, which has no ask, by its assignee), so a filtered view can tell whether a job is its only one.
+  - It never probes peers, settles jobs, drains inboxes, writes the state file or records an event.
+  - `hub_epoch` changes when the hub restarts; `capabilities` says which optional fields are filled.
+
+## Activity
+
+- A runtime reports what it is doing: `work`, `idle`, or `wait` (a permission prompt). The hub keeps it in memory only; after a restart every peer is unknown until it reports again.
+- `POST /activity` takes `{"session_id", "state", "source"?, "reason"?}` and finds the peer by its session; a `peer_id` names the peer directly.
+  - A report from a session that is not the peer's current one gets 409; an unknown peer 404; any other state 400.
+  - A repeated state keeps its `since`; `reason` and `source` are cut to 120 and 32 characters and lose control characters.
+  - `"check": true` marks a runtime's own look at its state; it yields to another state reported in the last 15 seconds, since a turn that has just reported work may not have started yet.
+- `POST /peers` may carry `"activity": {"state", "source"?, "reason"?}`, applied with the registration.
+- Activity is cleared when a registration replaces the peer's session, when its socket closes, and when the peer is pruned. A registration's activity applies only once the registration is on disk.
+- The hooks report:
+  - Claude Code: `UserPromptSubmit` work; `Notification` `permission_prompt` wait with its message, `idle_prompt` idle; `PostToolUse` (async, so Claude never waits for it) work; `Stop` idle unless the hook blocks the stop.
+  - Codex: `UserPromptSubmit` work; `Stop` idle unless the hook blocks it. A failed or interrupted turn runs no `Stop`, so the drainer reads its thread every 10 seconds and reports one that is `idle` or in `systemError` (a turn the server failed) as an idle check. The drainer also starts a turn for the next message on such a thread, as on an idle one.
+  - pi: `before_agent_start` and `agent_start` work. `agent_settled` reports idle a second later if pi's context still says idle with nothing pending, looking again each second while it does not, then every ten seconds after thirty tries; a run that starts meanwhile cancels it. pi clears its run flag just before `agent_settled` and may start a queued prompt right after it, so the settle alone does not mean idle. `agent_end` reports nothing.
 
 ## WebSocket
 

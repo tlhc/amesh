@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -50,6 +50,21 @@ struct Hub {
     /* next cleanup pass; 0 runs one at start, stamping rows from before the upgrade */
     sweep_at: u64,
     config: Config,
+    /* names this hub process in snapshots, so a reader can tell a restart from a gap */
+    epoch: String,
+    /* what each runtime last said it is doing, by peer_id. Memory only: after a restart
+    nobody knows until the runtime reports again, and unknown is the honest answer */
+    activity: HashMap<String, Activity>,
+}
+
+#[derive(Clone, Serialize)]
+struct Activity {
+    state: String,
+    since: u64,
+    observed_at: u64,
+    source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -82,6 +97,14 @@ struct Ask {
     failed: bool,
     #[serde(default)]
     closed_at: Option<u64>,
+    #[serde(default)]
+    opened_at: Option<u64>,
+    /* how the ask closed: "recipient" when its recipient acked, "hand" when an operator
+    acked without a name or a job's state was changed by hand, "hub" when the hub closed
+    it for a recipient whose session is gone; None on asks closed before this was kept.
+    Left out of JSON while unset, so an open ask handed to a runtime carries no noise */
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    closed_by: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -110,6 +133,8 @@ struct Job {
     nudge_at: Option<u64>,
     #[serde(default)]
     finished_at: Option<u64>,
+    #[serde(default)]
+    created_at: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -216,7 +241,9 @@ CREATE TABLE IF NOT EXISTS asks (
   open INTEGER NOT NULL,
   reply TEXT,
   failed INTEGER NOT NULL DEFAULT 0,
-  closed_at INTEGER
+  closed_at INTEGER,
+  opened_at INTEGER,
+  closed_by TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY,
@@ -233,7 +260,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   from_peer TEXT NOT NULL DEFAULT '',
   dispatch INTEGER NOT NULL DEFAULT 0,
   nudge_at INTEGER,
-  finished_at INTEGER
+  finished_at INTEGER,
+  created_at INTEGER
 );
 CREATE TABLE IF NOT EXISTS schedules (
   schedule_id TEXT PRIMARY KEY,
@@ -335,6 +363,9 @@ fn open_db(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE asks ADD COLUMN failed INTEGER NOT NULL DEFAULT 0",
         "ALTER TABLE jobs ADD COLUMN finished_at INTEGER",
         "ALTER TABLE asks ADD COLUMN closed_at INTEGER",
+        "ALTER TABLE asks ADD COLUMN opened_at INTEGER",
+        "ALTER TABLE asks ADD COLUMN closed_by TEXT",
+        "ALTER TABLE jobs ADD COLUMN created_at INTEGER",
     ] {
         let _ = db.execute(column, []);
     }
@@ -356,14 +387,14 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
     }
     for a in disk.asks.values() {
         tx.execute(
-            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64)],
+            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64), a.opened_at.map(|v| v as i64), a.closed_by],
         )
         .map_err(|e| e.to_string())?;
     }
     for j in disk.jobs.values() {
         tx.execute(
-            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 j.job_id,
                 j.title,
@@ -379,7 +410,8 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
                 j.from_peer,
                 j.dispatch as i32,
                 j.nudge_at.map(|v| v as i64),
-                j.finished_at.map(|v| v as i64)
+                j.finished_at.map(|v| v as i64),
+                j.created_at.map(|v| v as i64)
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -452,7 +484,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
     }
     let mut stmt = db
         .prepare(
-            "SELECT correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at FROM asks",
+            "SELECT correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by FROM asks",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -470,6 +502,11 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
                     .get::<_, Option<i64>>(8)
                     .unwrap_or_default()
                     .map(|v| v.max(0) as u64),
+                opened_at: r
+                    .get::<_, Option<i64>>(9)
+                    .unwrap_or_default()
+                    .map(|v| v.max(0) as u64),
+                closed_by: r.get::<_, Option<String>>(10).unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -478,7 +515,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
         disk.asks.insert(a.correlation_id.clone(), a);
     }
     let mut stmt = db
-        .prepare("SELECT job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at FROM jobs")
+        .prepare("SELECT job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at FROM jobs")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -507,6 +544,10 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
                     .map(|v| v.max(0) as u64),
                 finished_at: r
                     .get::<_, Option<i64>>(14)
+                    .unwrap_or_default()
+                    .map(|v| v.max(0) as u64),
+                created_at: r
+                    .get::<_, Option<i64>>(15)
                     .unwrap_or_default()
                     .map(|v| v.max(0) as u64),
             })
@@ -615,6 +656,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
             ask.open = false;
             ask.closed_at = Some(now_unix());
             ask.failed = true;
+            ask.closed_by = Some("hub".into());
             ask.reply = Some(
                 "amesh: recipient dropped at upgrade, its identity had invalid characters".into(),
             );
@@ -690,6 +732,8 @@ impl Hub {
             batches: HashMap::new(),
             sweep_at: 0,
             config: load_config(path),
+            epoch: Uuid::new_v4().simple().to_string(),
+            activity: HashMap::new(),
             mcp_servers: disk.mcp_servers,
         })
     }
@@ -948,6 +992,7 @@ fn close_open_asks(asks: &mut HashMap<String, Ask>, peer_id: &str, reason: &str)
             ask.open = false;
             ask.closed_at = Some(now_unix());
             ask.failed = true;
+            ask.closed_by = Some("hub".into());
             ask.reply = Some(reason.into());
             replies.push(json!({
                 "type": "ack",
@@ -1038,6 +1083,36 @@ struct RegisterReq {
     peer_id: Option<String>,
     #[serde(default)]
     session_id: Option<String>,
+    #[serde(default)]
+    activity: Option<ActivityReport>,
+}
+
+#[derive(Deserialize)]
+struct ActivityReport {
+    state: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+    /* a runtime's own look at its state, such as Codex's drainer reading its thread */
+    #[serde(default)]
+    check: bool,
+    /* a finished tool, reported without Claude waiting for it, so it can arrive after the
+    stop that ended its turn: it ends a wait, never an idle */
+    #[serde(default)]
+    ends_wait: bool,
+}
+
+/* a runtime reports by session, so a hook that never learned its peer_id can still report;
+peer_id is for runtimes without a session */
+#[derive(Deserialize)]
+struct ActivityReq {
+    #[serde(default)]
+    peer_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(flatten)]
+    report: ActivityReport,
 }
 
 #[derive(Deserialize)]
@@ -1195,6 +1270,8 @@ fn router(app: App) -> Router {
         )
         .route("/jobs/{id}/cancel", post(cancel_job))
         .route("/gc", post(gc_state))
+        .route("/snapshot", get(snapshot))
+        .route("/activity", post(report_activity))
         .route("/schedules", get(list_schedules).post(create_schedule))
         .route("/schedules/{id}", delete(delete_schedule))
         .route("/mcp", post(mcp))
@@ -1243,6 +1320,238 @@ fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Va
     } else {
         Err(unauthorized())
     }
+}
+
+#[derive(Deserialize)]
+struct SnapshotQuery {
+    circle: Option<String>,
+    detail: Option<String>,
+}
+
+const PREVIEW_CHARS: usize = 400;
+
+fn preview(text: &str) -> String {
+    text.chars().take(PREVIEW_CHARS).collect()
+}
+
+/* one consistent read for monitors: copies what it returns under a single lock and never
+probes, settles, drains, persists or records an event */
+const ACTIVITY_STATES: [&str; 3] = ["work", "idle", "wait"];
+/* a check yields to another state reported this recently: a turn that has just reported
+work may not have started when its thread is read */
+const CHECK_GRACE_SECS: u64 = 15;
+
+fn check_activity(report: &ActivityReport) -> Result<(), (StatusCode, Json<Value>)> {
+    if ACTIVITY_STATES.contains(&report.state.as_str()) {
+        return Ok(());
+    }
+    Err((
+        StatusCode::BAD_REQUEST,
+        Json(json!({"error": "state must be work, idle or wait"})),
+    ))
+}
+
+/* a repeated state keeps its start, so "working 12m" survives every tool call that
+reports it again; reason and source are cut and stripped of control characters because
+they are shown as they are */
+fn set_activity(hub: &mut Hub, peer_id: &str, report: &ActivityReport, now: u64) {
+    let fresh = |old: &Activity| {
+        old.state != report.state && now.saturating_sub(old.observed_at) < CHECK_GRACE_SECS
+    };
+    if report.check && hub.activity.get(peer_id).is_some_and(fresh) {
+        return;
+    }
+    let idle = |old: &Activity| old.state == "idle";
+    if report.ends_wait && hub.activity.get(peer_id).is_some_and(idle) {
+        return;
+    }
+    let clean = |text: Option<&str>, max: usize| {
+        text.map(|t| {
+            t.chars()
+                .filter(|c| !c.is_control())
+                .take(max)
+                .collect::<String>()
+        })
+        .filter(|t| !t.is_empty())
+    };
+    let since = hub
+        .activity
+        .get(peer_id)
+        .filter(|old| old.state == report.state)
+        .map_or(now, |old| old.since);
+    let activity = Activity {
+        state: report.state.clone(),
+        since,
+        observed_at: now,
+        source: clean(report.source.as_deref(), 32).unwrap_or_default(),
+        reason: clean(report.reason.as_deref(), 120),
+    };
+    hub.activity.insert(peer_id.to_string(), activity);
+}
+
+/* a report from a session that is not the peer's current one, or from no session for a
+peer that has one, is refused, so a runtime that lost its name cannot paint the new
+holder's state */
+async fn report_activity(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<ActivityReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    check_activity(&req.report)?;
+    let session = req.session_id.unwrap_or_default();
+    let mut hub = app.inner.lock().await;
+    let peer = match req.peer_id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => resolve(&hub, id),
+        None if !session.is_empty() => hub
+            .peers
+            .values()
+            .filter(|peer| peer.session_id == session)
+            .max_by_key(|peer| peer.last_seen),
+        None => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "peer_id or session_id is required"})),
+            ))
+        }
+    };
+    let Some(peer) = peer else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown peer"})),
+        ));
+    };
+    if !peer.session_id.is_empty() && peer.session_id != session {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "not the peer's current session", "peer_id": peer.peer_id})),
+        ));
+    }
+    let peer_id = peer.peer_id.clone();
+    let now = now_unix();
+    if let Some(peer) = hub.peers.get_mut(&peer_id) {
+        peer.last_seen = now;
+    }
+    set_activity(&mut hub, &peer_id, &req.report, now);
+    let activity = &hub.activity[&peer_id];
+    Ok(Json(
+        json!({"ok": true, "peer_id": peer_id, "state": activity.state, "since": activity.since}),
+    ))
+}
+
+async fn snapshot(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<SnapshotQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let circle = q.circle.filter(|c| !c.is_empty());
+    let hub = app.inner.lock().await;
+    let mut jobs: Vec<&Job> = hub
+        .jobs
+        .values()
+        .filter(|job| circle.as_deref().is_none_or(|c| job.circle == c))
+        .collect();
+    jobs.sort_by(|a, b| a.job_id.cmp(&b.job_id));
+    let ask_ids: BTreeSet<&String> = jobs.iter().filter_map(|job| job.ask_id.as_ref()).collect();
+    let (mut asks, mut missing_asks) = (Vec::new(), Vec::new());
+    for cid in ask_ids {
+        match hub.asks.get(cid) {
+            Some(ask) => asks.push(ask),
+            None => missing_asks.push(cid.clone()),
+        }
+    }
+    /* a recipient is a fixed peer_id: once that peer is gone, whoever took its name since is
+    someone else. Assignees and senders are names, resolved the way the hub will use them */
+    let recipients: BTreeSet<&str> = asks.iter().map(|ask| ask.to_peer_id.as_str()).collect();
+    let mut names: BTreeSet<&str> = BTreeSet::new();
+    for job in &jobs {
+        names.extend(job.assigned_peer.as_deref());
+        names.insert(&job.from_peer);
+    }
+    for ask in &asks {
+        names.insert(&ask.from_peer);
+    }
+    /* a worker's running jobs in every circle, so a filtered view can still tell whether
+    the one job it shows is the worker's only one */
+    let mut running: HashMap<&str, usize> = HashMap::new();
+    for job in hub.jobs.values().filter(|job| job.state == "running") {
+        /* a job run by hand has no ask and counts for whoever its assignee's name resolves
+        to, as the TUI reads it; a job whose ask is gone counts for nobody */
+        let worker = match &job.ask_id {
+            Some(cid) => hub.asks.get(cid).map(|ask| ask.to_peer_id.as_str()),
+            None => job
+                .assigned_peer
+                .as_deref()
+                .and_then(|name| resolve(&hub, name))
+                .map(|peer| peer.peer_id.as_str()),
+        };
+        if let Some(worker) = worker {
+            *running.entry(worker).or_default() += 1;
+        }
+    }
+    let lookups = recipients
+        .into_iter()
+        .map(|id| (id, hub.peers.get(id), false))
+        .chain(
+            names
+                .into_iter()
+                .map(|name| (name, resolve(&hub, name), true)),
+        );
+    let (mut peers, mut missing_peers, mut seen) = (Vec::new(), BTreeSet::new(), HashSet::new());
+    for (reference, found, name) in lookups.filter(|(reference, _, _)| !reference.is_empty()) {
+        match found {
+            Some(peer) if seen.insert(peer.peer_id.clone()) => peers.push(json!({
+                "peer_id": peer.peer_id, "name": peer.name, "backend": peer.backend,
+                "circle": peer.circle, "status": peer.status, "last_seen": peer.last_seen,
+                "activity": hub.activity.get(&peer.peer_id),
+                "running": running.get(peer.peer_id.as_str()).copied().unwrap_or(0),
+            })),
+            Some(_) => {}
+            /* "anonymous" as a name stands for no sender, unless a peer really took it; a
+            recipient id that is gone is missing whatever it reads */
+            None if name && reference == "anonymous" => {}
+            None => {
+                missing_peers.insert(reference.to_string());
+            }
+        }
+    }
+    let detail = q
+        .detail
+        .as_deref()
+        .and_then(|id| jobs.iter().find(|job| job.job_id == id))
+        .map(|job| {
+            json!({
+                "job_id": job.job_id, "title": job.title, "prompt": job.prompt, "result": job.result_summary,
+            })
+        });
+    let body = json!({
+        "schema_version": 1,
+        "captured_at": now_unix(),
+        "hub_epoch": hub.epoch,
+        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true},
+        "jobs": jobs.iter().map(|job| json!({
+            "job_id": job.job_id, "title": preview(&job.title), "title_len": job.title.chars().count(), "state": job.state,
+            "assigned_peer": job.assigned_peer, "from_peer": job.from_peer, "circle": job.circle,
+            "depends_on": job.depends_on, "ask_id": job.ask_id, "dispatch": job.dispatch,
+            "created_at": job.created_at, "finished_at": job.finished_at,
+            "prompt": preview(&job.prompt), "prompt_len": job.prompt.chars().count(),
+            "result": job.result_summary.as_deref().map(preview),
+            "result_len": job.result_summary.as_deref().map_or(0, |r| r.chars().count()),
+        })).collect::<Vec<_>>(),
+        "asks": asks.iter().map(|ask| json!({
+            "correlation_id": ask.correlation_id, "from_peer": ask.from_peer, "to_peer": ask.to_peer,
+            "to_peer_id": ask.to_peer_id, "open": ask.open, "failed": ask.failed,
+            "opened_at": ask.opened_at, "closed_at": ask.closed_at, "closed_by": ask.closed_by,
+            "reply": ask.reply.as_deref().map(preview),
+            "reply_len": ask.reply.as_deref().map_or(0, |r| r.chars().count()),
+        })).collect::<Vec<_>>(),
+        "peers": peers,
+        "missing": {"asks": missing_asks, "peers": missing_peers},
+        "detail": detail,
+    });
+    drop(hub);
+    Ok(Json(body))
 }
 
 async fn health() -> Json<Value> {
@@ -1352,6 +1661,9 @@ async fn register_peer(
     Json(req): Json<RegisterReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
+    if let Some(report) = &req.activity {
+        check_activity(report)?;
+    }
     let mut hub = app.inner.lock().await;
     /* a dead peer still holds its name until a read path prunes it; reclaim it here so a
     restarted runtime gets its own name back instead of drifting to -2, -3, ... */
@@ -1456,6 +1768,7 @@ async fn register_peer(
     let binding = !peer.session_id.is_empty() && old.is_some_and(|row| row.session_id.is_empty());
     if replaced {
         eprintln!("amesh: dropping backlog of {peer_id}: it belongs to another session");
+        hub.activity.remove(&peer_id);
         hub.owed.remove(&peer_id);
         hub.inbox.remove(&peer_id);
         if !hub.recv_live.contains(&peer_id) {
@@ -1529,6 +1842,11 @@ async fn register_peer(
     let mut replies = queue_replies(&mut hub, replies);
     replies.extend(to_push.into_iter().map(|event| (peer_id.clone(), event)));
     persist_ok(&mut hub)?;
+    /* only once the registration is on disk: a failed one rolls the peer back to its old
+    session, and activity kept in memory would outlive the rollback */
+    if let Some(report) = &req.activity {
+        set_activity(&mut hub, &peer_id, report, now_unix());
+    }
     if replaced || binding {
         if let Some((_, tx)) = hub.sockets.get(&peer_id) {
             let kind = if replaced { REPLACED } else { "bound" };
@@ -1560,6 +1878,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
         .collect();
     for id in &closed {
         hub.sockets.remove(id);
+        hub.activity.remove(id);
         changed = true;
     }
     let drop: Vec<String> = hub
@@ -1583,6 +1902,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
             .unwrap_or_default();
         hub.peers.remove(id);
         hub.mcp_servers.remove(id);
+        hub.activity.remove(id);
         /* what a session-bound peer is still owed, a queued message or an ask it has not
         answered, stays behind for that session, drainer or not: freed, the name would hand
         it to the next session that takes it. A peer with no known session has nobody to
@@ -1684,6 +2004,8 @@ async fn open_ask(
         reply: None,
         failed: false,
         closed_at: None,
+        opened_at: Some(now_unix()),
+        closed_by: None,
     };
     hub.asks.insert(cid.clone(), ask.clone());
     let mut event = json!({
@@ -1756,6 +2078,9 @@ async fn ack_ask(
         row.closed_at = Some(now_unix());
         row.reply = req.message.clone();
         row.failed = req.failed;
+        /* a named ack was checked above to come from the recipient */
+        let named = req.from_peer.as_deref().is_some_and(|id| !id.is_empty());
+        row.closed_by = Some(if named { "recipient" } else { "hand" }.into());
     }
     /* every runtime renders the text alone, so the outcome travels inside it */
     let message = match (&req.message, req.failed) {
@@ -2663,6 +2988,7 @@ async fn create_job(
         from_peer: req.from_peer.unwrap_or_default(),
         nudge_at: None,
         finished_at: None,
+        created_at: Some(now_unix()),
     };
     hub.jobs.insert(job_id.clone(), job.clone());
     persist_ok(&mut hub)?;
@@ -2749,6 +3075,7 @@ fn close_job_ask(hub: &mut Hub, job: &Job, reply: String, failed: bool) -> Optio
     ask.open = false;
     ask.closed_at = Some(now_unix());
     ask.failed = failed;
+    ask.closed_by = Some("hand".into());
     ask.reply = Some(reply);
     let worker = ask.to_peer_id.clone();
     let ack = json!({
@@ -3446,6 +3773,8 @@ fn advance_jobs(hub: &mut Hub) {
                 reply: None,
                 failed: false,
                 closed_at: None,
+                opened_at: Some(now_unix()),
+                closed_by: None,
             },
         );
         events.push(json!({
@@ -3620,6 +3949,8 @@ async fn tick_schedules(app: &App) {
                 reply: None,
                 failed: false,
                 closed_at: None,
+                opened_at: Some(now_unix()),
+                closed_by: None,
             };
             hub.asks.insert(cid.clone(), ask.clone());
             (
@@ -4682,6 +5013,7 @@ async fn close_connection(
         if let Some(peer) = hub.peers.get_mut(peer_id) {
             peer.status = "offline".into();
         }
+        hub.activity.remove(peer_id);
         dirty = true;
     }
     while let Ok(event) = rx.try_recv() {

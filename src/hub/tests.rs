@@ -392,6 +392,8 @@ async fn a_reply_to_a_departed_peer_leaves_no_permanent_queue() {
             reply: None,
             failed: false,
             closed_at: None,
+            opened_at: None,
+            closed_by: None,
         },
     );
     persist(&mut hub).unwrap();
@@ -1261,6 +1263,7 @@ fn job_circle_survives_restart_and_old_schema() {
                 dispatch: false,
                 nudge_at: None,
                 finished_at: None,
+                created_at: None,
             },
         );
         persist(&mut hub).unwrap();
@@ -3531,6 +3534,8 @@ fn abandoned_hub(path: &Path) -> Hub {
             reply: None,
             failed: false,
             closed_at: None,
+            opened_at: None,
+            closed_by: None,
         },
     );
     persist_then_deliver(
@@ -5055,6 +5060,8 @@ async fn legacy_ids_with_control_characters_never_reach_a_primer() {
                     reply: None,
                     failed: false,
                     closed_at: None,
+                    opened_at: None,
+                    closed_by: None,
                 },
             );
         }
@@ -5307,6 +5314,8 @@ async fn over_long_legacy_backlogs_are_kept_for_their_session() {
                 reply: None,
                 failed: false,
                 closed_at: None,
+                opened_at: None,
+                closed_by: None,
             },
         );
         persist(&mut hub).unwrap();

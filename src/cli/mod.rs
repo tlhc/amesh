@@ -17,17 +17,18 @@ use toml_edit::{value, DocumentMut};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-const DAEMON_UNREACHABLE: &str = "amesh daemon unreachable";
+pub(crate) const DAEMON_UNREACHABLE: &str = "amesh daemon unreachable";
 const AMESH_PI_HOOK_MARK: &str = "export default function AmeshHooks";
 const AMESH_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session"),
     ("UserPromptSubmit", "prompt"),
     ("Stop", "stop"),
     ("Notification", "notification"),
+    ("PostToolUse", "tool"),
 ];
 pub(crate) const LOG_CAP: u64 = 1_000_000;
 
-const HELP: &str = "amesh [serve|status|doctor|gc|setup|uninstall|peer|jobs|schedule|hook|mcp]
+const HELP: &str = "amesh [serve|status|doctor|gc|setup|uninstall|peer|jobs|schedule|tui|hook|mcp]
 
 daemon
   serve                            Start the daemon
@@ -40,6 +41,9 @@ daemon
                                    Default peer_id is {folder}-{backend}, then -2; --peer-id / AMESH_PEER_ID overrides
   uninstall [pi|claude-code|codex] [--home DIR] [--apply true]
                                    Default dry-run. --apply true strips amesh hooks and MCP entries.
+  tui [--circle NAME | --all] [--ascii] [--no-color] [--no-anim]
+                                   Watch jobs as dependency flows; read-only. Default circle: this directory's.
+                                   Colours from tui-theme.json beside the state file (~/.amesh) when present.
 
 mesh
   peer list [--cwd PATH] [--circle CIRCLE]
@@ -128,6 +132,7 @@ fn dispatch(args: &[String]) -> Result<()> {
             }
         }
         "mcp" => return mcp(&args[1..]),
+        "tui" => return crate::tui::run(&args[1..]),
         _ => {
             return Err(format!(
                 "unknown command or arguments; run amesh --help: {}",
@@ -214,6 +219,10 @@ impl Args {
 }
 
 fn curl_max_time(path: &str, body: Option<&Value>) -> String {
+    /* activity is only shown: each report gets a one-second HTTP request budget */
+    if path == "/activity" {
+        return "1".into();
+    }
     if path.starts_with("/asks/") && path.ends_with("/wait") {
         return "55".into();
     }
@@ -227,7 +236,7 @@ fn curl_max_time(path: &str, body: Option<&Value>) -> String {
     "5".into()
 }
 
-fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value> {
+pub(crate) fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value> {
     let bind: SocketAddr = std::env::var("AMESH_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8378".into())
         .parse()?;
@@ -305,7 +314,7 @@ fn local_spawn_bind(addr: SocketAddr) -> bool {
     }
 }
 
-fn state_file() -> PathBuf {
+pub(crate) fn state_file() -> PathBuf {
     let raw = if let Ok(path) = std::env::var("AMESH_STATE") {
         if path.is_empty() {
             default_state_file()
@@ -1860,7 +1869,7 @@ fn install_hooks(
         DocumentMut::new()
     };
     for &(event, subcommand) in AMESH_HOOK_EVENTS {
-        if event == "Notification" && backend != "claude-code" {
+        if matches!(event, "Notification" | "PostToolUse") && backend != "claude-code" {
             continue;
         }
         let mut command = format!(
@@ -1888,7 +1897,9 @@ fn install_hooks(
                 .is_some_and(|handlers| !handlers.is_empty())
         });
         let matcher = if event == "Notification" {
-            Some("idle_prompt")
+            Some("permission_prompt|idle_prompt")
+        } else if event == "PostToolUse" {
+            Some("*")
         } else if backend == "codex" && event == "SessionStart" {
             Some("startup|resume|clear")
         } else {
@@ -1897,6 +1908,11 @@ fn install_hooks(
         let mut group = json!({"hooks": [{"type": "command", "command": command, "timeout": 10}]});
         if let Some(matcher) = matcher {
             group["matcher"] = json!(matcher);
+        }
+        /* runs after every tool call only to say the turn goes on, so Claude never waits
+        for it */
+        if event == "PostToolUse" {
+            group["hooks"][0]["async"] = json!(true);
         }
         if backend == "codex" {
             let label = match event {
@@ -2610,7 +2626,9 @@ async fn app_inject(sink: &mut AppSink, text: &str) -> Result<()> {
     )
     .await?;
     sink.rpc_id += 1;
-    if crate::bridge::thread_is_idle(&read) {
+    /* a turn the server failed leaves the thread in systemError; the next message may start
+    a turn there, as after an idle one */
+    if crate::bridge::turn_is_over(&read) {
         sink.active_turn = None;
     } else if sink.active_turn.is_none() {
         return Err("thread busy".into());
@@ -3031,11 +3049,40 @@ async fn hook_ws_once(
                 if let Some(sink) = app.as_mut() {
                     if !flush_app_sink(sink, queued, owner.as_deref()).await {
                         app = None;
+                    } else if queued.is_empty() {
+                        check_turn(sink, peer_id, owner.as_deref()).await;
                     }
                 }
             }
         }
     }
+}
+
+/* Codex runs no Stop hook for a turn that fails or is interrupted, so the drainer reads its
+thread on every beat and reports an idle one as a check; the hub lets a check yield to a
+turn that reported work within its grace. A thread that cannot be read reports nothing */
+async fn check_turn(sink: &mut AppSink, peer_id: &str, owner: Option<&str>) {
+    let read = app_rpc(
+        &mut sink.ws,
+        sink.rpc_id,
+        "thread/read",
+        json!({"threadId": sink.thread_id}),
+    )
+    .await;
+    sink.rpc_id += 1;
+    if !read.as_ref().is_ok_and(crate::bridge::turn_is_over) {
+        return;
+    }
+    sink.active_turn = None;
+    let mut body =
+        json!({"peer_id": peer_id, "state": "idle", "source": "codex-check", "check": true});
+    if let Some(session) = owner.filter(|session| !session.is_empty()) {
+        body["session_id"] = json!(session);
+    }
+    /* not awaited: a hub that answers slowly must not hold the beat that delivers messages */
+    drop(tokio::task::spawn_blocking(move || {
+        request("POST", "/activity", Some(body)).is_ok()
+    }));
 }
 
 fn codex_thread_env() -> Option<String> {
@@ -3275,6 +3322,18 @@ fn mesh_primer(peer_id: &str, backend: &str, circle: &str) -> String {
     text
 }
 
+/* best effort: the request gets a one-second budget and its errors are ignored; starting
+the hook and scheduling it take their own time */
+fn report_activity(session: &str, state: &str, source: &str, ends_wait: bool) {
+    let _ = request(
+        "POST",
+        "/activity",
+        Some(
+            json!({"session_id": session, "state": state, "source": source, "ends_wait": ends_wait}),
+        ),
+    );
+}
+
 fn hook(raw: &[String]) -> Result<()> {
     if matches!(raw.first().map(String::as_str), Some("ws")) {
         return hook_ws(&raw[1..]);
@@ -3284,6 +3343,9 @@ fn hook(raw: &[String]) -> Result<()> {
         Some("prompt" | "UserPromptSubmit") => "UserPromptSubmit",
         Some("stop" | "Stop") => "Stop",
         Some("notification" | "Notification") => "Notification",
+        Some("tool" | "PostToolUse") => "PostToolUse",
+        Some("idle") => "Idle",
+        Some("work") => "Work",
         _ => return Err("unknown hook event".into()),
     };
     let args = Args::parse(&raw[1..], &["backend", "peer-id"])?;
@@ -3291,6 +3353,26 @@ fn hook(raw: &[String]) -> Result<()> {
     let backend = args.get("backend", "claude-code");
     if !["pi", "claude-code", "codex"].contains(&backend.as_str()) {
         return Err("unsupported hook backend".into());
+    }
+    /* a tool finishing (Claude) or the agent settling (pi) only reports activity: no
+    registration, no daemon start, nothing printed but what pi parses. A tool's output can be
+    any size, so only session_id is kept from the stream, and a bad payload stays quiet */
+    if matches!(event, "PostToolUse" | "Idle" | "Work") {
+        #[derive(serde::Deserialize)]
+        struct Session {
+            #[serde(default)]
+            session_id: String,
+        }
+        let found = serde_json::from_reader::<_, Session>(io::stdin().lock());
+        if let Some(session) = found.ok().map(|s| s.session_id).filter(|s| !s.is_empty()) {
+            let state = if event == "Idle" { "idle" } else { "work" };
+            let source = format!("{backend}-{}", raw[0]);
+            report_activity(&session, state, &source, event == "PostToolUse");
+        }
+        if backend == "pi" {
+            println!("{{}}");
+        }
+        return Ok(());
     }
     let mut input = String::new();
     io::stdin()
@@ -3300,13 +3382,15 @@ fn hook(raw: &[String]) -> Result<()> {
         return Err("hook input exceeds 1 MiB".into());
     }
     let payload: Value = serde_json::from_str(&input)?;
+    let session = payload["session_id"].as_str().filter(|id| !id.is_empty());
+    /* Claude stops for good after a stop the hook already blocked once */
     if event == "Stop" && payload["stop_hook_active"] == true {
+        if let Some(session) = session.filter(|_| backend != "pi") {
+            report_activity(session, "idle", &format!("{backend}-stop"), false);
+        }
         return Ok(());
     }
-    let session = payload["session_id"]
-        .as_str()
-        .filter(|id| !id.is_empty())
-        .ok_or("hook requires session_id")?;
+    let session = session.ok_or("hook requires session_id")?;
     let path = payload["cwd"]
         .as_str()
         .filter(|cwd| !cwd.is_empty())
@@ -3318,6 +3402,23 @@ fn hook(raw: &[String]) -> Result<()> {
         .unwrap_or_else(|| project_circle(&path));
     let mut body =
         json!({"path": path, "backend": backend, "circle": circle, "session_id": session});
+    /* pi's stop is agent_end, which can still have steers queued: pi reports idle when the
+    agent settles instead */
+    let activity = match (event, payload["notification_type"].as_str()) {
+        ("UserPromptSubmit", _) => {
+            Some(json!({"state": "work", "source": format!("{backend}-prompt")}))
+        }
+        ("Notification", Some("permission_prompt")) => Some(
+            json!({"state": "wait", "source": "claude-permission", "reason": payload["message"].as_str().unwrap_or("permission")}),
+        ),
+        ("Notification", Some("idle_prompt")) => {
+            Some(json!({"state": "idle", "source": "claude-idle"}))
+        }
+        _ => None,
+    };
+    if let Some(activity) = activity {
+        body["activity"] = activity;
+    }
     if let Some(id) = claimed_peer_id(&args) {
         body["peer_id"] = json!(id.clone());
         body["name"] = json!(id);
@@ -3384,6 +3485,8 @@ fn hook(raw: &[String]) -> Result<()> {
     } else if event == "Stop" {
         if !asks.is_empty() || inbox.map(|v| !v.is_empty()).unwrap_or(false) {
             println!("{}", json!({"decision": "block", "reason": context}));
+        } else {
+            report_activity(session, "idle", &format!("{backend}-stop"), false);
         }
     } else if event == "Notification" {
         if !asks.is_empty() || inbox.map(|v| !v.is_empty()).unwrap_or(false) {

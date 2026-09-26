@@ -85,6 +85,22 @@ fn thread_idle_status_clears_steer() {
 }
 
 #[test]
+fn a_failed_turn_leaves_the_thread_in_system_error() {
+    let status = |kind: &str| json!({"result": {"thread": {"status": {"type": kind}}}});
+    assert!(turn_is_over(&status("idle")));
+    assert!(
+        turn_is_over(&status("systemError")),
+        "a turn the server failed"
+    );
+    assert!(!turn_is_over(&status("active")));
+    assert!(
+        !turn_is_over(&status("notLoaded")),
+        "an unknown status is left alone"
+    );
+    assert!(!turn_is_over(&json!({})));
+}
+
+#[test]
 fn steer_when_busy() {
     assert_eq!(inject_method(None), "turn/start");
     assert_eq!(inject_method(Some("t1")), "turn/steer");

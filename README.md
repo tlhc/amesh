@@ -117,6 +117,33 @@ amesh peer ack ask-5e6f7a8b --message "no fixture" --failed true --from-peer ame
 - Reconnect MCP to load new tool parameters; until then use `amesh peer ack <cid> --failed true --from-peer <id>`.
 - Pin workers with `amesh setup <runtime> --peer-id`: after a restart under a new name, work waits on the old identity until reassigned.
 
+### Watching jobs
+
+`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`.
+
+```bash
+amesh tui                    # this directory's circle
+amesh tui --all --ascii      # every circle, ASCII only
+```
+
+- Each chain gets its own screen, with numbered jobs under a `chain <name> · done/total` header; jobs without dependencies share one block. The selected job's card shows its result or failure reason, worker, ask and dependencies, plus the command to retry it, nudge its worker, or hand it to another peer.
+- Keys:
+  - `j`/`k`: move along the chain; `h`/`l`: move within a stage
+  - digits: jump by number; `f`: show letter hints
+  - `/`: search all chains; `n`/`N`: step through matches
+  - `Tab`/`Shift-Tab`: next/previous chain
+  - `Enter`: open the full card (scroll with `j`/`k`, the arrows, `space`/`b`, `PgDn`/`PgUp`, `g`/`G`; `Esc` goes back)
+  - `r`: refresh; `q`: quit
+- Activity:
+  - spinner: the worker is busy with this job (`--no-anim` freezes it)
+  - `IDLE!`: the worker stopped with the ask open; the card gives a nudge command
+  - blinking `WAIT!`: Claude Code waits on a permission
+  - hooks installed before this reporting send none; rerun `amesh setup`
+- Colours:
+  - `tui-theme.json` next to the state file (default `~/.amesh`) overrides the roles `text title dim line done run fail wait worker near select select_bg`
+  - without `COLORTERM=truecolor`, colours map to the nearest of 256
+  - `NO_COLOR` or `--no-color` drops colour; every state keeps its own glyph
+
 ## Environment
 
 | variable | default |
@@ -149,7 +176,7 @@ Set `AMESH_TOKEN` before exposing the port and restart the hub after changing it
 - The event ring keeps the last 500 entries and clears on restart; it is not an audit log.
 - On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.
-- An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`) or the ask `failed` flag. Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
+- An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) or how an ask closed (`closed_by`). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
 - `gc` and `uninstall` are dry-run until `--apply true`. Attachments are left alone unless `--attachments-days N`.
 
 ## Troubleshooting
