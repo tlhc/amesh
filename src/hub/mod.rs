@@ -320,6 +320,8 @@ fn attachments_dir(app: &App) -> PathBuf {
         .join("attachments")
 }
 
+const WAL_LIMIT: i64 = 1 << 20;
+
 fn open_db(path: &Path) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -327,7 +329,13 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     let db = Connection::open(path).map_err(|e| e.to_string())?;
     db.busy_timeout(Duration::from_millis(5000))
         .map_err(|e| e.to_string())?;
+    /* every change rewrites the whole state, so auto_vacuum's page map would slow every
+    write; a VACUUM gives space back instead, here and after a sweep deletes rows. The log is
+    cut back to WAL_LIMIT whenever it resets */
+    let mode = auto_vacuum(&db);
     db.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|e| e.to_string())?;
+    db.pragma_update(None, "journal_size_limit", WAL_LIMIT)
         .map_err(|e| e.to_string())?;
     db.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
     let _ = db.execute(
@@ -369,7 +377,46 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     ] {
         let _ = db.execute(column, []);
     }
+    /* a file with free pages, or left in auto_vacuum by an earlier amesh, is rebuilt; nothing
+    is written otherwise, so another writer never stops a start. Best effort: a file busy
+    with another connection stays as it is, still usable, and is tried again next start */
+    if mode.is_some_and(|mode| mode != 0) || free_pages(&db) > 0 {
+        if mode != Some(0) {
+            let _ = db.pragma_update(None, "auto_vacuum", "NONE");
+        }
+        if let Err(error) = compact(&db).and_then(|()| cut_back_log(&db)) {
+            eprintln!("amesh: {}: {error}", path.display());
+        }
+    }
     Ok(db)
+}
+
+fn auto_vacuum(db: &Connection) -> Option<i64> {
+    db.pragma_query_value(None, "auto_vacuum", |row| row.get(0))
+        .ok()
+}
+
+fn free_pages(db: &Connection) -> i64 {
+    db.pragma_query_value(None, "freelist_count", |row| row.get(0))
+        .unwrap_or(0)
+}
+
+/* the rebuilt file lands in the log first; a passive checkpoint moves it back without
+waiting for readers, so the file itself shrinks now, and deleted rows' text goes with it */
+fn compact(db: &Connection) -> Result<(), String> {
+    db.execute_batch("VACUUM; PRAGMA wal_checkpoint(PASSIVE);")
+        .map_err(|error| format!("could not compact: {error}"))
+}
+
+/* a reader still on an older snapshot holds the log; it is cut back at its next reset */
+fn cut_back_log(db: &Connection) -> Result<(), String> {
+    match db.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(0) => Ok(()),
+        Ok(_) => Err("the log is in use; it is cut back at its next reset".into()),
+        Err(error) => Err(format!("could not cut back the log: {error}")),
+    }
 }
 
 fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
@@ -3534,6 +3581,10 @@ impl Sweep {
             && self.jobs.is_empty()
             && self.asks.is_empty()
     }
+
+    fn deleted(&self) -> bool {
+        !self.jobs.is_empty() || !self.asks.is_empty()
+    }
 }
 
 fn sweep_plan(hub: &Hub, now: u64) -> Sweep {
@@ -3666,6 +3717,11 @@ async fn gc_state(
         persist_ok(&mut hub)?;
     }
     prune_batches(&mut hub);
+    if swept.deleted() {
+        if let Err(error) = compact(&hub.db) {
+            eprintln!("amesh: {error}");
+        }
+    }
     Ok(Json(json!(swept)))
 }
 
@@ -3825,9 +3881,12 @@ fn advance_jobs(hub: &mut Hub) {
         changed = true;
     }
     let swept = now >= hub.sweep_at;
+    let mut deleted = false;
     if swept {
         hub.sweep_at = now + config.sweep_secs;
-        changed |= !sweep(hub, now).is_empty();
+        let gone = sweep(hub, now);
+        deleted = gone.deleted();
+        changed |= !gone.is_empty();
     }
     if !changed {
         if swept {
@@ -3844,6 +3903,11 @@ fn advance_jobs(hub: &mut Hub) {
         prune_batches(hub);
     }
     deliver_queued(hub, queued);
+    if deleted {
+        if let Err(error) = compact(&hub.db) {
+            eprintln!("amesh: {error}");
+        }
+    }
 }
 
 fn blocking_dependency<'a>(hub: &'a Hub, job: &'a Job) -> Option<(&'a str, &'a str)> {

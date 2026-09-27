@@ -178,6 +178,7 @@ Set `AMESH_TOKEN` before exposing the port and restart the hub after changing it
 - `GET /peers` (and so `amesh status` / `peer list`) probes sockets, drops closed ones, then removes peers with no live WebSocket and `last_seen` older than 30s, and may persist. A removed peer with a session keeps its name for that session while messages or open asks wait for it, up to 24h; then those asks close with a reason. `gc` dry-run can hit this path too; `--home` skips the probe.
 - A pinned name is for one session at a time. A different session claiming it closes pending asks, notifies their askers, and discards undelivered messages.
 - The event ring keeps the last 500 entries and clears on restart; it is not an audit log.
+- The hub reclaims unused database space and trims its runtime logs.
 - On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.
 - An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) or how an ask closed (`closed_by`). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.

@@ -3176,8 +3176,11 @@ pub(crate) fn cap_log(path: &Path) {
     }
 }
 
+/* only logs known to be opened for appending, which keep writing at the new end once cut:
+amesh's own, and codex-app-server.log, which a launch agent writes next to the state file.
+Only plain files: capping follows a link to whatever it names, and opening a pipe for
+writing waits for a reader */
 pub(crate) fn cap_runtime_logs(dir: &Path) {
-    cap_log(&dir.join("serve.log"));
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -3186,7 +3189,10 @@ pub(crate) fn cap_runtime_logs(dir: &Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        if name.starts_with("hook-ws-") && name.ends_with(".log") {
+        let known = matches!(name, "serve.log" | "codex-app-server.log")
+            || (name.starts_with("hook-ws-") && name.ends_with(".log"));
+        let plain = entry.file_type().is_ok_and(|kind| kind.is_file());
+        if known && plain {
             cap_log(&entry.path());
         }
     }
