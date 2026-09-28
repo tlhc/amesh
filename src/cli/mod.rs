@@ -2694,12 +2694,13 @@ fn hook_ws(raw: &[String]) -> Result<()> {
     })
 }
 
-fn hook_ws_retry_secs() -> u64 {
-    std::env::var("AMESH_WS_RETRY_SECS")
+/* a timing a test can shorten; unset, zero or unreadable keeps the default */
+pub(crate) fn env_secs(name: &str, default: u64) -> u64 {
+    std::env::var(name)
         .ok()
         .and_then(|value| value.parse().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(60)
+        .unwrap_or(default)
 }
 
 /* a queued inbound frame and the session it was received for, if the stream named one */
@@ -2805,7 +2806,7 @@ fn remember_hook_inbound(accepted: &mut VecDeque<String>, id: Option<&str>) {
 
 async fn hook_ws_loop(peer_id: String, backend: String) -> Result<()> {
     sweep_stale_runtime_files();
-    let retry = Duration::from_secs(hook_ws_retry_secs());
+    let retry = Duration::from_secs(env_secs("AMESH_WS_RETRY_SECS", 60));
     let mut deadline = Instant::now() + retry;
     let mut queued = VecDeque::new();
     let mut depth_warned = false;
@@ -2893,7 +2894,7 @@ async fn hook_ws_once(
     be flushed: the heartbeat's first tick is ready before any frame */
     let mut greeted = false;
     let mut warned = false;
-    let mut beat = tokio::time::interval(Duration::from_secs(10));
+    let mut beat = tokio::time::interval(Duration::from_secs(env_secs("AMESH_WS_BEAT_SECS", 10)));
     loop {
         tokio::select! {
             msg = ws.next() => {

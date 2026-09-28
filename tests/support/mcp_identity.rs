@@ -5,15 +5,16 @@ use tokio_tungstenite::tungstenite::Message;
 
 fn identity_probe_case(case: &str, target: Option<&str>) {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     sandbox.json(
         &[
             "peer",
             "register",
             "--peer-id",
-            "worker",
+            worker,
             "--name",
-            "worker",
+            worker,
             "--backend",
             "codex",
             "--path",
@@ -55,11 +56,11 @@ fn identity_probe_case(case: &str, target: Option<&str>) {
                                     continue;
                                 }
                                 let identity = match scenario.as_str() {
-                                    "duplicate" => "worker",
+                                    "duplicate" => worker,
                                     "missing" => "someone-else",
-                                    "target-first" if !own => "worker",
+                                    "target-first" if !own => worker,
                                     "target-first" => "someone-else",
-                                    _ if own => "worker",
+                                    _ if own => worker,
                                     _ => "worker-2",
                                 };
                                 json!({"content":[{"type":"text","text":identity}]})
@@ -75,13 +76,13 @@ fn identity_probe_case(case: &str, target: Option<&str>) {
         });
         let log_path = home.join("hook.log");
         let log = fs::File::create(&log_path).unwrap();
-        let mut hook = KillChild(Some(sandbox.command().args(["hook", "ws", "--peer-id", "worker", "--backend", "codex"])
+        let mut hook = KillChild(Some(sandbox.command().args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
             .env("CODEX_HOME", &home).stderr(Stdio::from(log)).spawn().unwrap()));
-        sandbox.json(&["peer", "notify", "worker", "identity-probe-marker"], None);
+        sandbox.json(&["peer", "notify", worker, "identity-probe-marker"], None);
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             let peers = sandbox.json(&["peer", "list"], None);
-            let peer = peers.as_array().unwrap().iter().find(|peer| peer["peer_id"] == "worker").unwrap();
+            let peer = peers.as_array().unwrap().iter().find(|peer| peer["peer_id"] == worker).unwrap();
             if let Some(target) = target {
                 if peer["session_id"] == target && calls.lock().unwrap().iter().any(|r| r["method"] == "turn/start") { break; }
                 assert!(Instant::now() < deadline, "identity was not bound: {peer}; log={}", fs::read_to_string(&log_path).unwrap());
@@ -624,9 +625,10 @@ fn codex_mcp_binds_by_its_nonce_without_meta_while_another_thread_stalls() {
 /* the previous run of a pinned thread: its row still carries session A and an open ask */
 fn pinned_after_a_previous_run() -> (Sandbox, PathBuf) {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "A");
-    sandbox.json(&["peer", "ask", "pinned", "for A only"], None);
+    sandbox.json(&["peer", "ask", pinned, "for A only"], None);
     let home = PathBuf::from(format!("/tmp/ap-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir_all(&home).unwrap();
     (sandbox, home)
@@ -635,25 +637,26 @@ fn pinned_after_a_previous_run() -> (Sandbox, PathBuf) {
 #[test]
 fn codex_pinned_mcp_names_its_thread_before_it_registers_or_drains() {
     let (sandbox, home) = pinned_after_a_previous_run();
-    let mut mcp = Mcp::start(&sandbox, &home, &["--peer-id", "pinned"]);
+    let pinned = sandbox.id("pinned");
+    let mut mcp = Mcp::start(&sandbox, &home, &["--peer-id", pinned]);
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
-        !hook_ws_alive("pinned"),
+        !hook_ws_alive(pinned),
         "no drainer may pick up A's backlog before this thread is known"
     );
-    assert_eq!(row_session(&sandbox, "pinned"), "A");
+    assert_eq!(row_session(&sandbox, pinned), "A");
     let who = mcp.call(whoami(json!({"threadId": "B"})));
-    assert_eq!(who["result"]["content"][0]["text"], "pinned", "{who}");
+    assert_eq!(who["result"]["content"][0]["text"], pinned, "{who}");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !hook_ws_alive("pinned") {
+    while !hook_ws_alive(pinned) {
         assert!(
             Instant::now() < deadline,
             "the drainer starts once B registers"
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert_eq!(row_session(&sandbox, "pinned"), "B");
-    let asks = sandbox.json(&["peer", "asks", "--peer-id", "pinned"], None);
+    assert_eq!(row_session(&sandbox, pinned), "B");
+    let asks = sandbox.json(&["peer", "asks", "--peer-id", pinned], None);
     assert!(
         asks["asks"].as_array().unwrap().is_empty(),
         "A's ask is closed, not handed to B: {asks}"
@@ -665,6 +668,7 @@ fn codex_pinned_mcp_names_its_thread_before_it_registers_or_drains() {
 #[test]
 fn codex_pinned_mcp_without_a_thread_speaks_for_its_pin_unregistered() {
     let (sandbox, home) = pinned_after_a_previous_run();
+    let pinned = sandbox.id("pinned");
     /* a second Codex row in the folder, so only the pin can say who is speaking */
     sandbox.json(
         &[
@@ -681,17 +685,14 @@ fn codex_pinned_mcp_without_a_thread_speaks_for_its_pin_unregistered() {
         ],
         None,
     );
-    let mut mcp = Mcp::start(&sandbox, &home, &["--peer-id", "pinned"]);
+    let mut mcp = Mcp::start(&sandbox, &home, &["--peer-id", pinned]);
     let who = mcp.call(json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "amesh_whoami", "arguments": {}}}));
-    assert_eq!(who["result"]["content"][0]["text"], "pinned", "{who}");
+    assert_eq!(who["result"]["content"][0]["text"], pinned, "{who}");
     std::thread::sleep(Duration::from_millis(1500));
-    assert!(
-        !hook_ws_alive("pinned"),
-        "a pin with no thread never drains"
-    );
-    assert_eq!(row_session(&sandbox, "pinned"), "A", "nor moves the row");
-    let asks = sandbox.json(&["peer", "asks", "--peer-id", "pinned"], None);
+    assert!(!hook_ws_alive(pinned), "a pin with no thread never drains");
+    assert_eq!(row_session(&sandbox, pinned), "A", "nor moves the row");
+    let asks = sandbox.json(&["peer", "asks", "--peer-id", pinned], None);
     assert_eq!(asks["asks"][0]["text"], "for A only", "{asks}");
     mcp.close();
     let _ = fs::remove_dir_all(&home);

@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
-import { test } from "node:test";
+import { test as nodeTest } from "node:test";
+
+/* AMESH_PI_DAEMON_ONLY keeps the session that talks to the daemon, for the run where
+session_start has to start it; the socket retry checks before it are left out and the
+subtests after it skipped, never cut off, so a failure still fails the run */
+const daemonOnly = process.env.AMESH_PI_DAEMON_ONLY === "1";
+let test = nodeTest;
 
 const sockets = [];
 const isolatedSockets = [];
@@ -127,7 +133,7 @@ async function waitUntil(pred, ms) {
   }
   return pred();
 }
-{
+if (!daemonOnly) {
   socketSink = isolatedSockets;
   wsFailRemaining = 1;
   wsAttempts = 0;
@@ -153,7 +159,7 @@ async function waitUntil(pred, ms) {
   assert.equal(wsAttempts, attemptsAtCatch);
   assert.equal(wsFailRemaining, 0);
 }
-{
+if (!daemonOnly) {
   const capSockets = [];
   socketSink = capSockets;
   wsFailRemaining = -1;
@@ -422,6 +428,9 @@ assert.ok(!recvsBeforeDead.includes("evt-dead"));
 await new Promise((resolve) => setTimeout(resolve, 1100));
 assert.equal(sockets.length, afterRetry, "shutdown must cancel reconnect");
 console.log("Pi session_start, before_agent_start and agent_end passed against the daemon");
+if (daemonOnly) {
+  test = (name, body) => nodeTest(name, { skip: true }, body);
+}
 
 const primer = { type: "custom_message", ...messages[0].message };
 const oldRules = { ...primer, content: `${primer.content}\nOld rules.` };

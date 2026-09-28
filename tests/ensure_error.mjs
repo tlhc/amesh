@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import net from "node:net";
 import { dirname, join } from "node:path";
@@ -12,6 +12,13 @@ const root = join(dirname(self), "..");
 const rawSrc = readFileSync(join(root, "src/cli/pi_hook.js"), "utf8");
 const srcHash = createHash("sha256").update(rawSrc).digest("hex");
 const caseName = process.env.AMESH_ENSURE_CASE || "";
+
+/* a case's home goes when its process exits, whether the case passed or not */
+function tempHome(prefix) {
+  const home = mkdtempSync(join(tmpdir(), prefix));
+  process.on("exit", () => rmSync(home, { recursive: true, force: true }));
+  return home;
+}
 
 function freePort() {
   return new Promise((resolve) => {
@@ -57,7 +64,7 @@ const ctx = {
 
 async function runA() {
   delete process.env.AMESH_SKIP_WS;
-  const home = mkdtempSync(join(tmpdir(), "amesh-ensure-A-"));
+  const home = tempHome("amesh-ensure-A-");
   process.env.HOME = home;
   process.env.AMESH_STATE = join(home, "state.db");
   process.env.AMESH_BIND = `127.0.0.1:${await freePort()}`;
@@ -72,7 +79,7 @@ async function runA() {
 
 async function runB() {
   delete process.env.AMESH_SKIP_WS;
-  const home = mkdtempSync(join(tmpdir(), "amesh-ensure-B-"));
+  const home = tempHome("amesh-ensure-B-");
   process.env.HOME = home;
   process.env.AMESH_STATE = join(home, "state.db");
   process.env.AMESH_BIND = `127.0.0.1:${await freePort()}`;
@@ -102,7 +109,7 @@ async function runB() {
 
 async function runTry() {
   delete process.env.AMESH_SKIP_WS;
-  const home = mkdtempSync(join(tmpdir(), "amesh-ensure-try-"));
+  const home = tempHome("amesh-ensure-try-");
   process.env.HOME = home;
   process.env.AMESH_STATE = join(home, "state.db");
   process.env.AMESH_BIND = "127.0.0.1:8378 x";
@@ -133,8 +140,7 @@ if (caseName === "A") {
 } else if (caseName === "try") {
   await runTry();
 } else {
-  const stampDir = join(tmpdir(), "amesh-ensure-probe");
-  mkdirSync(stampDir, { recursive: true });
+  const stampDir = tempHome("amesh-ensure-probe-");
   const stamp = join(stampDir, `from-src-${srcHash.slice(0, 12)}.js`);
   writeFileSync(
     stamp,

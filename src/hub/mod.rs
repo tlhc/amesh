@@ -1915,6 +1915,7 @@ const PEER_ONLINE_SECS: u64 = 30;
 
 fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
     let now = now_unix();
+    let online = crate::cli::env_secs("AMESH_PEER_ONLINE_SECS", PEER_ONLINE_SECS);
     let mut changed = false;
     let mut replies = Vec::new();
     let closed: Vec<String> = hub
@@ -1935,8 +1936,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
             if hub.sockets.contains_key(*id) {
                 return false;
             }
-            now.saturating_sub(hub.peers.get(*id).map(|peer| peer.last_seen).unwrap_or(0))
-                > PEER_ONLINE_SECS
+            now.saturating_sub(hub.peers.get(*id).map(|peer| peer.last_seen).unwrap_or(0)) > online
         })
         .cloned()
         .collect();

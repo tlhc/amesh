@@ -39,20 +39,84 @@ fn isolate_session_env<'a>(command: &'a mut Command, root: &Path) -> &'a mut Com
 struct Sandbox {
     root: PathBuf,
     bind: String,
+    tag: String,
     daemon: Option<Child>,
+    _port: PortLease,
+}
+
+/* a port no other sandbox in this run gets. bind(0) and every outgoing connection draw from
+the ephemeral range, from 32768 on Linux and 49152 on macOS, so a port bind(0) hands out can
+be taken again before the hub binds it; these stay below both. Nothing is bound to check
+one: macOS marks a new socket close-on-exec only after creating it, so a child another test
+spawns in between keeps the listener, and the port with it. A connect holds no port */
+fn sandbox_port() -> (u16, PortLease) {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let start = std::process::id() as usize;
+    loop {
+        let port = 20000 + (start + NEXT.fetch_add(1, Ordering::Relaxed)) % 12000;
+        let port = u16::try_from(port).unwrap();
+        let Some(lease) = lease_port(port) else {
+            continue;
+        };
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+            return (port, lease);
+        }
+    }
+}
+
+/* a suite running beside this one skips a port whose file it cannot lock, and the lock dies
+with its process. Ports belong to the machine, so the files sit in /tmp whatever TMPDIR a
+suite runs under. A file goes on drop while still locked, so a suite that opened it just
+before is left holding a file no longer at that path, which the inode check turns down */
+struct PortLease {
+    path: PathBuf,
+    _lock: fs::File,
+}
+
+impl Drop for PortLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn lease_port(port: u16) -> Option<PortLease> {
+    use std::os::unix::fs::MetadataExt;
+    let path = PathBuf::from(format!("/tmp/amesh-cli-port-{port}"));
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .ok()?;
+    file.try_lock().ok()?;
+    if fs::metadata(&path).ok()?.ino() == file.metadata().ok()?.ino() {
+        Some(PortLease { path, _lock: file })
+    } else {
+        None
+    }
 }
 
 impl Sandbox {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("amesh-cli-{}", uuid::Uuid::new_v4()));
+        let uuid = uuid::Uuid::new_v4();
+        let root = std::env::temp_dir().join(format!("amesh-cli-{uuid}"));
         fs::create_dir_all(&root).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let bind = listener.local_addr().unwrap().to_string();
+        let (port, lease) = sandbox_port();
         Self {
             root,
-            bind,
+            bind: format!("127.0.0.1:{port}"),
+            tag: uuid.simple().to_string()[..8].to_string(),
             daemon: None,
+            _port: lease,
         }
+    }
+
+    /* amesh finds and retires a drainer by the peer id on its command line, machine-wide,
+    so a peer id a drainer runs under is this sandbox's own; leaked so it fits wherever a
+    literal did */
+    fn id(&self, name: &str) -> &'static str {
+        Box::leak(format!("{name}-{}", self.tag).into_boxed_str())
     }
 
     fn command(&self) -> Command {
@@ -114,10 +178,31 @@ impl Sandbox {
     }
 
     fn start(&mut self) {
-        self.daemon = Some(self.command().arg("serve").spawn().unwrap());
+        self.start_with(&[]);
+    }
+
+    /* up once the port answers and this sandbox's own hub is the one listening there */
+    fn start_with(&mut self, env: &[(&str, &str)]) {
+        let daemon = self.daemon.insert(
+            self.command()
+                .arg("serve")
+                .envs(env.iter().copied())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = daemon.id().to_string();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
+            if let Some(status) = daemon.try_wait().unwrap() {
+                panic!("the hub exited before it listened: {status}");
+            }
             if TcpStream::connect(&self.bind).is_ok() {
+                let holders = listen_pids(&self.bind);
+                assert!(
+                    holders.contains(&pid),
+                    "{} is held by {holders:?}, not pid {pid}",
+                    self.bind
+                );
                 break;
             }
             assert!(Instant::now() < deadline, "daemon failed to listen");
@@ -138,38 +223,64 @@ fn listen_pids(bind: &str) -> Vec<String> {
         .collect()
 }
 
-fn kill_listen(bind: &str) {
+/* only listeners started for this sandbox, which all run inside it: a child another test
+spawned while a listener here was being created can hold it too (see sandbox_port) */
+fn kill_listen(bind: &str, root: &Path) {
+    let Ok(root) = root.canonicalize() else {
+        return;
+    };
     let me = std::process::id().to_string();
     for pid in listen_pids(bind) {
-        if pid != me {
+        if pid != me && process_cwd(&pid).is_some_and(|cwd| cwd.starts_with(&root)) {
             let _ = Command::new("kill").args(["-KILL", &pid]).status();
         }
     }
 }
 
-fn sandbox_hook_alive(folder: &str) -> bool {
+fn process_cwd(pid: &str) -> Option<PathBuf> {
+    let output = Command::new("lsof")
+        .args(["-a", "-p", pid, "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n'))
+        .map(PathBuf::from)
+}
+
+fn pattern_alive(pattern: &str) -> bool {
     let output = Command::new("pgrep")
-        .args(["-f", &format!("hook ws --peer-id {folder}($| )")])
+        .args(["-f", pattern])
         .output()
         .expect("pgrep must be available");
     assert!(matches!(output.status.code(), Some(0 | 1)), "pgrep failed");
     output.status.success()
 }
 
-fn stop_sandbox_hooks(folder: &str) {
-    let _ = Command::new("pkill")
-        .args(["-f", &format!("hook ws --peer-id {folder}")])
-        .status();
+/* drainers named after the sandbox folder and those under an id from Sandbox::id, however
+they were started: one a failed assertion left running puts the sandbox back when it exits */
+fn stop_sandbox_hooks(folder: &str, tag: &str) {
+    let patterns = [
+        format!("hook ws --peer-id {folder}"),
+        format!("hook ws --peer-id [^ ]*-{tag}($| )"),
+    ];
+    for pattern in &patterns {
+        let _ = Command::new("pkill").args(["-f", pattern]).status();
+    }
+    let alive = || patterns.iter().any(|pattern| pattern_alive(pattern));
     let deadline = Instant::now() + Duration::from_secs(1);
-    while sandbox_hook_alive(folder) && Instant::now() < deadline {
+    while alive() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    if sandbox_hook_alive(folder) {
+    if alive() {
         eprintln!("sandbox hook still alive after stop: {folder}");
     }
 }
 
-fn serve_log_paths(root: &PathBuf) -> Vec<PathBuf> {
+/* a hub amesh starts logs to serve.log and a drainer it spawns to hook-ws-<peer>.log, both
+in the sandbox, so whoever holds one was started for it; a drainer left running would put
+the sandbox back when it exits */
+fn runtime_log_paths(root: &PathBuf) -> Vec<PathBuf> {
     let mut out = Vec::new();
     fn walk(dir: &PathBuf, depth: u8, out: &mut Vec<PathBuf>) {
         if depth > 3 {
@@ -182,7 +293,13 @@ fn serve_log_paths(root: &PathBuf) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, depth + 1, out);
-            } else if path.file_name().and_then(|name| name.to_str()) == Some("serve.log") {
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name == "serve.log" || name.starts_with("hook-ws-") && name.ends_with(".log")
+                })
+            {
                 out.push(path);
             }
         }
@@ -229,6 +346,10 @@ fn drop_trace(line: &str) {
         .unwrap_or(0);
     let path = drop_trace_path();
     if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
+        /* every suite on the machine appends here */
+        if file.metadata().is_ok_and(|meta| meta.len() > 1_000_000) {
+            let _ = file.set_len(0);
+        }
         let _ = writeln!(file, "{now} {line}");
     }
 }
@@ -236,7 +357,7 @@ fn drop_trace(line: &str) {
 fn holder_snapshot(root: &PathBuf) -> (Vec<u32>, bool) {
     let mut pids = Vec::new();
     let mut failed = false;
-    for log in serve_log_paths(root) {
+    for log in runtime_log_paths(root) {
         match log_holder_pids(&log) {
             Ok(found) => pids.extend(found),
             Err(_) => failed = true,
@@ -247,12 +368,12 @@ fn holder_snapshot(root: &PathBuf) -> (Vec<u32>, bool) {
     (pids, failed)
 }
 
-fn stop_serve_log_holders(root: &PathBuf) {
+fn stop_log_holders(root: &PathBuf) {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         let mut pids = Vec::new();
         let mut failed = false;
-        for log in serve_log_paths(root) {
+        for log in runtime_log_paths(root) {
             match log_holder_pids(&log) {
                 Ok(found) => pids.extend(found),
                 Err(error) => {
@@ -274,7 +395,7 @@ fn stop_serve_log_holders(root: &PathBuf) {
         if Instant::now() >= deadline {
             if !pids.is_empty() || failed {
                 eprintln!(
-                    "stop_serve_log_holders incomplete root={} leftover={pids:?} failed={failed}",
+                    "stop_log_holders incomplete root={} leftover={pids:?} failed={failed}",
                     root.display()
                 );
             }
@@ -1070,13 +1191,13 @@ impl Drop for Sandbox {
             self.bind,
             listen_pids(&self.bind)
         ));
-        stop_sandbox_hooks(&folder);
+        stop_sandbox_hooks(&folder, &self.tag);
         if let Some(child) = self.daemon.as_mut() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        stop_serve_log_holders(&self.root);
-        kill_listen(&self.bind);
+        stop_log_holders(&self.root);
+        kill_listen(&self.bind, &self.root);
         if let Err(error) = fs::remove_dir_all(&self.root) {
             drop_trace(&format!(
                 "remove test={test} root={} first_err={error}",
@@ -1086,8 +1207,8 @@ impl Drop for Sandbox {
                 "sandbox remove first_err test={test} root={} {error}",
                 self.root.display()
             );
-            stop_serve_log_holders(&self.root);
-            kill_listen(&self.bind);
+            stop_log_holders(&self.root);
+            kill_listen(&self.bind, &self.root);
             if let Err(error) = fs::remove_dir_all(&self.root) {
                 eprintln!("sandbox cleanup {}: {error}", self.root.display());
             }
@@ -1114,6 +1235,17 @@ impl Drop for Sandbox {
 }
 
 struct KillChild(Option<Child>);
+
+/* what a test made outside its sandbox, removed even when the test ends in a panic */
+struct Remove(Vec<PathBuf>);
+
+impl Drop for Remove {
+    fn drop(&mut self) {
+        for path in &self.0 {
+            let _ = fs::remove_dir_all(path).or_else(|_| fs::remove_file(path));
+        }
+    }
+}
 
 impl Drop for KillChild {
     fn drop(&mut self) {
@@ -2766,10 +2898,11 @@ fn cli_routes_peer_mcp_list_add_and_delete() {
 #[test]
 fn hook_ws_registers_peer_before_connect() {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     let mut child = sandbox
         .command()
-        .args(["hook", "ws", "--peer-id", "worker", "--backend", "codex"])
+        .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -2777,7 +2910,7 @@ fn hook_ws_registers_peer_before_connect() {
     while Instant::now() < deadline {
         let peers = sandbox.json(&["peer", "list"], None);
         if peers.as_array().unwrap().iter().any(|peer| {
-            peer["peer_id"] == "worker" && peer["backend"] == "codex" && peer["status"] == "online"
+            peer["peer_id"] == worker && peer["backend"] == "codex" && peer["status"] == "online"
         }) {
             found = true;
             break;
@@ -2829,17 +2962,18 @@ fn hook_ws_starts_daemon_when_hub_is_down() {
 #[test]
 fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     sandbox.json(
         &[
             "peer",
             "register",
             "--name",
-            "worker",
+            worker,
             "--backend",
             "pi",
             "--peer-id",
-            "worker",
+            worker,
         ],
         None,
     );
@@ -2850,7 +2984,7 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
     let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let mut child = sandbox
         .command()
-        .args(["hook", "ws", "--peer-id", "worker"])
+        .args(["hook", "ws", "--peer-id", worker])
         .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
         .spawn()
         .unwrap();
@@ -2861,7 +2995,7 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|peer| peer["peer_id"] == "worker" && peer["status"] == "online")
+            .any(|peer| peer["peer_id"] == worker && peer["status"] == "online")
         {
             break;
         }
@@ -2876,6 +3010,7 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
     let still = child.try_wait().unwrap();
     let _ = child.kill();
     let _ = child.wait();
+    let _ = fs::remove_file(&sock);
     assert!(
         still.is_none(),
         "hook ws exited after hub SIGKILL past retry window: {still:?}"
@@ -2887,6 +3022,7 @@ fn hook_ws_injects_notify_into_claude_socket() {
     use std::io::BufRead;
     use std::os::unix::net::UnixListener;
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
     let sock = PathBuf::from(format!(
@@ -2898,7 +3034,7 @@ fn hook_ws_injects_notify_into_claude_socket() {
     listener.set_nonblocking(true).unwrap();
     let mut child = sandbox
         .command()
-        .args(["hook", "ws", "--peer-id", "worker"])
+        .args(["hook", "ws", "--peer-id", worker])
         .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
         .spawn()
         .unwrap();
@@ -2910,7 +3046,7 @@ fn hook_ws_injects_notify_into_claude_socket() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|peer| peer["peer_id"] == "worker" && peer["status"] == "online")
+            .any(|peer| peer["peer_id"] == worker && peer["status"] == "online")
         {
             online = true;
             break;
@@ -2927,7 +3063,7 @@ fn hook_ws_injects_notify_into_claude_socket() {
         );
     }
     assert_eq!(
-        sandbox.json(&["peer", "notify", "worker", "inbox-ping"], None)["ok"],
+        sandbox.json(&["peer", "notify", worker, "inbox-ping"], None)["ok"],
         true
     );
     let mut line = String::new();
@@ -2972,6 +3108,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     use std::io::BufRead;
     use std::os::unix::net::UnixListener;
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
     sandbox.json(
@@ -2995,7 +3132,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     drop(UnixListener::bind(&sock).unwrap());
     let mut child = sandbox
         .command()
-        .args(["hook", "ws", "--peer-id", "worker"])
+        .args(["hook", "ws", "--peer-id", worker])
         .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
         .spawn()
         .unwrap();
@@ -3007,7 +3144,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|peer| peer["peer_id"] == "worker" && peer["status"] == "online")
+            .any(|peer| peer["peer_id"] == worker && peer["status"] == "online")
         {
             online = true;
             break;
@@ -3024,20 +3161,13 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     }
     assert_eq!(
         sandbox.json(
-            &[
-                "peer",
-                "notify",
-                "worker",
-                "c-fail-n",
-                "--from-peer",
-                "boss"
-            ],
+            &["peer", "notify", worker, "c-fail-n", "--from-peer", "boss"],
             None
         )["ok"],
         true
     );
     let opened = sandbox.json(
-        &["peer", "ask", "worker", "c-fail-a", "--from-peer", "boss"],
+        &["peer", "ask", worker, "c-fail-a", "--from-peer", "boss"],
         None,
     );
     let cid = opened["correlation_id"].as_str().unwrap().to_string();
@@ -3046,14 +3176,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     listener.set_nonblocking(true).unwrap();
     assert_eq!(
         sandbox.json(
-            &[
-                "peer",
-                "notify",
-                "worker",
-                "c-fail-c",
-                "--from-peer",
-                "boss"
-            ],
+            &["peer", "notify", worker, "c-fail-c", "--from-peer", "boss"],
             None
         )["ok"],
         true
@@ -3132,6 +3255,7 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
     use std::io::BufRead;
     use std::os::unix::net::UnixListener;
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
     sandbox.json(
@@ -3148,14 +3272,7 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
         None,
     );
     let opened = sandbox.json(
-        &[
-            "peer",
-            "ask",
-            "worker",
-            "already-done",
-            "--from-peer",
-            "boss",
-        ],
+        &["peer", "ask", worker, "already-done", "--from-peer", "boss"],
         None,
     );
     let cid = opened["correlation_id"].as_str().unwrap().to_string();
@@ -3172,7 +3289,7 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
     listener.set_nonblocking(true).unwrap();
     let mut child = sandbox
         .command()
-        .args(["hook", "ws", "--peer-id", "worker"])
+        .args(["hook", "ws", "--peer-id", worker])
         .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
         .spawn()
         .unwrap();
@@ -3183,14 +3300,14 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|peer| peer["peer_id"] == "worker" && peer["status"] == "online")
+            .any(|peer| peer["peer_id"] == worker && peer["status"] == "online")
         {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(
-        sandbox.json(&["peer", "notify", "worker", "after-connect"], None)["ok"],
+        sandbox.json(&["peer", "notify", worker, "after-connect"], None)["ok"],
         true
     );
     let mut saw_closed = false;
@@ -3229,6 +3346,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
     use std::sync::{Arc, Mutex};
     use tokio_tungstenite::tungstenite::Message;
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     let cwd = sandbox.root.clone();
     let codex_home = PathBuf::from(format!(
@@ -3238,7 +3356,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
     let sock = codex_home
         .join("app-server-control")
         .join("app-server-control.sock");
-    bind_session(&sandbox, "codex", "worker", "th1");
+    bind_session(&sandbox, "codex", worker, "th1");
     sandbox.json(
         &[
             "peer",
@@ -3254,7 +3372,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
     );
     let mut child = sandbox
         .command()
-        .args(["hook", "ws", "--peer-id", "worker", "--backend", "codex"])
+        .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
         .env("CODEX_HOME", &codex_home)
         .env("CODEX_THREAD_ID", "th1")
         .spawn()
@@ -3267,7 +3385,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|peer| peer["peer_id"] == "worker" && peer["status"] == "online")
+            .any(|peer| peer["peer_id"] == worker && peer["status"] == "online")
         {
             online = true;
             break;
@@ -3285,7 +3403,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
     for text in ["q0", "q1", "q2"] {
         assert_eq!(
             sandbox.json(
-                &["peer", "notify", "worker", text, "--from-peer", "boss"],
+                &["peer", "notify", worker, text, "--from-peer", "boss"],
                 None
             )["ok"],
             true
@@ -3370,7 +3488,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|peer| peer["peer_id"] == "worker" && peer["status"] == "online")
+            .any(|peer| peer["peer_id"] == worker && peer["status"] == "online")
         {
             online = true;
             break;
@@ -3449,6 +3567,7 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
         Router,
     };
     let sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     let socket_path = PathBuf::from(format!("/tmp/ar-{}.sock", uuid::Uuid::new_v4().simple()));
     if inbox == "refused" {
         drop(std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
@@ -3460,8 +3579,9 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
             .to_string()
     };
     let app_home = PathBuf::from(format!("/tmp/ap-{}", uuid::Uuid::new_v4().simple()));
+    let _made = Remove(vec![socket_path.clone(), app_home.clone()]);
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let received = rt.block_on(async {
+    rt.block_on(async {
         let app_task = if inbox.starts_with("app-") {
             use futures_util::{SinkExt, StreamExt};
             use tokio_tungstenite::tungstenite::Message as AppMessage;
@@ -3518,9 +3638,11 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
         let app = Router::new()
             .route(
                 "/peers",
-                post(|| async { axum::Json(json!({"peer_id":"worker"})) }).get(|| async {
-                    axum::Json(json!([{"peer_id":"worker","session_id":"fixture-thread"}]))
-                }),
+                post(move || async move { axum::Json(json!({"peer_id":worker})) }).get(
+                    move || async move {
+                        axum::Json(json!([{"peer_id":worker,"session_id":"fixture-thread"}]))
+                    },
+                ),
             )
             .route(
                 "/asks/closed/wait",
@@ -3567,7 +3689,7 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
         } else {
             "codex"
         };
-        cmd.args(["hook", "ws", "--peer-id", "worker", "--backend", backend])
+        cmd.args(["hook", "ws", "--peer-id", worker, "--backend", backend])
             .env("CODEX_HOME", sandbox.root.join("missing-codex"));
         if matches!(inbox, "refused" | "gone") {
             cmd.env("CLAUDE_CODE_MESSAGING_SOCKET", &socket_path);
@@ -3605,10 +3727,7 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
             }
         }
         frames
-    });
-    let _ = fs::remove_file(socket_path);
-    let _ = fs::remove_dir_all(app_home);
-    received
+    })
 }
 
 #[test]
@@ -3689,6 +3808,7 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
     use std::sync::{Arc, Mutex};
     use tokio::io::AsyncBufReadExt;
     let sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     let path = PathBuf::from(format!("/tmp/ad-{}.sock", uuid::Uuid::new_v4().simple()));
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(async {
@@ -3729,7 +3849,7 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
         let app = Router::new()
             .route(
                 "/peers",
-                post(|| async { axum::Json(json!({"peer_id":"worker"})) }),
+                post(move || async move { axum::Json(json!({"peer_id":worker})) }),
             )
             .route(
                 "/ws",
@@ -3794,7 +3914,7 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
                 "hook",
                 "ws",
                 "--peer-id",
-                "worker",
+                worker,
                 "--backend",
                 "claude-code",
             ])
@@ -4068,6 +4188,7 @@ fn codex_mcp_binds_its_thread_env_once_the_hub_takes_it() {
 #[test]
 fn codex_pinned_mcp_refuses_a_named_thread_it_cannot_register() {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     /* another row already carries the pin as its name, so the hub refuses to register it */
     sandbox.json(
@@ -4077,7 +4198,7 @@ fn codex_pinned_mcp_refuses_a_named_thread_it_cannot_register() {
             "--peer-id",
             "other",
             "--name",
-            "pinned",
+            pinned,
             "--backend",
             "codex",
         ],
@@ -4086,7 +4207,7 @@ fn codex_pinned_mcp_refuses_a_named_thread_it_cannot_register() {
     let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": "amesh_whoami", "arguments": {}, "_meta": {"threadId": "B"}}});
     let output = sandbox.run_text(
-        &["mcp", "--peer-id", "pinned"],
+        &["mcp", "--peer-id", pinned],
         &call.to_string(),
         &[("AMESH_BACKEND", "codex")],
     );
@@ -4109,7 +4230,14 @@ fn stale_drainer(sandbox: &Sandbox, codex_home: &Path) -> KillChild {
     KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "pinned", "--backend", "codex"])
+            .args([
+                "hook",
+                "ws",
+                "--peer-id",
+                sandbox.id("pinned"),
+                "--backend",
+                "codex",
+            ])
             .env("CODEX_THREAD_ID", "A")
             .env("CODEX_HOME", codex_home)
             .spawn()
@@ -4120,20 +4248,22 @@ fn stale_drainer(sandbox: &Sandbox, codex_home: &Path) -> KillChild {
 #[test]
 fn codex_drainer_never_moves_its_rows_session() {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "B");
-    sandbox.json(&["peer", "ask", "pinned", "for B"], None);
+    sandbox.json(&["peer", "ask", pinned, "for B"], None);
     let _drainer = stale_drainer(&sandbox, &sandbox.root.join("absent-codex"));
-    wait_for_drainer("pinned");
+    wait_for_drainer(pinned);
     std::thread::sleep(Duration::from_millis(1500));
-    assert_eq!(row_session(&sandbox, "pinned"), "B");
-    let asks = sandbox.json(&["peer", "asks", "--peer-id", "pinned"], None);
+    assert_eq!(row_session(&sandbox, pinned), "B");
+    let asks = sandbox.json(&["peer", "asks", "--peer-id", pinned], None);
     assert_eq!(asks["asks"][0]["text"], "for B", "B keeps its ask: {asks}");
 }
 
 #[test]
 fn codex_drainer_follows_the_rows_session_over_its_thread_env() {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "B");
     let codex_home = PathBuf::from(format!(
@@ -4142,7 +4272,7 @@ fn codex_drainer_follows_the_rows_session_over_its_thread_env() {
     ));
     let injected = app_server_capture_threads(&codex_home, &["A", "B"], &[]);
     let _drainer = stale_drainer(&sandbox, &codex_home);
-    sandbox.json(&["peer", "notify", "pinned", "for the owner"], None);
+    sandbox.json(&["peer", "notify", pinned, "for the owner"], None);
     let raw = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the notify must be injected");
@@ -4154,6 +4284,7 @@ fn codex_drainer_follows_the_rows_session_over_its_thread_env() {
 #[test]
 fn codex_drainer_drops_the_old_sessions_queue_when_the_name_is_replaced() {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "A");
     let codex_home = PathBuf::from(format!(
@@ -4165,17 +4296,17 @@ fn codex_drainer_drops_the_old_sessions_queue_when_the_name_is_replaced() {
     let _drainer = KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "pinned", "--backend", "codex"])
+            .args(["hook", "ws", "--peer-id", pinned, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .spawn()
             .unwrap(),
     ));
-    wait_for_drainer("pinned");
+    wait_for_drainer(pinned);
     std::thread::sleep(Duration::from_millis(1500));
-    sandbox.json(&["peer", "notify", "pinned", "A-era"], None);
+    sandbox.json(&["peer", "notify", pinned, "A-era"], None);
     std::thread::sleep(Duration::from_millis(500));
     pin_session(&sandbox, "B");
-    sandbox.json(&["peer", "notify", "pinned", "B-era"], None);
+    sandbox.json(&["peer", "notify", pinned, "B-era"], None);
     let raw = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the B-era notify must reach B");
@@ -4196,12 +4327,13 @@ fn bind_session(sandbox: &Sandbox, backend: &str, peer: &str, session: &str) {
 }
 
 fn pin_session(sandbox: &Sandbox, session: &str) {
-    bind_session(sandbox, "codex", "pinned", session);
+    bind_session(sandbox, "codex", sandbox.id("pinned"), session);
 }
 
 #[test]
 fn codex_drainer_keeps_the_old_sessions_queue_from_the_new_owner_across_a_reconnect() {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "A");
     let codex_home = PathBuf::from(format!(
@@ -4213,14 +4345,14 @@ fn codex_drainer_keeps_the_old_sessions_queue_from_the_new_owner_across_a_reconn
     let drainer = KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "pinned", "--backend", "codex"])
+            .args(["hook", "ws", "--peer-id", pinned, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .spawn()
             .unwrap(),
     ));
-    wait_for_drainer("pinned");
+    wait_for_drainer(pinned);
     std::thread::sleep(Duration::from_millis(1500));
-    sandbox.json(&["peer", "notify", "pinned", "A-era"], None);
+    sandbox.json(&["peer", "notify", pinned, "A-era"], None);
     std::thread::sleep(Duration::from_millis(500));
     /* the drainer is away while the hub restarts and B takes the pin, so no replaced
     notice can reach it */
@@ -4242,7 +4374,7 @@ fn codex_drainer_keeps_the_old_sessions_queue_from_the_new_owner_across_a_reconn
         .unwrap()
         .success());
     std::thread::sleep(Duration::from_millis(2500));
-    sandbox.json(&["peer", "notify", "pinned", "B-era"], None);
+    sandbox.json(&["peer", "notify", pinned, "B-era"], None);
     let raw = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the B-era notify must reach B");
@@ -4255,6 +4387,7 @@ fn codex_drainer_keeps_the_old_sessions_queue_from_the_new_owner_across_a_reconn
 #[test]
 fn codex_drainer_follows_a_first_bind_over_its_thread_env() {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     let root = sandbox.root.canonicalize().unwrap();
     sandbox.json(
@@ -4262,9 +4395,9 @@ fn codex_drainer_follows_a_first_bind_over_its_thread_env() {
             "peer",
             "register",
             "--peer-id",
-            "pinned",
+            pinned,
             "--name",
-            "pinned",
+            pinned,
             "--backend",
             "codex",
             "--path",
@@ -4280,10 +4413,10 @@ fn codex_drainer_follows_a_first_bind_over_its_thread_env() {
     keeps what it gets from A */
     let injected = app_server_capture_threads(&codex_home, &["A", "C"], &[]);
     let _drainer = stale_drainer(&sandbox, &codex_home);
-    sandbox.json(&["peer", "notify", "pinned", "before the bind"], None);
+    sandbox.json(&["peer", "notify", pinned, "before the bind"], None);
     std::thread::sleep(Duration::from_millis(1500));
     pin_session(&sandbox, "C");
-    sandbox.json(&["peer", "notify", "pinned", "after the bind"], None);
+    sandbox.json(&["peer", "notify", pinned, "after the bind"], None);
     let first = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the first owner gets what the unbound name queued");
@@ -4300,7 +4433,7 @@ fn codex_drainer_follows_a_first_bind_over_its_thread_env() {
 }
 
 fn bind_pinprune(sandbox: &Sandbox, session: &str) {
-    bind_session(sandbox, "codex", "pinprune", session);
+    bind_session(sandbox, "codex", sandbox.id("pinprune"), session);
 }
 
 fn signal(pid: &str, sig: &str) {
@@ -4323,6 +4456,7 @@ fn pruned_while_away(
     PathBuf,
 ) {
     let mut sandbox = Sandbox::new();
+    let pinprune = sandbox.id("pinprune");
     sandbox.start();
     bind_pinprune(&sandbox, "A");
     let codex_home = PathBuf::from(format!(
@@ -4333,15 +4467,15 @@ fn pruned_while_away(
     let drainer = KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "pinprune", "--backend", "codex"])
+            .args(["hook", "ws", "--peer-id", pinprune, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .env("CODEX_THREAD_ID", "B")
             .spawn()
             .unwrap(),
     ));
-    wait_for_drainer("pinprune");
+    wait_for_drainer(pinprune);
     std::thread::sleep(Duration::from_millis(1500));
-    sandbox.json(&["peer", "notify", "pinprune", "A-era"], None);
+    sandbox.json(&["peer", "notify", pinprune, "A-era"], None);
     std::thread::sleep(Duration::from_millis(500));
     let pid = drainer.0.as_ref().unwrap().id().to_string();
     signal(&pid, "-STOP");
@@ -4349,12 +4483,12 @@ fn pruned_while_away(
         let _ = hub.kill();
         let _ = hub.wait();
     }
-    sandbox.start();
-    std::thread::sleep(Duration::from_secs(31));
-    assert!(
-        row_session(&sandbox, "pinprune").is_empty(),
-        "the row must be pruned"
-    );
+    sandbox.start_with(&[("AMESH_PEER_ONLINE_SECS", "1")]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !row_session(&sandbox, pinprune).is_empty() {
+        assert!(Instant::now() < deadline, "the row must be pruned");
+        std::thread::sleep(Duration::from_millis(100));
+    }
     signal(&pid, "-CONT");
     std::thread::sleep(Duration::from_millis(2500));
     (sandbox, drainer, injected, codex_home)
@@ -4364,17 +4498,18 @@ fn pruned_while_away(
 fn codex_drainer_gives_another_owner_only_what_the_unowned_name_queued() {
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
     let (sandbox, drainer, injected, codex_home) = pruned_while_away(busy);
+    let pinprune = sandbox.id("pinprune");
     /* a frame for the unowned name is waiting when B binds it; nothing flushes to the
     thread env's B before the stream says B owns the name */
     let pid = drainer.0.as_ref().unwrap().id().to_string();
     signal(&pid, "-STOP");
-    sandbox.json(&["peer", "notify", "pinprune", "unowned-era"], None);
+    sandbox.json(&["peer", "notify", pinprune, "unowned-era"], None);
     bind_pinprune(&sandbox, "B");
     signal(&pid, "-CONT");
     let first = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the first owner gets what the unowned name queued");
-    sandbox.json(&["peer", "notify", "pinprune", "B-era"], None);
+    sandbox.json(&["peer", "notify", pinprune, "B-era"], None);
     let second = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("and what follows");
@@ -4393,9 +4528,10 @@ fn codex_drainer_gives_another_owner_only_what_the_unowned_name_queued() {
 fn codex_drainer_keeps_a_pruned_owners_queue_for_its_return() {
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
     let (sandbox, _drainer, injected, codex_home) = pruned_while_away(busy.clone());
+    let pinprune = sandbox.id("pinprune");
     busy.lock().unwrap().clear();
     bind_pinprune(&sandbox, "A");
-    sandbox.json(&["peer", "notify", "pinprune", "A-again"], None);
+    sandbox.json(&["peer", "notify", pinprune, "A-again"], None);
     let first = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("A gets what it had queued");
@@ -4421,9 +4557,40 @@ fn a_era(peer: &str) -> Vec<Value> {
     ]
 }
 
+/* sends `frames`, then waits until the drainer has done all they lead to: it answers a
+frame's id only once it has injected what that frame let through, and a greeting resets its
+heartbeat, which injects before it pings */
+async fn fence(socket: &mut axum::extract::ws::WebSocket, frames: &[Value]) {
+    use axum::extract::ws::Message;
+    for frame in frames {
+        let _ = socket.send(Message::Text(frame.to_string().into())).await;
+    }
+    let mut last = frames.iter().rev().find_map(|frame| frame["id"].as_str());
+    let mut beat = frames.iter().any(|frame| {
+        matches!(
+            frame["type"].as_str(),
+            Some("connected" | "bound" | "replaced")
+        )
+    });
+    while last.is_some() || beat {
+        match socket.recv().await {
+            Some(Ok(Message::Text(text))) => {
+                let reply: Value = serde_json::from_str(&text).unwrap_or_default();
+                beat &= reply["type"] != "ping";
+                if reply["type"] == "recv" && reply["id"].as_str() == last {
+                    last = None;
+                }
+            }
+            Some(Ok(_)) => {}
+            _ => return,
+        }
+    }
+}
+
 /* a hub whose first connection sends `first`, ending once the drainer has taken its frame;
-its second signals the returned receiver, sends `before`, waits for the release, then sends
-`after`. GET /peers answers `rows` */
+its second signals the returned receiver, sends `before` and signals again once the drainer
+has settled them, then waits for the release and does the same with `after`. GET /peers
+answers `rows` */
 fn fake_hub(
     sandbox: &Sandbox,
     peer: &'static str,
@@ -4487,17 +4654,11 @@ fn fake_hub(
                             first tick is ready long before the delay ends */
                             let _ = recv_tx.send(());
                             tokio::time::sleep(Duration::from_millis(1500)).await;
-                            for frame in &frames.1 {
-                                let _ = socket
-                                    .send(HubMessage::Text(frame.to_string().into()))
-                                    .await;
-                            }
+                            fence(&mut socket, &frames.1).await;
+                            let _ = recv_tx.send(());
                             release.notified().await;
-                            for frame in &frames.2 {
-                                let _ = socket
-                                    .send(HubMessage::Text(frame.to_string().into()))
-                                    .await;
-                            }
+                            fence(&mut socket, &frames.2).await;
+                            let _ = recv_tx.send(());
                             while let Some(Ok(_)) = socket.recv().await {}
                         }
                     })
@@ -4516,21 +4677,21 @@ fn fake_hub(
 
 /* the first connection's frame stays queued in a Claude drainer whose inbox is down; the
 inbox listens again once the drainer reconnects, before the hub greets it. Returns what
-reached it before and after the release */
+reached it by the time the drainer settled before and after the release */
 fn claude_across_a_reconnect(
     first: Vec<Value>,
     before: Vec<Value>,
     after: Vec<Value>,
 ) -> (Vec<String>, Vec<String>) {
     let sandbox = Sandbox::new();
+    let claude_x = sandbox.id("claude-x");
     let inbox = PathBuf::from(format!(
         "/tmp/ai{}.sock",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
     /* the messaging socket is there but nobody listens, so what reaches A stays queued */
     drop(std::os::unix::net::UnixListener::bind(&inbox).unwrap());
-    let (_hub, release, reconnected) =
-        fake_hub(&sandbox, "claude-x", json!([]), first, before, after);
+    let (_hub, release, progress) = fake_hub(&sandbox, claude_x, json!([]), first, before, after);
     let _drainer = KillChild(Some(
         sandbox
             .command()
@@ -4538,7 +4699,7 @@ fn claude_across_a_reconnect(
                 "hook",
                 "ws",
                 "--peer-id",
-                "claude-x",
+                claude_x,
                 "--backend",
                 "claude-code",
             ])
@@ -4546,7 +4707,7 @@ fn claude_across_a_reconnect(
             .spawn()
             .unwrap(),
     ));
-    reconnected
+    progress
         .recv_timeout(Duration::from_secs(10))
         .expect("the drainer reconnects");
     /* renamed into place, so the drainer never finds its inbox gone and yields */
@@ -4554,23 +4715,22 @@ fn claude_across_a_reconnect(
     let live = std::os::unix::net::UnixListener::bind(&fresh).unwrap();
     fs::rename(&fresh, &inbox).unwrap();
     live.set_nonblocking(true).unwrap();
-    let collect = |window: Duration| {
-        let deadline = Instant::now() + window;
+    let collect = || {
+        progress
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drainer settles");
         let mut delivered = Vec::new();
-        while Instant::now() < deadline {
-            if let Ok((stream, _)) = live.accept() {
-                stream.set_nonblocking(false).unwrap();
-                let mut line = String::new();
-                let _ = BufReader::new(stream).read_line(&mut line);
-                delivered.push(line);
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        while let Ok((stream, _)) = live.accept() {
+            stream.set_nonblocking(false).unwrap();
+            let mut line = String::new();
+            let _ = BufReader::new(stream).read_line(&mut line);
+            delivered.push(line);
         }
         delivered
     };
-    let early = collect(Duration::from_secs(5));
+    let early = collect();
     release.notify_one();
-    let late = collect(Duration::from_secs(3));
+    let late = collect();
     let _ = fs::remove_file(&inbox);
     (early, late)
 }
@@ -5023,6 +5183,7 @@ fn claude_drainer_flushes_nothing_from_an_earlier_connection_before_the_hub_gree
 #[test]
 fn codex_drainer_flushes_nothing_from_an_earlier_connection_before_the_hub_greets_it() {
     let sandbox = Sandbox::new();
+    let codex_g = sandbox.id("codex-g");
     let codex_home = PathBuf::from(format!(
         "/tmp/ag{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -5031,19 +5192,19 @@ fn codex_drainer_flushes_nothing_from_an_earlier_connection_before_the_hub_greet
     /* the row still names X; only the second connection's greeting says Y owns the name */
     let (_hub, _release, reconnected) = fake_hub(
         &sandbox,
-        "codex-g",
-        json!([{"peer_id": "codex-g", "session_id": "X", "backend": "codex", "status": "online"}]),
+        codex_g,
+        json!([{"peer_id": codex_g, "session_id": "X", "backend": "codex", "status": "online"}]),
         vec![
-            json!({"type": "connected", "peer_id": "codex-g", "session_id": ""}),
+            json!({"type": "connected", "peer_id": codex_g, "session_id": ""}),
             json!({"type": "notify", "id": "u1", "from_peer": "boss", "text": "unbound-era"}),
         ],
-        vec![json!({"type": "connected", "peer_id": "codex-g", "session_id": "Y"})],
+        vec![json!({"type": "connected", "peer_id": codex_g, "session_id": "Y"})],
         vec![],
     );
     let _drainer = KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "codex-g", "--backend", "codex"])
+            .args(["hook", "ws", "--peer-id", codex_g, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .spawn()
             .unwrap(),
@@ -5082,6 +5243,7 @@ fn claude_drainer_holds_an_earlier_sessions_queue_from_a_hub_too_old_to_name_the
 #[test]
 fn codex_drainer_holds_another_sessions_queue_from_a_hub_too_old_to_name_the_owner() {
     let sandbox = Sandbox::new();
+    let codex_x = sandbox.id("codex-x");
     let codex_home = PathBuf::from(format!(
         "/tmp/al{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -5090,11 +5252,11 @@ fn codex_drainer_holds_another_sessions_queue_from_a_hub_too_old_to_name_the_own
     let injected = app_server_capture_threads(&codex_home, &["A", "B"], &["A"]);
     let (_hub, _release, reconnected) = fake_hub(
         &sandbox,
-        "codex-x",
-        json!([{"peer_id": "codex-x", "session_id": "B", "backend": "codex", "status": "online"}]),
-        a_era("codex-x"),
+        codex_x,
+        json!([{"peer_id": codex_x, "session_id": "B", "backend": "codex", "status": "online"}]),
+        a_era(codex_x),
         vec![
-            json!({"type": "connected", "peer_id": "codex-x"}),
+            json!({"type": "connected", "peer_id": codex_x}),
             json!({"type": "notify", "id": "l1", "from_peer": "boss", "text": "legacy-era"}),
         ],
         vec![],
@@ -5102,7 +5264,7 @@ fn codex_drainer_holds_another_sessions_queue_from_a_hub_too_old_to_name_the_own
     let _drainer = KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "codex-x", "--backend", "codex"])
+            .args(["hook", "ws", "--peer-id", codex_x, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .spawn()
             .unwrap(),
@@ -5118,6 +5280,7 @@ fn codex_drainer_holds_another_sessions_queue_from_a_hub_too_old_to_name_the_own
 #[test]
 fn codex_drainer_keeps_a_first_owners_queue_from_the_session_that_replaces_it() {
     let mut sandbox = Sandbox::new();
+    let pinfirst = sandbox.id("pinfirst");
     sandbox.start();
     let root = sandbox.root.canonicalize().unwrap();
     sandbox.json(
@@ -5125,9 +5288,9 @@ fn codex_drainer_keeps_a_first_owners_queue_from_the_session_that_replaces_it() 
             "peer",
             "register",
             "--peer-id",
-            "pinfirst",
+            pinfirst,
             "--name",
-            "pinfirst",
+            pinfirst,
             "--backend",
             "codex",
             "--path",
@@ -5144,16 +5307,16 @@ fn codex_drainer_keeps_a_first_owners_queue_from_the_session_that_replaces_it() 
     let drainer = KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "pinfirst", "--backend", "codex"])
+            .args(["hook", "ws", "--peer-id", pinfirst, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .spawn()
             .unwrap(),
     ));
-    wait_for_drainer("pinfirst");
+    wait_for_drainer(pinfirst);
     std::thread::sleep(Duration::from_millis(1500));
-    sandbox.json(&["peer", "notify", "pinfirst", "unowned-era"], None);
+    sandbox.json(&["peer", "notify", pinfirst, "unowned-era"], None);
     std::thread::sleep(Duration::from_millis(500));
-    bind_session(&sandbox, "codex", "pinfirst", "A");
+    bind_session(&sandbox, "codex", pinfirst, "A");
     std::thread::sleep(Duration::from_millis(500));
     /* B takes the name from A while the drainer is away, so no replaced notice reaches it */
     let pid = drainer.0.as_ref().unwrap().id().to_string();
@@ -5163,10 +5326,10 @@ fn codex_drainer_keeps_a_first_owners_queue_from_the_session_that_replaces_it() 
         let _ = hub.wait();
     }
     sandbox.start();
-    bind_session(&sandbox, "codex", "pinfirst", "B");
+    bind_session(&sandbox, "codex", pinfirst, "B");
     signal(&pid, "-CONT");
     std::thread::sleep(Duration::from_millis(2500));
-    sandbox.json(&["peer", "notify", "pinfirst", "B-era"], None);
+    sandbox.json(&["peer", "notify", pinfirst, "B-era"], None);
     let raw = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the B-era notify must reach B");
@@ -5394,7 +5557,7 @@ fn lazy_spawn_keeps_persisted_peers() {
         let _ = child.wait();
     }
     sandbox.daemon = None;
-    kill_listen(&sandbox.bind);
+    kill_listen(&sandbox.bind, &sandbox.root);
     let payload = json!({"session_id": "again", "cwd": sandbox.root}).to_string();
     let out = sandbox.run_text(
         &["hook", "session", "--backend", "pi", "--peer-id", "keep"],
@@ -5445,7 +5608,7 @@ fn concurrent_lazy_spawn_keeps_existing_ask() {
         let _ = child.wait();
     }
     sandbox.daemon = None;
-    kill_listen(&sandbox.bind);
+    kill_listen(&sandbox.bind, &sandbox.root);
     let payload = json!({"session_id": "c", "cwd": sandbox.root}).to_string();
     std::thread::scope(|scope| {
         scope.spawn(|| {
@@ -5497,6 +5660,7 @@ fn pi_session_start_registers_when_daemon_was_down() {
         .env("AMESH_BIND", &sandbox.bind)
         .env("AMESH_TOKEN", "cli-test-token")
         .env("AMESH_STATE", sandbox.root.join("state.json"))
+        .env("AMESH_PI_DAEMON_ONLY", "1")
         .output()
         .unwrap();
     /* node:test names the failing subtest on stdout; stderr only carries the faults the
@@ -5736,7 +5900,7 @@ fn app_server_capture_with(
 /* a drainer holds what it gets until a session owns the name, so the row names one the way
 a hook registers it; without a messaging socket the hook spawns no drainer of its own */
 fn register_drain_peer(sandbox: &Sandbox, backend: &str) {
-    bind_session(sandbox, backend, "worker", "thread-1");
+    bind_session(sandbox, backend, sandbox.id("worker"), "thread-1");
 }
 
 fn peer_is_online(sandbox: &Sandbox, peer: &str) -> bool {
@@ -5753,6 +5917,7 @@ fn peer_is_online(sandbox: &Sandbox, peer: &str) -> bool {
 #[test]
 fn claude_drainer_without_socket_exits_and_reaches_nothing() {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     /* deliberately unregistered: hook_ws_once announces the peer itself, so the roster
     staying empty is what proves the guard returned before any hub contact */
@@ -5765,7 +5930,7 @@ fn claude_drainer_without_socket_exits_and_reaches_nothing() {
             "hook",
             "ws",
             "--peer-id",
-            "worker",
+            worker,
             "--backend",
             "claude-code",
         ])
@@ -5807,14 +5972,11 @@ fn claude_drainer_without_socket_exits_and_reaches_nothing() {
         !sandbox
             .json(&["peer", "list"], None)
             .as_array()
-            .map(|rows| rows.iter().any(|row| row["peer_id"] == "worker"))
+            .map(|rows| rows.iter().any(|row| row["peer_id"] == worker))
             .unwrap_or(false),
         "a declined drainer must not announce itself to the hub"
     );
-    assert!(
-        !hook_ws_alive("worker"),
-        "a declined drainer must not linger"
-    );
+    assert!(!hook_ws_alive(worker), "a declined drainer must not linger");
     drop(app);
     let _ = fs::remove_dir_all(&codex_home);
 }
@@ -5822,6 +5984,7 @@ fn claude_drainer_without_socket_exits_and_reaches_nothing() {
 #[test]
 fn claude_drainer_with_socket_never_reaches_the_app_server() {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
     let claude = AcceptCounter::bind(claude_socket_path());
@@ -5832,7 +5995,7 @@ fn claude_drainer_with_socket_never_reaches_the_app_server() {
             "hook",
             "ws",
             "--peer-id",
-            "worker",
+            worker,
             "--backend",
             "claude-code",
         ])
@@ -5841,12 +6004,12 @@ fn claude_drainer_with_socket_never_reaches_the_app_server() {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !peer_is_online(&sandbox, "worker") && Instant::now() < deadline {
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(peer_is_online(&sandbox, "worker"), "drainer must connect");
+    assert!(peer_is_online(&sandbox, worker), "drainer must connect");
     assert_eq!(
-        sandbox.json(&["peer", "notify", "worker", "routed-ping"], None)["ok"],
+        sandbox.json(&["peer", "notify", worker, "routed-ping"], None)["ok"],
         true
     );
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -5864,6 +6027,7 @@ fn claude_drainer_with_socket_never_reaches_the_app_server() {
 #[test]
 fn codex_drainer_ignores_an_inherited_claude_socket() {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "codex");
     let claude = AcceptCounter::bind(claude_socket_path());
@@ -5875,7 +6039,7 @@ fn codex_drainer_ignores_an_inherited_claude_socket() {
     /* the reverse leak: a codex drainer started under a live Claude session */
     let mut child = sandbox
         .command()
-        .args(["hook", "ws", "--peer-id", "worker", "--backend", "codex"])
+        .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
         .env("CLAUDE_CODE_MESSAGING_SOCKET", &claude.path)
         .env("CLAUDE_CODE_MESSAGING_TOKEN", "inherited-token")
         .env("CODEX_HOME", &codex_home)
@@ -5883,12 +6047,12 @@ fn codex_drainer_ignores_an_inherited_claude_socket() {
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !peer_is_online(&sandbox, "worker") && Instant::now() < deadline {
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(peer_is_online(&sandbox, "worker"), "drainer must connect");
+    assert!(peer_is_online(&sandbox, worker), "drainer must connect");
     assert_eq!(
-        sandbox.json(&["peer", "notify", "worker", "codex-only-ping"], None)["ok"],
+        sandbox.json(&["peer", "notify", worker, "codex-only-ping"], None)["ok"],
         true
     );
     /* the message itself must arrive at the App Server, which is what proves the message
@@ -5906,7 +6070,10 @@ fn codex_drainer_ignores_an_inherited_claude_socket() {
         "codex must not inject into an inherited Claude session"
     );
     assert!(
-        !sandbox.root.join("hook-ws-worker.inbox").exists(),
+        !sandbox
+            .root
+            .join(format!("hook-ws-{worker}.inbox"))
+            .exists(),
         "codex must not stamp a Claude messaging socket"
     );
     let _ = child.kill();
@@ -5952,6 +6119,7 @@ fn claude_session_hook_without_socket_spawns_no_drainer() {
 #[test]
 fn drainer_with_an_unsupported_backend_never_acknowledges() {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "pi");
     let claude = AcceptCounter::bind(claude_socket_path());
@@ -5959,7 +6127,7 @@ fn drainer_with_an_unsupported_backend_never_acknowledges() {
     for backend in ["pi", "grok"] {
         let mut child = sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "worker", "--backend", backend])
+            .args(["hook", "ws", "--peer-id", worker, "--backend", backend])
             .env("CLAUDE_CODE_MESSAGING_SOCKET", &claude.path)
             .env("CODEX_HOME", &codex_home)
             .spawn()
@@ -5993,11 +6161,11 @@ fn drainer_with_an_unsupported_backend_never_acknowledges() {
     }
     /* the durable copy must still be the hub's: nothing acknowledged it */
     assert_eq!(
-        sandbox.json(&["peer", "notify", "worker", "undeliverable"], None)["ok"],
+        sandbox.json(&["peer", "notify", worker, "undeliverable"], None)["ok"],
         true
     );
     std::thread::sleep(Duration::from_millis(400));
-    let pending = sandbox.json(&["peer", "asks", "--peer-id", "worker"], None);
+    let pending = sandbox.json(&["peer", "asks", "--peer-id", worker], None);
     assert_eq!(
         pending["inbox"].as_array().map(|q| q.len()).unwrap_or(0),
         1,
@@ -6009,43 +6177,109 @@ fn drainer_with_an_unsupported_backend_never_acknowledges() {
     let _ = fs::remove_dir_all(&codex_home);
 }
 
+/* a hub that greets the drainer as `session`'s and sends it `frame`, then signals the
+returned receiver for each heartbeat the drainer sends once it has acknowledged that frame */
+fn beat_counting_hub(
+    sandbox: &Sandbox,
+    peer: &'static str,
+    session: &'static str,
+    frame: Value,
+) -> (tokio::runtime::Runtime, std::sync::mpsc::Receiver<()>) {
+    use axum::{
+        extract::ws::{Message as HubMessage, WebSocketUpgrade},
+        routing::get,
+        Router,
+    };
+    let (beat_tx, beat_rx) = std::sync::mpsc::channel::<()>();
+    let hub = Router::new()
+        .route(
+            "/health",
+            get(|| async { axum::Json(json!({"ok": true, "name": "amesh"})) }),
+        )
+        .route(
+            "/peers",
+            get(|| async { axum::Json(json!([])) })
+                .post(move || async move { axum::Json(json!({"ok": true, "peer_id": peer})) }),
+        )
+        .route(
+            "/ws",
+            get(move |ws: WebSocketUpgrade| {
+                let (frame, beat_tx) = (frame.clone(), beat_tx.clone());
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        if !matches!(socket.recv().await, Some(Ok(_))) {
+                            return;
+                        }
+                        let greeting =
+                            json!({"type": "connected", "peer_id": peer, "session_id": session});
+                        for sent in [greeting, frame.clone()] {
+                            let _ = socket.send(HubMessage::Text(sent.to_string().into())).await;
+                        }
+                        let mut received = false;
+                        while let Some(Ok(message)) = socket.recv().await {
+                            let HubMessage::Text(text) = message else {
+                                continue;
+                            };
+                            let reply: Value = serde_json::from_str(&text).unwrap_or_default();
+                            if reply["type"] == "recv" && reply["id"] == frame["id"] {
+                                received = true;
+                            } else if received && reply["type"] == "ping" {
+                                let _ = beat_tx.send(());
+                            }
+                        }
+                    })
+                }
+            }),
+        );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind(&sandbox.bind))
+        .unwrap();
+    runtime.spawn(async move {
+        axum::serve(listener, hub).await.unwrap();
+    });
+    (runtime, beat_rx)
+}
+
 #[test]
 fn codex_heartbeat_never_flushes_into_an_inherited_claude_socket() {
-    let mut sandbox = Sandbox::new();
-    sandbox.start();
-    register_drain_peer(&sandbox, "codex");
+    let sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     let claude = AcceptCounter::bind(claude_socket_path());
+    let (_hub, beats) = beat_counting_hub(
+        &sandbox,
+        worker,
+        "thread-1",
+        json!({"type": "notify", "id": "q1", "from_peer": "boss", "text": "queued-ping"}),
+    );
     /* no App Server at all, so the notify stays queued and the only code left that could
     drain it is the heartbeat; with an inherited Claude socket that is where the reverse
     leak would surface */
     let missing = sandbox.root.join("absent-codex");
-    let mut child = sandbox
-        .command()
-        .args(["hook", "ws", "--peer-id", "worker", "--backend", "codex"])
-        .env("CLAUDE_CODE_MESSAGING_SOCKET", &claude.path)
-        .env("CLAUDE_CODE_MESSAGING_TOKEN", "inherited-token")
-        .env("CODEX_HOME", &missing)
-        .env("CODEX_THREAD_ID", "thread-1")
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !peer_is_online(&sandbox, "worker") && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
+    let _drainer = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &claude.path)
+            .env("CLAUDE_CODE_MESSAGING_TOKEN", "inherited-token")
+            .env("CODEX_HOME", &missing)
+            .env("CODEX_THREAD_ID", "thread-1")
+            .env("AMESH_WS_BEAT_SECS", "1")
+            .spawn()
+            .unwrap(),
+    ));
+    /* two beats after the receipt: the first ran with the notify queued, and anything it
+    leaked has landed by the second */
+    for _ in 0..2 {
+        beats
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a heartbeat after the receipt");
     }
-    assert!(peer_is_online(&sandbox, "worker"), "drainer must connect");
-    assert_eq!(
-        sandbox.json(&["peer", "notify", "worker", "queued-ping"], None)["ok"],
-        true
-    );
-    /* one heartbeat is 10s */
-    std::thread::sleep(Duration::from_secs(13));
     assert_eq!(
         claude.count(),
         0,
         "a codex heartbeat must not flush into an inherited Claude socket"
     );
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 fn hook_ws_pid(peer_id: &str) -> Option<String> {
@@ -6425,9 +6659,10 @@ fn setup_installs_activity_hooks_for_claude_only() {
 #[test]
 fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
     let mut sandbox = Sandbox::new();
+    let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "A");
-    sandbox.json(&["jobs", "create", "watch", "--from-peer", "pinned"], None);
+    sandbox.json(&["jobs", "create", "watch", "--from-peer", pinned], None);
     let codex_home = PathBuf::from(format!(
         "/tmp/ai{}",
         &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -6435,14 +6670,7 @@ fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
     let injected = app_server_capture_with(&codex_home, &["A"], busy.clone());
     let prompt = sandbox.run(
-        &[
-            "hook",
-            "prompt",
-            "--backend",
-            "codex",
-            "--peer-id",
-            "pinned",
-        ],
+        &["hook", "prompt", "--backend", "codex", "--peer-id", pinned],
         Some(json!({"session_id": "A", "cwd": sandbox.root})),
     );
     assert!(
@@ -6453,13 +6681,13 @@ fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
     let drainer = KillChild(Some(
         sandbox
             .command()
-            .args(["hook", "ws", "--peer-id", "pinned", "--backend", "codex"])
+            .args(["hook", "ws", "--peer-id", pinned, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .spawn()
             .unwrap(),
     ));
-    wait_for_drainer("pinned");
-    let state = || activity_of(&sandbox, "pinned");
+    wait_for_drainer(pinned);
+    let state = || activity_of(&sandbox, pinned);
     std::thread::sleep(Duration::from_secs(12));
     assert_eq!(
         state()["state"],
@@ -6475,7 +6703,7 @@ fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
     }
     let seen = state();
     /* a failed turn must not hold back the next message: the drainer starts a turn */
-    sandbox.json(&["peer", "notify", "pinned", "after-failure"], None);
+    sandbox.json(&["peer", "notify", pinned, "after-failure"], None);
     let delivered = injected.recv_timeout(Duration::from_secs(20));
     drop(drainer);
     let _ = fs::remove_dir_all(&codex_home);

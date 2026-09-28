@@ -22,6 +22,7 @@ async fn next<T>(rx: &mut UnboundedReceiver<T>) -> T {
 #[test]
 fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() {
     let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
     let root = PathBuf::from(format!("/tmp/amesh-cli-{}", uuid::Uuid::new_v4().simple()));
     fs::rename(&sandbox.root, &root).unwrap();
     sandbox.root = root;
@@ -37,17 +38,17 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
         let state = (binding.clone(), generation, receipt_tx);
         let hub = Router::new()
             .route("/health", get(|| async { axum::Json(json!({"ok":true,"name":"amesh"})) }))
-            .route("/peers", post(|| async { axum::Json(json!({"peer_id":"worker"})) })
-                .get(|State((binding, _, _)): State<(Arc<Mutex<String>>, Arc<AtomicUsize>, tokio::sync::mpsc::UnboundedSender<Value>)>| async move {
-                    axum::Json(json!([{"peer_id":"worker","session_id":binding.lock().unwrap().clone()}]))
+            .route("/peers", post(move || async move { axum::Json(json!({"peer_id":worker})) })
+                .get(move |State((binding, _, _)): State<(Arc<Mutex<String>>, Arc<AtomicUsize>, tokio::sync::mpsc::UnboundedSender<Value>)>| async move {
+                    axum::Json(json!([{"peer_id":worker,"session_id":binding.lock().unwrap().clone()}]))
                 }))
-            .route("/ws", get(|ws: WebSocketUpgrade, State((_, generation, receipts)): State<(Arc<Mutex<String>>, Arc<AtomicUsize>, tokio::sync::mpsc::UnboundedSender<Value>)>| async move {
+            .route("/ws", get(move |ws: WebSocketUpgrade, State((_, generation, receipts)): State<(Arc<Mutex<String>>, Arc<AtomicUsize>, tokio::sync::mpsc::UnboundedSender<Value>)>| async move {
                 ws.on_upgrade(move |mut socket| async move {
                     let Some(Ok(_)) = socket.recv().await else { return; };
                     let index = generation.fetch_add(1, Ordering::SeqCst);
                     let messages = if index == 0 { vec!["q0", "q1"] } else { vec!["q2"] };
                     /* a hub from before session_id: the row is the only identity */
-                    socket.send(Message::Text(json!({"type":"connected","peer_id":"worker"}).to_string().into())).await.unwrap();
+                    socket.send(Message::Text(json!({"type":"connected","peer_id":worker}).to_string().into())).await.unwrap();
                     for text in messages {
                         socket.send(Message::Text(json!({"type":"notify","id":text,"from_peer":"boss","text":text}).to_string().into())).await.unwrap();
                     }
@@ -96,7 +97,7 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
         let (log_tx, mut logs) = unbounded_channel();
         let mut readers = Vec::new();
         let mut spawn = || {
-            let mut child = sandbox.command().args(["hook","ws","--peer-id","worker","--backend","codex"])
+            let mut child = sandbox.command().args(["hook","ws","--peer-id",worker,"--backend","codex"])
                 .env("CODEX_HOME", "cx").spawn().unwrap();
             let stderr = child.stderr.take().unwrap();
             let tx = log_tx.clone();

@@ -1,23 +1,30 @@
+use super::tests::TempState;
 use super::*;
 use axum::http::Request;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-struct Fixture(App);
+/* a hub, and the directory it made for itself; one opened on a test's own path leaves that
+directory to the test */
+struct Fixture(App, Option<TempState>);
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("amesh-jobs-{}", Uuid::new_v4()));
-        fs::create_dir_all(&root).unwrap();
-        Self::open(root.join("state.db"))
+        let state = TempState::new("jobs");
+        let mut fixture = Self::open(state.to_path_buf());
+        fixture.1 = Some(state);
+        fixture
     }
 
     fn open(state_path: PathBuf) -> Self {
-        Self(App {
-            inner: Arc::new(Mutex::new(Hub::open(&state_path).unwrap())),
-            token: None,
-            state_path,
-        })
+        Self(
+            App {
+                inner: Arc::new(Mutex::new(Hub::open(&state_path).unwrap())),
+                token: None,
+                state_path,
+            },
+            None,
+        )
     }
 
     async fn request(&self, method: &str, uri: &str, body: Value) -> (StatusCode, Value) {
@@ -779,9 +786,7 @@ async fn manual_running_is_refused_for_dispatched_jobs() {
 
 #[tokio::test]
 async fn corrupt_job_rows_fail_closed() {
-    let root = std::env::temp_dir().join(format!("amesh-jobs-corrupt-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let path = root.join("state.db");
+    let path = TempState::new("jobs-corrupt");
     let (queued, running) = {
         let f = Fixture::open(path.clone());
         f.peer("boss", "one").await;
@@ -812,7 +817,7 @@ async fn corrupt_job_rows_fail_closed() {
         .unwrap();
     }
 
-    let f = Fixture::open(path);
+    let f = Fixture::open(path.to_path_buf());
     let broken = f.row(&queued).await;
     assert!(
         !broken.dispatch,
@@ -1205,9 +1210,7 @@ async fn delete_job_refuses_open_dependents() {
 
 #[tokio::test]
 async fn legacy_job_never_dispatches() {
-    let root = std::env::temp_dir().join(format!("amesh-jobs-legacy-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let path = root.join("state.db");
+    let path = TempState::new("jobs-legacy");
     {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute_batch(
@@ -1226,7 +1229,7 @@ async fn legacy_job_never_dispatches() {
         )
         .unwrap();
     }
-    let f = Fixture::open(path);
+    let f = Fixture::open(path.to_path_buf());
     f.peer("w1", "one").await;
     let old = f.row("job-old").await;
     assert!(!old.dispatch);
@@ -1296,9 +1299,7 @@ async fn mcp_job_create_rejects_malformed_dependencies() {
 
 #[tokio::test]
 async fn running_job_survives_restart() {
-    let root = std::env::temp_dir().join(format!("amesh-jobs-restart-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let path = root.join("state.db");
+    let path = TempState::new("jobs-restart");
     let (a, cid) = {
         let f = Fixture::open(path.clone());
         f.peer("boss", "one").await;
@@ -1311,7 +1312,7 @@ async fn running_job_survives_restart() {
         (a, cid)
     };
 
-    let f = Fixture::open(path);
+    let f = Fixture::open(path.to_path_buf());
     assert_eq!(f.row(&a).await.state, "running");
     assert_eq!(f.ask_id(&a).await, cid);
     f.advance().await;
@@ -1335,9 +1336,7 @@ async fn running_job_survives_restart() {
 error, so every field here is set away from its default */
 #[tokio::test]
 async fn restart_keeps_every_job_and_ask_field() {
-    let root = std::env::temp_dir().join(format!("amesh-jobs-fields-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let path = root.join("state.db");
+    let path = TempState::new("jobs-fields");
     let before = {
         let f = Fixture::open(path.clone());
         f.peer("boss", "one").await;
@@ -1376,7 +1375,7 @@ async fn restart_keeps_every_job_and_ask_field() {
         (json!(hub.jobs), json!(hub.asks))
     };
 
-    let f = Fixture::open(path);
+    let f = Fixture::open(path.to_path_buf());
     let hub = f.0.inner.lock().await;
     assert_eq!(json!(hub.jobs), before.0);
     assert_eq!(json!(hub.asks), before.1);
@@ -1585,9 +1584,8 @@ async fn gc_previews_without_writing_and_stamps_before_deleting() {
 
 #[tokio::test]
 async fn config_file_overrides_defaults() {
-    let root = std::env::temp_dir().join(format!("amesh-config-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let state = root.join("state.db");
+    let state = TempState::new("config");
+    let root = state.parent().unwrap();
     assert_eq!(load_config(&state), Config::default());
     let template = fs::read_to_string(root.join("config.toml")).expect("first start writes it");
     assert!(template
@@ -1645,7 +1643,7 @@ async fn config_file_overrides_defaults() {
         "job_keep_secs = 120\nask_keep_secs = 0\nsweep_secs = \"often\"\njob_keep_sec = 5\n",
     )
     .unwrap();
-    let f = Fixture::open(state);
+    let f = Fixture::open(state.to_path_buf());
     let config = f.0.inner.lock().await.config;
     assert_eq!(
         (
@@ -1914,9 +1912,7 @@ async fn every_creation_path_stamps_its_time() {
 
 #[tokio::test]
 async fn a_database_without_the_time_columns_loads() {
-    let root = std::env::temp_dir().join(format!("amesh-times-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let state = root.join("state.db");
+    let state = TempState::new("times");
     {
         let f = Fixture::open(state.clone());
         f.peer("boss", "c1").await;
@@ -1932,7 +1928,7 @@ async fn a_database_without_the_time_columns_loads() {
     )
     .unwrap();
     drop(db);
-    let f = Fixture::open(state);
+    let f = Fixture::open(state.to_path_buf());
     let hub = f.0.inner.lock().await;
     assert_eq!((hub.jobs.len(), hub.asks.len()), (1, 1));
     assert!(hub.jobs.values().all(|job| job.created_at.is_none()));
@@ -1941,9 +1937,7 @@ async fn a_database_without_the_time_columns_loads() {
 
 #[tokio::test]
 async fn times_survive_a_restart() {
-    let root = std::env::temp_dir().join(format!("amesh-times-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let state = root.join("state.db");
+    let state = TempState::new("times");
     let job = {
         let f = Fixture::open(state.clone());
         f.peer("boss", "c1").await;
@@ -1955,7 +1949,7 @@ async fn times_survive_a_restart() {
         assert!(persist_ok(&mut *f.0.inner.lock().await).is_ok());
         job
     };
-    let f = Fixture::open(state);
+    let f = Fixture::open(state.to_path_buf());
     assert!(f.row(&job).await.created_at.is_some(), "created_at");
     assert!(
         f.ask(&f.ask_id(&job).await).await.opened_at.is_some(),
@@ -2430,9 +2424,7 @@ async fn a_job_run_by_hand_counts_for_its_assignee() {
 /* who closed an ask is recorded when it closes, not guessed from the reply's text */
 #[tokio::test]
 async fn an_ask_records_how_it_closed() {
-    let root = std::env::temp_dir().join(format!("amesh-closed-{}", Uuid::new_v4()));
-    fs::create_dir_all(&root).unwrap();
-    let state = root.join("state.db");
+    let state = TempState::new("closed");
     let asks = {
         let f = Fixture::open(state.clone());
         f.peer("boss", "c1").await;
@@ -2511,7 +2503,7 @@ async fn an_ask_records_how_it_closed() {
     db.execute_batch("ALTER TABLE asks DROP COLUMN closed_by;")
         .unwrap();
     drop(db);
-    let f = Fixture::open(state);
+    let f = Fixture::open(state.to_path_buf());
     assert!(
         f.0.inner
             .lock()
