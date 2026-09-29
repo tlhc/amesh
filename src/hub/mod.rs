@@ -996,6 +996,16 @@ fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Value>) -> 
     false
 }
 
+/* the peer a record for `to` goes to, named by id or by name. An ack goes only to the peer id
+its ask recorded: to its row, or to the backlog kept for its session while it is away, never
+to a peer that took that id as its name after the asker left */
+fn recipient_key(hub: &Hub, to: &str, event: &Value) -> Option<String> {
+    if event["type"] == "ack" {
+        return (hub.peers.contains_key(to) || hub.owed.contains_key(to)).then(|| to.to_string());
+    }
+    resolve(hub, to).map(|peer| peer.peer_id.clone())
+}
+
 fn persist_then_deliver(
     hub: &mut Hub,
     to: &str,
@@ -1005,7 +1015,7 @@ fn persist_then_deliver(
     path only drops the inbox of peers it removes. Callers that cannot check the target
     themselves, an ack replying to a departed asker and a schedule firing at one, would
     leave a queue that outlives every peer and later replays onto whoever takes the name */
-    let Some(key) = resolve(hub, to).map(|p| p.peer_id.clone()) else {
+    let Some(key) = recipient_key(hub, to, &event) else {
         eprintln!("amesh: dropping {} for unknown peer {to}", event["type"]);
         return persist_ok(hub);
     };
@@ -1053,12 +1063,13 @@ fn close_open_asks(asks: &mut HashMap<String, Ask>, peer_id: &str, reason: &str)
             ask.failed = true;
             ask.closed_by = Some("hub".into());
             ask.reply = Some(reason.into());
+            /* every runtime renders the text alone, so the outcome travels inside it */
             replies.push(json!({
                 "type": "ack",
                 "correlation_id": ask.correlation_id,
                 "from_peer": ask.to_peer,
                 "to_peer": ask.from_peer,
-                "message": ask.reply,
+                "message": format!("[failed] {reason}"),
             }));
         }
     }
@@ -1069,7 +1080,7 @@ fn queue_replies(hub: &mut Hub, replies: Vec<Value>) -> Vec<(String, Value)> {
     let mut queued = Vec::new();
     for event in replies {
         let to = event["to_peer"].as_str().unwrap_or_default();
-        let Some(target) = resolve(hub, to).map(|peer| peer.peer_id.clone()) else {
+        let Some(target) = recipient_key(hub, to, &event) else {
             eprintln!("amesh: dropping {} for unknown peer {to}", event["type"]);
             continue;
         };
@@ -1252,6 +1263,8 @@ struct ScheduleCreateReq {
     fire_at: Option<u64>,
     #[serde(default)]
     every_seconds: Option<u64>,
+    #[serde(default)]
+    cross_circle: bool,
 }
 
 #[derive(Deserialize)]
@@ -1386,6 +1399,7 @@ fn check_auth(app: &App, headers: &HeaderMap) -> Result<(), (StatusCode, Json<Va
 struct SnapshotQuery {
     circle: Option<String>,
     detail: Option<String>,
+    ask: Option<String>,
 }
 
 const PREVIEW_CHARS: usize = 400;
@@ -1521,6 +1535,32 @@ async fn snapshot(
             None => missing_asks.push(cid.clone()),
         }
     }
+    /* and the asks no job points at, for the TUI's asks screen: in the view's circle when the
+    sender's name resolves to a row there or the recipient's id is one there; all of them
+    without a circle. An omitted sender is stored as anonymous and names no circle, whoever
+    took that name */
+    let taken: HashSet<&str> = hub
+        .jobs
+        .values()
+        .filter_map(|job| job.ask_id.as_deref())
+        .collect();
+    let mut loose: Vec<&Ask> = hub
+        .asks
+        .values()
+        .filter(|ask| !taken.contains(ask.correlation_id.as_str()))
+        .filter(|ask| {
+            circle.as_deref().is_none_or(|c| {
+                (ask.from_peer != "anonymous"
+                    && resolve(&hub, &ask.from_peer).is_some_and(|peer| peer.circle == c))
+                    || hub
+                        .peers
+                        .get(&ask.to_peer_id)
+                        .is_some_and(|peer| peer.circle == c)
+            })
+        })
+        .collect();
+    loose.sort_by(|a, b| a.correlation_id.cmp(&b.correlation_id));
+    asks.extend(loose);
     /* a recipient is a fixed peer_id: once that peer is gone, whoever took its name since is
     someone else. Assignees and senders are names, resolved the way the hub will use them */
     let recipients: BTreeSet<&str> = asks.iter().map(|ask| ask.to_peer_id.as_str()).collect();
@@ -1580,7 +1620,7 @@ async fn snapshot(
         }
     }
     /* every row in the view's circle, for the TUI's line of who is online; peers stays what
-    the jobs refer to */
+    the jobs and the listed asks refer to */
     let mut listed: Vec<&Peer> = hub
         .peers
         .values()
@@ -1603,12 +1643,17 @@ async fn snapshot(
                 "job_id": job.job_id, "title": job.title, "prompt": job.prompt, "result": job.result_summary,
             })
         });
+    let ask_detail = q
+        .ask
+        .as_deref()
+        .and_then(|id| asks.iter().find(|ask| ask.correlation_id == id))
+        .map(|ask| json!({"correlation_id": ask.correlation_id, "text": ask.text, "reply": ask.reply}));
     let body = json!({
         "schema_version": 1,
         "captured_at": now_unix(),
         "hub_epoch": hub.epoch,
         "event_count": event_count,
-        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true, "roster": true, "event_count": true},
+        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true, "roster": true, "event_count": true, "ask_list": true},
         "jobs": jobs.iter().map(|job| json!({
             "job_id": job.job_id, "title": preview(&job.title), "title_len": job.title.chars().count(), "state": job.state,
             "assigned_peer": job.assigned_peer, "from_peer": job.from_peer, "circle": job.circle,
@@ -1622,6 +1667,7 @@ async fn snapshot(
             "correlation_id": ask.correlation_id, "from_peer": ask.from_peer, "to_peer": ask.to_peer,
             "to_peer_id": ask.to_peer_id, "open": ask.open, "failed": ask.failed,
             "opened_at": ask.opened_at, "closed_at": ask.closed_at, "closed_by": ask.closed_by,
+            "text": preview(&ask.text), "text_len": ask.text.chars().count(),
             "reply": ask.reply.as_deref().map(preview),
             "reply_len": ask.reply.as_deref().map_or(0, |r| r.chars().count()),
         })).collect::<Vec<_>>(),
@@ -1629,6 +1675,7 @@ async fn snapshot(
         "roster": roster,
         "missing": {"asks": missing_asks, "peers": missing_peers},
         "detail": detail,
+        "ask_detail": ask_detail,
     });
     drop(hub);
     Ok(Json(body))
@@ -1986,7 +2033,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
         /* what a session-bound peer is still owed, a queued message or an ask it has not
         answered, stays behind for that session, drainer or not: freed, the name would hand
         it to the next session that takes it. A peer with no known session has nobody to
-        hand it to, so its backlog is dropped */
+        hand it to, so its backlog is dropped and its asks are closed below */
         let holds_backlog =
             hub.inbox.get(id).is_some_and(|q| !q.is_empty()) || has_open_ask(&hub.asks, id);
         if holds_backlog && !session.is_empty() {
@@ -2028,7 +2075,31 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
         ));
         changed = true;
     }
+    /* an ask whose recipient has no row and no backlog kept for a session has nobody left
+    to answer it, and the next holder of the name must not inherit it */
+    let gone: BTreeSet<String> = hub
+        .asks
+        .values()
+        .filter(|ask| ask.open)
+        .map(|ask| ask.to_peer_id.clone())
+        .filter(|id| !hub.peers.contains_key(id) && !hub.owed.contains_key(id))
+        .collect();
+    for id in &gone {
+        replies.extend(close_open_asks(
+            &mut hub.asks,
+            id,
+            "amesh: recipient left the hub",
+        ));
+        changed = true;
+    }
     (changed, queue_replies(hub, replies))
+}
+
+/* who an ask, a job or a schedule is from, as a peer id: its ack goes back to that peer, and
+a name may pass to another peer before then. A name no peer holds stays as given */
+fn sender_id(hub: &Hub, from: Option<&str>) -> Option<String> {
+    from.filter(|name| !name.is_empty())
+        .map(|name| resolve(hub, name).map_or(name.to_string(), |peer| peer.peer_id.clone()))
 }
 
 fn has_open_ask(asks: &HashMap<String, Ask>, peer_id: &str) -> bool {
@@ -2076,7 +2147,7 @@ async fn open_ask(
     let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let ask = Ask {
         correlation_id: cid.clone(),
-        from_peer: req.from_peer.unwrap_or_else(|| "anonymous".into()),
+        from_peer: sender_id(&hub, req.from_peer.as_deref()).unwrap_or_else(|| "anonymous".into()),
         to_peer: req.to_peer.clone(),
         to_peer_id: to_peer_id.clone(),
         text: req.text.clone(),
@@ -2466,6 +2537,16 @@ async fn ask_many(
         ));
     }
     let parent = format!("batch-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    /* every recipient is checked before any ask is opened, so a refused fan-out opens none */
+    {
+        let hub = app.inner.lock().await;
+        for to in &req.to_peers {
+            if resolve(&hub, to).is_none() {
+                return Err(unknown_peer(&hub, req.from_peer.as_deref()));
+            }
+            require_cross_circle(&hub, req.from_peer.as_deref(), to, req.cross_circle)?;
+        }
+    }
     let mut cids = Vec::new();
     for to in &req.to_peers {
         let (st, body) = {
@@ -2487,6 +2568,17 @@ async fn ask_many(
             }
         };
         if st != StatusCode::OK {
+            /* one that fails after others went out names them, so a retry does not ask twice */
+            let mut body = body;
+            if !cids.is_empty() {
+                app.inner
+                    .lock()
+                    .await
+                    .batches
+                    .insert(parent.clone(), cids.clone());
+                body["parent_id"] = json!(parent);
+                body["asks"] = json!(cids);
+            }
             return Err((st, Json(body)));
         }
         if let Some(cid) = body.get("correlation_id").and_then(Value::as_str) {
@@ -2508,7 +2600,9 @@ async fn ask_many_result(
     let Some(cids) = hub.batches.get(&id).cloned() else {
         return Err((
             StatusCode::NOT_FOUND,
-            Json(json!({"error": "unknown batch"})),
+            Json(
+                json!({"error": "unknown batch: batches live in memory and do not outlive a restart; wait on its asks by id"}),
+            ),
         ));
     };
     let asks: Vec<Ask> = cids
@@ -3100,7 +3194,7 @@ async fn create_job(
         circle,
         depends_on,
         ask_id: None,
-        from_peer: req.from_peer.unwrap_or_default(),
+        from_peer: sender_id(&hub, req.from_peer.as_deref()).unwrap_or_default(),
         nudge_at: None,
         finished_at: None,
         created_at: Some(now_unix()),
@@ -3431,6 +3525,12 @@ async fn create_schedule(
         ));
     };
     let to_peer = target.peer_id.clone();
+    require_cross_circle(
+        &hub,
+        req.from_peer.as_deref(),
+        &req.to_peer,
+        req.cross_circle,
+    )?;
     let circle = if let Some(id) = req.from_peer.as_deref().filter(|s| !s.is_empty()) {
         resolve(&hub, id)
             .map(|peer| peer.circle.clone())
@@ -3449,7 +3549,7 @@ async fn create_schedule(
     let schedule_id = format!("sched-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let sched = Schedule {
         schedule_id: schedule_id.clone(),
-        from_peer: req.from_peer.unwrap_or_else(|| "anonymous".into()),
+        from_peer: sender_id(&hub, req.from_peer.as_deref()).unwrap_or_else(|| "anonymous".into()),
         to_peer,
         text: req.text,
         kind: kind.into(),
@@ -3944,7 +4044,8 @@ fn advance_jobs(hub: &mut Hub) {
         } else {
             format!("{peer} cannot be reached")
         };
-        if !job.from_peer.is_empty() {
+        /* the reminder follows the creator's recorded peer id, as its ask's ack does */
+        if hub.peers.contains_key(&job.from_peer) {
             events.push(json!({
                 "type": "notify",
                 "id": format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]),
@@ -4390,7 +4491,8 @@ fn mcp_tools() -> Vec<Value> {
                     "kind": {"type": "string"},
                     "in_seconds": {"type": "integer"},
                     "fire_at": {"type": "integer"},
-                    "every_seconds": {"type": "integer"}
+                    "every_seconds": {"type": "integer"},
+                    "cross_circle": {"type": "boolean"}
                 }),
                 &[],
             );
@@ -4424,7 +4526,8 @@ fn mcp_tools() -> Vec<Value> {
                 json!({
                     "to_peers": {"type": "array", "items": {"type": "string"}},
                     "text": {"type": "string"},
-                    "from_peer": {"type": "string"}
+                    "from_peer": {"type": "string"},
+                    "cross_circle": {"type": "boolean"}
                 }),
                 &["to_peers", "text"],
             );
@@ -4758,6 +4861,10 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                     in_seconds: args.get("in_seconds").and_then(Value::as_u64),
                     fire_at: args.get("fire_at").and_then(Value::as_u64),
                     every_seconds: args.get("every_seconds").and_then(Value::as_u64),
+                    cross_circle: args
+                        .get("cross_circle")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
                 }),
             )
             .await?;

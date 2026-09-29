@@ -72,6 +72,7 @@ jobs
               [--assigned-peer ID] [--prompt TEXT]
   schedule create TO TEXT (--in-seconds N|--fire-at UNIX_SECONDS)
                   [--every-seconds N] [--kind notify|ask] [--from-peer ID]
+                  [--cross-circle true]
   schedule list|delete ID
 
 internals
@@ -1215,6 +1216,7 @@ fn schedule(raw: &[String]) -> Result<Value> {
             "in-seconds",
             "fire-at",
             "every-seconds",
+            "cross-circle",
         ],
         "list" | "delete" => &[],
         _ => return Err(format!("unknown schedule command: {command}").into()),
@@ -1263,6 +1265,7 @@ fn schedule(raw: &[String]) -> Result<Value> {
                     body[key.replace('-', "_")] = json!(number);
                 }
             }
+            body["cross_circle"] = json!(args.get("cross-circle", "") == "true");
             request("POST", "/schedules", Some(body))
         }
     }
@@ -2996,9 +2999,6 @@ async fn hook_ws_once(
                 let tag = owner.clone().filter(|id| !id.is_empty());
                 enqueue_hook_inbound(queued, (tag, wrapped), depth_warned);
                 remember_hook_inbound(accepted, id);
-                if !hook_ws_recv(&mut ws, &event).await {
-                    return Ok(false);
-                }
                 if uses_app_server && app.is_none() && Instant::now() >= next_app_try {
                     app = app_connect(peer_id, owner.as_deref()).await;
                     if app.is_none() {
@@ -3008,15 +3008,18 @@ async fn hook_ws_once(
                         app_backoff = Duration::from_secs(10);
                     }
                 }
-                let Some(sink) = app.as_mut() else {
-                    if !warned {
-                        eprintln!("amesh hook ws: no verified App Server thread for inject, queued={}", queued.len());
-                        warned = true;
+                /* recv follows the inject, as on the Claude path: a drainer that dies inside it
+                leaves the frame with the hub, which sends it to the next one */
+                if let Some(sink) = app.as_mut() {
+                    if !flush_app_sink(sink, queued, owner.as_deref()).await {
+                        app = None;
                     }
-                    continue;
-                };
-                if !flush_app_sink(sink, queued, owner.as_deref()).await {
-                    app = None;
+                } else if !warned {
+                    eprintln!("amesh hook ws: no verified App Server thread for inject, queued={}", queued.len());
+                    warned = true;
+                }
+                if !hook_ws_recv(&mut ws, &event).await {
+                    return Ok(false);
                 }
             }
             _ = beat.tick() => {

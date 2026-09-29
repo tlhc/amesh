@@ -1627,6 +1627,7 @@ fn add(
             failed: state == "failed",
             opened_at: Some(sent),
             closed_by: (state != "running").then(|| "recipient".into()),
+            ..Default::default()
         });
     }
     snap.jobs.push(job);
@@ -3561,5 +3562,740 @@ fn a_stale_count_stays_off_the_rule_while_the_hub_is_unreachable() {
         !lines[2].contains("events"),
         "the count is as old as the snapshot: {}",
         lines[2]
+    );
+}
+
+const CC: &str = "openhitls-sm2-opt-claude-code";
+const CODEX: &str = "openhitls-sm2-opt-codex";
+const PI: &str = "openhitls-sm2-opt-pi";
+const PI2: &str = "openhitls-sm2-opt-pi-2";
+
+fn lone(cid: &str, from: &str, to: &str, opened_at: Option<u64>) -> Ask {
+    Ask {
+        correlation_id: cid.into(),
+        from_peer: from.into(),
+        to_peer: to.into(),
+        to_peer_id: to.into(),
+        open: true,
+        opened_at,
+        text: format!("question {cid}"),
+        ..Default::default()
+    }
+}
+
+fn closed(mut ask: Ask, at: u64, by: &str, failed: bool, reply: &str) -> Ask {
+    ask.open = false;
+    ask.closed_at = Some(at);
+    ask.closed_by = (!by.is_empty()).then(|| by.into());
+    ask.failed = failed;
+    ask.reply = Some(reply.into());
+    ask
+}
+
+/* asks and the peers they name, who are the view's own peers, as a hub with ask_list sends
+them */
+fn with_asks(mut snap: Snapshot, asks: Vec<Ask>, peers: Vec<Peer>) -> Snapshot {
+    snap.capabilities.ask_list = true;
+    snap.capabilities.peer_activity = true;
+    snap.capabilities.roster = true;
+    snap.asks.extend(asks);
+    snap.roster.extend(peers.iter().cloned());
+    snap.peers.extend(peers);
+    snap
+}
+
+/* the fan-out of the design: one question to three peers; codex has answered, pi's turn
+ended without an answer */
+fn fan_out() -> Snapshot {
+    with_asks(
+        Snapshot {
+            captured_at: 1000,
+            ..Default::default()
+        },
+        vec![
+            lone("ask-1223c9e0", CC, PI2, Some(820)),
+            lone("ask-a3a07b51", CC, PI, Some(820)),
+            closed(
+                lone("ask-a904f2d6", CC, CODEX, Some(820)),
+                950,
+                "recipient",
+                false,
+                "2 findings, both fixed",
+            ),
+        ],
+        vec![
+            doing(CC, "idle", 830, None),
+            doing(CODEX, "idle", 950, None),
+            doing(PI, "idle", 940, None),
+            doing(PI2, "work", 830, None),
+        ],
+    )
+}
+
+fn row_text(row: &[(String, layout::Tone)]) -> String {
+    row.iter().map(|(t, _)| t.as_str()).collect()
+}
+
+#[test]
+fn the_asks_of_jobs_stay_on_their_cards() {
+    let mut snap = s1();
+    snap.jobs
+        .iter_mut()
+        .find(|j| j.job_id == "perf")
+        .unwrap()
+        .ask_id = Some("ask-job".into());
+    snap.asks.push(lone("ask-job", "cc", "cc", Some(900)));
+    snap.asks.push(lone("ask-lone", "cc", "cc", Some(900)));
+    let ids: Vec<&str> = snap
+        .asks_outside_jobs()
+        .iter()
+        .map(|a| a.correlation_id.as_str())
+        .collect();
+    assert_eq!(ids, ["ask-lone"]);
+}
+
+#[test]
+fn the_asks_are_listed_open_by_age_then_closed_latest_first() {
+    let snap = with_asks(
+        Snapshot::default(),
+        vec![
+            lone("ask-b", CC, PI, Some(900)),
+            closed(
+                lone("ask-c1", CC, PI, Some(10)),
+                950,
+                "recipient",
+                false,
+                "r",
+            ),
+            lone("ask-legacy", CC, PI, None),
+            lone("ask-a", CC, PI, Some(800)),
+            closed(
+                lone("ask-c2", CC, PI, Some(10)),
+                990,
+                "recipient",
+                false,
+                "r",
+            ),
+        ],
+        vec![],
+    );
+    let ids: Vec<&str> = super::asks::order(&snap)
+        .iter()
+        .map(|a| a.correlation_id.as_str())
+        .collect();
+    assert_eq!(ids, ["ask-a", "ask-b", "ask-legacy", "ask-c2", "ask-c1"]);
+}
+
+#[test]
+fn each_ask_reads_in_the_words_of_the_job_card() {
+    use layout::Tone;
+    let base = Snapshot {
+        captured_at: 1000,
+        ..Default::default()
+    };
+    let open = |p: Option<Peer>| {
+        let snap = with_asks(
+            base.clone(),
+            vec![lone("ask-x", CC, PI, Some(820))],
+            p.into_iter().collect(),
+        );
+        super::asks::state(&snap, &snap.asks[0])
+    };
+    assert_eq!(
+        open(Some(doing(PI, "work", 900, None))),
+        ("waiting 3m".into(), Tone::Run)
+    );
+    assert_eq!(
+        open(Some(doing(PI, "idle", 940, None))),
+        ("IDLE! 1m".into(), Tone::Fail)
+    );
+    assert_eq!(
+        open(Some(doing(PI, "wait", 960, None))),
+        ("WAIT! 40s".into(), Tone::Wait)
+    );
+    assert_eq!(
+        open(Some(peer(PI, "offline", None))),
+        ("offline".into(), Tone::Fail)
+    );
+    assert_eq!(open(None), ("left the hub".into(), Tone::Fail));
+    let mut quiet = with_asks(
+        base.clone(),
+        vec![lone("ask-x", CC, PI, Some(820))],
+        vec![doing(PI, "idle", 940, None)],
+    );
+    quiet.capabilities.peer_activity = false;
+    assert_eq!(
+        super::asks::state(&quiet, &quiet.asks[0]),
+        ("waiting 3m".into(), Tone::Run),
+        "IDLE! needs the hub's activity reports"
+    );
+    let shut = |by: &str, failed: bool| {
+        let snap = with_asks(
+            base.clone(),
+            vec![closed(
+                lone("ask-x", CC, PI, Some(820)),
+                950,
+                by,
+                failed,
+                "r",
+            )],
+            vec![],
+        );
+        super::asks::state(&snap, &snap.asks[0])
+    };
+    assert_eq!(shut("recipient", false), ("acked ok".into(), Tone::Done));
+    assert_eq!(shut("recipient", true), ("acked failed".into(), Tone::Fail));
+    assert_eq!(shut("hand", false), ("closed by hand".into(), Tone::Done));
+    assert_eq!(shut("hub", true), ("closed by hub".into(), Tone::Fail));
+    assert_eq!(shut("", false), ("closed ok".into(), Tone::Done));
+    assert_eq!(shut("", true), ("closed failed".into(), Tone::Fail));
+}
+
+#[test]
+fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
+    let snap = fan_out();
+    let order = super::asks::order(&snap);
+    let text = |cols: usize| -> Vec<String> {
+        super::asks::rows(&snap, &order, cols)
+            .iter()
+            .map(|row| row_text(row))
+            .collect()
+    };
+    let wide = text(100);
+    assert!(
+        wide[0].starts_with("1 ◆ 1223 …claude-code>…pi-2  "),
+        "{}",
+        wide[0]
+    );
+    assert!(
+        wide[0].contains("waiting 3m") && wide[0].contains("question ask-1223c9e0"),
+        "{}",
+        wide[0]
+    );
+    assert!(wide[1].contains("IDLE! 1m"), "{}", wide[1]);
+    assert!(
+        wide[2].starts_with("3 ● a904 …claude-code>…codex")
+            && wide[2].contains("acked ok")
+            && wide[2].contains("→ 2 findings, both fixed"),
+        "{}",
+        wide[2]
+    );
+    assert!(wide.iter().all(|row| width(row) <= 100));
+    let narrow = text(46);
+    assert!(
+        narrow[0].trim_end().ends_with("waiting 3m"),
+        "no room for a preview: {}",
+        narrow[0]
+    );
+    let mut far = fan_out();
+    far.asks.push(lone(
+        "ask-0594aa3c",
+        "crypto-software-agile-pi-2",
+        "crypto-software-agile-pi-3",
+        None,
+    ));
+    let order = super::asks::order(&far);
+    let rows: Vec<String> = super::asks::rows(&far, &order, 46)
+        .iter()
+        .map(|row| row_text(row))
+        .collect();
+    let gone = rows.iter().find(|r| r.contains("0594")).unwrap();
+    assert!(
+        gone.trim_end().ends_with("left the hub") && gone.contains('…') && width(gone) <= 46,
+        "the route gives way: {gone}"
+    );
+    let mut anon = fan_out();
+    anon.asks
+        .push(lone("ask-anon0001", "anonymous", PI, Some(900)));
+    let order = super::asks::order(&anon);
+    let rows = super::asks::rows(&anon, &order, 100);
+    assert!(
+        rows.iter()
+            .any(|row| row.iter().any(|(t, _)| t.starts_with("anonymous>…pi "))),
+        "a name without a row keeps the prefix: {:?}",
+        rows.iter().map(|r| row_text(r)).collect::<Vec<_>>()
+    );
+    let mut across = fan_out();
+    across.asks.push(lone("ask-1167aa00", "far", PI, Some(900)));
+    across.peers.push(doing("far", "idle", 900, None));
+    let order = super::asks::order(&across);
+    let rows: Vec<String> = super::asks::rows(&across, &order, 46)
+        .iter()
+        .map(|row| row_text(row))
+        .collect();
+    assert!(
+        rows.iter().any(|r| r.contains("far>…pi "))
+            && rows.iter().any(|r| r.contains("…claude-code>…pi-2")),
+        "a sender from another circle keeps its name and leaves the prefix to the circle's own: {rows:?}"
+    );
+    let mut all = fan_out();
+    all.roster.clear();
+    let order = super::asks::order(&all);
+    let rows: Vec<String> = super::asks::rows(&all, &order, 46)
+        .iter()
+        .map(|row| row_text(row))
+        .collect();
+    assert!(
+        [PI2, PI, CODEX]
+            .iter()
+            .zip(&rows)
+            .all(|(to, row)| row.contains(" …") && row.contains(&format!(">{to}  "))),
+        "a route that does not fit keeps its end, the recipient: {rows:?}"
+    );
+    let mut kin = fan_out();
+    let foreign = "openhitls-sm2-opt-external";
+    kin.peers.push(doing(foreign, "work", 900, None));
+    kin.peers.push(doing("anonymous", "work", 900, None));
+    kin.roster.push(doing("anonymous", "work", 900, None));
+    kin.asks.push(lone("ask-f0000001", foreign, PI, Some(900)));
+    kin.asks.push(lone(
+        "ask-f0000002",
+        CC,
+        "openhitls-sm2-opt-pi-3",
+        Some(900),
+    ));
+    kin.asks
+        .push(lone("ask-f0000003", "anonymous", PI2, Some(900)));
+    let order = super::asks::order(&kin);
+    let rows: Vec<String> = super::asks::rows(&kin, &order, 200)
+        .iter()
+        .map(|row| row_text(row))
+        .collect();
+    assert!(
+        rows.iter().any(|r| r.contains(" anonymous>…pi-2 ")),
+        "anonymous keeps its name and leaves the prefix alone: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains(&format!(" {foreign}>…pi "))),
+        "a name from another circle keeps its whole name: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|r| r.contains(" …claude-code>openhitls-sm2-opt-pi-3 ")),
+        "a peer that left keeps its whole name: {rows:?}"
+    );
+}
+
+#[test]
+fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
+    let snap = fan_out();
+    let find = |cid: &str| snap.asks.iter().find(|a| a.correlation_id == cid).unwrap();
+    let text = |cid: &str, cols: usize| {
+        super::asks::card(&snap, find(cid), 1, cols, None, Fit::Rows(24)).text()
+    };
+    let mut long = fan_out();
+    long.asks[2].reply = Some("word ".repeat(80));
+    let codex = super::asks::card(&long, &long.asks[2], 3, 46, None, Fit::Rows(30)).text();
+    let lines: Vec<&str> = codex.lines().collect();
+    assert!(
+        lines[0].starts_with("┌● 3 ask a904 · acked ok · took 2m"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("│ reply   word"),
+        "the reply comes first: {}",
+        lines[1]
+    );
+    assert!(
+        lines[4].contains('…') && !lines[5].contains("word"),
+        "four lines of it under the list:\n{codex}"
+    );
+    let whole = super::asks::card(&long, &long.asks[2], 3, 46, None, Fit::Whole).text();
+    assert!(
+        whole.lines().filter(|l| l.contains("word")).count() > 4,
+        "all of it in the full card:\n{whole}"
+    );
+    let pi = text("ask-a3a07b51", 46);
+    assert!(
+        pi.contains("│ from    openhitls-sm2-opt-claude-code"),
+        "{pi}"
+    );
+    assert!(
+        pi.contains("│         · now IDLE"),
+        "a status that does not fit takes its own line:\n{pi}"
+    );
+    assert!(pi.contains("IDLE! 1m · turn ended"), "{pi}");
+    let joined: String = pi
+        .lines()
+        .map(|l| l.trim_matches(|c| c == '│' || c == ' '))
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        pi.lines()
+            .any(|l| l.starts_with("│ nudge   amesh peer notify"))
+            && joined.contains("notify openhitls-sm2-opt-pi 'ask a3a0 waits for your ack'"),
+        "{pi}"
+    );
+    assert!(
+        !text("ask-1223c9e0", 46).contains("nudge"),
+        "a recipient at work needs no nudge"
+    );
+    let mut gone = fan_out();
+    gone.peers.retain(|p| p.peer_id != PI);
+    let left = super::asks::card(&gone, &gone.asks[1], 2, 90, None, Fit::Rows(12)).text();
+    assert!(
+        left.contains("openhitls-sm2-opt-pi · left the hub")
+            && left.contains(
+                "│ close   amesh peer ack ask-a3a07b51 --failed true --message 'recipient left'"
+            ),
+        "{left}"
+    );
+    let mut old = fan_out();
+    old.asks[0].opened_at = None;
+    let legacy = super::asks::card(&old, &old.asks[0], 1, 46, None, Fit::Rows(20)).text();
+    assert!(
+        legacy.contains("open, age unknown")
+            && legacy.contains("sent before the hub kept the time"),
+        "{legacy}"
+    );
+}
+
+#[test]
+fn a_opens_the_asks_screen_even_without_jobs() {
+    let mut app = app_with(fan_out());
+    app.opts.circle = Some("project-42990b2f3ebd".into());
+    assert!(screen_text(&mut app, 100, 30)
+        .iter()
+        .any(|l| l.starts_with("no jobs here yet")));
+    app.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut app, 100, 30);
+    let at = lines
+        .iter()
+        .position(|l| l.starts_with("asks · 2 open · 1 answered"))
+        .expect("the asks header");
+    assert!(
+        lines[at + 1].ends_with('─'),
+        "the rule under it: {}",
+        lines[at + 1]
+    );
+    assert!(lines[at + 3].starts_with("1 ◆ 1223"), "{}", lines[at + 3]);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("┌◆ 1 ask 1223 · waiting 3m")),
+        "the first ask's card"
+    );
+    assert!(lines.last().unwrap().ends_with("a jobs"));
+    app.key(KeyCode::Char('a'));
+    assert!(
+        screen_text(&mut app, 100, 30)
+            .iter()
+            .any(|l| l.starts_with("no jobs here yet")),
+        "a again goes back"
+    );
+}
+
+#[test]
+fn the_asks_screen_moves_jumps_finds_and_opens_the_full_card() {
+    let mut app = app_with(fan_out());
+    app.key(KeyCode::Char('a'));
+    screen_text(&mut app, 100, 30);
+    app.key(KeyCode::Char('j'));
+    assert_eq!(app.ask_sel.as_deref(), Some("ask-a3a07b51"));
+    app.key(KeyCode::Char('3'));
+    assert_eq!(app.ask_sel.as_deref(), Some("ask-a904f2d6"));
+    app.key(KeyCode::Char('/'));
+    for c in "pi-2".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    assert_eq!(
+        app.ask_sel.as_deref(),
+        Some("ask-1223c9e0"),
+        "found by the recipient's name"
+    );
+    app.key(KeyCode::Char('f'));
+    app.key(KeyCode::Char('a'));
+    assert!(!app.asks, "f gives no hints here, so a still goes back");
+    app.key(KeyCode::Char('a'));
+    app.key(KeyCode::Enter);
+    let full = screen_text(&mut app, 100, 30);
+    assert!(
+        full.iter().all(|l| !l.starts_with("1 ◆")),
+        "the full card takes the list's place"
+    );
+    assert!(full.last().unwrap().contains("esc back"));
+}
+
+#[test]
+fn the_ask_selection_follows_its_id_when_the_list_reorders() {
+    let mut app = app_with(fan_out());
+    app.key(KeyCode::Char('a'));
+    screen_text(&mut app, 100, 30);
+    app.key(KeyCode::Char('2'));
+    assert_eq!(app.ask_sel.as_deref(), Some("ask-a3a07b51"));
+    let mut next = fan_out();
+    next.asks[0] = closed(next.asks[0].clone(), 990, "recipient", true, "no toolchain");
+    app.apply(Ok(next));
+    let lines = screen_text(&mut app, 100, 30);
+    assert_eq!(
+        app.ask_sel.as_deref(),
+        Some("ask-a3a07b51"),
+        "the same ask, now first"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("┌◆ 1 ask a3a0")),
+        "{lines:?}"
+    );
+    let mut many = fan_out();
+    for i in 0..9 {
+        many.asks
+            .push(lone(&format!("ask-m{i:03}"), CC, PI2, Some(900 + i)));
+    }
+    let mut app = app_with(many.clone());
+    app.key(KeyCode::Char('a'));
+    screen_text(&mut app, 100, 40);
+    app.key(KeyCode::Char('1'));
+    many.asks.retain(|a| a.correlation_id != "ask-1223c9e0");
+    app.apply(Ok(many));
+    let before = app.ask_sel.clone();
+    app.key(KeyCode::Char('0'));
+    assert_eq!(
+        app.ask_sel, before,
+        "a half-typed jump is dropped once the order changed"
+    );
+}
+
+#[test]
+fn the_selected_ask_row_is_marked_across_the_pane() {
+    use ratatui::style::Modifier;
+    let mut app = app_with(fan_out());
+    app.key(KeyCode::Char('a'));
+    let lines = app.screen(100, 30, 0);
+    let text = |l: &ratatui::text::Line| {
+        l.spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>()
+    };
+    let row = lines
+        .iter()
+        .position(|l| text(l).starts_with("1 ◆ 1223"))
+        .unwrap();
+    assert!(lines[row]
+        .spans
+        .iter()
+        .all(|s| s.style.add_modifier.contains(Modifier::REVERSED)));
+    assert!(lines[row + 1]
+        .spans
+        .iter()
+        .all(|s| !s.style.add_modifier.contains(Modifier::REVERSED)));
+    app.opts.color = true;
+    let lines = app.screen(100, 30, 0);
+    let idle = lines[row + 1]
+        .spans
+        .iter()
+        .find(|s| s.content.contains("IDLE!"))
+        .unwrap();
+    assert_eq!(
+        idle.style.fg,
+        Some(app.opts.theme.fail),
+        "an unselected row keeps its colours"
+    );
+    let sel = &lines[row];
+    assert!(sel
+        .spans
+        .iter()
+        .all(|s| s.style.bg == Some(app.opts.theme.select_bg)));
+    let waiting = sel
+        .spans
+        .iter()
+        .find(|s| s.content.contains("waiting"))
+        .unwrap();
+    assert_eq!(
+        waiting.style.fg,
+        Some(app.opts.theme.run),
+        "the selected row keeps its colours too"
+    );
+}
+
+#[test]
+fn the_asks_screen_speaks_for_old_hubs_and_empty_views() {
+    let mut app = app_with(s1());
+    app.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut app, 100, 30);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l
+                .contains("this hub lists only the asks of jobs; restart it on the current amesh")),
+        "{lines:?}"
+    );
+    let mut empty = s1();
+    empty.capabilities.ask_list = true;
+    let mut app = app_with(empty);
+    app.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut app, 100, 30);
+    assert!(
+        lines.iter().any(|l| l.starts_with("no asks here yet")),
+        "{lines:?}"
+    );
+    let mut app = app_with(fan_out());
+    app.key(KeyCode::Char('a'));
+    app.opts.ascii = true;
+    let lines = screen_text(&mut app, 100, 30);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("asks | all circles | 2 open | 1 answered")),
+        "without a circle the header says so: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.starts_with("1 > 1223 ~claude-code>~pi-2")),
+        "ASCII glyphs: {lines:?}"
+    );
+}
+
+fn with_lone_asks(snap: Snapshot) -> Snapshot {
+    with_asks(
+        snap,
+        vec![
+            lone("ask-1223c9e0", CC, PI2, Some(820)),
+            lone("ask-a3a07b51", CC, PI, Some(820)),
+        ],
+        vec![doing(PI2, "work", 830, None), doing(PI, "work", 830, None)],
+    )
+}
+
+#[test]
+fn the_rule_counts_the_open_asks_and_gives_way_after_the_events() {
+    let mut app = app_with(with_events(with_lone_asks(s1()), 1234567));
+    let rule = |app: &mut App, cols: usize| -> String {
+        screen_text(app, cols, 40)
+            .into_iter()
+            .find(|l| l.starts_with("────"))
+            .unwrap()
+    };
+    let wide = rule(&mut app, 100);
+    assert!(wide.ends_with(" 2 asks open · 1234567 events ─"), "{wide}");
+    let both = " 2 asks open ·".width() + " 1234567 events ".width() + 1 + 4;
+    let narrow = rule(&mut app, both - 1);
+    assert!(
+        narrow.ends_with(" 2 asks open ─"),
+        "the events go first: {narrow}"
+    );
+    app.apply(Err("connection refused".into()));
+    let stale = rule(&mut app, 100);
+    assert!(
+        !stale.contains("asks open"),
+        "as old as the snapshot: {stale}"
+    );
+}
+
+#[test]
+fn the_no_jobs_row_counts_the_asks_and_points_to_their_screen() {
+    let mut app = app_with(with_events(fan_out(), 3));
+    let lines = screen_text(&mut app, 100, 30);
+    let row = lines
+        .iter()
+        .find(|l| l.starts_with("no jobs here yet"))
+        .unwrap();
+    assert!(row.ends_with("2 asks open · 3 events"), "{row}");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "asks have a screen of their own: press a"),
+        "{lines:?}"
+    );
+    let lines = screen_text(&mut app, 34, 30);
+    let row = lines
+        .iter()
+        .find(|l| l.starts_with("no jobs here yet"))
+        .unwrap();
+    assert!(row.ends_with("2 asks open"), "the events go first: {row}");
+    let mut quiet = with_events(fan_out(), 3);
+    quiet.asks.clear();
+    let mut app = app_with(quiet);
+    let lines = screen_text(&mut app, 100, 30);
+    let row = lines
+        .iter()
+        .find(|l| l.starts_with("no jobs here yet"))
+        .unwrap();
+    assert!(
+        row.ends_with("  3 events") && !lines.iter().any(|l| l.contains("press a")),
+        "no asks, no count and no pointer: {lines:?}"
+    );
+}
+
+#[test]
+fn the_footer_names_a_while_the_view_holds_asks() {
+    let mut app = app_with(s1());
+    assert_eq!(
+        screen_text(&mut app, 100, 40).last().unwrap(),
+        "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain"
+    );
+    let mut app = app_with(with_lone_asks(s1()));
+    assert_eq!(
+        screen_text(&mut app, 100, 40).last().unwrap(),
+        "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  tab chain  a asks"
+    );
+    assert_eq!(
+        screen_text(&mut app, 46, 40).last().unwrap(),
+        "j/k move  h/l stage  1-9 jump  f hint  a asks"
+    );
+}
+
+#[test]
+fn the_fetch_asks_for_the_text_the_card_shows() {
+    let mut app = app_with(with_lone_asks(s1()));
+    screen_text(&mut app, 100, 40);
+    assert_eq!(app.wanted().as_deref(), Some("detail=perf"));
+    app.key(KeyCode::Char('a'));
+    assert_eq!(
+        app.wanted().as_deref(),
+        Some("ask=ask-1223c9e0"),
+        "the asks screen starts on its first ask"
+    );
+    app.key(KeyCode::Char('j'));
+    assert_eq!(app.wanted().as_deref(), Some("ask=ask-a3a07b51"));
+}
+
+#[test]
+fn the_full_ask_card_shows_the_whole_text_once_it_arrives() {
+    let mut snap = fan_out();
+    snap.asks[0].text = "x ".repeat(200);
+    let mut app = app_with(snap.clone());
+    app.key(KeyCode::Char('a'));
+    app.key(KeyCode::Enter);
+    assert!(
+        !screen_text(&mut app, 100, 30)
+            .iter()
+            .any(|l| l.contains("END")),
+        "the preview until the detail comes"
+    );
+    snap.ask_detail = Some(model::AskDetail {
+        correlation_id: "ask-1223c9e0".into(),
+        text: format!("{}END", "x ".repeat(600)),
+        reply: None,
+    });
+    app.apply(Ok(snap));
+    app.key(KeyCode::Char('G'));
+    let lines = screen_text(&mut app, 100, 30);
+    assert!(lines.iter().any(|l| l.contains("END")), "{lines:?}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("└─ lines")),
+        "the full card scrolls"
+    );
+}
+
+#[test]
+fn the_smallest_pane_still_lists_the_selected_ask() {
+    let mut app = app_with(fan_out());
+    app.key(KeyCode::Char('a'));
+    for cols in [30, 46] {
+        let lines = screen_text(&mut app, cols, 8);
+        assert!(
+            lines.iter().any(|l| l.starts_with("1 ◆ 1223")),
+            "the blank row gives way to the list at {cols}x8: {lines:?}"
+        );
+    }
+    app.key(KeyCode::Char('j'));
+    let lines = screen_text(&mut app, 46, 8);
+    assert!(
+        lines.iter().any(|l| l.starts_with("2 ◆ a3a0")),
+        "the one row there is the selected ask: {lines:?}"
     );
 }

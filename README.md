@@ -93,7 +93,7 @@ A **circle** is one git repo: `project-` plus a short hash of the git common dir
 | `amesh_ask` / `amesh_ack` / `amesh_wait` | tracked question |
 | `amesh_notify_peer` / `amesh_broadcast` / `amesh_ask_many` | notify / broadcast / fan-out |
 | `amesh_events` | recent events (this circle) |
-| `amesh_job_*` / `amesh_schedule_*` | jobs with dependencies / timed notify or ask |
+| `amesh_job_*` / `amesh_schedule_*` | jobs with dependencies / timed notify or ask (another circle needs `cross_circle`) |
 
 The CLI mirrors this under `amesh peer`, `amesh jobs`, and `amesh schedule`; `amesh --help` lists the flags.
 
@@ -118,6 +118,7 @@ amesh peer ack ask-5e6f7a8b --message "no fixture" --failed true --from-peer ame
 - Legacy jobs dispatch only after an explicit `assigned_peer` update.
 - Set `from_peer` to receive replies and reminders; anonymous jobs keep results only in `amesh jobs show`, until cleanup.
 - A chain of jobs joined by `depends_on` is deleted `job_keep_secs` after all its jobs end, and a closed ask `ask_keep_secs` after closing once no job refers to it; `amesh_wait` and repeated acks then return 404, so take results from the ack. `amesh gc --apply true` cleans up now.
+- An ask whose recipient leaves with no session to come back for is closed as failed at once; `amesh_ask_many` batches are not kept across a hub restart (wait on each ask by id).
 - Reconnect MCP to load new tool parameters; until then use `amesh peer ack <cid> --failed true --from-peer <id>`.
 - Pin workers with `amesh setup <runtime> --peer-id`: after a restart under a new name, work waits on the old identity until reassigned.
 
@@ -132,6 +133,7 @@ amesh tui --all --ascii      # every circle, ASCII only
 
 - The top of the screen lists the peers online in this view and what each is doing.
 - The rule under the header shows how many events the hub keeps for this view.
+- `a` shows the asks no job points at, open ones first: who waits on whom and for how long, the question and the reply, and a nudge or close command when an answer stalls. The rule counts the open ones.
 - Each chain gets its own screen, with numbered jobs under a `chain <name> · done/total` header; jobs without dependencies share one block. The selected job's card shows its result or failure reason, worker, ask and dependencies, plus the command to retry it, nudge its worker, or hand it to another peer.
 - Keys:
   - `j`/`k`: move along the chain; `h`/`l`: move within a stage
@@ -139,6 +141,7 @@ amesh tui --all --ascii      # every circle, ASCII only
   - `/`: search all chains; `n`/`N`: step through matches
   - `Tab`/`Shift-Tab`: next/previous chain
   - `Enter`: open the full card (scroll with `j`/`k`, the arrows, `space`/`b`, `PgDn`/`PgUp`, `g`/`G`; `Esc` goes back)
+  - `a`: the asks screen and back
   - `r`: refresh; `q`: quit
 - Activity:
   - spinner: the worker is busy with this job (`--no-anim` freezes it)

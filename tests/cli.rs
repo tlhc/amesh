@@ -5876,6 +5876,16 @@ fn app_server_capture_with(
                             }
                             "turn/start" | "turn/steer" => {
                                 let _ = tx.send(raw.to_string());
+                                /* "~id" is a thread that takes the message and never answers */
+                                let thread = req["params"]["threadId"].as_str().unwrap_or("");
+                                let stall = busy
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|id| id.strip_prefix('~') == Some(thread));
+                                if stall {
+                                    std::future::pending::<()>().await;
+                                }
                                 json!({"turn": {"id": "turn-1"}})
                             }
                             _ => json!({}),
@@ -6769,5 +6779,53 @@ fn an_activity_report_gives_up_on_a_hub_that_does_not_answer() {
     assert!(
         took < Duration::from_millis(2500),
         "the report took {took:?}"
+    );
+}
+
+/* the App Server takes the message and never answers, so the drainer dies inside the inject;
+the hub must still hold the frame for the hook's pending read or the next drainer */
+#[test]
+fn a_codex_drainer_that_dies_inside_the_inject_leaves_the_frame_with_the_hub() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_drain_peer(&sandbox, "codex");
+    let codex_home = PathBuf::from(format!(
+        "/tmp/ac{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    ));
+    let injected = app_server_capture_threads(&codex_home, &["thread-1"], &["~thread-1"]);
+    let mut child = sandbox
+        .command()
+        .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_THREAD_ID", "thread-1")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(peer_is_online(&sandbox, worker), "drainer must connect");
+    assert_eq!(
+        sandbox.json(&["peer", "notify", worker, "held-inject"], None)["ok"],
+        true
+    );
+    let seen = injected
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the App Server takes the message");
+    assert!(seen.contains("held-inject"), "{seen}");
+    let _ = child.kill();
+    let _ = child.wait();
+    let _ = fs::remove_dir_all(&codex_home);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    /* with the socket gone the pending read hands the inbox out */
+    let pending = sandbox.json(&["peer", "asks", "--peer-id", worker], None);
+    assert!(
+        pending["inbox"].to_string().contains("held-inject"),
+        "the frame stays with the hub until the inject returns: {pending}"
     );
 }

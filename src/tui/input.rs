@@ -23,6 +23,8 @@ pub(crate) enum Act {
     Chain(i32),
     Card(bool),
     Find(i32),
+    /* the asks screen and back */
+    Asks,
     Refresh,
     Quit,
 }
@@ -138,6 +140,7 @@ impl Input {
                 KeyCode::Char('G') | KeyCode::End => Act::Edge(1),
                 KeyCode::Char('n') => Act::Find(1),
                 KeyCode::Char('N') => Act::Find(-1),
+                KeyCode::Char('a') => Act::Asks,
                 KeyCode::Char('r') => Act::Refresh,
                 KeyCode::Char('q') => Act::Quit,
                 _ => Act::None,

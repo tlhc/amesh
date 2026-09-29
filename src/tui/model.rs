@@ -19,6 +19,9 @@ pub(crate) struct Snapshot {
     pub event_count: u64,
     #[serde(default)]
     pub detail: Option<Detail>,
+    /* the whole text and reply of the ask the asks screen selected, from hubs that list asks */
+    #[serde(default)]
+    pub ask_detail: Option<AskDetail>,
     #[serde(default)]
     pub capabilities: Capabilities,
 }
@@ -31,6 +34,8 @@ pub(crate) struct Capabilities {
     pub roster: bool,
     #[serde(default)]
     pub event_count: bool,
+    #[serde(default)]
+    pub ask_list: bool,
 }
 
 /* what a runtime last said it is doing; the hub keeps it in memory only */
@@ -86,6 +91,13 @@ pub(crate) struct Ask {
     /* "recipient", "hand" or "hub", from hubs that record it */
     #[serde(default)]
     pub closed_by: Option<String>,
+    /* the question and the answer, cut to a preview; AskDetail has them whole */
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub reply: Option<String>,
+    #[serde(default)]
+    pub closed_at: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -113,6 +125,15 @@ pub(crate) struct Detail {
     pub result: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct AskDetail {
+    pub correlation_id: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub reply: Option<String>,
+}
+
 impl Snapshot {
     pub fn job(&self, id: &str) -> Option<&Job> {
         self.jobs.iter().find(|job| job.job_id == id)
@@ -120,6 +141,19 @@ impl Snapshot {
 
     pub fn ask(&self, id: Option<&str>) -> Option<&Ask> {
         id.and_then(|id| self.asks.iter().find(|ask| ask.correlation_id == id))
+    }
+
+    /* the asks no job in the view points at; hubs without ask_list send only the asks of jobs */
+    pub fn asks_outside_jobs(&self) -> Vec<&Ask> {
+        let taken: HashSet<&str> = self
+            .jobs
+            .iter()
+            .filter_map(|job| job.ask_id.as_deref())
+            .collect();
+        self.asks
+            .iter()
+            .filter(|ask| !taken.contains(ask.correlation_id.as_str()))
+            .collect()
     }
 
     /* an ask's recipient is a fixed peer_id; a name may have passed to another peer */

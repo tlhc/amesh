@@ -1730,7 +1730,7 @@ async fn snapshot_returns_jobs_their_asks_and_peers() {
         .job(json!({"title": "b", "assigned_peer": "two", "from_peer": "boss", "depends_on": [a]}))
         .await;
     f.advance().await;
-    f.open_ask("boss", "two").await;
+    let loose = f.open_ask("boss", "two").await;
     let s = snapshot_of(&f, "").await;
     assert_eq!(s["schema_version"], 1);
     assert!(!s["hub_epoch"].as_str().unwrap().is_empty());
@@ -1743,8 +1743,13 @@ async fn snapshot_returns_jobs_their_asks_and_peers() {
     assert_eq!(row_b["depends_on"], json!([a]));
     let cid = row_a["ask_id"].as_str().expect("a was dispatched");
     let asks = s["asks"].as_array().unwrap();
-    assert_eq!(asks.len(), 1);
+    assert_eq!(
+        asks.len(),
+        2,
+        "the job's ask, then the ask no job points at"
+    );
     assert_eq!(asks[0]["correlation_id"], cid);
+    assert_eq!(asks[1]["correlation_id"], loose.as_str());
     assert_eq!(asks[0]["open"], true);
     assert!(asks[0]["opened_at"].is_u64());
     let peers: BTreeSet<&str> = s["peers"]
@@ -1788,6 +1793,7 @@ async fn snapshot_changes_nothing() {
         )
         .await;
     assert_eq!(status, StatusCode::OK);
+    let loose = f.open_ask("boss", "one").await;
     f.0.inner
         .lock()
         .await
@@ -1802,6 +1808,7 @@ async fn snapshot_changes_nothing() {
     assert!(!inbox.is_empty());
     for _ in 0..3 {
         snapshot_of(&f, "").await;
+        snapshot_of(&f, &format!("?ask={loose}")).await;
     }
     let hub = f.0.inner.lock().await;
     assert_eq!(
@@ -2737,4 +2744,517 @@ async fn snapshot_counts_the_events_the_hub_keeps() {
         "a swept ask's events leave the count"
     );
     assert_eq!(count(&snapshot_of(&f, "").await), 1);
+}
+
+async fn ask_across(f: &Fixture, from: &str, to: &str) -> String {
+    let (status, body) = f
+        .request(
+            "POST",
+            "/ask",
+            json!({"from_peer": from, "to_peer": to, "text": "q", "cross_circle": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body["correlation_id"].as_str().unwrap().to_string()
+}
+
+fn ask_ids(s: &Value) -> BTreeSet<String> {
+    s["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|ask| ask["correlation_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn snapshot_lists_the_asks_no_job_points_at_by_circle() {
+    let f = team("c1", &["boss", "one"]).await;
+    f.peer("far", "c2").await;
+    f.peer("far2", "c2").await;
+    let job = f
+        .job(json!({"title": "a", "assigned_peer": "one", "from_peer": "boss"}))
+        .await;
+    f.advance().await;
+    let of_job = f.ask_id(&job).await;
+    let inside = f.open_ask("boss", "one").await;
+    let into_c1 = ask_across(&f, "far", "one").await;
+    let out_of_c1 = ask_across(&f, "boss", "far").await;
+    let c2_only = f.open_ask("far", "far2").await;
+    let c1 = snapshot_of(&f, "?circle=c1").await;
+    assert_eq!(c1["capabilities"]["ask_list"], true);
+    assert_eq!(
+        ask_ids(&c1),
+        BTreeSet::from([of_job, inside, into_c1.clone(), out_of_c1.clone()]),
+        "the job's ask, and every ask whose sender or recipient is in the circle"
+    );
+    assert_eq!(
+        ask_ids(&snapshot_of(&f, "?circle=c2").await),
+        BTreeSet::from([into_c1, out_of_c1, c2_only]),
+        "a cross-circle ask shows in both circles"
+    );
+    assert_eq!(
+        ask_ids(&snapshot_of(&f, "").await).len(),
+        5,
+        "without a circle, every ask"
+    );
+    let peers: BTreeSet<&str> = c1["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|peer| peer["peer_id"].as_str().unwrap())
+        .collect();
+    assert!(
+        peers.contains("far"),
+        "the peers of the listed asks come along: {peers:?}"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_lists_an_ask_whose_rows_are_gone_only_without_a_circle() {
+    let f = team("c1", &["boss", "one"]).await;
+    let cid = f.open_ask("boss", "one").await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.peers.remove("boss");
+        hub.peers.remove("one");
+    }
+    assert!(
+        !ask_ids(&snapshot_of(&f, "?circle=c1").await).contains(&cid),
+        "no row places it in a circle"
+    );
+    assert!(ask_ids(&snapshot_of(&f, "").await).contains(&cid));
+}
+
+#[tokio::test]
+async fn snapshot_cuts_an_asks_text_to_a_preview() {
+    let f = team("c1", &["boss", "one"]).await;
+    let (_, body) = f
+        .request(
+            "POST",
+            "/ask",
+            json!({"from_peer": "boss", "to_peer": "one", "text": "x".repeat(1000)}),
+        )
+        .await;
+    let cid = body["correlation_id"].as_str().unwrap().to_string();
+    let s = snapshot_of(&f, "?circle=c1").await;
+    let row = s["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|ask| ask["correlation_id"] == cid.as_str())
+        .unwrap()
+        .clone();
+    assert_eq!(row["text"].as_str().unwrap().chars().count(), PREVIEW_CHARS);
+    assert_eq!(row["text_len"], 1000);
+}
+
+#[tokio::test]
+async fn snapshot_gives_the_whole_text_of_the_ask_asked_for() {
+    let f = team("c1", &["boss", "one"]).await;
+    f.peer("far", "c2").await;
+    let (_, body) = f
+        .request(
+            "POST",
+            "/ask",
+            json!({"from_peer": "boss", "to_peer": "one", "text": "x".repeat(1000)}),
+        )
+        .await;
+    let cid = body["correlation_id"].as_str().unwrap().to_string();
+    let (status, _) = f
+        .ack(
+            &cid,
+            json!({"message": "y".repeat(900), "from_peer": "one"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        snapshot_of(&f, "?circle=c1").await["ask_detail"],
+        Value::Null
+    );
+    let s = snapshot_of(&f, &format!("?circle=c1&ask={cid}")).await;
+    assert_eq!(s["ask_detail"]["text"].as_str().unwrap().len(), 1000);
+    assert_eq!(s["ask_detail"]["reply"].as_str().unwrap().len(), 900);
+    let mut keys: Vec<&str> = s["ask_detail"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(keys, ["correlation_id", "reply", "text"]);
+    assert_eq!(
+        snapshot_of(&f, &format!("?circle=c2&ask={cid}")).await["ask_detail"],
+        Value::Null,
+        "the detail follows the circle filter"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_places_an_ask_without_a_sender_by_its_recipient_alone() {
+    let f = team("c1", &["anonymous"]).await;
+    f.peer("worker", "c2").await;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/ask",
+            json!({"to_peer": "worker", "text": "unattributed question"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let cid = body["correlation_id"].as_str().unwrap().to_string();
+    let c1 = snapshot_of(&f, &format!("?circle=c1&ask={cid}")).await;
+    assert!(
+        !ask_ids(&c1).contains(&cid) && c1["ask_detail"].is_null(),
+        "an omitted sender is stored as anonymous and names no circle, even with a peer by that name: {c1}"
+    );
+    assert!(ask_ids(&snapshot_of(&f, "?circle=c2").await).contains(&cid));
+}
+
+#[tokio::test]
+async fn a_recipient_that_leaves_without_a_session_closes_its_asks() {
+    let f = team("c", &["sender"]).await;
+    f.peer("folder-pi", "c").await;
+    let cid = f.open_ask("sender", "folder-pi").await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.peers.get_mut("folder-pi").unwrap().last_seen = 0;
+        probe_peers(&mut hub).unwrap();
+        let ask = &hub.asks[&cid];
+        assert!(
+            !ask.open && ask.failed && ask.closed_by.as_deref() == Some("hub"),
+            "nobody is left to answer it"
+        );
+    }
+    let acks: Vec<Value> = f
+        .inbox("sender")
+        .await
+        .into_iter()
+        .filter(|e| e["type"] == "ack" && e["correlation_id"] == cid.as_str())
+        .collect();
+    assert_eq!(acks.len(), 1, "the asker hears why");
+    let (_, reg) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"path": "/tmp/folder", "backend": "pi", "circle": "c", "session_id": "next"}),
+        )
+        .await;
+    assert_eq!(reg["peer_id"], "folder-pi");
+    let (_, pending) = f
+        .request("GET", "/asks/pending?peer_id=folder-pi", json!({}))
+        .await;
+    assert_eq!(
+        pending["asks"],
+        json!([]),
+        "the next session in the folder does not inherit it"
+    );
+}
+
+#[tokio::test]
+async fn an_open_ask_whose_recipient_is_gone_for_good_is_closed() {
+    let f = team("c", &["sender", "w1"]).await;
+    let cid = f.open_ask("sender", "w1").await;
+    let mut hub = f.0.inner.lock().await;
+    /* a row removed with no backlog kept for a session, as the 9 asks on the live hub were */
+    hub.peers.remove("w1");
+    probe_peers(&mut hub).unwrap();
+    assert!(!hub.asks[&cid].open);
+}
+
+#[tokio::test]
+async fn ask_many_opens_nothing_when_a_recipient_is_refused() {
+    let f = team("c", &["sender", "worker"]).await;
+    f.peer("far", "c2").await;
+    for to in [json!(["worker", "missing"]), json!(["worker", "far"])] {
+        let (status, body) = f
+            .request(
+                "POST",
+                "/ask-many",
+                json!({"from_peer": "sender", "to_peers": to, "text": "do work"}),
+            )
+            .await;
+        assert!(!status.is_success(), "{body}");
+    }
+    let tools = mcp_tools();
+    let schema = tools
+        .iter()
+        .find(|t| t["name"] == "amesh_ask_many")
+        .unwrap();
+    assert_eq!(
+        schema["inputSchema"]["properties"]["cross_circle"]["type"], "boolean",
+        "the tool says how to reach another circle"
+    );
+    let hub = f.0.inner.lock().await;
+    assert!(
+        hub.asks.is_empty() && hub.inbox.get("worker").is_none_or(Vec::is_empty),
+        "a refused fan-out opens no ask at all"
+    );
+}
+
+#[tokio::test]
+async fn ask_many_names_the_asks_it_opened_before_a_later_one_failed() {
+    let f = team("c", &["sender", "w1", "w2"]).await;
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .execute_batch("CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;")
+        .unwrap();
+    let (status, body) = f
+        .request(
+            "POST",
+            "/ask-many",
+            json!({"from_peer": "sender", "to_peers": ["w1", "w2"], "text": "t"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let opened: Vec<String> = f.0.inner.lock().await.asks.keys().cloned().collect();
+    assert_eq!(opened.len(), 1, "the first write held, the second failed");
+    assert_eq!(
+        body["asks"],
+        json!(opened),
+        "the error names what was opened: {body}"
+    );
+    let parent = body["parent_id"].as_str().unwrap();
+    let (_, batch) = f
+        .request("GET", &format!("/ask-many/{parent}"), json!({}))
+        .await;
+    assert_eq!(batch["asks"][0]["correlation_id"], opened[0].as_str());
+}
+
+#[tokio::test]
+async fn an_ack_goes_back_to_the_peer_that_asked_after_its_name_moves() {
+    let f = team("c", &["worker"]).await;
+    let reg = |id: &str, name: &str, circle: &str| json!({"peer_id": id, "name": name, "backend": "pi", "circle": circle});
+    f.request("POST", "/peers", reg("caller-a", "sender", "c"))
+        .await;
+    let cid = f.open_ask("sender", "worker").await;
+    let job = f.job(json!({"title": "j", "from_peer": "sender"})).await;
+    let (_, sched) = f
+        .request(
+            "POST",
+            "/schedules",
+            json!({"from_peer": "sender", "to_peer": "worker", "text": "later", "in_seconds": 3600}),
+        )
+        .await;
+    f.request("POST", "/peers", reg("caller-a", "renamed", "c"))
+        .await;
+    f.request("POST", "/peers", reg("caller-b", "sender", "other"))
+        .await;
+    let (status, _) = f
+        .ack(&cid, json!({"from_peer": "worker", "message": "answer"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let got = |inbox: Vec<Value>| inbox.iter().filter(|e| e["type"] == "ack").count();
+    assert_eq!(
+        got(f.inbox("caller-a").await),
+        1,
+        "the asker gets its answer"
+    );
+    assert_eq!(
+        got(f.inbox("caller-b").await),
+        0,
+        "the peer that took the name later gets nothing"
+    );
+    assert_eq!(
+        f.ask(&cid).await.from_peer,
+        "caller-a",
+        "the ask keeps who asked"
+    );
+    assert_eq!(f.row(&job).await.from_peer, "caller-a", "so does a job");
+    assert_eq!(sched["from_peer"], "caller-a", "and a schedule");
+}
+
+#[tokio::test]
+async fn a_hub_close_says_failed_in_the_reply_text() {
+    let f = team("c", &["sender"]).await;
+    f.peer_in_session("worker", "c", "s-worker").await;
+    let cid = f.open_ask("sender", "worker").await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.peers.get_mut("worker").unwrap().last_seen = 0;
+        probe_peers(&mut hub).unwrap();
+        hub.owed.get_mut("worker").unwrap().since = 0;
+        probe_peers(&mut hub).unwrap();
+        assert_eq!(
+            hub.asks[&cid].reply.as_deref(),
+            Some("amesh: recipient's session did not come back within 24h"),
+            "the ask keeps the reason as it is"
+        );
+    }
+    let ack = f
+        .inbox("sender")
+        .await
+        .into_iter()
+        .find(|e| e["type"] == "ack" && e["correlation_id"] == cid.as_str())
+        .unwrap();
+    assert!(
+        ack["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("[failed] amesh: recipient's session did not come back"),
+        "the text carries the outcome, as a failed ack's does: {ack}"
+    );
+}
+
+#[tokio::test]
+async fn a_schedule_to_another_circle_needs_cross_circle() {
+    let f = team("c1", &["a"]).await;
+    f.peer("b", "c2").await;
+    let body = |cross: bool| json!({"from_peer": "a", "to_peer": "b", "text": "later", "kind": "ask", "in_seconds": 3600, "cross_circle": cross});
+    let (refused, _) = f.request("POST", "/schedules", body(false)).await;
+    assert_eq!(refused, StatusCode::FORBIDDEN, "the rule /ask keeps");
+    let (allowed, _) = f.request("POST", "/schedules", body(true)).await;
+    assert_eq!(allowed, StatusCode::OK);
+    let (_, tool) = f
+        .tool(
+            "amesh_schedule_create",
+            json!({"from_peer": "a", "to_peer": "b", "text": "later", "in_seconds": 3600, "cross_circle": true}),
+        )
+        .await;
+    assert!(
+        tool["schedule_id"].is_string(),
+        "the tool passes it on: {tool}"
+    );
+    let tools = mcp_tools();
+    let schema = tools
+        .iter()
+        .find(|t| t["name"] == "amesh_schedule_create")
+        .unwrap();
+    assert_eq!(
+        schema["inputSchema"]["properties"]["cross_circle"]["type"],
+        "boolean"
+    );
+}
+
+#[tokio::test]
+async fn a_batch_gone_with_a_restart_says_so() {
+    let state = TempState::new("batch-restart");
+    let f = Fixture::open(state.to_path_buf());
+    for p in ["sender", "w1"] {
+        f.peer(p, "c").await;
+    }
+    let (_, body) = f
+        .request(
+            "POST",
+            "/ask-many",
+            json!({"from_peer": "sender", "to_peers": ["w1"], "text": "t"}),
+        )
+        .await;
+    let parent = body["parent_id"].as_str().unwrap().to_string();
+    drop(f);
+    let g = Fixture::open(state.to_path_buf());
+    let (status, gone) = g
+        .request("GET", &format!("/ask-many/{parent}"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        gone["error"].as_str().unwrap().contains("restart"),
+        "the reply says batches do not outlive a restart: {gone}"
+    );
+}
+
+#[tokio::test]
+async fn nothing_for_a_gone_asker_goes_to_a_peer_that_took_its_id_as_a_name() {
+    let f = team("c", &["worker", "leaver"]).await;
+    let reg = |id: &str, name: &str, circle: &str| json!({"peer_id": id, "name": name, "backend": "pi", "circle": circle});
+    f.request("POST", "/peers", reg("caller-a", "sender", "c"))
+        .await;
+    let answered = f.open_ask("sender", "worker").await;
+    let closed = f.open_ask("sender", "leaver").await;
+    let job = f
+        .job(json!({"title": "j", "assigned_peer": "worker", "from_peer": "sender"}))
+        .await;
+    f.advance().await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.peers.get_mut("caller-a").unwrap().last_seen = 0;
+        probe_peers(&mut hub).unwrap();
+    }
+    f.request("POST", "/peers", reg("caller-b", "caller-a", "other"))
+        .await;
+    let (status, _) = f
+        .ack(
+            &answered,
+            json!({"from_peer": "worker", "message": "private answer"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.peers.get_mut("leaver").unwrap().last_seen = 0;
+        probe_peers(&mut hub).unwrap();
+        hub.jobs.get_mut(&job).unwrap().nudge_at = Some(now_unix() - 1);
+    }
+    f.advance().await;
+    let inbox = f.inbox("caller-b").await;
+    let about = |id: &str| {
+        inbox
+            .iter()
+            .any(|e| e["correlation_id"] == id || e["topic"] == id)
+    };
+    assert!(
+        !about(&answered),
+        "the recipient's answer stays off it: {inbox:?}"
+    );
+    assert!(!about(&closed), "so does the hub's close: {inbox:?}");
+    assert!(!about(&job), "and the job's reminder: {inbox:?}");
+    assert_eq!(
+        f.ask(&answered).await.reply.as_deref(),
+        Some("private answer"),
+        "the answer stays with the ask for a wait"
+    );
+}
+
+#[tokio::test]
+async fn an_asker_away_with_its_session_kept_is_owed_its_answer() {
+    for recipient_acks in [false, true] {
+        let f = team("c", &["other"]).await;
+        f.peer_in_session("asker", "c", "s-asker").await;
+        f.peer("worker", "c").await;
+        let cid = f.open_ask("asker", "worker").await;
+        /* a queued message makes the pruned asker's backlog stay for its session */
+        let (status, _) = f
+            .request(
+                "POST",
+                "/notify",
+                json!({"from_peer": "other", "to_peer": "asker", "message": "keep"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK);
+        {
+            let mut hub = f.0.inner.lock().await;
+            hub.peers.get_mut("asker").unwrap().last_seen = 0;
+            if !recipient_acks {
+                hub.peers.get_mut("worker").unwrap().last_seen = 0;
+            }
+            probe_peers(&mut hub).unwrap();
+        }
+        if recipient_acks {
+            let (status, _) = f
+                .ack(&cid, json!({"from_peer": "worker", "message": "answer"}))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+        f.peer_in_session("asker", "c", "s-asker").await;
+        let (_, pending) = f
+            .request("GET", "/asks/pending?peer_id=asker", json!({}))
+            .await;
+        let acks = pending["inbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["type"] == "ack" && e["correlation_id"] == cid.as_str())
+            .count();
+        let what = if recipient_acks {
+            "the answer"
+        } else {
+            "the hub's close"
+        };
+        assert_eq!(
+            acks, 1,
+            "{what} waits with the backlog for the asker's session: {pending}"
+        );
+    }
 }

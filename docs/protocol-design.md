@@ -21,7 +21,9 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 
 ## Ask
 
-- `POST /ask` → `{"ok":true,"correlation_id":"ask-…"}`. Cross-circle needs `cross_circle: true` (`require_cross_circle`).
+- `POST /ask` → `{"ok":true,"correlation_id":"ask-…"}`. Cross-circle needs `cross_circle: true` (`require_cross_circle`). A sender given by name is recorded as its peer id. The ack goes to that peer id only: to its row, or to the backlog kept for its session while it is away, never to a peer that later holds that id as its name; a job's reminders to its creator follow the same id.
+- `POST /ask-many` checks every recipient and the cross-circle rule before it opens any ask; one that still fails after others went out returns its error with `parent_id` and the `asks` already opened. Batches live in memory: after a restart `GET /ask-many/{id}` is 404, and the asks are waited on by id.
+- The hub closes an open ask, failed and `closed_by: "hub"`, when its recipient's session is replaced under the same name, did not come back within 24 h, or its recipient left with no session to come back for; the asker's copy reads `[failed] <reason>`.
 - `GET /asks/pending?peer_id=` returns open asks for that peer. With an acknowledging WebSocket attached, the inbox is empty here; only WS `recv` retires those copies.
 - `POST /asks/{id}/wait` waits on that id.
 - `POST /ack` with `correlation_id` closes the ask:
@@ -74,15 +76,15 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 
 ## Snapshot
 
-- `GET /snapshot` is the read-only view for monitors such as `amesh tui`: the jobs, the asks they point at and the peers they name, copied under one lock.
-  - `?circle=NAME` filters the jobs; `?detail=JOB_ID` also returns that job's title, prompt and result in full.
+- `GET /snapshot` is the read-only view for monitors such as `amesh tui`: the jobs, the asks they point at, the asks no job points at and the peers they name, copied under one lock.
+  - `?circle=NAME` filters the jobs, and keeps the asks no job points at whose sender's name or recipient's id is a peer in that circle (every such ask without `circle`); `?detail=JOB_ID` also returns that job's title, prompt and result in full, `?ask=ASK_ID` that ask's `text` and `reply` in full as `ask_detail`.
   - Text fields, titles included, are cut to 400 characters, with `*_len` giving the full length; references that no longer resolve are listed under `missing`.
   - An ask's `to_peer_id` is matched by peer id only, so a recipient that left is listed under `missing` even when another peer has taken its name since. Assignees and senders are names, resolved the way the hub resolves them next.
   - Each peer carries its `activity` (below), or null while unknown, and `running`: its running jobs in every circle, counted by recipient (a job run by hand, which has no ask, by its assignee), so a filtered view can tell whether a job is its only one.
   - It never probes peers, settles jobs, drains inboxes, writes the state file or records an event.
   - `roster` lists every peer in the requested circle (every peer without `circle`), sorted by `peer_id`, in the shape of `peers`; a monitor judges who is online from it.
   - `event_count` is the number of events `GET /events` would list for the same `circle`.
-  - `hub_epoch` changes when the hub restarts; `capabilities` says which optional fields are filled (`roster`, `event_count`, `peer_activity`, ...).
+  - `hub_epoch` changes when the hub restarts; `capabilities` says which optional fields are filled (`roster`, `event_count`, `peer_activity`, ...); `ask_list` marks hubs that send the asks no job points at and each ask's `text`.
 
 ## Activity
 
@@ -103,7 +105,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `GET /ws`. The first text frame must be `{"type":"connect","peer_id":"…"}` (or `name`), with optional `auth_token` and `recv`. The hub replies `{"type":"connected","peer_id":"…","name":"…"}`.
 - If `recv` is true, the peer promises `{"type":"recv","id":"…"}` for each event with an id:
   - the hub drops the durable inbox row only on that recv (`acknowledge_event`)
-  - the CLI `amesh hook ws` also keeps a process-local FIFO; restarting that process drops the FIFO
+  - the CLI `amesh hook ws` sends it once it has tried to hand the frame to the runtime, so a drainer that dies mid-inject leaves the record owed; what the runtime could not take waits in a process-local FIFO, which restarting that process drops
 
 ## MCP
 

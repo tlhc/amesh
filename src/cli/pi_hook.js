@@ -484,6 +484,7 @@ export default function AmeshHooks(pi) {
         in_seconds: { type: "integer" },
         fire_at: { type: "integer" },
         every_seconds: { type: "integer" },
+        cross_circle: { type: "boolean" },
       }, []],
       ["schedule_list", "List schedules in your circle; cross_circle without circle lists all", {
         circle: { type: "string" },
@@ -493,6 +494,7 @@ export default function AmeshHooks(pi) {
       ["ask_many", "Ask many peers", {
         to_peers: { type: "array", items: { type: "string" } },
         text: { type: "string" },
+        cross_circle: { type: "boolean" },
       }, ["to_peers", "text"]],
       ["wait", "Wait for an ask ack. timeout_seconds is capped at 50. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives. The recipient acks once.", {
         correlation_id: { type: "string" },

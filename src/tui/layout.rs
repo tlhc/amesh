@@ -995,14 +995,14 @@ pub(crate) fn quote(word: &str) -> String {
     format!("'{}'", word.replace('\'', r"'\''"))
 }
 
-type Row = Vec<(String, Tone)>;
+pub(crate) type Row = Vec<(String, Tone)>;
 
-const KEY: usize = 8;
+pub(crate) const KEY: usize = 8;
 
 /* a card names at most three dependencies on one line, as in the design */
 const LISTED: usize = 3;
 
-fn key(k: &str, first: bool) -> (String, Tone) {
+pub(crate) fn key(k: &str, first: bool) -> (String, Tone) {
     debug_assert!(width(k) < KEY, "{k} leaves no space before its value");
     (
         if first {
@@ -1015,7 +1015,7 @@ fn key(k: &str, first: bool) -> (String, Tone) {
 }
 
 /* the first n lines of a field; the last ends in … when any were left out */
-fn field(k: &str, lines: &[String], n: usize, tone: Tone, room: usize) -> Vec<Row> {
+pub(crate) fn field(k: &str, lines: &[String], n: usize, tone: Tone, room: usize) -> Vec<Row> {
     let mut out: Vec<Row> = lines
         .iter()
         .take(n)
@@ -1030,7 +1030,14 @@ fn field(k: &str, lines: &[String], n: usize, tone: Tone, room: usize) -> Vec<Ro
     out
 }
 
-fn wrapped(side: &mut Vec<Row>, k: &str, text: &str, tone: Tone, max: usize, lines: usize) {
+pub(crate) fn wrapped(
+    side: &mut Vec<Row>,
+    k: &str,
+    text: &str,
+    tone: Tone,
+    max: usize,
+    lines: usize,
+) {
     let room = max.saturating_sub(KEY);
     side.extend(field(k, &wrap(text, room), lines, tone, room));
 }
@@ -1085,6 +1092,13 @@ pub(crate) enum Fit {
     Rows(usize),
 }
 
+/* a card takes two columns from 96 columns on; how wide each is */
+pub(crate) fn columns(cols: usize) -> (bool, usize) {
+    let two = cols >= 96;
+    let inner = cols.saturating_sub(4);
+    (two, if two { inner / 2 - 1 } else { inner })
+}
+
 /* the design's card: fields on the left and, in a wide pane, the prompt and any command
 on the right */
 pub(crate) fn card(
@@ -1102,9 +1116,7 @@ pub(crate) fn card(
     let job = snap.job(id).expect("selected job is in the snapshot");
     let ask = snap.ask(job.ask_id.as_deref());
     let now = snap.captured_at;
-    let two = cols >= 96;
-    let inner = cols.saturating_sub(4);
-    let colw = if two { inner / 2 - 1 } else { inner };
+    let (two, colw) = columns(cols);
     let (mut left, mut right, mut commands): (Vec<Row>, Vec<Row>, Vec<Row>) =
         (Vec::new(), Vec::new(), Vec::new());
     let prompt = full_text.map_or(job.prompt.as_str(), |(p, _)| p);
@@ -1498,11 +1510,23 @@ pub(crate) fn card(
     if keep_stage {
         head.push_str(&stage);
     }
+    framed(glyph(state), &head, &left, &right, cols)
+}
+
+/* a card's frame: the glyph and head in its top border, the left rows and, in a wide pane,
+the right rows beside them */
+pub(crate) fn framed(
+    mark: (char, Tone),
+    head: &str,
+    left: &[Row],
+    right: &[Row],
+    cols: usize,
+) -> Grid {
+    let (two, colw) = columns(cols);
     let mut g = Grid::default();
     g.put(0, 0, "┌", Tone::Line);
-    let (ch, tone) = glyph(state);
-    g.put(0, 1, &ch.to_string(), tone);
-    let at = g.put(0, 2, &fit(&head, cols.saturating_sub(4)), Tone::Title);
+    g.put(0, 1, &mark.0.to_string(), mark.1);
+    let at = g.put(0, 2, &fit(head, cols.saturating_sub(4)), Tone::Title);
     g.put(
         0,
         at,

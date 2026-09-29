@@ -1,3 +1,4 @@
+mod asks;
 mod input;
 mod layout;
 mod model;
@@ -58,6 +59,11 @@ pub(crate) struct App {
     needed them: the view moves down at once and back up only once the roster held still */
     snaps: u64,
     held: (usize, u64),
+    /* the asks screen is up instead of the jobs; the ask selected there, and the order its
+    numbers were read against */
+    asks: bool,
+    ask_sel: Option<String>,
+    ask_order: Vec<String>,
 }
 
 /* a chain or the loose block, numbered 1..n; base counts the jobs in the blocks above */
@@ -97,6 +103,9 @@ impl App {
             page: 10,
             snaps: 0,
             held: (0, 0),
+            asks: false,
+            ask_sel: None,
+            ask_order: Vec::new(),
         }
     }
 
@@ -176,6 +185,9 @@ impl App {
     }
 
     pub fn key(&mut self, code: KeyCode) -> Act {
+        if self.asks {
+            return self.ask_key(code);
+        }
         let blocks = self.blocks();
         /* digits typed against numbers that have since changed would land on another job */
         if matches!(self.input.mode, Mode::Jump(_)) && self.numbers.renumbered != self.typed_at {
@@ -185,7 +197,11 @@ impl App {
         }
         self.typed_at = self.numbers.renumbered;
         let Some((b, p)) = self.settle(&blocks) else {
-            return self.input.key(code, 0);
+            let act = self.input.key(code, 0);
+            if act == Act::Asks {
+                self.flip();
+            }
+            return act;
         };
         let cur = &blocks[b];
         let act = self.input.key(code, cur.order.len());
@@ -225,6 +241,7 @@ impl App {
                 self.full = open;
                 self.scroll = 0;
             }
+            Act::Asks => self.flip(),
             Act::Find(d) => {
                 let query = self.input.query.to_lowercase();
                 let snap = self.snap.as_ref();
@@ -253,12 +270,113 @@ impl App {
         act
     }
 
+    /* the asks screen and back; a full card closes, and the asks screen keeps the ask it had
+    selected while that ask is still listed */
+    fn flip(&mut self) {
+        self.asks = !self.asks;
+        self.full = false;
+        self.scroll = 0;
+        if let (true, Some(snap)) = (self.asks, &self.snap) {
+            let order = asks::order(snap);
+            if !order
+                .iter()
+                .any(|ask| Some(&ask.correlation_id) == self.ask_sel.as_ref())
+            {
+                self.ask_sel = order.first().map(|ask| ask.correlation_id.clone());
+            }
+        }
+    }
+
+    fn ask_key(&mut self, code: KeyCode) -> Act {
+        let order: Vec<String> = self.snap.as_ref().map_or(Vec::new(), |snap| {
+            asks::order(snap)
+                .iter()
+                .map(|ask| ask.correlation_id.clone())
+                .collect()
+        });
+        /* digits typed against an order that has since changed would land on another ask */
+        if matches!(self.input.mode, Mode::Jump(_)) && order != self.ask_order {
+            self.input.mode = Mode::Normal;
+            self.ask_order = order;
+            return Act::None;
+        }
+        self.ask_order = order.clone();
+        let act = self.input.key(code, order.len());
+        /* the asks carry no letter hints */
+        if matches!(self.input.mode, Mode::Hint) {
+            self.input.mode = Mode::Normal;
+        }
+        let at = self
+            .ask_sel
+            .as_ref()
+            .and_then(|id| order.iter().position(|x| x == id))
+            .unwrap_or(0);
+        let before = self.ask_sel.clone();
+        match act {
+            Act::Asks => self.flip(),
+            Act::Move(d) if self.full => {
+                self.scroll = self.scroll.saturating_add_signed(d as isize);
+            }
+            Act::Page(d) if self.full => {
+                self.scroll = self
+                    .scroll
+                    .saturating_add_signed(d as isize * self.page as isize);
+            }
+            Act::Edge(d) if self.full => self.scroll = if d < 0 { 0 } else { usize::MAX },
+            Act::Card(open) => {
+                self.full = open;
+                self.scroll = 0;
+            }
+            _ if order.is_empty() => {}
+            Act::Pick(num) => self.ask_sel = order.get(num - 1).cloned().or(before.clone()),
+            Act::Move(d) => {
+                let n = order.len() as i32;
+                self.ask_sel = Some(order[(at as i32 + d).rem_euclid(n) as usize].clone());
+            }
+            Act::Find(d) => {
+                let query = self.input.query.to_lowercase();
+                let snap = self.snap.as_ref();
+                let hit = |id: &String| {
+                    snap.and_then(|s| s.asks.iter().find(|a| &a.correlation_id == id))
+                        .is_some_and(|a| {
+                            [&a.from_peer, &a.to_peer_id, &a.text]
+                                .iter()
+                                .any(|t| t.to_lowercase().contains(&query))
+                        })
+                };
+                let n = order.len() as i32;
+                let (start, step) = if d == 0 {
+                    (at as i32, 1)
+                } else {
+                    (at as i32 + d, d.signum())
+                };
+                if let Some(id) = (0..n)
+                    .map(|k| &order[(start + k * step).rem_euclid(n) as usize])
+                    .find(|id| hit(id))
+                {
+                    self.ask_sel = Some(id.clone());
+                }
+            }
+            _ => {}
+        }
+        if self.ask_sel != before {
+            self.scroll = 0;
+        }
+        act
+    }
+
     /* the design's screen: the selected job's chain alone under its header, the flow, then
     the card; Tab moves to the next chain */
     pub fn screen(&mut self, cols: usize, rows: usize, tick: usize) -> Vec<Line<'static>> {
         let mut g = Grid::default();
         let blocks = self.blocks();
-        let settled = self.settle(&blocks);
+        /* settling picks a job and starts its card at the top; the asks screen keeps its own
+        place in the card it shows */
+        let settled = if self.asks {
+            None
+        } else {
+            self.settle(&blocks)
+        };
         if cols < 30 || rows < 8 {
             g.put(0, 0, "pane too small", Tone::Warn);
             return self.lines(&g, cols, rows);
@@ -283,6 +401,9 @@ impl App {
             }
             peer_rows = self.held.0.min(cap);
         }
+        if self.asks {
+            return self.asks_screen(g, peer_rows, cols, rows, tick);
+        }
         let Some((b, _)) = settled else {
             let stale;
             let (text, hint) = match (&self.error, &self.snap) {
@@ -301,16 +422,45 @@ impl App {
             for (r, line) in lines.iter().enumerate() {
                 g.put(peer_rows + r, 0, line, Tone::Warn);
             }
-            if self.error.is_none() {
-                if let Some(events) = self.snap.as_ref().and_then(layout::events_tag) {
-                    let taken = lines.first().map_or(0, |line| layout::width(line));
-                    if taken + 2 + layout::width(&events) <= cols {
-                        g.put(peer_rows, cols - layout::width(&events), &events, Tone::Dim);
+            /* the open asks and what the hub keeps at the right end, the events the first to go */
+            if let Some(snap) = self.snap.as_ref().filter(|_| self.error.is_none()) {
+                let taken = lines.first().map_or(0, |line| layout::width(line));
+                let tags: Vec<(String, Tone)> = [
+                    asks::tag(snap).map(|t| (t, Tone::Near)),
+                    layout::events_tag(snap).map(|t| (t, Tone::Dim)),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                for keep in (1..=tags.len()).rev() {
+                    let w = tags[..keep]
+                        .iter()
+                        .map(|(t, _)| layout::width(t))
+                        .sum::<usize>()
+                        + 3 * (keep - 1);
+                    if taken + 2 + w <= cols {
+                        let mut c = cols - w;
+                        for (i, (t, tone)) in tags[..keep].iter().enumerate() {
+                            if i > 0 {
+                                c = g.put(peer_rows, c, " · ", Tone::Dim);
+                            }
+                            c = g.put(peer_rows, c, t, *tone);
+                        }
+                        break;
                     }
                 }
             }
-            for (r, line) in layout::wrap(hint, cols).iter().enumerate() {
+            let hints = layout::wrap(hint, cols);
+            for (r, line) in hints.iter().enumerate() {
                 g.put(peer_rows + lines.len() + r, 0, line, Tone::Dim);
+            }
+            if !hint.is_empty() && self.snap.as_ref().is_some_and(asks::held) {
+                g.put(
+                    peer_rows + lines.len() + hints.len(),
+                    0,
+                    &layout::fit("asks have a screen of their own: press a", cols),
+                    Tone::Near,
+                );
             }
             return self.lines(&g, cols, rows);
         };
@@ -356,17 +506,30 @@ impl App {
             right.push((run, Tone::Run));
             right.push((format!(" {}/{} ", b + 1, blocks.len()), Tone::Dim));
         }
-        /* what the hub keeps goes first, and is the first to go when the pane is narrow; an
-        error on screen means the count is as old as the snapshot */
-        if let Some(events) = layout::events_tag(&snap).filter(|_| self.error.is_none()) {
-            let piece = if right.is_empty() {
-                format!(" {events} ")
-            } else {
-                format!(" {events} ·")
-            };
-            let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
-            if used + layout::width(&piece) + 1 + RULE_MIN <= cols {
-                right.insert(0, (piece, Tone::Dim));
+        /* ahead of them the open asks and what the hub keeps, both as old as the snapshot while
+        an error shows; the events are the first to go when the pane is narrow, the asks next */
+        let tags: Vec<(String, Tone)> = [
+            asks::tag(&snap).map(|t| (t, Tone::Near)),
+            layout::events_tag(&snap).map(|t| (t, Tone::Dim)),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|_| self.error.is_none())
+        .collect();
+        let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
+        for keep in (1..=tags.len()).rev() {
+            let pieces: Vec<(String, Tone)> = tags[..keep]
+                .iter()
+                .enumerate()
+                .map(|(i, (t, tone))| match i + 1 == keep && right.is_empty() {
+                    true => (format!(" {t} "), *tone),
+                    false => (format!(" {t} ·"), *tone),
+                })
+                .collect();
+            let w: usize = pieces.iter().map(|(text, _)| layout::width(text)).sum();
+            if used + w + 1 + RULE_MIN <= cols {
+                right.splice(0..0, pieces);
+                break;
             }
         }
         let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
@@ -423,7 +586,6 @@ impl App {
             },
             false => card(Fit::Rows(avail - view_h)),
         };
-        let card_h = card.height().min(avail - view_h);
         let node = cur.base + cur.num[&sel];
         let sel_row = body
             .rows
@@ -432,44 +594,7 @@ impl App {
             .map_or(0, |(r, _)| *r);
         let scroll = sel_row.saturating_sub(view_h / 2).min(body_h - view_h);
         g.blit(&body, scroll..scroll + view_h, top);
-        if self.full && card.height() > avail {
-            /* the full card scrolls under its header, and its bottom edge says where */
-            let rows = avail.saturating_sub(2).max(1);
-            let lines = card.height() - 2;
-            self.page = rows;
-            self.scroll = self.scroll.min(lines.saturating_sub(rows));
-            g.blit(&card, 0..1, top);
-            g.blit(&card, 1 + self.scroll..1 + self.scroll + rows, top + 1);
-            let at = format!(
-                "└─ lines {}-{} of {lines} ",
-                self.scroll + 1,
-                (self.scroll + rows).min(lines)
-            );
-            let end = g.put(top + 1 + rows, 0, &layout::fit(&at, cols - 1), Tone::Line);
-            g.put(
-                top + 1 + rows,
-                end,
-                &format!("{}┘", "─".repeat(cols.saturating_sub(end + 1))),
-                Tone::Line,
-            );
-        } else if card_h < card.height() && card_h > 0 {
-            g.blit(&card, 0..card_h - 1, top + view_h);
-            let more = format!("└─ {} more lines · enter ", card.height() - card_h + 1);
-            let end = g.put(
-                top + view_h + card_h - 1,
-                0,
-                &layout::fit(&more, cols - 1),
-                Tone::Line,
-            );
-            g.put(
-                top + view_h + card_h - 1,
-                end,
-                &format!("{}┘", "─".repeat(cols.saturating_sub(end + 1))),
-                Tone::Line,
-            );
-        } else {
-            g.blit(&card, 0..card_h, top + view_h);
-        }
+        self.place(&mut g, &card, top, view_h, avail, cols);
         let footer = match &self.input.mode {
             Mode::Jump(buf) => {
                 let c = self.input.candidates(cur.order.len());
@@ -484,7 +609,9 @@ impl App {
                 "j/k ↑↓ scroll  space/b page  g/G top/end  h/l ←→ stage  esc back".into()
             }
             Mode::Normal if self.full => "j/k scroll  space/b page  h/l stage  esc back".into(),
+            Mode::Normal if cols >= 96 && asks::held(&snap) => "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  tab chain  a asks".into(),
             Mode::Normal if cols >= 96 => "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain".into(),
+            Mode::Normal if asks::held(&snap) => "j/k move  h/l stage  1-9 jump  f hint  a asks".into(),
             Mode::Normal => "j/k move  h/l stage  digits jump  f hint".into(),
         };
         g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
@@ -548,6 +675,221 @@ impl App {
             }
         }
         self.lines(&g, cols, rows)
+    }
+
+    /* the card under the view: the full card scrolls under its header, its bottom edge saying
+    where; a card cut short says how many lines it lost */
+    fn place(
+        &mut self,
+        g: &mut Grid,
+        card: &Grid,
+        top: usize,
+        view_h: usize,
+        avail: usize,
+        cols: usize,
+    ) {
+        let card_h = card.height().min(avail - view_h);
+        if self.full && card.height() > avail {
+            /* the full card scrolls under its header, and its bottom edge says where */
+            let rows = avail.saturating_sub(2).max(1);
+            let lines = card.height() - 2;
+            self.page = rows;
+            self.scroll = self.scroll.min(lines.saturating_sub(rows));
+            g.blit(card, 0..1, top);
+            g.blit(card, 1 + self.scroll..1 + self.scroll + rows, top + 1);
+            let at = format!(
+                "└─ lines {}-{} of {lines} ",
+                self.scroll + 1,
+                (self.scroll + rows).min(lines)
+            );
+            let end = g.put(top + 1 + rows, 0, &layout::fit(&at, cols - 1), Tone::Line);
+            g.put(
+                top + 1 + rows,
+                end,
+                &format!("{}┘", "─".repeat(cols.saturating_sub(end + 1))),
+                Tone::Line,
+            );
+        } else if card_h < card.height() && card_h > 0 {
+            g.blit(card, 0..card_h - 1, top + view_h);
+            let more = format!("└─ {} more lines · enter ", card.height() - card_h + 1);
+            let end = g.put(
+                top + view_h + card_h - 1,
+                0,
+                &layout::fit(&more, cols - 1),
+                Tone::Line,
+            );
+            g.put(
+                top + view_h + card_h - 1,
+                end,
+                &format!("{}┘", "─".repeat(cols.saturating_sub(end + 1))),
+                Tone::Line,
+            );
+        } else {
+            g.blit(card, 0..card_h, top + view_h);
+        }
+    }
+
+    /* the asks no job points at under their header and the rule, the list, then the selected
+    ask's card; the list and the card share the pane the way the flow and a job's card do */
+    fn asks_screen(
+        &mut self,
+        mut g: Grid,
+        peer_rows: usize,
+        cols: usize,
+        rows: usize,
+        tick: usize,
+    ) -> Vec<Line<'static>> {
+        let empty = |snap: &Snapshot| asks::order(snap).is_empty();
+        let say = match (&self.error, &self.snap) {
+            (Some(error), None) => Some((error.clone(), "")),
+            (None, None) => Some(("waiting for the hub".to_string(), "")),
+            (_, Some(snap)) if !snap.capabilities.ask_list => Some((
+                "this hub lists only the asks of jobs; restart it on the current amesh".to_string(),
+                "a: back to the jobs",
+            )),
+            (Some(error), Some(snap)) if empty(snap) => Some((self.stale(error), "")),
+            (None, Some(snap)) if empty(snap) => Some((
+                "no asks here yet".to_string(),
+                "asks appear when a peer calls amesh_ask; a: back to the jobs",
+            )),
+            _ => None,
+        };
+        if let Some((text, hint)) = say {
+            let lines = layout::wrap(&text, cols);
+            for (r, line) in lines.iter().enumerate() {
+                g.put(peer_rows + r, 0, line, Tone::Warn);
+            }
+            for (r, line) in layout::wrap(hint, cols).iter().enumerate() {
+                g.put(peer_rows + lines.len() + r, 0, line, Tone::Dim);
+            }
+            return self.lines(&g, cols, rows);
+        }
+        let snap = self.snap.clone().expect("checked above");
+        let order = asks::order(&snap);
+        let at = match self
+            .ask_sel
+            .as_deref()
+            .and_then(|id| order.iter().position(|ask| ask.correlation_id == id))
+        {
+            Some(at) => at,
+            None => {
+                /* the selected ask is gone: a half-typed jump meant a number of the old order */
+                if matches!(self.input.mode, Mode::Jump(_)) {
+                    self.input.mode = Mode::Normal;
+                }
+                self.scroll = 0;
+                self.ask_sel = Some(order[0].correlation_id.clone());
+                0
+            }
+        };
+        let ask = order[at];
+        let head = asks::header(&order, self.opts.circle.is_none());
+        g.put(peer_rows, 0, &layout::fit(&head, cols), Tone::Plain);
+        g.put(peer_rows + 1, 0, &"─".repeat(cols), Tone::Line);
+        if let Some(events) = layout::events_tag(&snap).filter(|_| self.error.is_none()) {
+            let piece = format!(" {events} ");
+            if layout::width(&piece) + 1 + RULE_MIN <= cols {
+                g.put(
+                    peer_rows + 1,
+                    cols - layout::width(&piece) - 1,
+                    &piece,
+                    Tone::Dim,
+                );
+            }
+        }
+        if let Some(error) = &self.error {
+            g.put(
+                peer_rows + 2,
+                0,
+                &layout::fit(&self.stale(error), cols),
+                Tone::Warn,
+            );
+        }
+        let top = peer_rows + 3;
+        let avail = rows - 1 - top;
+        let list = asks::rows(&snap, &order, cols);
+        let detail = snap
+            .ask_detail
+            .as_ref()
+            .filter(|d| d.correlation_id == ask.correlation_id)
+            .map(|d| (d.text.as_str(), d.reply.as_deref()));
+        let card = |fit| asks::card(&snap, ask, at + 1, cols, detail, fit);
+        let list_h = if self.full { 0 } else { list.len() + 1 };
+        let least = if self.full {
+            0
+        } else {
+            card(Fit::Rows(0)).height()
+        };
+        let view_h = if list_h + least <= avail {
+            list_h
+        } else {
+            list_h.min(avail.saturating_sub(least).max(avail / 2))
+        };
+        let card = match self.full {
+            true => match card(Fit::Whole) {
+                whole if whole.height() > avail => whole,
+                _ => card(Fit::Rows(avail)),
+            },
+            false => card(Fit::Rows(avail - view_h)),
+        };
+        /* the list scrolls to keep the selected ask in view; the blank row under it is the
+        first to give way when the card needs the room */
+        let shown = view_h.min(list.len());
+        let first = at
+            .saturating_sub(shown / 2)
+            .min(list.len().saturating_sub(shown));
+        for (i, row) in list.iter().skip(first).take(shown).enumerate() {
+            let mut c = 0;
+            for (text, tone) in row {
+                c = g.put(top + i, c, text, *tone);
+            }
+        }
+        self.place(&mut g, &card, top, view_h, avail, cols);
+        let footer = match (&self.input.mode, self.full) {
+            (Mode::Jump(buf), _) => {
+                let c = self.input.candidates(order.len());
+                format!(
+                    "jump {buf}_ → {}  enter · esc",
+                    c.iter().map(usize::to_string).collect::<Vec<_>>().join(" ")
+                )
+            }
+            (Mode::Search(q), _) => format!("/{q}_"),
+            (_, true) if cols >= 96 => "j/k ↑↓ scroll  space/b page  g/G top/end  esc back".into(),
+            (_, true) => "j/k scroll  space/b page  esc back".into(),
+            _ if cols >= 96 => {
+                "j/k ↑↓ move  digits jump  / find  enter card  esc back  a jobs".into()
+            }
+            _ => "j/k move  1-9 jump  enter card  a jobs".into(),
+        };
+        g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
+        /* WAIT! blinks once a second, as on the job screen */
+        if self.opts.anim && tick / 4 % 2 == 1 {
+            for cell in g.rows.values_mut().flat_map(|row| row.values_mut()) {
+                if cell.tone == Tone::Wait {
+                    cell.ch = ' ';
+                }
+            }
+        }
+        let mut lines = self.lines(&g, cols, rows);
+        if !self.full && (first..first + shown).contains(&at) {
+            if let Some(line) = lines.get_mut(top + at - first) {
+                for span in &mut line.spans {
+                    span.style = match self.opts.color {
+                        true => span.style.bg(self.opts.theme.select_bg),
+                        false => span.style.add_modifier(Modifier::REVERSED),
+                    };
+                }
+            }
+        }
+        lines
+    }
+
+    /* the full texts the card wants: the selected job's, or on the asks screen the ask's */
+    fn wanted(&self) -> Option<String> {
+        match self.asks {
+            true => self.ask_sel.as_ref().map(|cid| format!("ask={cid}")),
+            false => self.sel.as_ref().map(|id| format!("detail={id}")),
+        }
     }
 
     /* the hub did not answer: say so, and how old the snapshot on screen is */
@@ -712,7 +1054,7 @@ fn fetch(
             query.push(format!("circle={c}"));
         }
         if let Some(d) = want.lock().ok().and_then(|w| w.clone()) {
-            query.push(format!("detail={d}"));
+            query.push(d);
         }
         let path = if query.is_empty() {
             "/snapshot".to_string()
@@ -751,8 +1093,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 app.apply(got);
             }
             /* a new selection fetches its full text now instead of on the next second */
-            if app.sel != asked {
-                asked = app.sel.clone();
+            let wanted = app.wanted();
+            if wanted != asked {
+                asked = wanted;
                 if let Ok(mut w) = want.lock() {
                     *w = asked.clone();
                 }

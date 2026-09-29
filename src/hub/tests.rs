@@ -1226,7 +1226,8 @@ async fn mcp_schedule_list_stamps_creator_circle() {
             "from_peer": "here",
             "to_peer": "away",
             "text": "later",
-            "in_seconds": 86400
+            "in_seconds": 86400,
+            "cross_circle": true
         }),
     )
     .await;
@@ -1308,7 +1309,8 @@ async fn schedule_circle_survives_restart_old_schema_and_missing_target() {
             "from_peer": "here",
             "to_peer": "away",
             "text": "later",
-            "in_seconds": 86400
+            "in_seconds": 86400,
+            "cross_circle": true
         }),
     )
     .await;
@@ -2820,7 +2822,10 @@ async fn ownership_expiry_notifies_the_connected_asker_after_commit() {
     let ask = disk.asks.values().next().unwrap();
     assert!(!ask.open);
     assert_eq!(ack["correlation_id"], ask.correlation_id);
-    assert_eq!(ack["message"], ask.reply.as_deref().unwrap());
+    assert_eq!(
+        ack["message"],
+        format!("[failed] {}", ask.reply.as_deref().unwrap())
+    );
     assert!(ack["message"]
         .as_str()
         .unwrap()
@@ -2847,7 +2852,10 @@ async fn ownership_expiry_retains_the_offline_askers_ack_across_restart() {
         .expect("the offline asker must retain its expiry")[0];
     assert_eq!(ack["type"], "ack");
     assert_eq!(ack["correlation_id"], ask.correlation_id);
-    assert_eq!(ack["message"], ask.reply.as_deref().unwrap());
+    assert_eq!(
+        ack["message"],
+        format!("[failed] {}", ask.reply.as_deref().unwrap())
+    );
     assert!(!ask.open);
 }
 
@@ -3020,7 +3028,10 @@ async fn ownership_claimed_name_closes_previous_sessions_asks() {
     let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=boss", json!({})).await;
     assert_eq!(pending["inbox"][0]["type"], "ack", "{pending}");
     assert_eq!(pending["inbox"][0]["correlation_id"], cid);
-    assert_eq!(pending["inbox"][0]["message"], waited["reply"]);
+    assert_eq!(
+        pending["inbox"][0]["message"],
+        format!("[failed] {}", waited["reply"].as_str().unwrap())
+    );
 }
 
 #[tokio::test]
@@ -3059,7 +3070,10 @@ async fn ownership_replacement_notifies_the_connected_asker_after_commit() {
     let ask = disk.asks.values().next().unwrap();
     assert!(!ask.open);
     assert_eq!(ack["correlation_id"], ask.correlation_id);
-    assert_eq!(ack["message"], ask.reply.as_deref().unwrap());
+    assert_eq!(
+        ack["message"],
+        format!("[failed] {}", ask.reply.as_deref().unwrap())
+    );
     assert_eq!(disk.inbox["boss"][0], ack, "recv retires the durable copy");
 }
 
@@ -3223,7 +3237,7 @@ async fn ownership_session_change_closes_asks_even_when_the_pin_is_connected() {
     assert_eq!(hub.inbox["boss"][0]["correlation_id"], ask.correlation_id);
     assert_eq!(
         hub.inbox["boss"][0]["message"],
-        ask.reply.as_deref().unwrap()
+        format!("[failed] {}", ask.reply.as_deref().unwrap())
     );
     assert!(hub.sockets.contains_key("tmp-codex"));
     assert!(hub.recv_known.contains("tmp-codex"));
