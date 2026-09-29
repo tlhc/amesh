@@ -130,6 +130,8 @@ amesh tui                    # this directory's circle
 amesh tui --all --ascii      # every circle, ASCII only
 ```
 
+- The top of the screen lists the peers online in this view and what each is doing.
+- The rule under the header shows how many events the hub keeps for this view.
 - Each chain gets its own screen, with numbered jobs under a `chain <name> · done/total` header; jobs without dependencies share one block. The selected job's card shows its result or failure reason, worker, ask and dependencies, plus the command to retry it, nudge its worker, or hand it to another peer.
 - Keys:
   - `j`/`k`: move along the chain; `h`/`l`: move within a stage
@@ -177,7 +179,7 @@ Set `AMESH_TOKEN` before exposing the port and restart the hub after changing it
 
 - `GET /peers` (and so `amesh status` / `peer list`) probes sockets, drops closed ones, then removes peers with no live WebSocket and `last_seen` older than 30s, and may persist. A removed peer with a session keeps its name for that session while messages or open asks wait for it, up to 24h; then those asks close with a reason. `gc` dry-run can hit this path too; `--home` skips the probe.
 - A pinned name is for one session at a time. A different session claiming it closes pending asks, notifies their askers, and discards undelivered messages.
-- The event ring keeps the last 500 entries and clears on restart; it is not an audit log.
+- The event ring keeps the last 500 entries, drops an ask's or job's events when the hub deletes it, and clears on restart; it is not an audit log.
 - The hub reclaims unused database space and trims its runtime logs.
 - On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.

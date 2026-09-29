@@ -163,6 +163,188 @@ impl Grid {
     }
 }
 
+/* the top line: the peers online in the view and what each is doing, in name order. When
+they do not all fit, those waiting for a person or at work are placed first, a name that
+does not fit is counted and the next one tried; names are never cut. `spin` is the
+spinner's frame, `lit` whether the WAIT mark shows in this frame */
+pub(crate) fn presence(snap: &Snapshot, cols: usize, spin: char, lit: bool) -> Vec<(String, Tone)> {
+    if !snap.capabilities.roster {
+        let hint = "peers: restart the hub on the current amesh to list them";
+        return vec![(fit(hint, cols), Tone::Dim)];
+    }
+    let online = online_peers(snap);
+    if online.is_empty() {
+        return vec![(fit("no peers online", cols), Tone::Dim)];
+    }
+    let label = label(online.len());
+    let need = |kept: &[&Peer]| line_width(&label, kept, online.len() - kept.len());
+    let mut kept = online.clone();
+    if need(&kept) > cols {
+        let mut ranked = online.clone();
+        ranked.sort_by_key(|p| urgency(snap, p));
+        kept.clear();
+        for peer in ranked {
+            kept.push(peer);
+            if need(&kept) > cols {
+                kept.pop();
+            }
+        }
+        if kept.is_empty() {
+            return vec![(fit(&format!("{} online", online.len()), cols), Tone::Dim)];
+        }
+        kept.sort_by(|a, b| shown(a).cmp(shown(b)));
+    }
+    let mut out = vec![(label, Tone::Dim)];
+    for (i, peer) in kept.iter().enumerate() {
+        if i > 0 {
+            out.push(("  ".into(), Tone::Plain));
+        }
+        out.push(mark(snap, peer, spin, lit));
+        out.push((format!(" {}", shown(peer)), Tone::Soft));
+    }
+    let hidden = online.len() - kept.len();
+    if hidden > 0 {
+        out.push((format!("  +{hidden}"), Tone::Dim));
+    }
+    out
+}
+
+/* the online peers on at most `rows` lines: the top line while they all fit on it; otherwise
+a grid, each name padded to the widest and every further line indented under the first name,
+so the names stand in columns. A grid taller than `rows` keeps those waiting or at work and
+counts the rest in its last cell; a name wider than any column leaves the one top line */
+pub(crate) fn presence_lines(
+    snap: &Snapshot,
+    cols: usize,
+    rows: usize,
+    spin: char,
+    lit: bool,
+) -> Vec<Vec<(String, Tone)>> {
+    let line = presence(snap, cols, spin, lit);
+    let online = online_peers(snap);
+    let label = label(online.len());
+    let single = line_width(&label, &online, 0);
+    let cell = online
+        .iter()
+        .map(|p| 2 + width(shown(p)))
+        .chain([width(&format!("+{}", online.len()))])
+        .max()
+        .unwrap_or(0);
+    let per = (cols.saturating_sub(width(&label)) + 2) / (cell + 2);
+    if rows < 2 || !snap.capabilities.roster || online.is_empty() || single <= cols || per == 0 {
+        return vec![line];
+    }
+    let mut kept = online.clone();
+    if kept.len() > rows * per {
+        kept.sort_by_key(|p| urgency(snap, p));
+        kept.truncate(rows * per - 1);
+        kept.sort_by(|a, b| shown(a).cmp(shown(b)));
+    }
+    let hidden = online.len() - kept.len();
+    let mut cells: Vec<Vec<(String, Tone)>> = kept
+        .iter()
+        .map(|peer| {
+            vec![
+                mark(snap, peer, spin, lit),
+                (format!(" {}", shown(peer)), Tone::Soft),
+            ]
+        })
+        .collect();
+    if hidden > 0 {
+        cells.push(vec![(format!("+{hidden}"), Tone::Dim)]);
+    }
+    cells
+        .chunks(per)
+        .enumerate()
+        .map(|(r, group)| {
+            let lead = if r == 0 {
+                label.clone()
+            } else {
+                " ".repeat(width(&label))
+            };
+            let mut out = vec![(lead, Tone::Dim)];
+            for (i, pieces) in group.iter().enumerate() {
+                if i > 0 {
+                    let used: usize = group[i - 1].iter().map(|(t, _)| width(t)).sum();
+                    out.push((" ".repeat(cell - used + 2), Tone::Plain));
+                }
+                out.extend(pieces.iter().cloned());
+            }
+            out
+        })
+        .collect()
+}
+
+/* the online peers, in name order */
+fn online_peers(snap: &Snapshot) -> Vec<&Peer> {
+    let mut online: Vec<&Peer> = snap
+        .roster
+        .iter()
+        .filter(|p| p.status == "online")
+        .collect();
+    online.sort_by(|a, b| shown(a).cmp(shown(b)));
+    online
+}
+
+fn label(online: usize) -> String {
+    format!("{online} online · ")
+}
+
+/* the top line's width with `kept` shown after `label` and `hidden` counted */
+fn line_width(label: &str, kept: &[&Peer], hidden: usize) -> usize {
+    width(label)
+        + kept.iter().map(|p| 2 + width(shown(p))).sum::<usize>()
+        + 2 * kept.len().saturating_sub(1)
+        + if hidden > 0 {
+            2 + width(&format!("+{hidden}"))
+        } else {
+            0
+        }
+}
+
+fn shown(peer: &Peer) -> &str {
+    if peer.name.is_empty() {
+        &peer.peer_id
+    } else {
+        &peer.name
+    }
+}
+
+fn doing(snap: &Snapshot, peer: &Peer) -> Option<String> {
+    peer.activity
+        .as_ref()
+        .filter(|_| snap.capabilities.peer_activity)
+        .map(|a| a.state.clone())
+}
+
+/* waiting for a person first, then at work, then the rest */
+fn urgency(snap: &Snapshot, peer: &Peer) -> u8 {
+    match doing(snap, peer).as_deref() {
+        Some("wait") => 0,
+        Some("work") => 1,
+        _ => 2,
+    }
+}
+
+fn mark(snap: &Snapshot, peer: &Peer, spin: char, lit: bool) -> (String, Tone) {
+    let (mark, tone) = match doing(snap, peer).as_deref() {
+        Some("work") => (spin, Tone::Run),
+        Some("wait") => (if lit { '!' } else { ' ' }, Tone::Wait),
+        Some("idle") => ('○', Tone::Dim),
+        _ => ('●', Tone::Soft),
+    };
+    (mark.to_string(), tone)
+}
+
+/* how many events the hub keeps for the view, for the rule under the header; nothing from a
+hub that does not count them */
+pub(crate) fn events_tag(snap: &Snapshot) -> Option<String> {
+    snap.capabilities.event_count.then(|| {
+        let n = snap.event_count;
+        format!("{n} event{}", if n == 1 { "" } else { "s" })
+    })
+}
+
 pub(crate) fn glyph(state: &str) -> (char, Tone) {
     match state {
         "done" => ('●', Tone::Done),

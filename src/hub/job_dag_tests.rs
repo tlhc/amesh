@@ -1856,6 +1856,59 @@ async fn snapshot_filters_by_circle_and_cuts_previews() {
 }
 
 #[tokio::test]
+async fn snapshot_lists_the_circles_peers_in_its_roster() {
+    let f = team("c1", &["boss", "left"]).await;
+    f.peer("far", "c2").await;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"name": "boss", "peer_id": "boss", "backend": "pi", "circle": "c1",
+                   "activity": {"state": "work"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.0.inner.lock().await.peers.get_mut("left").unwrap().status = "offline".into();
+    let ids = |s: &Value| -> Vec<String> {
+        s["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["peer_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let s = snapshot_of(&f, "?circle=c1").await;
+    assert_eq!(s["capabilities"]["roster"], true);
+    assert_eq!(ids(&s), ["boss", "left"], "the circle's rows and no others");
+    let row = |id: &str| {
+        s["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["peer_id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(row("boss")["activity"]["state"], "work");
+    assert_eq!(
+        row("left")["status"],
+        "offline",
+        "the TUI judges who is online"
+    );
+    assert_eq!(
+        s["peers"],
+        json!([]),
+        "peers still holds only what jobs refer to"
+    );
+    let all = snapshot_of(&f, "").await;
+    assert_eq!(
+        ids(&all),
+        ["boss", "far", "left"],
+        "without a circle, every row"
+    );
+}
+
+#[tokio::test]
 async fn snapshot_needs_the_token() {
     let f = Fixture::new();
     let app = App {
@@ -2513,4 +2566,175 @@ async fn an_ask_records_how_it_closed() {
             .all(|ask| ask.closed_by.is_none()),
         "a database from before the column loads, not knowing"
     );
+}
+
+async fn ring_of(f: &Fixture) -> Vec<Value> {
+    let (status, body) = f.request("GET", "/events", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    body.as_array().unwrap().clone()
+}
+
+fn topics(ring: &[Value], topic: &str) -> usize {
+    ring.iter().filter(|event| event["topic"] == topic).count()
+}
+
+#[tokio::test]
+async fn gc_takes_a_deleted_asks_events_out_of_the_ring() {
+    let f = team("c1", &["boss", "one"]).await;
+    let gone = f.open_ask("boss", "one").await;
+    let fresh = f.open_ask("boss", "one").await;
+    let open = f.open_ask("boss", "one").await;
+    for cid in [&gone, &fresh] {
+        f.ack(cid, json!({"message": "done", "from_peer": "one"}))
+            .await;
+    }
+    f.request(
+        "POST",
+        "/notify",
+        json!({"from_peer": "boss", "to_peer": "one", "message": "hi"}),
+    )
+    .await;
+    f.0.inner
+        .lock()
+        .await
+        .asks
+        .get_mut(&gone)
+        .unwrap()
+        .closed_at = Some(1);
+    let before = ring_of(&f).await;
+    assert_eq!(
+        (
+            topics(&before, &gone),
+            topics(&before, &fresh),
+            topics(&before, &open)
+        ),
+        (2, 2, 1),
+        "an ask and its ack share a topic: {before:?}"
+    );
+    let (status, _) = f.request("POST", "/gc", json!({"apply": true})).await;
+    assert_eq!(status, StatusCode::OK);
+    let after = ring_of(&f).await;
+    assert_eq!(
+        topics(&after, &gone),
+        0,
+        "the deleted ask's events left with it"
+    );
+    assert_eq!(
+        topics(&after, &fresh),
+        2,
+        "an ask closed just now keeps its events"
+    );
+    assert_eq!(topics(&after, &open), 1, "an open ask keeps its event");
+    assert_eq!(
+        after.iter().filter(|e| e.get("topic").is_none()).count(),
+        1,
+        "a notify has no topic and stays"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_tick_takes_a_deleted_asks_events_too() {
+    let f = team("c1", &["boss", "one"]).await;
+    let gone = f.open_ask("boss", "one").await;
+    f.ack(&gone, json!({"message": "done", "from_peer": "one"}))
+        .await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.asks.get_mut(&gone).unwrap().closed_at = Some(1);
+        hub.sweep_at = 0;
+    }
+    assert_eq!(topics(&ring_of(&f).await, &gone), 2);
+    f.advance().await;
+    assert_eq!(topics(&ring_of(&f).await, &gone), 0);
+}
+
+#[tokio::test]
+async fn a_job_nudge_belongs_to_its_job_and_goes_when_the_job_does() {
+    let f = team("c1", &["boss", "one"]).await;
+    let job = f
+        .job(json!({"title": "stuck", "assigned_peer": "one", "from_peer": "boss"}))
+        .await;
+    f.advance().await;
+    let cid = f.ask_id(&job).await;
+    f.0.inner.lock().await.jobs.get_mut(&job).unwrap().nudge_at = Some(1);
+    f.advance().await;
+    let ring = ring_of(&f).await;
+    let nudge = ring
+        .iter()
+        .find(|e| e["type"] == "notify" && e["from_peer"] == "amesh")
+        .expect("the stalled job reminded its creator");
+    assert_eq!(nudge["topic"], job.as_str());
+    f.0.inner.lock().await.sweep_at = 0;
+    f.advance().await;
+    assert_eq!(
+        topics(&ring_of(&f).await, &job),
+        1,
+        "a live job keeps its nudge through a prune"
+    );
+    let (status, _) = f
+        .request("DELETE", &format!("/jobs/{job}"), json!({}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        topics(&ring_of(&f).await, &job),
+        1,
+        "nothing prunes before the next sweep"
+    );
+    f.0.inner.lock().await.sweep_at = 0;
+    f.advance().await;
+    let after = ring_of(&f).await;
+    assert_eq!(
+        topics(&after, &job),
+        0,
+        "the deleted job's nudge left the ring"
+    );
+    assert!(
+        topics(&after, &cid) >= 1,
+        "the ask's own events stay until the ask is swept"
+    );
+}
+
+#[tokio::test]
+async fn snapshot_counts_the_events_the_hub_keeps() {
+    let f = team("c1", &["boss", "one"]).await;
+    f.peer("far", "c2").await;
+    f.peer("far2", "c2").await;
+    let cid = f.open_ask("boss", "one").await;
+    f.ack(&cid, json!({"message": "ok", "from_peer": "one"}))
+        .await;
+    f.request(
+        "POST",
+        "/notify",
+        json!({"from_peer": "far", "to_peer": "far2", "message": "hi"}),
+    )
+    .await;
+    let count = |s: &Value| s["event_count"].as_u64().unwrap();
+    for (query, uri) in [
+        ("?circle=c1", "/events?circle=c1"),
+        ("?circle=c2", "/events?circle=c2"),
+        ("", "/events"),
+    ] {
+        let snapshot = snapshot_of(&f, query).await;
+        let (_, ring) = f.request("GET", uri, json!({})).await;
+        assert_eq!(
+            count(&snapshot),
+            ring.as_array().unwrap().len() as u64,
+            "{query}"
+        );
+    }
+    assert_eq!(count(&snapshot_of(&f, "?circle=c1").await), 2);
+    assert_eq!(count(&snapshot_of(&f, "?circle=c2").await), 1);
+    assert_eq!(count(&snapshot_of(&f, "").await), 3);
+    assert_eq!(
+        snapshot_of(&f, "").await["capabilities"]["event_count"],
+        true
+    );
+    f.0.inner.lock().await.asks.get_mut(&cid).unwrap().closed_at = Some(1);
+    f.request("POST", "/gc", json!({"apply": true})).await;
+    assert_eq!(
+        count(&snapshot_of(&f, "?circle=c1").await),
+        0,
+        "a swept ask's events leave the count"
+    );
+    assert_eq!(count(&snapshot_of(&f, "").await), 1);
 }

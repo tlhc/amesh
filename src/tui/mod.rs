@@ -31,6 +31,12 @@ pub(crate) struct Opts {
 }
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/* the most lines the online peers take above the view */
+const PEER_ROWS: usize = 4;
+/* snapshots the peer rows are kept after the roster stopped needing them */
+const PEER_HOLD: u64 = 5;
+/* rule characters that stay to the left of what the rule row says at its right end */
+const RULE_MIN: usize = 4;
 
 pub(crate) struct App {
     opts: Opts,
@@ -48,6 +54,10 @@ pub(crate) struct App {
     /* the full-screen card's first shown line, and how many lines a page is */
     scroll: usize,
     page: usize,
+    /* snapshots taken in, and the peer rows the view keeps with the snapshot that last
+    needed them: the view moves down at once and back up only once the roster held still */
+    snaps: u64,
+    held: (usize, u64),
 }
 
 /* a chain or the loose block, numbered 1..n; base counts the jobs in the blocks above */
@@ -85,12 +95,15 @@ impl App {
             typed_at: 0,
             scroll: 0,
             page: 10,
+            snaps: 0,
+            held: (0, 0),
         }
     }
 
     pub fn apply(&mut self, fetched: std::result::Result<Snapshot, String>) {
         match fetched {
             Ok(snap) => {
+                self.snaps += 1;
                 self.snap = Some(snap);
                 self.error = None;
                 self.last_ok = Some(Instant::now());
@@ -250,9 +263,34 @@ impl App {
             g.put(0, 0, "pane too small", Tone::Warn);
             return self.lines(&g, cols, rows);
         }
+        /* who is online, above whatever the view shows; the view starts below its last line
+        and keeps at least three rows */
+        let mut peer_rows = 1;
+        if let Some(snap) = &self.snap {
+            let moving = self.opts.anim;
+            let spin = SPINNER[if moving { tick % SPINNER.len() } else { 0 }];
+            let lit = !(moving && tick / 4 % 2 == 1);
+            let cap = PEER_ROWS.min(rows - 7);
+            let lines = layout::presence_lines(snap, cols, cap, spin, lit);
+            for (r, line) in lines.iter().enumerate() {
+                let mut c = 0;
+                for (text, tone) in line {
+                    c = g.put(r, c, text, *tone);
+                }
+            }
+            if lines.len() >= self.held.0 || self.snaps >= self.held.1 + PEER_HOLD {
+                self.held = (lines.len(), self.snaps);
+            }
+            peer_rows = self.held.0.min(cap);
+        }
         let Some((b, _)) = settled else {
+            let stale;
             let (text, hint) = match (&self.error, &self.snap) {
-                (Some(error), _) => (error.as_str(), ""),
+                (Some(error), Some(_)) => {
+                    stale = self.stale(error);
+                    (stale.as_str(), "")
+                }
+                (Some(error), None) => (error.as_str(), ""),
                 (None, Some(_)) => (
                     "no jobs here yet",
                     "jobs appear once created: amesh jobs create TITLE --assigned-peer ID",
@@ -261,10 +299,18 @@ impl App {
             };
             let lines = layout::wrap(text, cols);
             for (r, line) in lines.iter().enumerate() {
-                g.put(r, 0, line, Tone::Warn);
+                g.put(peer_rows + r, 0, line, Tone::Warn);
+            }
+            if self.error.is_none() {
+                if let Some(events) = self.snap.as_ref().and_then(layout::events_tag) {
+                    let taken = lines.first().map_or(0, |line| layout::width(line));
+                    if taken + 2 + layout::width(&events) <= cols {
+                        g.put(peer_rows, cols - layout::width(&events), &events, Tone::Dim);
+                    }
+                }
             }
             for (r, line) in layout::wrap(hint, cols).iter().enumerate() {
-                g.put(lines.len() + r, 0, line, Tone::Dim);
+                g.put(peer_rows + lines.len() + r, 0, line, Tone::Dim);
             }
             return self.lines(&g, cols, rows);
         };
@@ -289,10 +335,11 @@ impl App {
             cols,
         );
         debug_assert!(layout::width(&head) <= cols, "{head} is wider than {cols}");
-        g.put(0, 0, &head, Tone::Plain);
-        g.put(1, 0, &"─".repeat(cols), Tone::Line);
-        /* which block of how many, and what runs in the others, so work out of sight is
-        not taken for work that stopped */
+        g.put(peer_rows, 0, &head, Tone::Plain);
+        g.put(peer_rows + 1, 0, &"─".repeat(cols), Tone::Line);
+        /* at the right end of the rule: which block of how many, and what runs in the others,
+        so work out of sight is not taken for work that stopped */
+        let mut right: Vec<(String, Tone)> = Vec::new();
         if blocks.len() > 1 {
             let elsewhere = blocks
                 .iter()
@@ -306,26 +353,36 @@ impl App {
             } else {
                 String::new()
             };
-            let tag = format!(" {}/{} ", b + 1, blocks.len());
-            let at = cols - layout::width(&run) - layout::width(&tag) - 1;
-            g.put(1, at, &run, Tone::Run);
-            g.put(1, at + layout::width(&run), &tag, Tone::Dim);
+            right.push((run, Tone::Run));
+            right.push((format!(" {}/{} ", b + 1, blocks.len()), Tone::Dim));
+        }
+        /* what the hub keeps goes first, and is the first to go when the pane is narrow; an
+        error on screen means the count is as old as the snapshot */
+        if let Some(events) = layout::events_tag(&snap).filter(|_| self.error.is_none()) {
+            let piece = if right.is_empty() {
+                format!(" {events} ")
+            } else {
+                format!(" {events} ·")
+            };
+            let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
+            if used + layout::width(&piece) + 1 + RULE_MIN <= cols {
+                right.insert(0, (piece, Tone::Dim));
+            }
+        }
+        let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
+        let mut at = cols - used - 1;
+        for (text, tone) in right {
+            at = g.put(peer_rows + 1, at, &text, tone);
         }
         if let Some(error) = &self.error {
-            let age = self
-                .last_ok
-                .map_or("--".to_string(), |t| format!("{}s", t.elapsed().as_secs()));
             g.put(
-                2,
+                peer_rows + 2,
                 0,
-                &layout::fit(
-                    &format!("! {error} · showing the snapshot from {age} ago"),
-                    cols,
-                ),
+                &layout::fit(&self.stale(error), cols),
                 Tone::Warn,
             );
         }
-        let top = 3;
+        let top = peer_rows + 3;
         let avail = rows - 1 - top;
         let view = cur.view(&snap, &sel);
         let body = if self.full {
@@ -491,6 +548,14 @@ impl App {
             }
         }
         self.lines(&g, cols, rows)
+    }
+
+    /* the hub did not answer: say so, and how old the snapshot on screen is */
+    fn stale(&self, error: &str) -> String {
+        let age = self
+            .last_ok
+            .map_or("--".to_string(), |t| format!("{}s", t.elapsed().as_secs()));
+        format!("! {error} · showing the snapshot from {age} ago")
     }
 
     fn lines(&self, g: &Grid, cols: usize, rows: usize) -> Vec<Line<'static>> {

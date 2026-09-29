@@ -66,9 +66,11 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 
 ## Events
 
-- `GET /events` is the in-memory ring (last 500, cleared on restart):
-  - `?since=<id>` starts after that id
+- `GET /events` is the in-memory ring (last 500, cleared on restart). Each entry carries `seq` (rising by one per entry, starting at the clock in microseconds, so a restart on a clock that moves forward starts above every earlier entry), `at` (unix seconds) and, when it concerns an ask or a job, `topic` (that id):
+  - `?since=<seq>` returns the entries after that seq; an event id is taken too and stands for its entry. An id the ring no longer holds, or a seq above the newest entry's, returns everything held. A seq inside the current run's own range is read as this run's: a clock set back to the previous start, within as many microseconds as the two runs pushed entries, can hide the entries up to it.
   - `?circle=NAME` keeps events whose `from_circle` or `to_circle` matches
+- An ask's or job's events leave the ring when the hub deletes it, at the cleanup pass that deletes it.
+- The MCP tool `amesh_events` without `since` lists the last hour; it shows `seq` as text and takes a string or a number for `since`.
 
 ## Snapshot
 
@@ -78,7 +80,9 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - An ask's `to_peer_id` is matched by peer id only, so a recipient that left is listed under `missing` even when another peer has taken its name since. Assignees and senders are names, resolved the way the hub resolves them next.
   - Each peer carries its `activity` (below), or null while unknown, and `running`: its running jobs in every circle, counted by recipient (a job run by hand, which has no ask, by its assignee), so a filtered view can tell whether a job is its only one.
   - It never probes peers, settles jobs, drains inboxes, writes the state file or records an event.
-  - `hub_epoch` changes when the hub restarts; `capabilities` says which optional fields are filled.
+  - `roster` lists every peer in the requested circle (every peer without `circle`), sorted by `peer_id`, in the shape of `peers`; a monitor judges who is online from it.
+  - `event_count` is the number of events `GET /events` would list for the same `circle`.
+  - `hub_epoch` changes when the hub restarts; `capabilities` says which optional fields are filled (`roster`, `event_count`, `peer_activity`, ...).
 
 ## Activity
 

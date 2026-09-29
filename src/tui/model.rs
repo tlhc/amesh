@@ -11,6 +11,12 @@ pub(crate) struct Snapshot {
     pub asks: Vec<Ask>,
     #[serde(default)]
     pub peers: Vec<Peer>,
+    /* every peer in the view's circle, from hubs that list them */
+    #[serde(default)]
+    pub roster: Vec<Peer>,
+    /* the events the hub keeps for the view's circle, from hubs that count them */
+    #[serde(default)]
+    pub event_count: u64,
     #[serde(default)]
     pub detail: Option<Detail>,
     #[serde(default)]
@@ -21,6 +27,10 @@ pub(crate) struct Snapshot {
 pub(crate) struct Capabilities {
     #[serde(default)]
     pub peer_activity: bool,
+    #[serde(default)]
+    pub roster: bool,
+    #[serde(default)]
+    pub event_count: bool,
 }
 
 /* what a runtime last said it is doing; the hub keeps it in memory only */

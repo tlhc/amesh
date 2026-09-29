@@ -1,7 +1,7 @@
 use super::input::{Act, Input, Mode};
 use super::layout::{self, width, Fit, View};
 use super::model::{self, Activity, Ask, Job, Numbers, Peer, Snapshot};
-use super::{App, Opts};
+use super::{App, Opts, PEER_HOLD};
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::KeyCode;
 use ratatui::Terminal;
@@ -458,9 +458,9 @@ fn one_chain_per_screen_and_tab_crosses_them() {
     let text = screen_text(&mut app, 46, 60).join("\n");
     assert_eq!(app.sel.as_deref(), Some("lint"), "the first running job");
     let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
-    assert_eq!(lines[0], "independent jobs · 1/2 done · 1 run", "{text}");
+    assert_eq!(lines[1], "independent jobs · 1/2 done · 1 run", "{text}");
     assert!(
-        lines[1].starts_with("───") && lines[1].trim_end().ends_with("─ +2 run · 1/2 ─"),
+        lines[2].starts_with("───") && lines[2].trim_end().ends_with("─ +2 run · 1/2 ─"),
         "the rule says which of two blocks this is, and what runs in the other:\n{text}"
     );
     assert!(
@@ -488,8 +488,8 @@ fn one_chain_per_screen_and_tab_crosses_them() {
     );
     let text = screen_text(&mut app, 46, 60).join("\n");
     assert!(
-        text.starts_with("chain deploy · 3/9 done · 1 fail · 2 run\n")
-            && text.lines().nth(1).unwrap().ends_with("─ +1 run · 2/2 ─")
+        text.lines().nth(1) == Some("chain deploy · 3/9 done · 1 fail · 2 run")
+            && text.lines().nth(2).unwrap().ends_with("─ +1 run · 2/2 ─")
             && !text.contains("lint"),
         "{text}"
     );
@@ -670,7 +670,7 @@ fn the_terminal_shows_the_same_screen() {
         let mut app = app_with(snap.clone());
         let rows = rendered(&mut app, cols, 50);
         let text = rows.join("\n");
-        assert_eq!(rows[0], "independent jobs · 1/2 done · 1 run", "{text}");
+        assert_eq!(rows[1], "independent jobs · 1/2 done · 1 run", "{text}");
         assert!(
             text.contains("2 审查 hub 数据"),
             "wide characters keep their order:\n{text}"
@@ -1953,16 +1953,19 @@ fn proto_s5() -> Snapshot {
 }
 
 /* frames of the approved mock-up, exported from its generator: every card state at both
-widths, S4's skip-level note and S5's box. Four changes are agreed: three the data forces, an
+widths, S4's skip-level note and S5's box. Five changes are agreed: three the data forces, an
 open ask reading "unacked" (the hub keeps no read receipts), the nudge text single-quoted
 for the shell, and the 14-job chain named after its last job, as the design's rule says,
-instead of the mock-up's "ship"; and one the user chose, a card that holds still (its glyph
-and lists show ◆, its worker reads WORK) while the flow carries the spinner. The mock-up's
+instead of the mock-up's "ship"; and two the user chose, a card that holds still (its glyph
+and lists show ◆, its worker reads WORK) while the flow carries the spinner, and a top line
+that names every online peer, in columns aligned under the first name, where the mock-up
+counted the ones that did not fit. The mock-up's
 other frames differ from these fixtures only where its sample data contradicts itself: ages
 that disagree with its own times, one worker both working and idle, two spinners under one
 worker, a queued job with an ask, and retry commands naming the mock-up's random job ids */
 const FRAMES: &str = r#"
 ===== S1 narrow scope
+4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
 ──────────────────────────────────────────────
 
@@ -1989,6 +1992,7 @@ chain deploy · 3/9 done · 1 fail · 2 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S1 narrow perf
+4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
 ──────────────────────────────────────────────
 
@@ -2016,6 +2020,7 @@ chain deploy · 3/9 done · 1 fail · 2 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S4 narrow audit
+4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
 ──────────────────────────────────────────────
 
@@ -2041,6 +2046,7 @@ chain verify · 4/6 done · 1 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S4 narrow deploy
+4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
 ──────────────────────────────────────────────
 
@@ -2067,6 +2073,8 @@ chain verify · 4/6 done · 1 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S5 narrow scope
+7 online · ⠋ cc     ○ codex  ○ pi     ○ pi-2
+           ○ pi-3   ⠋ u1     ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
 ──────────────────────────────────────────────
 
@@ -2095,6 +2103,8 @@ chain deploy · 6/14 done · 1 fail · 3 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S5 narrow sec
+7 online · ⠋ cc     ○ codex  ○ pi     ○ pi-2
+           ○ pi-3   ⠋ u1     ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
 ──────────────────────────────────────────────
 
@@ -2127,6 +2137,7 @@ chain deploy · 6/14 done · 1 fail · 3 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S1 wide upg
+4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -2145,6 +2156,7 @@ chain deploy · 3/9 done · 1 fail · 2 run
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
 ===== S5 wide scope
+7 online · ⠋ cc  ○ codex  ○ pi  ○ pi-2  ○ pi-3  ⠋ u1  ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -2168,6 +2180,7 @@ chain deploy · 6/14 done · 1 fail · 3 run
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
 ===== S1 narrow synth
+4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
 ──────────────────────────────────────────────
 
@@ -2193,6 +2206,7 @@ chain deploy · 3/9 done · 1 fail · 2 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S1 wide synth
+4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -2211,6 +2225,7 @@ chain deploy · 3/9 done · 1 fail · 2 run
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
 ===== S4 narrow review
+4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
 ──────────────────────────────────────────────
 
@@ -2236,6 +2251,7 @@ chain verify · 4/6 done · 1 run
 └────────────────────────────────────────────┘
 j/k move  h/l stage  digits jump  f hint
 ===== S4 wide deploy
+4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -2252,6 +2268,7 @@ chain verify · 4/6 done · 1 run
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
 ===== S5 wide sec
+7 online · ⠋ cc  ○ codex  ○ pi  ○ pi-2  ○ pi-3  ⠋ u1  ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -2293,7 +2310,7 @@ fn screens_match_the_approved_design() {
     let mut wrong = Vec::new();
     for (name, want) in frames {
         let parts: Vec<&str> = name.split(' ').collect();
-        let snap = match parts[0] {
+        let mut snap = match parts[0] {
             "S1" => proto_s1(),
             "S4" => proto_s4(),
             _ => proto_s5(),
@@ -2304,6 +2321,8 @@ fn screens_match_the_approved_design() {
         } else {
             parts[2]
         };
+        snap.roster = snap.peers.clone();
+        snap.capabilities.roster = true;
         let mut app = app_with(snap);
         app.sel = Some(sel.into());
         let got: Vec<String> = screen_text(&mut app, cols, want.len());
@@ -2557,7 +2576,7 @@ fn the_screen_fills_the_pane_and_follows_its_size() {
             lines.join("\n")
         );
     }
-    let tall = screen_text(&mut app, 46, 60).join("\n");
+    let tall = screen_text(&mut app, 46, 61)[1..].join("\n");
     assert!(
         !tall.contains('…') && flat(&tall).contains("100k rows review perf: sweep"),
         "a tall pane shows the whole prompt:\n{tall}"
@@ -2661,11 +2680,11 @@ fn widths_follow_the_pane() {
     let mut app = app_with(named);
     let top = screen_text(&mut app, 30, 20);
     assert!(
-        top[0].starts_with("chain review")
-            && top[0].ends_with(" · 2/3 done")
-            && width(&top[0]) <= 30,
+        top[1].starts_with("chain review")
+            && top[1].ends_with(" · 2/3 done")
+            && width(&top[1]) <= 30,
         "a long chain name gives way to the counts:\n{}",
-        top[0]
+        top[1]
     );
     let mut app = app_with(wordy.clone());
     app.sel = Some("b".into());
@@ -2673,10 +2692,10 @@ fn widths_follow_the_pane() {
     let narrow = head(&mut app, 46);
     let broad = head(&mut app, 160);
     assert!(
-        narrow[0].ends_with(" · 2/3 done") && broad[0].ends_with(" · 2/3 done"),
+        narrow[1].ends_with(" · 2/3 done") && broad[1].ends_with(" · 2/3 done"),
         "the counts always show:\n{}\n{}",
-        narrow[0],
-        broad[0]
+        narrow[1],
+        broad[1]
     );
     let card_head = |lines: &[String]| lines.iter().find(|l| l.starts_with("┌●")).unwrap().clone();
     assert!(
@@ -2765,14 +2784,14 @@ fn the_full_card_scrolls_and_the_flow_keeps_its_keys() {
     let mut app = app_with(snap);
     app.sel = Some("func".into());
     let top = |app: &mut App| {
-        let lines = screen_text(app, 46, 20);
-        let first = lines[4].clone();
+        let lines = screen_text(app, 46, 21);
+        let first = lines[5].clone();
         let at = lines
             .iter()
             .find(|l| l.starts_with("└─ lines"))
             .cloned()
             .unwrap_or_default();
-        (lines[3].clone(), first, at)
+        (lines[4].clone(), first, at)
     };
     app.key(KeyCode::Enter);
     let (head, first, at) = top(&mut app);
@@ -2860,14 +2879,14 @@ fn the_counts_survive_a_narrow_pane() {
         ..Default::default()
     });
     for cols in [30, 34, 46, 60] {
-        let head = screen_text(&mut app, cols, 12)[0].clone();
+        let head = screen_text(&mut app, cols, 12)[1].clone();
         assert!(
             head.ends_with("0/40 done · 20 fail · 20 run") && width(&head) <= cols,
             "{cols}: {head}"
         );
     }
-    assert!(screen_text(&mut app, 60, 12)[0].starts_with("independent jobs · "));
-    assert!(screen_text(&mut app, 46, 12)[0].starts_with("independent jo… · "));
+    assert!(screen_text(&mut app, 60, 12)[1].starts_with("independent jobs · "));
+    assert!(screen_text(&mut app, 46, 12)[1].starts_with("independent jo… · "));
     assert_eq!(
         layout::wrap("中文", 1),
         ["…", "…"],
@@ -3036,7 +3055,7 @@ fn ascii_reaches_the_headers_glyph_counts() {
         jobs,
         ..Default::default()
     }));
-    let head = screen_text(&mut app, 30, 12)[0].clone();
+    let head = screen_text(&mut app, 30, 12)[1].clone();
     assert_eq!(head, "0/1000* 500x 500>", "the glyph counts, in ASCII");
 }
 
@@ -3061,5 +3080,486 @@ fn the_card_holds_its_wait_still() {
     assert!(
         !row.contains("WAIT!") && worker.contains("w3 WAIT! 2m"),
         "the flow row blinks, the card does not:\n{row}\n{worker}"
+    );
+}
+
+fn peer(id: &str, status: &str, state: Option<&str>) -> Peer {
+    Peer {
+        peer_id: id.into(),
+        name: id.into(),
+        status: status.into(),
+        activity: state.map(|s| Activity {
+            state: s.into(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+fn with_roster(mut snap: Snapshot, roster: Vec<Peer>) -> Snapshot {
+    snap.capabilities.peer_activity = true;
+    snap.capabilities.roster = true;
+    snap.roster = roster;
+    snap
+}
+
+fn joined(pieces: &[(String, layout::Tone)]) -> String {
+    pieces.iter().map(|(text, _)| text.as_str()).collect()
+}
+
+#[test]
+fn the_top_line_names_the_online_peers_and_what_each_does() {
+    let snap = with_roster(
+        Snapshot::default(),
+        vec![
+            peer("b-work", "online", Some("work")),
+            peer("a-idle", "online", Some("idle")),
+            peer("e-gone", "offline", Some("work")),
+            peer("c-wait", "online", Some("wait")),
+            peer("d-quiet", "online", None),
+        ],
+    );
+    let pieces = layout::presence(&snap, 120, '⠹', true);
+    assert_eq!(
+        joined(&pieces),
+        "4 online · ○ a-idle  ⠹ b-work  ! c-wait  ● d-quiet"
+    );
+    let tone = |mark: &str| {
+        pieces
+            .iter()
+            .find(|(t, _)| t == mark)
+            .map(|(_, tone)| *tone)
+    };
+    assert_eq!(tone("○"), Some(layout::Tone::Dim));
+    assert_eq!(tone("⠹"), Some(layout::Tone::Run));
+    assert_eq!(tone("!"), Some(layout::Tone::Wait));
+    assert_eq!(tone("●"), Some(layout::Tone::Soft));
+    assert_eq!(
+        joined(&layout::presence(&snap, 120, '⠹', false)),
+        "4 online · ○ a-idle  ⠹ b-work    c-wait  ● d-quiet",
+        "the WAIT mark blinks"
+    );
+}
+
+#[test]
+fn an_overflowing_top_line_keeps_the_peers_that_need_attention() {
+    let snap = with_roster(
+        Snapshot::default(),
+        vec![
+            peer("a-idle", "online", Some("idle")),
+            peer("b-idle", "online", Some("idle")),
+            peer("c-idle", "online", None),
+            peer("d-work", "online", Some("work")),
+            peer("e-wait", "online", Some("wait")),
+        ],
+    );
+    /* the label, two tokens and "  +3" take exactly 33 columns */
+    assert_eq!(
+        joined(&layout::presence(&snap, 33, '⠹', true)),
+        "5 online · ⠹ d-work  ! e-wait  +3"
+    );
+    assert_eq!(
+        joined(&layout::presence(&snap, 32, '⠹', true)),
+        "5 online · ! e-wait  +4",
+        "waiting outranks working"
+    );
+    assert_eq!(
+        joined(&layout::presence(&snap, 20, '⠹', true)),
+        "5 online",
+        "no token fits: the count alone"
+    );
+}
+
+#[test]
+fn the_top_line_says_so_when_nobody_is_online_or_the_hub_cannot_tell() {
+    let nobody = with_roster(Snapshot::default(), vec![peer("gone", "offline", None)]);
+    assert_eq!(
+        joined(&layout::presence(&nobody, 60, '⠹', true)),
+        "no peers online"
+    );
+    let old = Snapshot {
+        roster: vec![peer("x", "online", None)],
+        ..Default::default()
+    };
+    assert_eq!(
+        joined(&layout::presence(&old, 80, '⠹', true)),
+        "peers: restart the hub on the current amesh to list them"
+    );
+    assert!(width(&joined(&layout::presence(&old, 20, '⠹', true))) <= 20);
+}
+
+#[test]
+fn the_screen_puts_the_online_peers_above_the_chain() {
+    let roster = vec![
+        peer("cc", "online", Some("work")),
+        peer("pi", "online", Some("idle")),
+    ];
+    let mut app = app_with(with_roster(s1(), roster.clone()));
+    let lines = screen_text(&mut app, 46, 60);
+    assert_eq!(lines[0], "2 online · ⠋ cc  ○ pi", "{}", lines.join("\n"));
+    assert!(
+        lines[1].starts_with("chain deploy · "),
+        "{}",
+        lines.join("\n")
+    );
+    assert!(lines[2].starts_with("───"), "{}", lines.join("\n"));
+    let mut empty = app_with(with_roster(Snapshot::default(), roster));
+    let lines = screen_text(&mut empty, 46, 20);
+    assert_eq!(
+        lines[0], "2 online · ⠋ cc  ○ pi",
+        "the line shows before any job exists"
+    );
+    assert_eq!(lines[1], "no jobs here yet");
+}
+
+#[test]
+fn the_top_line_keeps_its_marks_in_ascii_and_blinks() {
+    let roster = vec![
+        peer("a", "online", Some("idle")),
+        peer("b", "online", Some("work")),
+        peer("c", "online", Some("wait")),
+        peer("d", "online", None),
+    ];
+    let mut app = app_with(with_roster(s1(), roster));
+    app.opts.ascii = true;
+    assert_eq!(
+        screen_text(&mut app, 60, 40)[0],
+        "4 online | o a  | b  ! c  * d"
+    );
+    let dark: String = app.screen(60, 40, 4)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    assert_eq!(dark.trim_end(), "4 online | o a  | b    c  * d");
+}
+
+#[test]
+fn a_stale_top_line_says_how_old_it_is() {
+    let roster = vec![peer("worker", "online", Some("work"))];
+    let mut app = app_with(with_roster(Snapshot::default(), roster));
+    app.apply(Err("connection refused".into()));
+    app.last_ok = Some(std::time::Instant::now() - std::time::Duration::from_secs(120));
+    let lines = screen_text(&mut app, 60, 20);
+    assert_eq!(lines[0], "1 online · ⠋ worker", "{}", lines.join("\n"));
+    assert!(
+        lines[1].starts_with("! connection refused · showing the snapshot from 12"),
+        "the peers above are that old:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn an_overflowing_top_line_counts_a_name_too_long_to_show_and_goes_on() {
+    let long = "w".repeat(40);
+    let snap = with_roster(
+        Snapshot::default(),
+        vec![
+            peer(&long, "online", Some("wait")),
+            peer("a", "online", Some("work")),
+        ],
+    );
+    assert_eq!(
+        joined(&layout::presence(&snap, 40, '⠹', true)),
+        "2 online · ⠹ a  +1",
+        "the name that cannot fit is counted, the next one still shows"
+    );
+}
+
+#[test]
+fn the_top_line_falls_back_to_ids_and_keeps_to_its_width() {
+    let mut unnamed = peer("id-only", "online", None);
+    unnamed.name.clear();
+    let twin = |id: &str| Peer {
+        name: "same".into(),
+        ..peer(id, "online", Some("idle"))
+    };
+    let snap = with_roster(Snapshot::default(), vec![twin("x2"), unnamed, twin("x1")]);
+    assert_eq!(
+        joined(&layout::presence(&snap, 80, '⠹', true)),
+        "3 online · ● id-only  ○ same  ○ same"
+    );
+    let wide = with_roster(
+        Snapshot::default(),
+        vec![
+            peer("审查", "online", None),
+            peer("数据中心", "online", None),
+        ],
+    );
+    for cols in [8, 10, 16, 19, 20, 30] {
+        let line = joined(&layout::presence(&wide, cols, '⠹', true));
+        assert!(width(&line) <= cols, "{cols}: {line}");
+    }
+    assert_eq!(
+        joined(&layout::presence(&wide, 30, '⠹', true)),
+        "2 online · ● 审查  ● 数据中心"
+    );
+}
+
+#[test]
+fn the_smallest_pane_keeps_the_top_line_and_the_header() {
+    let mut app = app_with(with_roster(s1(), vec![peer("cc", "online", Some("work"))]));
+    let lines = screen_text(&mut app, 46, 8);
+    assert_eq!(lines.len(), 8, "{}", lines.join("\n"));
+    assert_eq!(lines[0], "1 online · ⠋ cc");
+    assert!(
+        lines[1].starts_with("chain deploy · "),
+        "{}",
+        lines.join("\n")
+    );
+}
+
+fn grid_text(snap: &Snapshot, cols: usize, rows: usize) -> Vec<String> {
+    layout::presence_lines(snap, cols, rows, '⠹', true)
+        .iter()
+        .map(|line| joined(line).trim_end().to_string())
+        .collect()
+}
+
+#[test]
+fn a_top_line_that_does_not_fit_wraps_into_aligned_columns() {
+    let snap = with_roster(
+        Snapshot::default(),
+        vec![
+            peer("acme-web-frontend-pi-2", "online", Some("idle")),
+            peer("acme-web-frontend-claude-code", "online", Some("work")),
+            peer("acme-web-frontend-codex", "online", Some("idle")),
+        ],
+    );
+    assert_eq!(
+        grid_text(&snap, 80, 4),
+        [
+            "3 online · ⠹ acme-web-frontend-claude-code  ○ acme-web-frontend-codex",
+            "           ○ acme-web-frontend-pi-2",
+        ],
+        "every name shows, each line indented under the first name"
+    );
+    assert_eq!(
+        grid_text(&snap, 120, 4),
+        ["3 online · ⠹ acme-web-frontend-claude-code  ○ acme-web-frontend-codex  ○ acme-web-frontend-pi-2"],
+        "one line while they all fit"
+    );
+    assert_eq!(grid_text(&snap, 60, 4).len(), 3, "one name per line");
+    for cols in [42, 45, 60, 80, 94, 95] {
+        for line in grid_text(&snap, cols, 4) {
+            assert!(width(&line) <= cols, "{cols}: {line}");
+        }
+    }
+    assert_eq!(
+        layout::presence_lines(&snap, 80, 1, '⠹', true),
+        vec![layout::presence(&snap, 80, '⠹', true)],
+        "a single row keeps the top line and its count"
+    );
+}
+
+#[test]
+fn a_grid_taller_than_its_rows_keeps_attention_first_and_counts_the_rest() {
+    let snap = with_roster(
+        Snapshot::default(),
+        vec![
+            peer("a-idle", "online", Some("idle")),
+            peer("b-idle", "online", Some("idle")),
+            peer("c-idle", "online", None),
+            peer("d-work", "online", Some("work")),
+            peer("e-wait", "online", Some("wait")),
+        ],
+    );
+    assert_eq!(
+        grid_text(&snap, 33, 2),
+        ["5 online · ○ a-idle  ⠹ d-work", "           ! e-wait  +2"]
+    );
+    assert_eq!(
+        grid_text(&snap, 33, 3),
+        [
+            "5 online · ○ a-idle  ○ b-idle",
+            "           ● c-idle  ⠹ d-work",
+            "           ! e-wait",
+        ],
+        "three rows hold all five"
+    );
+}
+
+#[test]
+fn the_screen_moves_the_chain_below_a_wrapped_top_line() {
+    let roster = vec![
+        peer("acme-web-frontend-claude-code", "online", Some("work")),
+        peer("acme-web-frontend-codex", "online", Some("idle")),
+        peer("acme-web-frontend-pi-2", "online", Some("idle")),
+    ];
+    let mut app = app_with(with_roster(s1(), roster.clone()));
+    let lines = screen_text(&mut app, 80, 30);
+    assert_eq!(
+        lines[..2],
+        [
+            "3 online · ⠋ acme-web-frontend-claude-code  ○ acme-web-frontend-codex",
+            "           ○ acme-web-frontend-pi-2",
+        ],
+        "{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines[2].starts_with("chain deploy · "),
+        "{}",
+        lines.join("\n")
+    );
+    assert!(lines[3].starts_with("───"), "{}", lines.join("\n"));
+    let mut empty = app_with(with_roster(Snapshot::default(), roster.clone()));
+    let lines = screen_text(&mut empty, 80, 20);
+    assert_eq!(lines[2], "no jobs here yet", "{}", lines.join("\n"));
+    let mut small = app_with(with_roster(s1(), roster));
+    let lines = screen_text(&mut small, 80, 8);
+    assert_eq!(lines.len(), 8, "{}", lines.join("\n"));
+    assert!(
+        lines[0].ends_with("+1"),
+        "the smallest pane keeps one line and counts the rest:\n{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines[1].starts_with("chain deploy · "),
+        "{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn the_view_moves_down_at_once_and_back_up_once_the_roster_held_still() {
+    let long = |id: &str| peer(&format!("acme-web-frontend-{id}"), "online", Some("idle"));
+    let two = vec![long("claude-code"), long("codex")];
+    let three = vec![long("claude-code"), long("codex"), long("pi-2")];
+    let header = |app: &mut App| {
+        let lines = screen_text(app, 80, 30);
+        lines
+            .iter()
+            .position(|l| l.starts_with("chain deploy · "))
+            .unwrap_or_else(|| panic!("{}", lines.join("\n")))
+    };
+    let mut app = app_with(with_roster(s1(), two.clone()));
+    assert_eq!(header(&mut app), 1, "two names fit on the top line");
+    app.apply(Ok(with_roster(s1(), three)));
+    assert_eq!(
+        header(&mut app),
+        2,
+        "a third wraps it and the view moves down at once"
+    );
+    assert_eq!(
+        screen_text(&mut app, 80, 8)[1].get(..13),
+        Some("chain deploy "),
+        "a small pane caps the rows kept"
+    );
+    for n in 1..PEER_HOLD {
+        app.apply(Ok(with_roster(s1(), two.clone())));
+        assert_eq!(
+            header(&mut app),
+            2,
+            "{n} snapshots after it left, its row is kept"
+        );
+    }
+    app.apply(Ok(with_roster(s1(), two.clone())));
+    assert_eq!(header(&mut app), 1, "then the view moves back up");
+}
+
+fn with_events(mut snap: Snapshot, n: u64) -> Snapshot {
+    snap.capabilities.event_count = true;
+    snap.event_count = n;
+    snap
+}
+
+#[test]
+fn the_events_tag_counts_and_stays_out_of_hubs_that_do_not() {
+    assert_eq!(layout::events_tag(&Snapshot::default()), None);
+    for (n, want) in [(0, "0 events"), (1, "1 event"), (42, "42 events")] {
+        assert_eq!(
+            layout::events_tag(&with_events(Snapshot::default(), n)).as_deref(),
+            Some(want)
+        );
+    }
+}
+
+#[test]
+fn the_rule_shows_how_many_events_the_hub_keeps() {
+    let mut app = app_with(with_events(s1(), 42));
+    for cols in [46usize, 100] {
+        let lines = screen_text(&mut app, cols, 40);
+        assert!(
+            lines[2].starts_with("───") && lines[2].ends_with(" 42 events ─"),
+            "{cols}: {}",
+            lines[2]
+        );
+        assert_eq!(width(&lines[2]), cols);
+    }
+    let old = screen_text(&mut app_with(s1()), 46, 40);
+    assert!(
+        !old[2].contains("event"),
+        "a hub that does not count shows nothing"
+    );
+}
+
+#[test]
+fn the_events_tag_joins_the_block_tag_and_gives_way_first_when_narrow() {
+    let mut app = app_with(with_events(mixed(), 42));
+    let wide = screen_text(&mut app, 46, 60);
+    assert!(
+        wide[2].ends_with(" 42 events · +2 run · 1/2 ─"),
+        "{}",
+        wide[2]
+    );
+    let narrow = screen_text(&mut app, 30, 60);
+    assert!(
+        narrow[2].ends_with("─ +2 run · 1/2 ─") && !narrow[2].contains("events"),
+        "{}",
+        narrow[2]
+    );
+    app.opts.ascii = true;
+    let ascii = screen_text(&mut app, 46, 60);
+    assert!(
+        ascii[2].ends_with(" 42 events | +2 run | 1/2 -"),
+        "{}",
+        ascii[2]
+    );
+}
+
+#[test]
+fn the_view_without_jobs_shows_the_count_on_its_message_row() {
+    let mut app = app_with(with_events(Snapshot::default(), 42));
+    let lines = screen_text(&mut app, 46, 20);
+    assert!(
+        lines[1].starts_with("no jobs here yet") && lines[1].ends_with("42 events"),
+        "{}",
+        lines[1]
+    );
+    assert_eq!(width(&lines[1]), 46);
+    /* wide enough that the error line leaves room for the count, so only the rule for an
+    error keeps it off */
+    let fresh = screen_text(&mut app, 100, 20);
+    assert!(fresh[1].ends_with("42 events"), "{}", fresh[1]);
+    app.apply(Err("connection refused".into()));
+    let lines = screen_text(&mut app, 100, 20);
+    assert!(
+        lines[1].starts_with("! connection refused"),
+        "the error is on screen: {}",
+        lines[1]
+    );
+    assert!(
+        !lines.join("\n").contains("42 events"),
+        "a stale count stays off the screen"
+    );
+}
+
+#[test]
+fn a_stale_count_stays_off_the_rule_while_the_hub_is_unreachable() {
+    let mut app = app_with(with_events(s1(), 42));
+    let fresh = screen_text(&mut app, 100, 40);
+    assert!(fresh[2].ends_with(" 42 events ─"), "{}", fresh[2]);
+    app.apply(Err("connection refused".into()));
+    let lines = screen_text(&mut app, 100, 40);
+    assert!(
+        lines[3].starts_with("! connection refused"),
+        "the error is on screen: {}",
+        lines[3]
+    );
+    assert!(
+        !lines[2].contains("events"),
+        "the count is as old as the snapshot: {}",
+        lines[2]
     );
 }

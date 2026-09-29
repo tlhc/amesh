@@ -194,7 +194,12 @@ async fn events_since_uses_global_cursor_before_circle_filter() {
     let after = f.events("/events?since=e498&circle=one").await;
     assert_eq!(after.as_array().unwrap().len(), 1);
     assert_eq!(after[0]["id"], "e500");
-    assert_eq!(f.events("/events?since=e0&circle=one").await, json!([]));
+    let unknown = f.events("/events?since=e0&circle=one").await;
+    assert_eq!(
+        unknown.as_array().unwrap().len(),
+        498,
+        "an id the ring dropped starts from the oldest entry: every entry of the circle"
+    );
 }
 
 #[tokio::test]
@@ -305,4 +310,186 @@ async fn events_codex_identity_is_required() {
 #[tokio::test]
 async fn events_claude_identity_is_required() {
     caller_identity("claude-code").await;
+}
+
+#[tokio::test]
+async fn ring_entries_carry_seq_at_and_the_topic_they_belong_to() {
+    let f = Fixture::new();
+    f.peer("a", "one", "pi").await;
+    let before = now_unix();
+    {
+        let mut hub = f.0.inner.lock().await;
+        for event in [
+            json!({"id": "x1", "type": "ask", "correlation_id": "ask-1", "from_peer": "a"}),
+            json!({"id": "x2", "type": "notify", "topic": "job-7", "correlation_id": "ask-2", "from_peer": "a"}),
+            json!({"id": "x3", "type": "notify", "from_peer": "a"}),
+            json!({"id": "x4", "type": "ack", "correlation_id": "", "from_peer": "a"}),
+        ] {
+            push_event(&mut hub, event);
+        }
+    }
+    let all = f.events("/events").await;
+    let all = all.as_array().unwrap();
+    let seqs: Vec<u64> = all.iter().map(|e| e["seq"].as_u64().unwrap()).collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "seq rises by one per entry: {seqs:?}"
+    );
+    assert!(all.iter().all(|e| e["at"].as_u64().unwrap() >= before));
+    assert_eq!(all[0]["topic"], "ask-1", "a correlation_id names the topic");
+    assert_eq!(
+        all[1]["topic"], "job-7",
+        "a topic already on the event wins"
+    );
+    assert!(
+        all[2].get("topic").is_none(),
+        "a notify belongs to no topic"
+    );
+    assert!(
+        all[3].get("topic").is_none(),
+        "an empty correlation_id names none"
+    );
+}
+
+#[tokio::test]
+async fn a_seq_cursor_survives_the_removal_of_its_own_entry() {
+    let f = Fixture::new();
+    f.peer("a", "one", "pi").await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        for (id, topic) in [("e1", "ask-gone"), ("e2", "ask-kept"), ("e3", "")] {
+            let mut event = json!({"id": id, "from_peer": "a"});
+            if !topic.is_empty() {
+                event["topic"] = json!(topic);
+            }
+            push_event(&mut hub, event);
+        }
+    }
+    let all = f.events("/events").await;
+    let cursor = all[0]["seq"].as_u64().unwrap();
+    f.0.inner
+        .lock()
+        .await
+        .events
+        .retain(|e| e["topic"] != "ask-gone");
+    let after = f.events(&format!("/events?since={cursor}")).await;
+    let ids: Vec<&str> = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["e2", "e3"],
+        "the cursor's own entry is gone and nothing newer is hidden"
+    );
+}
+
+#[tokio::test]
+async fn a_cursor_the_ring_cannot_place_starts_from_the_oldest_entry() {
+    let f = Fixture::new();
+    f.peer("a", "one", "pi").await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        for n in 0..3 {
+            push_event(&mut hub, json!({"id": format!("e{n}"), "from_peer": "a"}));
+        }
+    }
+    let newest = f.0.inner.lock().await.event_seq;
+    for since in [
+        "0".to_string(),
+        "gone".to_string(),
+        (newest + 10).to_string(),
+        u64::MAX.to_string(),
+    ] {
+        let got = f.events(&format!("/events?since={since}")).await;
+        assert_eq!(got.as_array().unwrap().len(), 3, "since={since}");
+    }
+    let by_seq = f.events(&format!("/events?since={newest}")).await;
+    assert_eq!(by_seq, json!([]), "the newest seq has nothing after it");
+    let by_id = f.events("/events?since=e1").await;
+    assert_eq!(
+        by_id.as_array().unwrap().len(),
+        1,
+        "an id still names its entry"
+    );
+}
+
+#[tokio::test]
+async fn the_tool_orients_on_the_last_hour_and_a_cursor_reaches_further_back() {
+    let f = Fixture::new();
+    f.peer("a", "one", "pi").await;
+    let first = {
+        let mut hub = f.0.inner.lock().await;
+        for n in 0..3 {
+            push_event(&mut hub, json!({"id": format!("e{n}"), "from_peer": "a"}));
+        }
+        for event in hub.events.iter_mut().take(2) {
+            event["at"] = json!(now_unix() - EVENTS_VIEW_SECS - 60);
+        }
+        hub.events[0]["seq"].as_u64().unwrap()
+    };
+    let view = f.mcp(json!({"from_peer": "a"})).await.unwrap();
+    assert_eq!(
+        view.as_array().unwrap().len(),
+        1,
+        "the two older than an hour are left out"
+    );
+    let paged = f
+        .mcp(json!({"from_peer": "a", "since": (first - 1).to_string()}))
+        .await
+        .unwrap();
+    assert_eq!(
+        paged.as_array().unwrap().len(),
+        3,
+        "a cursor is not cut by age"
+    );
+    assert!(
+        paged[0]["seq"].is_string(),
+        "the tool shows seq as text, the type `since` declares"
+    );
+    let by_number = f
+        .mcp(json!({"from_peer": "a", "since": first}))
+        .await
+        .unwrap();
+    assert_eq!(
+        by_number.as_array().unwrap().len(),
+        2,
+        "a number is taken too"
+    );
+    assert_eq!(
+        f.events("/events").await.as_array().unwrap().len(),
+        3,
+        "HTTP keeps the whole ring"
+    );
+    assert!(f.events("/events").await[0]["seq"].is_u64());
+}
+
+#[tokio::test]
+async fn a_cursor_inside_the_current_runs_own_range_is_read_as_this_runs() {
+    let f = Fixture::new();
+    f.peer("a", "one", "pi").await;
+    let cursor = {
+        let mut hub = f.0.inner.lock().await;
+        let cursor = hub.event_seq;
+        hub.event_seq = cursor - 2;
+        for n in 0..3 {
+            push_event(&mut hub, json!({"id": format!("e{n}"), "from_peer": "a"}));
+        }
+        cursor
+    };
+    let after = f.events(&format!("/events?since={cursor}")).await;
+    let ids: Vec<&str> = after
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["e2"],
+        "seq {cursor} is the second entry of this run, so a clock set back onto an earlier \
+         run's range hides what precedes it; documented in protocol-design.md"
+    );
 }

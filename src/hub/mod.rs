@@ -45,6 +45,9 @@ struct Hub {
     inbox: HashMap<String, Vec<Value>>,
     conn_gen: u64,
     events: Vec<Value>,
+    /* the seq of the newest ring entry, seeded from the clock at start so a cursor issued
+    before a restart sits below every new entry while the clock moves forward */
+    event_seq: u64,
     batches: HashMap<String, Vec<String>>,
     mcp_servers: HashMap<String, Vec<Value>>,
     /* next cleanup pass; 0 runs one at start, stamping rows from before the upgrade */
@@ -179,6 +182,13 @@ fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn now_micros() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
 }
 
@@ -776,6 +786,7 @@ impl Hub {
             owed: disk.owed,
             conn_gen: 0,
             events: Vec::new(),
+            event_seq: now_micros(),
             batches: HashMap::new(),
             sweep_at: 0,
             config: load_config(path),
@@ -1010,8 +1021,8 @@ fn persist_then_deliver(
         copy, and only the peer's recv for this id takes the record away */
         let event = with_event_id(event);
         queue_inbox(hub, &key, [event.clone()]);
-        push_event(hub, event.clone());
         persist_ok(hub)?;
+        push_event(hub, event.clone());
         if !unsettled {
             if let Some((_, tx)) = hub.sockets.get(&key) {
                 let _ = tx.send(event);
@@ -1028,8 +1039,9 @@ fn persist_then_deliver(
         hub.sockets.remove(&key);
     }
     queue_inbox(hub, &key, [event.clone()]);
+    persist_ok(hub)?;
     push_event(hub, event);
-    persist_ok(hub)
+    Ok(())
 }
 
 fn close_open_asks(asks: &mut HashMap<String, Ask>, peer_id: &str, reason: &str) -> Vec<Value> {
@@ -1063,16 +1075,17 @@ fn queue_replies(hub: &mut Hub, replies: Vec<Value>) -> Vec<(String, Value)> {
         };
         let event = with_event_id(event);
         queue_inbox(hub, &target, [event.clone()]);
-        push_event(hub, event.clone());
         queued.push((target, event));
     }
     queued
 }
 
-/* callers persist the records and their state changes before sending any copy */
+/* callers persist the records and their state changes before this records them in the ring
+and sends any copy */
 fn deliver_queued(hub: &mut Hub, records: Vec<(String, Value)>) {
     let mut retired = false;
     for (target, event) in records {
+        push_event(hub, event.clone());
         if hub.owed.contains_key(&target) {
             continue;
         }
@@ -1545,15 +1558,18 @@ async fn snapshot(
                 .into_iter()
                 .map(|name| (name, resolve(&hub, name), true)),
         );
+    let row = |peer: &Peer| {
+        json!({
+            "peer_id": peer.peer_id, "name": peer.name, "backend": peer.backend,
+            "circle": peer.circle, "status": peer.status, "last_seen": peer.last_seen,
+            "activity": hub.activity.get(&peer.peer_id),
+            "running": running.get(peer.peer_id.as_str()).copied().unwrap_or(0),
+        })
+    };
     let (mut peers, mut missing_peers, mut seen) = (Vec::new(), BTreeSet::new(), HashSet::new());
     for (reference, found, name) in lookups.filter(|(reference, _, _)| !reference.is_empty()) {
         match found {
-            Some(peer) if seen.insert(peer.peer_id.clone()) => peers.push(json!({
-                "peer_id": peer.peer_id, "name": peer.name, "backend": peer.backend,
-                "circle": peer.circle, "status": peer.status, "last_seen": peer.last_seen,
-                "activity": hub.activity.get(&peer.peer_id),
-                "running": running.get(peer.peer_id.as_str()).copied().unwrap_or(0),
-            })),
+            Some(peer) if seen.insert(peer.peer_id.clone()) => peers.push(row(peer)),
             Some(_) => {}
             /* "anonymous" as a name stands for no sender, unless a peer really took it; a
             recipient id that is gone is missing whatever it reads */
@@ -1563,6 +1579,21 @@ async fn snapshot(
             }
         }
     }
+    /* every row in the view's circle, for the TUI's line of who is online; peers stays what
+    the jobs refer to */
+    let mut listed: Vec<&Peer> = hub
+        .peers
+        .values()
+        .filter(|peer| circle.as_deref().is_none_or(|c| peer.circle == c))
+        .collect();
+    listed.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+    let roster: Vec<Value> = listed.into_iter().map(row).collect();
+    /* what GET /events?circle= would list, counted */
+    let event_count = hub
+        .events
+        .iter()
+        .filter(|event| circle.as_deref().is_none_or(|c| event_in_circle(event, c)))
+        .count();
     let detail = q
         .detail
         .as_deref()
@@ -1576,7 +1607,8 @@ async fn snapshot(
         "schema_version": 1,
         "captured_at": now_unix(),
         "hub_epoch": hub.epoch,
-        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true},
+        "event_count": event_count,
+        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true, "roster": true, "event_count": true},
         "jobs": jobs.iter().map(|job| json!({
             "job_id": job.job_id, "title": preview(&job.title), "title_len": job.title.chars().count(), "state": job.state,
             "assigned_peer": job.assigned_peer, "from_peer": job.from_peer, "circle": job.circle,
@@ -1594,6 +1626,7 @@ async fn snapshot(
             "reply_len": ask.reply.as_deref().map_or(0, |r| r.chars().count()),
         })).collect::<Vec<_>>(),
         "peers": peers,
+        "roster": roster,
         "missing": {"asks": missing_asks, "peers": missing_peers},
         "detail": detail,
     });
@@ -2343,6 +2376,9 @@ struct McpServerReq {
     command: Option<String>,
 }
 
+const EVENTS_KEEP: usize = 500;
+/* amesh_events without a cursor lists what happened within this many seconds */
+const EVENTS_VIEW_SECS: u64 = 3600;
 const EVENTS_DEFAULT: usize = 20;
 const EVENTS_MAX: usize = 50;
 const EVENT_TEXT_CHARS: usize = 200;
@@ -2364,6 +2400,9 @@ fn trim_events(events: Value, limit: Option<u64>, from_cursor: bool) -> Value {
     };
     let trimmed = window.iter().cloned().map(|mut event| {
         if let Some(object) = event.as_object_mut() {
+            if let Some(seq) = object.get("seq").and_then(Value::as_u64) {
+                object.insert("seq".into(), json!(seq.to_string()));
+            }
             for field in ["text", "message"] {
                 let cut = object.get(field).and_then(Value::as_str).and_then(|text| {
                     (text.chars().count() > EVENT_TEXT_CHARS)
@@ -2396,8 +2435,20 @@ fn push_event(hub: &mut Hub, mut event: Value) {
             }
         }
     }
+    hub.event_seq += 1;
+    let topic = ["topic", "correlation_id"]
+        .iter()
+        .find_map(|key| event[*key].as_str().filter(|id| !id.is_empty()))
+        .map(str::to_string);
+    if let Some(object) = event.as_object_mut() {
+        object.insert("seq".into(), json!(hub.event_seq));
+        object.insert("at".into(), json!(now_unix()));
+        if let Some(topic) = topic {
+            object.insert("topic".into(), json!(topic));
+        }
+    }
     hub.events.push(event);
-    if hub.events.len() > 500 {
+    if hub.events.len() > EVENTS_KEEP {
         hub.events.remove(0);
     }
 }
@@ -2610,6 +2661,26 @@ async fn ask_blocking(
     .await
 }
 
+fn event_in_circle(event: &Value, circle: &str) -> bool {
+    event["from_circle"].as_str() == Some(circle) || event["to_circle"].as_str() == Some(circle)
+}
+
+/* the seq an entry must exceed to be newer than `since`: an id the ring holds stands for its
+entry, anything else that reads as a number is a seq. What the ring cannot place, an id it
+dropped or a seq this run never issued, starts from the oldest entry, since everything held
+is newer than it */
+fn event_cursor(hub: &Hub, since: &str) -> u64 {
+    let by_id = hub
+        .events
+        .iter()
+        .find(|event| event["id"].as_str() == Some(since))
+        .and_then(|event| event["seq"].as_u64());
+    by_id
+        .or_else(|| since.parse::<u64>().ok())
+        .filter(|seq| *seq <= hub.event_seq)
+        .unwrap_or(0)
+}
+
 async fn list_events(
     State(app): State<App>,
     headers: HeaderMap,
@@ -2617,21 +2688,18 @@ async fn list_events(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
     let hub = app.inner.lock().await;
-    let mut events = if let Some(since) = q.get("since").filter(|s| !s.is_empty()) {
-        hub.events
-            .iter()
-            .skip_while(|e| e.get("id").and_then(Value::as_str) != Some(since.as_str()))
-            .skip(1)
-            .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        hub.events.clone()
-    };
+    let cursor = q
+        .get("since")
+        .filter(|s| !s.is_empty())
+        .map(|since| event_cursor(&hub, since));
+    let mut events: Vec<Value> = hub
+        .events
+        .iter()
+        .filter(|event| cursor.is_none_or(|seq| event["seq"].as_u64().unwrap_or(0) > seq))
+        .cloned()
+        .collect();
     if let Some(circle) = q.get("circle").filter(|s| !s.is_empty()) {
-        events.retain(|event| {
-            event["from_circle"].as_str() == Some(circle.as_str())
-                || event["to_circle"].as_str() == Some(circle.as_str())
-        });
+        events.retain(|event| event_in_circle(event, circle));
     }
     Ok(Json(json!(events)))
 }
@@ -3657,7 +3725,8 @@ fn sweep_plan(hub: &Hub, now: u64) -> Sweep {
     plan
 }
 
-/* a deleted ask's copies leave the inboxes too; acks stay, they carry the reply */
+/* a deleted ask's copies leave the inboxes too; acks stay, they carry the reply. The ring
+follows in prune_events */
 fn sweep(hub: &mut Hub, now: u64) -> Sweep {
     let plan = sweep_plan(hub, now);
     for id in &plan.stamp_jobs {
@@ -3696,6 +3765,17 @@ fn prune_batches(hub: &mut Hub) {
         .retain(|_, cids| cids.iter().any(|cid| hub.asks.contains_key(cid)));
 }
 
+/* what the ring holds for an ask or a job goes with it: an entry whose topic the hub no
+longer has is dropped. The ring is memory only, so this runs where prune_batches does, once
+the deletion is on disk */
+fn prune_events(hub: &mut Hub) {
+    hub.events.retain(|event| {
+        event["topic"]
+            .as_str()
+            .is_none_or(|topic| hub.asks.contains_key(topic) || hub.jobs.contains_key(topic))
+    });
+}
+
 #[derive(Deserialize)]
 struct GcReq {
     #[serde(default)]
@@ -3717,6 +3797,7 @@ async fn gc_state(
         persist_ok(&mut hub)?;
     }
     prune_batches(&mut hub);
+    prune_events(&mut hub);
     if swept.deleted() {
         if let Err(error) = compact(&hub.db) {
             eprintln!("amesh: {error}");
@@ -3869,6 +3950,7 @@ fn advance_jobs(hub: &mut Hub) {
                 "id": format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]),
                 "from_peer": "amesh",
                 "to_peer": job.from_peer,
+                "topic": job.job_id,
                 "message": format!(
                     "job {} {} is {}: {stall}; amesh_job_update can retry, reassign or cancel",
                     job.job_id, job.title, job.state
@@ -3891,6 +3973,7 @@ fn advance_jobs(hub: &mut Hub) {
     if !changed {
         if swept {
             prune_batches(hub);
+            prune_events(hub);
         }
         return;
     }
@@ -3901,6 +3984,7 @@ fn advance_jobs(hub: &mut Hub) {
     }
     if swept {
         prune_batches(hub);
+        prune_events(hub);
     }
     deliver_queued(hub, queued);
     if deleted {
@@ -4361,9 +4445,9 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "List recent events in your circle; cross_circle without circle lists all. In-memory ring cleared on hub restart; newest 20 by default, limit up to 50, text trimmed to 200 chars",
+                "List events in your circle: newest 20 by default from the last hour, limit up to 50, text trimmed to 200 chars; cross_circle without circle lists all. Each has a seq: pass since=<seq of the last one you saw> to page forward from it. The hub keeps about 500 events, drops an ask's or job's events when it deletes it, and clears them on restart",
                 json!({
-                    "since": {"type": "string"},
+                    "since": {"type": "string", "description": "seq of the last event you saw; returns the events after it"},
                     "limit": {"type": "integer"},
                     "circle": {"type": "string"},
                     "cross_circle": {"type": "boolean"}
@@ -4816,20 +4900,28 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             if let Some(circle) = circle.or_else(|| (!cross).then_some(own.as_str())) {
                 q.insert("circle".into(), circle.to_string());
             }
-            if let Some(since) = args.get("since").and_then(Value::as_str) {
-                q.insert("since".into(), since.to_string());
+            let since = args
+                .get("since")
+                .and_then(|value| match value {
+                    Value::String(text) => Some(text.clone()),
+                    Value::Number(number) => Some(number.to_string()),
+                    _ => None,
+                })
+                .filter(|since| !since.is_empty());
+            if let Some(since) = &since {
+                q.insert("since".into(), since.clone());
             }
             let res = list_events(State(app.clone()), auth_headers(app), Query(q)).await?;
-            let from_cursor = args
-                .get("since")
-                .and_then(Value::as_str)
-                .is_some_and(|since| !since.is_empty());
-            trim_events(
-                res.0,
-                args.get("limit").and_then(Value::as_u64),
-                from_cursor,
-            )
-            .to_string()
+            let from_cursor = since.is_some();
+            let mut rows = res.0;
+            /* without a cursor the tool orients: what happened within the last hour */
+            if !from_cursor {
+                let floor = now_unix().saturating_sub(EVENTS_VIEW_SECS);
+                if let Some(list) = rows.as_array_mut() {
+                    list.retain(|event| event["at"].as_u64().is_none_or(|at| at >= floor));
+                }
+            }
+            trim_events(rows, args.get("limit").and_then(Value::as_u64), from_cursor).to_string()
         }
         _ => {
             return Err((
