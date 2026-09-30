@@ -4243,15 +4243,15 @@ fn the_footer_names_a_while_the_view_holds_asks() {
 fn the_fetch_asks_for_the_text_the_card_shows() {
     let mut app = app_with(with_lone_asks(s1()));
     screen_text(&mut app, 100, 40);
-    assert_eq!(app.wanted().as_deref(), Some("detail=perf"));
+    assert_eq!(app.wanted().detail.as_deref(), Some("detail=perf"));
     app.key(KeyCode::Char('a'));
     assert_eq!(
-        app.wanted().as_deref(),
+        app.wanted().detail.as_deref(),
         Some("ask=ask-1223c9e0"),
         "the asks screen starts on its first ask"
     );
     app.key(KeyCode::Char('j'));
-    assert_eq!(app.wanted().as_deref(), Some("ask=ask-a3a07b51"));
+    assert_eq!(app.wanted().detail.as_deref(), Some("ask=ask-a3a07b51"));
 }
 
 #[test]
@@ -4552,4 +4552,693 @@ fn nothing_is_just_now_after_the_capture_or_from_a_hub_without_one() {
             "captured at {captured_at}: nor a job sent after it"
         );
     }
+}
+
+/* an online peer with a push channel or without, and the records waiting for it */
+fn reached(id: &str, push: bool, queued: usize) -> Peer {
+    Peer {
+        push,
+        queued,
+        ..peer(id, "online", Some("idle"))
+    }
+}
+
+fn delivering(snap: Snapshot, roster: Vec<Peer>, at: u64) -> Snapshot {
+    let mut snap = with_roster(snap, roster);
+    snap.capabilities.delivery = true;
+    snap.captured_at = at;
+    snap
+}
+
+/* the snapshot taken three times a second apart, so its full queues read as stuck */
+fn app_stuck(snap: Snapshot) -> App {
+    let mut app = app_with(Snapshot::default());
+    for k in 0..3 {
+        let mut s = snap.clone();
+        s.captured_at += k;
+        app.apply(Ok(s));
+    }
+    app
+}
+
+#[test]
+fn delivery_fields_read_from_hubs_that_send_them_and_default_otherwise() {
+    let new: Snapshot = serde_json::from_value(serde_json::json!({
+        "hub_epoch": "e1",
+        "capabilities": {"delivery": true},
+        "roster": [{"peer_id": "pi", "push": true, "acks": true, "queued": 3}]
+    }))
+    .unwrap();
+    assert_eq!(new.hub_epoch, "e1");
+    assert!(new.capabilities.delivery);
+    assert!(new.roster[0].push);
+    assert_eq!(new.roster[0].queued, 3);
+    let old: Snapshot =
+        serde_json::from_value(serde_json::json!({"roster": [{"peer_id": "pi"}]})).unwrap();
+    assert!(
+        !old.capabilities.delivery,
+        "an old hub says nothing about delivery"
+    );
+    assert!(!old.roster[0].push);
+    assert_eq!(old.roster[0].queued, 0);
+    assert!(old.hub_epoch.is_empty());
+}
+
+#[test]
+fn a_queue_is_stuck_once_it_stays_full_over_three_snapshots() {
+    let mut app = app_with(Snapshot::default());
+    let full = |at| delivering(Snapshot::default(), vec![reached("pi", true, 2)], at);
+    app.apply(Ok(full(100)));
+    app.apply(Ok(full(101)));
+    assert!(
+        app.snap.as_ref().unwrap().stuck.is_empty(),
+        "two snapshots may still be copies in flight"
+    );
+    app.apply(Ok(full(102)));
+    assert_eq!(
+        app.snap.as_ref().unwrap().stuck.get("pi"),
+        Some(&100),
+        "the third calls it stuck, dated from the first"
+    );
+    app.apply(Ok(delivering(
+        Snapshot::default(),
+        vec![reached("pi", true, 0)],
+        103,
+    )));
+    assert!(
+        app.snap.as_ref().unwrap().stuck.is_empty(),
+        "an empty queue ends the run"
+    );
+    app.apply(Ok(full(104)));
+    app.apply(Ok(full(105)));
+    assert!(
+        app.snap.as_ref().unwrap().stuck.is_empty(),
+        "a new run counts from its own start"
+    );
+}
+
+#[test]
+fn a_hub_without_delivery_calls_no_queue_stuck() {
+    let mut app = app_with(Snapshot::default());
+    for at in 100..105 {
+        let mut snap = delivering(Snapshot::default(), vec![reached("pi", true, 2)], at);
+        snap.capabilities.delivery = false;
+        app.apply(Ok(snap));
+    }
+    assert!(app.snap.as_ref().unwrap().stuck.is_empty());
+}
+
+#[test]
+fn the_top_line_marks_a_stuck_queue_and_dims_a_peer_without_push() {
+    let mut snap = delivering(
+        Snapshot::default(),
+        vec![
+            reached("a-pi", true, 2),
+            reached("b-codex", false, 0),
+            reached("c-cc", true, 0),
+        ],
+        200,
+    );
+    snap.stuck.insert("a-pi".into(), 160);
+    let pieces = layout::presence(&snap, 120, '⠹', true);
+    assert_eq!(joined(&pieces), "3 online · ○ a-pi ✉2  ○ b-codex  ○ c-cc");
+    let tone = |text: &str| {
+        pieces
+            .iter()
+            .find(|(t, _)| t == text)
+            .map(|(_, tone)| *tone)
+    };
+    assert_eq!(tone(" ✉2"), Some(layout::Tone::Warn));
+    assert_eq!(
+        tone(" b-codex"),
+        Some(layout::Tone::Dim),
+        "no push channel dims the name"
+    );
+    assert_eq!(tone(" c-cc"), Some(layout::Tone::Soft));
+    snap.capabilities.delivery = false;
+    let old = layout::presence(&snap, 120, '⠹', true);
+    assert_eq!(
+        joined(&old),
+        "3 online · ○ a-pi  ○ b-codex  ○ c-cc",
+        "an old hub gets no marks"
+    );
+    assert!(old
+        .iter()
+        .all(|(t, tone)| !t.contains("codex") || *tone == layout::Tone::Soft));
+}
+
+#[test]
+fn a_wrapped_top_line_keeps_its_columns_with_a_queue_mark() {
+    let roster = (0..6)
+        .map(|i| reached(&format!("peer-{i}"), true, 0))
+        .collect();
+    let mut snap = delivering(Snapshot::default(), roster, 200);
+    snap.roster[0].queued = 12;
+    snap.stuck.insert("peer-0".into(), 150);
+    let lines: Vec<String> = layout::presence_lines(&snap, 50, 4, '⠹', true)
+        .iter()
+        .map(|line| joined(line))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            "6 online · ○ peer-0 ✉12  ○ peer-1",
+            "           ○ peer-2      ○ peer-3",
+            "           ○ peer-4      ○ peer-5",
+        ]
+    );
+}
+
+#[test]
+fn the_job_card_says_why_its_open_ask_may_go_unseen() {
+    let mut snap = busy();
+    snap.capabilities.delivery = true;
+    for p in snap.peers.iter_mut() {
+        p.push = true;
+    }
+    let w1 = snap.peers.iter_mut().find(|p| p.peer_id == "w1").unwrap();
+    w1.push = false;
+    w1.queued = 2;
+    let mut app = app_stuck(snap);
+    app.sel = Some("perf".into());
+    let lines = screen_at(&mut app, 100, 0);
+    let at = lines
+        .iter()
+        .position(|l| l.contains("w1 WORK"))
+        .unwrap_or_else(|| panic!("no worker line:\n{}", lines.join("\n")));
+    assert!(
+        lines[at + 1].contains("no push · 2 queued for 2s"),
+        "the row under the worker says it:\n{}",
+        lines.join("\n")
+    );
+    app.sel = Some("upg".into());
+    let lines = screen_at(&mut app, 100, 0);
+    assert!(
+        !lines
+            .iter()
+            .any(|l| l.contains("no push") || l.contains("queued for")),
+        "a worker with a push channel and an empty queue gets no row:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn the_ask_card_says_why_an_open_ask_may_go_unseen() {
+    let mut snap = fan_out();
+    snap.capabilities.delivery = true;
+    for p in snap.peers.iter_mut().chain(snap.roster.iter_mut()) {
+        p.push = p.peer_id != PI2 && p.peer_id != CODEX;
+        if p.peer_id == PI2 {
+            p.queued = 1;
+        }
+    }
+    let mut app = app_stuck(snap);
+    app.key(KeyCode::Char('a'));
+    let lines = screen_at(&mut app, 100, 0);
+    let to = lines
+        .iter()
+        .position(|l| l.contains(PI2) && l.contains("now WORK"))
+        .unwrap_or_else(|| panic!("no to line:\n{}", lines.join("\n")));
+    assert!(
+        lines[to + 1].contains("no push · 1 queued for 2s"),
+        "the row under to says it:\n{}",
+        lines.join("\n")
+    );
+    app.key(KeyCode::Char('3'));
+    let lines = screen_at(&mut app, 100, 0);
+    assert!(
+        !lines.iter().any(|l| l.contains("no push")),
+        "a closed ask has nothing left to explain:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn a_healthy_mesh_draws_what_it_drew_before() {
+    let jobs = {
+        let snap = busy();
+        let peers = snap.peers.clone();
+        with_roster(snap, peers)
+    };
+    for (base, key) in [(jobs, None), (fan_out(), Some('a'))] {
+        let mut healthy = base.clone();
+        healthy.capabilities.delivery = true;
+        for p in healthy.peers.iter_mut().chain(healthy.roster.iter_mut()) {
+            p.push = true;
+        }
+        let (mut before, mut after) = (app_stuck(base), app_stuck(healthy));
+        /* in colour, so a tone that changed shows even where the text did not */
+        before.opts.color = true;
+        after.opts.color = true;
+        if let Some(k) = key {
+            before.key(KeyCode::Char(k));
+            after.key(KeyCode::Char(k));
+        }
+        for cols in [60, 100] {
+            assert_eq!(
+                before.screen(cols, 40, 0),
+                after.screen(cols, 40, 0),
+                "at {cols} columns"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_queue_mark_reads_plus_in_ascii() {
+    let mut snap = with_roster(busy(), vec![reached("pi", true, 3)]);
+    snap.capabilities.delivery = true;
+    let mut app = app_stuck(snap);
+    app.opts.ascii = true;
+    assert_eq!(screen_text(&mut app, 100, 40)[0], "1 online | o pi +3");
+}
+
+fn ev(seq: u64, kind: &str, from: &str, to: &str, body: &str) -> model::Event {
+    let asked = kind == "ask" || kind == "ack";
+    model::Event {
+        seq: Some(seq),
+        at: Some(1000 + seq),
+        kind: kind.into(),
+        from_peer: from.into(),
+        to_peer: to.into(),
+        correlation_id: if asked {
+            format!("ask-{seq:08}")
+        } else {
+            String::new()
+        },
+        text: if kind == "ask" {
+            body.into()
+        } else {
+            String::new()
+        },
+        message: if kind == "ask" {
+            String::new()
+        } else {
+            body.into()
+        },
+        ..Default::default()
+    }
+}
+
+/* the events screen of a view with one peer online, after `events` came in */
+fn events_app(events: Vec<model::Event>) -> App {
+    let snap = Snapshot {
+        captured_at: 1100,
+        hub_epoch: "e1".into(),
+        ..Default::default()
+    };
+    let mut app = app_with(with_roster(snap, vec![peer("cc", "online", Some("idle"))]));
+    app.key(KeyCode::Char('e'));
+    app.take_events(Ok(events));
+    app
+}
+
+fn held_seqs(app: &App) -> Vec<Option<u64>> {
+    app.feed
+        .iter()
+        .map(|h| match h {
+            super::feed::Held::Event(e) => e.seq,
+            super::feed::Held::Restart(_) => None,
+        })
+        .collect()
+}
+
+#[test]
+fn e_opens_the_events_screen_and_e_or_a_leaves_it() {
+    let mut app = app_with(with_lone_asks(s1()));
+    screen_text(&mut app, 100, 40);
+    app.key(KeyCode::Char('e'));
+    assert!(app.events);
+    let lines = screen_text(&mut app, 80, 40);
+    assert!(
+        lines.iter().any(|l| l.starts_with("events · ")),
+        "{lines:?}"
+    );
+    assert_eq!(
+        lines.last().unwrap(),
+        "j/k move  enter card  e jobs  a asks"
+    );
+    app.key(KeyCode::Char('e'));
+    assert!(!app.events && !app.asks, "e again goes to the jobs");
+    app.key(KeyCode::Char('e'));
+    app.key(KeyCode::Char('a'));
+    assert!(!app.events && app.asks, "a goes to the asks");
+    app.key(KeyCode::Char('e'));
+    assert!(app.events, "e opens the events from the asks too");
+    app.key(KeyCode::Char('a'));
+    assert!(
+        !app.events && app.asks,
+        "a over the asks goes back to them, not to the jobs"
+    );
+    app.key(KeyCode::Char('e'));
+    app.key(KeyCode::Char('e'));
+    assert!(
+        !app.events && !app.asks,
+        "e again goes to the jobs, not back to the asks"
+    );
+}
+
+#[test]
+fn the_feed_keeps_what_is_new_and_at_most_500() {
+    let mut app = events_app(vec![
+        ev(1, "ask", "cc", "pi", "q1"),
+        ev(2, "ack", "pi", "cc", "a1"),
+    ]);
+    app.take_events(Ok(vec![
+        ev(2, "ack", "pi", "cc", "a1"),
+        ev(3, "notify", "cc", "pi", "n"),
+    ]));
+    assert_eq!(
+        held_seqs(&app),
+        vec![Some(1), Some(2), Some(3)],
+        "what is held already is not taken twice"
+    );
+    app.take_events(Ok(vec![ev(4, "chat_turn_delta", "", "", "partial")]));
+    assert_eq!(held_seqs(&app).len(), 3, "streaming deltas stay out");
+    app.take_events(Ok((10..610)
+        .map(|s| ev(s, "notify", "cc", "pi", "n"))
+        .collect()));
+    let held = held_seqs(&app);
+    assert_eq!(held.len(), 500);
+    assert_eq!(held.first(), Some(&Some(110)), "the oldest went first");
+}
+
+#[test]
+fn a_hub_that_numbers_no_events_is_read_whole() {
+    let bare = |text: &str| model::Event {
+        kind: "notify".into(),
+        from_peer: "cc".into(),
+        to_peer: "pi".into(),
+        message: text.into(),
+        ..Default::default()
+    };
+    let mut app = events_app(vec![bare("one"), bare("two")]);
+    app.take_events(Ok(vec![bare("two"), bare("three")]));
+    let texts: Vec<String> = app
+        .feed
+        .iter()
+        .filter_map(|h| match h {
+            super::feed::Held::Event(e) => Some(e.message.clone()),
+            super::feed::Held::Restart(_) => None,
+        })
+        .collect();
+    assert_eq!(texts, ["two", "three"]);
+}
+
+#[test]
+fn the_rows_read_time_kind_route_and_text() {
+    let fan = |seq, to: &str| model::Event {
+        id: "bc-1".into(),
+        ..ev(seq, "broadcast", "cc", to, "deploying at ten")
+    };
+    let chat = model::Event {
+        seq: Some(7),
+        at: Some(1007),
+        kind: "chat".into(),
+        peer: "cc".into(),
+        role: "user".into(),
+        text: "hello there".into(),
+        ..Default::default()
+    };
+    let mut app = events_app(vec![
+        ev(1, "ask", "cc", "pi", "list the modules\nsecond line"),
+        ev(2, "ack", "pi", "cc", "seven modules"),
+        ev(3, "notify", "amesh", "cc", "job j1 is stalled"),
+        fan(4, "a"),
+        fan(5, "b"),
+        fan(6, "c"),
+        chat,
+    ]);
+    let rows: Vec<String> = screen_text(&mut app, 100, 40)
+        .into_iter()
+        .filter(|l| l.starts_with("00:16:"))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "00:16:41 ask    cc → pi  list the modules",
+            "00:16:42 ack    pi → cc  seven modules",
+            "00:16:43 notify amesh → cc  job j1 is stalled",
+            "00:16:44 bcast  cc → 3 peers  deploying at ten",
+            "00:16:47 chat   cc (user)  hello there",
+        ]
+    );
+}
+
+#[test]
+fn the_selection_follows_the_newest_until_moved_and_holds_its_event() {
+    let mut app = events_app(
+        (1..=3)
+            .map(|s| ev(s, "notify", "cc", "pi", &format!("n{s}")))
+            .collect(),
+    );
+    let card = |app: &mut App| {
+        screen_text(app, 100, 40)
+            .into_iter()
+            .find(|l| l.contains(" notify · "))
+            .unwrap()
+    };
+    assert!(card(&mut app).contains("00:16:43"), "the newest first");
+    app.key(KeyCode::Char('k'));
+    assert!(card(&mut app).contains("00:16:42"));
+    app.take_events(Ok(vec![ev(4, "notify", "cc", "pi", "n4")]));
+    assert!(
+        card(&mut app).contains("00:16:42"),
+        "a new event leaves the selection where it is"
+    );
+    app.key(KeyCode::Char('j'));
+    app.key(KeyCode::Char('j'));
+    assert_eq!(app.ev_sel, None, "the newest row follows the newest again");
+    app.take_events(Ok(vec![ev(5, "notify", "cc", "pi", "n5")]));
+    assert!(card(&mut app).contains("00:16:45"));
+    app.key(KeyCode::Char('k'));
+    app.take_events(Ok((10..510)
+        .map(|s| ev(s, "notify", "cc", "pi", "n"))
+        .collect()));
+    assert_eq!(
+        app.ev_sel, None,
+        "a selection that went with the oldest follows the newest"
+    );
+}
+
+#[test]
+fn a_hub_restart_leaves_a_divider_and_takes_the_new_ring() {
+    let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
+    let mut snap = app.snap.clone().unwrap();
+    snap.hub_epoch = "e2".into();
+    snap.captured_at = 1200;
+    app.apply(Ok(snap.clone()));
+    app.apply(Ok(snap.clone()));
+    app.take_events(Ok(vec![ev(1, "ask", "cc", "pi", "after")]));
+    app.apply(Ok(snap));
+    let lines = screen_text(&mut app, 100, 40);
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle}:\n{}", lines.join("\n")))
+    };
+    let divider = "─── hub restarted 00:20:00 ───";
+    assert!(at("before") < at(divider));
+    assert!(
+        at(divider) < at("after"),
+        "the new ring comes in even with lower numbers"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("hub restarted")).count(),
+        1,
+        "one divider per restart"
+    );
+}
+
+#[test]
+fn the_events_screen_says_so_when_empty_or_a_read_fails() {
+    let mut app = events_app(Vec::new());
+    let lines = screen_text(&mut app, 100, 40);
+    assert!(
+        lines.iter().any(|l| l == "no events yet"),
+        "an empty screen says so: {lines:?}"
+    );
+    app.take_events(Ok(vec![ev(1, "ask", "cc", "pi", "q")]));
+    app.take_events(Err("hub unreachable".into()));
+    let lines = screen_text(&mut app, 100, 40);
+    assert!(
+        lines.iter().any(|l| l == "! events: hub unreachable"),
+        "a failed read says so: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("cc → pi")),
+        "the list stays: {lines:?}"
+    );
+    app.take_events(Ok(Vec::new()));
+    assert!(
+        !screen_text(&mut app, 100, 40)
+            .iter()
+            .any(|l| l.contains("! events")),
+        "a good read clears it"
+    );
+}
+
+#[test]
+fn enter_shows_the_whole_event_and_esc_goes_back() {
+    let long = (1..=40)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut events: Vec<model::Event> =
+        (1..=30).map(|s| ev(s, "notify", "cc", "pi", "n")).collect();
+    events.push(ev(31, "notify", "cc", "pi", &long));
+    let mut app = events_app(events);
+    assert!(
+        !screen_text(&mut app, 100, 30)
+            .iter()
+            .any(|l| l.contains("line 40")),
+        "the card under the list cuts the text"
+    );
+    app.key(KeyCode::Enter);
+    assert!(app.full);
+    app.key(KeyCode::Char('G'));
+    assert!(
+        screen_text(&mut app, 100, 30)
+            .iter()
+            .any(|l| l.contains("line 40")),
+        "the full card scrolls to the end of the text"
+    );
+    app.key(KeyCode::Esc);
+    assert!(!app.full);
+}
+
+#[test]
+fn the_fetch_reads_events_only_while_their_screen_is_up() {
+    let mut app = app_with(with_lone_asks(s1()));
+    screen_text(&mut app, 100, 40);
+    assert!(!app.wanted().events);
+    app.key(KeyCode::Char('e'));
+    assert_eq!(
+        app.wanted(),
+        super::Want {
+            detail: None,
+            events: true
+        },
+        "the events screen wants no card text"
+    );
+    app.key(KeyCode::Char('a'));
+    assert!(!app.wanted().events, "the asks screen reads no events");
+}
+
+#[test]
+fn a_queue_seen_three_times_within_a_second_is_not_stuck_yet() {
+    let mut app = app_with(Snapshot::default());
+    let full = |at| delivering(Snapshot::default(), vec![reached("pi", true, 1)], at);
+    for _ in 0..3 {
+        app.apply(Ok(full(100)));
+    }
+    assert!(
+        app.snap.as_ref().unwrap().stuck.is_empty(),
+        "snapshots poked in quick succession leave a copy in flight alone"
+    );
+    app.apply(Ok(full(102)));
+    assert_eq!(
+        app.snap.as_ref().unwrap().stuck.get("pi"),
+        Some(&100),
+        "two seconds on, the same run is stuck"
+    );
+}
+
+fn unnumbered(text: &str) -> model::Event {
+    model::Event {
+        kind: "notify".into(),
+        from_peer: "cc".into(),
+        to_peer: "pi".into(),
+        message: text.into(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn an_empty_ring_from_a_hub_that_numbers_no_events_clears_the_list() {
+    let mut app = events_app(vec![unnumbered("old")]);
+    app.take_events(Ok(Vec::new()));
+    assert!(
+        app.feed.is_empty(),
+        "a hub that sends its whole ring each time sent an empty one"
+    );
+}
+
+#[test]
+fn the_events_screen_says_when_its_hub_numbers_no_events() {
+    let mut app = events_app(vec![unnumbered("one"), unnumbered("two")]);
+    let lines = screen_text(&mut app, 100, 40);
+    assert!(
+        lines.iter().any(|l| l
+            == "this hub numbers no events, so only the newest opens; restart it on the current amesh"),
+        "the screen says why j/k pick nothing: {lines:?}"
+    );
+    let mut app = events_app(vec![ev(1, "notify", "cc", "pi", "n")]);
+    assert!(
+        !screen_text(&mut app, 100, 40)
+            .iter()
+            .any(|l| l.contains("numbers no events")),
+        "a hub that numbers them gets no such line"
+    );
+}
+
+#[test]
+fn a_hub_that_numbers_no_events_keeps_what_came_before_its_restart() {
+    let mut app = events_app(vec![unnumbered("before")]);
+    let mut snap = app.snap.clone().unwrap();
+    snap.hub_epoch = "e2".into();
+    snap.captured_at = 1200;
+    app.apply(Ok(snap));
+    app.take_events(Ok(vec![unnumbered("after")]));
+    let lines = screen_text(&mut app, 100, 40);
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle}:\n{}", lines.join("\n")))
+    };
+    let divider = "hub restarted 00:20:00";
+    assert!(
+        at("before") < at(divider) && at(divider) < at("after"),
+        "the ring read whole after a restart replaces only what came after it"
+    );
+}
+
+#[test]
+fn each_restart_gets_its_divider_even_with_no_events_between() {
+    let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
+    for (epoch, at) in [("e2", 1200), ("e3", 1260)] {
+        let mut snap = app.snap.clone().unwrap();
+        snap.hub_epoch = epoch.into();
+        snap.captured_at = at;
+        app.apply(Ok(snap));
+    }
+    let lines = screen_text(&mut app, 100, 40);
+    for divider in ["hub restarted 00:20:00", "hub restarted 00:21:00"] {
+        assert!(
+            lines.iter().any(|l| l.contains(divider)),
+            "each restart gets its own divider: {divider} missing in {lines:?}"
+        );
+    }
+}
+
+#[test]
+fn a_hub_upgraded_to_number_its_events_is_read_by_seq_again() {
+    let mut app = events_app(vec![unnumbered("old")]);
+    let mut snap = app.snap.clone().unwrap();
+    snap.hub_epoch = "e2".into();
+    snap.captured_at = 1200;
+    app.apply(Ok(snap));
+    app.take_events(Ok(vec![ev(10, "notify", "cc", "pi", "fresh-ring")]));
+    app.take_events(Ok(Vec::new()));
+    let lines = screen_text(&mut app, 100, 40);
+    assert!(
+        lines.iter().any(|l| l.contains("fresh-ring")),
+        "an empty read from a hub that numbers its events keeps what it has: {lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("numbers no events")),
+        "the unnumbered events of an earlier ring say nothing about this one: {lines:?}"
+    );
 }

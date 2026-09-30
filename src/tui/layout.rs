@@ -181,7 +181,7 @@ pub(crate) fn presence(snap: &Snapshot, cols: usize, spin: char, lit: bool) -> V
         return vec![(fit("no peers online", cols), Tone::Dim)];
     }
     let label = label(online.len());
-    let need = |kept: &[&Peer]| line_width(&label, kept, online.len() - kept.len());
+    let need = |kept: &[&Peer]| line_width(snap, &label, kept, online.len() - kept.len());
     let mut kept = online.clone();
     if need(&kept) > cols {
         let mut ranked = online.clone();
@@ -204,7 +204,7 @@ pub(crate) fn presence(snap: &Snapshot, cols: usize, spin: char, lit: bool) -> V
             out.push(("  ".into(), Tone::Plain));
         }
         out.push(mark(snap, peer, spin, lit));
-        out.push((format!(" {}", shown(peer)), Tone::Soft));
+        out.extend(named(snap, peer));
     }
     let hidden = online.len() - kept.len();
     if hidden > 0 {
@@ -227,10 +227,10 @@ pub(crate) fn presence_lines(
     let line = presence(snap, cols, spin, lit);
     let online = online_peers(snap);
     let label = label(online.len());
-    let single = line_width(&label, &online, 0);
+    let single = line_width(snap, &label, &online, 0);
     let cell = online
         .iter()
-        .map(|p| 2 + width(shown(p)))
+        .map(|p| 2 + width(shown(p)) + width(&tail(snap, p)))
         .chain([width(&format!("+{}", online.len()))])
         .max()
         .unwrap_or(0);
@@ -247,12 +247,7 @@ pub(crate) fn presence_lines(
     let hidden = online.len() - kept.len();
     let mut cells: Vec<Vec<(String, Tone)>> = kept
         .iter()
-        .map(|peer| {
-            vec![
-                mark(snap, peer, spin, lit),
-                (format!(" {}", shown(peer)), Tone::Soft),
-            ]
-        })
+        .map(|peer| [vec![mark(snap, peer, spin, lit)], named(snap, peer)].concat())
         .collect();
     if hidden > 0 {
         cells.push(vec![(format!("+{hidden}"), Tone::Dim)]);
@@ -295,9 +290,12 @@ fn label(online: usize) -> String {
 }
 
 /* the top line's width with `kept` shown after `label` and `hidden` counted */
-fn line_width(label: &str, kept: &[&Peer], hidden: usize) -> usize {
+fn line_width(snap: &Snapshot, label: &str, kept: &[&Peer], hidden: usize) -> usize {
     width(label)
-        + kept.iter().map(|p| 2 + width(shown(p))).sum::<usize>()
+        + kept
+            .iter()
+            .map(|p| 2 + width(shown(p)) + width(&tail(snap, p)))
+            .sum::<usize>()
         + 2 * kept.len().saturating_sub(1)
         + if hidden > 0 {
             2 + width(&format!("+{hidden}"))
@@ -312,6 +310,48 @@ fn shown(peer: &Peer) -> &str {
     } else {
         &peer.name
     }
+}
+
+/* a name on the top line, dimmed while its peer has no push channel, and after it ✉ with the
+count of a stuck queue */
+fn named(snap: &Snapshot, peer: &Peer) -> Vec<(String, Tone)> {
+    let tone = match snap.capabilities.delivery && !peer.push {
+        true => Tone::Dim,
+        false => Tone::Soft,
+    };
+    let mut out = vec![(format!(" {}", shown(peer)), tone)];
+    let tail = tail(snap, peer);
+    if !tail.is_empty() {
+        out.push((tail, Tone::Warn));
+    }
+    out
+}
+
+fn tail(snap: &Snapshot, peer: &Peer) -> String {
+    match snap.capabilities.delivery && snap.stuck.contains_key(&peer.peer_id) {
+        true => format!(" ✉{}", peer.queued),
+        false => String::new(),
+    }
+}
+
+/* why an open ask to an online peer may go unseen, from hubs that report delivery: no push
+channel, a queue stuck over several snapshots */
+pub(crate) fn delivery(snap: &Snapshot, peer: &Peer) -> Row {
+    let mut out: Row = Vec::new();
+    if !snap.capabilities.delivery || peer.status != "online" {
+        return out;
+    }
+    if !peer.push {
+        out.push(("no push".into(), Tone::Dim));
+    }
+    if let Some(first) = snap.stuck.get(&peer.peer_id) {
+        if !out.is_empty() {
+            out.push((" · ".into(), Tone::Dim));
+        }
+        let age = ago(snap.captured_at, Some(*first));
+        out.push((format!("{} queued for {age}", peer.queued), Tone::Warn));
+    }
+    out
 }
 
 fn doing(snap: &Snapshot, peer: &Peer) -> Option<String> {
@@ -405,6 +445,20 @@ pub(crate) fn clock(t: Option<u64>) -> String {
         "{:02}:{:02}",
         local.rem_euclid(86_400) / 3600,
         local.rem_euclid(3600) / 60
+    )
+}
+
+/* local wall-clock time with seconds, for what comes several a minute */
+pub(crate) fn stamp(t: Option<u64>) -> String {
+    let Some(t) = t else {
+        return "--:--:--".into();
+    };
+    let local = t as i64 + utc_offset(t);
+    format!(
+        "{:02}:{:02}:{:02}",
+        local.rem_euclid(86_400) / 3600,
+        local.rem_euclid(3600) / 60,
+        local.rem_euclid(60)
     )
 }
 
@@ -1194,6 +1248,7 @@ pub(crate) fn card(
             None => p.name.clone(),
         }
     };
+    let worker_block = left.len();
     match (state, snap.worker(job)) {
         ("queued", _) => left.push(vec![
             key("worker", true),
@@ -1241,6 +1296,13 @@ pub(crate) fn card(
         }
         (_, Some(p)) => left.push(vec![key("worker", true), (doing(p), Tone::Soft)]),
         (_, None) => left.push(vec![key("worker", true), (worker.to_string(), Tone::Soft)]),
+    }
+    /* why the open ask may go unseen, on a row of its own so a halved card keeps it whole */
+    if let (Some(p), true) = (snap.worker(job), ask.is_some_and(|a| a.open)) {
+        let words = delivery(snap, p);
+        if !words.is_empty() && left.len() > worker_block {
+            left.push([vec![key("", false)], words].concat());
+        }
     }
     if let Some(ask) = ask {
         /* the hub records how an ask closed; "acked" is the recipient's own answer, and an

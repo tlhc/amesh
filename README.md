@@ -122,7 +122,7 @@ amesh peer ack ask-5e6f7a8b --message "no fixture" --failed true --from-peer ame
 
 ### Watching jobs
 
-`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`.
+`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`, and `GET /events` while the events screen is up.
 
 ```bash
 amesh tui                    # this directory's circle
@@ -132,6 +132,7 @@ amesh tui --all --ascii      # every circle, ASCII only
 - The top of the screen lists the peers online in this view and what each is doing.
 - The rule under the header shows how many events the hub keeps for this view.
 - `a` shows the asks no job points at, open ones first: who waits on whom and for how long, the question and the reply, and a nudge or close command when an answer stalls. The rule counts the open ones.
+- `e` lists the hub's events, the newest at the bottom: asks, acks, notifies, broadcasts (one row each) and chat, with the whole text in the card; a divider marks a hub restart.
 - Each chain gets its own screen, with numbered jobs under a `chain <name> · done/total` header; jobs without dependencies share one block. The selected job's card shows its result or failure reason, worker, ask and dependencies, plus the command to retry it, nudge its worker, or hand it to another peer.
 - Keys:
   - `j`/`k`: move along the chain; `h`/`l`: move within a stage
@@ -140,11 +141,14 @@ amesh tui --all --ascii      # every circle, ASCII only
   - `Tab`/`Shift-Tab`: next/previous chain
   - `Enter`: open the full card (scroll with `j`/`k`, the arrows, `space`/`b`, `PgDn`/`PgUp`, `g`/`G`; `Esc` goes back)
   - `a`: the asks screen and back
+  - `e`: the events screen; `e` again goes to the jobs, `a` to the asks
   - `r`: refresh; `q`: quit
 - Activity:
   - spinner: the worker is busy with this job (`--no-anim` freezes it)
   - `sender─▸─recipient` on an open ask: the arrowhead steps toward a recipient that is working and holds still otherwise; for a second after the ack it steps back (`─◂─`)
   - a dot on the rail into a job the hub has just sent, then its glyph lights
+  - `✉N` after a name (`+N` in ASCII): N records have waited in that peer's inbox over three snapshots in a row, two seconds or more; a card whose ask to it is open says `N queued for 38s` under the worker or `to` line
+  - a dimmed name: the peer is online without a push channel (its `amesh hook ws` or pi extension is not connected); such a card says `no push`
   - `IDLE!`: the worker stopped with the ask open; the card gives a nudge command
   - blinking `WAIT!`: Claude Code waits on a permission
   - hooks installed before this reporting send none; rerun `amesh setup`

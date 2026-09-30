@@ -5669,3 +5669,46 @@ fn a_reply_enters_the_ring_when_delivered_not_when_queued() {
     assert_eq!(hub.events.len(), 1);
     assert_eq!(hub.events[0]["topic"], "ask-x");
 }
+
+#[tokio::test]
+async fn the_snapshot_says_how_each_peer_is_reached() {
+    let (app, inner, _state) = test_app_with_hub();
+    register(app.clone(), "worker", "pi", "one").await;
+    register(app.clone(), "quiet", "codex", "one").await;
+    let (tx, _rx) = mpsc::unbounded_channel();
+    {
+        let mut hub = inner.lock().await;
+        hub.sockets.insert("worker".into(), (1, tx));
+        hub.recv_live.insert("worker".into());
+        hub.inbox.insert(
+            "worker".into(),
+            vec![
+                json!({"type": "notify", "id": "n1"}),
+                json!({"type": "notify", "id": "n2"}),
+            ],
+        );
+    }
+    let (status, snap) = json_req(app, "GET", "/snapshot?circle=one", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        snap["capabilities"]["delivery"], true,
+        "a monitor must know the hub fills the delivery fields"
+    );
+    let row = |id: &str| {
+        snap["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["peer_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} in {snap}"))
+    };
+    let worker = row("worker");
+    assert_eq!(worker["push"], true, "a live socket is a push channel");
+    assert_eq!(worker["acks"], true, "that socket confirms each frame");
+    assert_eq!(worker["queued"], 2, "both records wait in the inbox");
+    let quiet = row("quiet");
+    assert_eq!(quiet["push"], false, "no socket, no push channel");
+    assert_eq!(quiet["acks"], false);
+    assert_eq!(quiet["queued"], 0, "an empty inbox counts nothing");
+}

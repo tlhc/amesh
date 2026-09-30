@@ -25,6 +25,8 @@ pub(crate) enum Act {
     Find(i32),
     /* the asks screen and back */
     Asks,
+    /* the events screen and back */
+    Events,
     Refresh,
     Quit,
 }
@@ -141,6 +143,7 @@ impl Input {
                 KeyCode::Char('n') => Act::Find(1),
                 KeyCode::Char('N') => Act::Find(-1),
                 KeyCode::Char('a') => Act::Asks,
+                KeyCode::Char('e') => Act::Events,
                 KeyCode::Char('r') => Act::Refresh,
                 KeyCode::Char('q') => Act::Quit,
                 _ => Act::None,

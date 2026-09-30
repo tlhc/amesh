@@ -1598,12 +1598,17 @@ async fn snapshot(
                 .into_iter()
                 .map(|name| (name, resolve(&hub, name), true)),
         );
+    /* and how the hub reaches each: a live socket now, whether that socket confirms each
+    frame, and the records in its inbox it has not taken */
     let row = |peer: &Peer| {
         json!({
             "peer_id": peer.peer_id, "name": peer.name, "backend": peer.backend,
             "circle": peer.circle, "status": peer.status, "last_seen": peer.last_seen,
             "activity": hub.activity.get(&peer.peer_id),
             "running": running.get(peer.peer_id.as_str()).copied().unwrap_or(0),
+            "push": hub.sockets.contains_key(&peer.peer_id),
+            "acks": hub.recv_live.contains(&peer.peer_id),
+            "queued": hub.inbox.get(&peer.peer_id).map_or(0, Vec::len),
         })
     };
     let (mut peers, mut missing_peers, mut seen) = (Vec::new(), BTreeSet::new(), HashSet::new());
@@ -1653,7 +1658,7 @@ async fn snapshot(
         "captured_at": now_unix(),
         "hub_epoch": hub.epoch,
         "event_count": event_count,
-        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true, "roster": true, "event_count": true, "ask_list": true},
+        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true, "roster": true, "event_count": true, "ask_list": true, "delivery": true},
         "jobs": jobs.iter().map(|job| json!({
             "job_id": job.job_id, "title": preview(&job.title), "title_len": job.title.chars().count(), "state": job.state,
             "assigned_peer": job.assigned_peer, "from_peer": job.from_peer, "circle": job.circle,

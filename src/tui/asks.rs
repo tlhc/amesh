@@ -325,6 +325,12 @@ pub(crate) fn card(
         _ => now_doing(snap, to),
     };
     left.extend(party("to", &ask.to_peer_id, status, room));
+    if let (Some(p), true) = (to, ask.open) {
+        let words = layout::delivery(snap, p);
+        if !words.is_empty() {
+            left.push([vec![key("", false)], words].concat());
+        }
+    }
     let times = match (ask.open, ask.opened_at) {
         (true, None) => "sent before the hub kept the time".to_string(),
         (true, Some(t)) => format!("sent {} · waiting {}", clock(Some(t)), ago(now, Some(t))),

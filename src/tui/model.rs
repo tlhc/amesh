@@ -22,12 +22,19 @@ pub(crate) struct Snapshot {
     /* the whole text and reply of the ask the asks screen selected, from hubs that list asks */
     #[serde(default)]
     pub ask_detail: Option<AskDetail>,
+    /* names the hub process: another name means the hub restarted */
+    #[serde(default)]
+    pub hub_epoch: String,
     #[serde(default)]
     pub capabilities: Capabilities,
     /* set on the copy the TUI draws when the snapshot came in within the last two seconds:
     only then does what it reports as just now still move */
     #[serde(skip)]
     pub fresh: bool,
+    /* set by the TUI on each snapshot it takes: the peers whose queue stayed non-empty over
+    several snapshots in a row, with the capture time of the first */
+    #[serde(skip)]
+    pub stuck: HashMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -40,6 +47,8 @@ pub(crate) struct Capabilities {
     pub event_count: bool,
     #[serde(default)]
     pub ask_list: bool,
+    #[serde(default)]
+    pub delivery: bool,
 }
 
 /* what a runtime last said it is doing; the hub keeps it in memory only */
@@ -118,6 +127,12 @@ pub(crate) struct Peer {
     /* its running jobs in every circle, from hubs that count them */
     #[serde(default)]
     pub running: Option<usize>,
+    /* how the hub reaches it, from hubs with capabilities.delivery: a live push socket, and
+    the records waiting in its inbox */
+    #[serde(default)]
+    pub push: bool,
+    #[serde(default)]
+    pub queued: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -136,6 +151,36 @@ pub(crate) struct AskDetail {
     pub text: String,
     #[serde(default)]
     pub reply: Option<String>,
+}
+
+/* one record of the hub's event ring as GET /events lists it; ask and chat carry `text`, the
+others `message` */
+#[derive(Clone, Debug, Default, Deserialize)]
+pub(crate) struct Event {
+    #[serde(default)]
+    pub seq: Option<u64>,
+    #[serde(default)]
+    pub at: Option<u64>,
+    #[serde(default, rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub from_peer: String,
+    #[serde(default)]
+    pub to_peer: String,
+    #[serde(default)]
+    pub peer: String,
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub correlation_id: String,
+    #[serde(default)]
+    pub topic: String,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub message: String,
 }
 
 impl Snapshot {

@@ -1,4 +1,5 @@
 mod asks;
+mod feed;
 mod input;
 mod layout;
 mod model;
@@ -36,6 +37,11 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 const PEER_ROWS: usize = 4;
 /* snapshots the peer rows are kept after the roster stopped needing them */
 const PEER_HOLD: u64 = 5;
+/* snapshots in a row a peer's queue stays non-empty before it counts as stuck, and the
+seconds they must span: what an acknowledging peer has in flight clears within one, and a key
+held down pokes several snapshots into one second */
+const STUCK_AFTER: u32 = 3;
+const STUCK_FOR: u64 = 2;
 /* rule characters that stay to the left of what the rule row says at its right end */
 const RULE_MIN: usize = 4;
 
@@ -64,6 +70,17 @@ pub(crate) struct App {
     asks: bool,
     ask_sel: Option<String>,
     ask_order: Vec<String>,
+    /* each peer with a non-empty queue: the capture time of the first snapshot in its run of
+    them, and how many the run has lasted */
+    queues: HashMap<String, (u64, u32)>,
+    /* the events screen is up instead of the jobs or the asks; the events it holds, the seq
+    of the one selected (None follows the newest), the last read's error, and the hub process
+    the snapshots came from */
+    events: bool,
+    feed: Vec<feed::Held>,
+    ev_sel: Option<u64>,
+    ev_error: Option<String>,
+    epoch: String,
 }
 
 /* a chain or the loose block, numbered 1..n; base counts the jobs in the blocks above */
@@ -106,13 +123,21 @@ impl App {
             asks: false,
             ask_sel: None,
             ask_order: Vec::new(),
+            queues: HashMap::new(),
+            events: false,
+            feed: Vec::new(),
+            ev_sel: None,
+            ev_error: None,
+            epoch: String::new(),
         }
     }
 
     pub fn apply(&mut self, fetched: std::result::Result<Snapshot, String>) {
         match fetched {
-            Ok(snap) => {
+            Ok(mut snap) => {
                 self.snaps += 1;
+                self.track_queues(&mut snap);
+                self.mark_restart(&snap);
                 self.snap = Some(snap);
                 self.error = None;
                 self.last_ok = Some(Instant::now());
@@ -128,6 +153,97 @@ impl App {
                 self.error = Some("hub unreachable".into())
             }
             Err(error) => self.error = Some(error),
+        }
+    }
+
+    /* a peer's queue is stuck once it stayed non-empty over STUCK_AFTER snapshots in a row that
+    span STUCK_FOR seconds; the snapshot keeps each stuck peer with its run's first capture */
+    fn track_queues(&mut self, snap: &mut Snapshot) {
+        if !snap.capabilities.delivery {
+            self.queues.clear();
+            return;
+        }
+        let mut runs: HashMap<String, (u64, u32)> = HashMap::new();
+        for peer in snap
+            .roster
+            .iter()
+            .chain(&snap.peers)
+            .filter(|p| p.queued > 0)
+        {
+            if runs.contains_key(&peer.peer_id) {
+                continue;
+            }
+            let (first, count) = self
+                .queues
+                .get(&peer.peer_id)
+                .copied()
+                .unwrap_or((snap.captured_at, 0));
+            runs.insert(peer.peer_id.clone(), (first, count + 1));
+        }
+        snap.stuck = runs
+            .iter()
+            .filter(|(_, (first, count))| {
+                *count >= STUCK_AFTER && snap.captured_at.saturating_sub(*first) >= STUCK_FOR
+            })
+            .map(|(id, (first, _))| (id.clone(), *first))
+            .collect();
+        self.queues = runs;
+    }
+
+    /* another hub_epoch means the hub restarted and its ring started over: while any event is
+    held, a divider goes after what is held, one for each restart */
+    fn mark_restart(&mut self, snap: &Snapshot) {
+        if snap.hub_epoch.is_empty() {
+            return;
+        }
+        let before = std::mem::replace(&mut self.epoch, snap.hub_epoch.clone());
+        if !before.is_empty()
+            && before != snap.hub_epoch
+            && self.feed.iter().any(|h| matches!(h, feed::Held::Event(_)))
+        {
+            self.feed.push(feed::Held::Restart(snap.captured_at));
+        }
+    }
+
+    /* events read from the hub: those newer than any held since the last restart, or the whole
+    ring from a hub that numbers none; the oldest go past feed::KEEP */
+    pub fn take_events(&mut self, got: std::result::Result<Vec<model::Event>, String>) {
+        let list = match got {
+            Ok(list) => list,
+            Err(error) => {
+                self.ev_error = Some(error);
+                return;
+            }
+        };
+        self.ev_error = None;
+        let list: Vec<model::Event> = list
+            .into_iter()
+            .filter(|e| e.kind != "chat_turn_delta")
+            .collect();
+        /* a hub that numbers no events sends its whole ring on every read, an empty one too */
+        let whole = list.iter().any(|e| e.seq.is_none())
+            || (list.is_empty() && feed::unnumbered(&self.feed));
+        if !whole {
+            let newest = feed::newest(&self.feed);
+            self.feed.extend(
+                list.into_iter()
+                    .filter(|e| e.seq > newest)
+                    .map(|e| feed::Held::Event(Box::new(e))),
+            );
+        } else {
+            /* the ring read whole stands for what came after the last restart only */
+            let kept = self
+                .feed
+                .iter()
+                .rposition(|h| matches!(h, feed::Held::Restart(_)))
+                .map_or(0, |at| at + 1);
+            self.feed.truncate(kept);
+            self.feed
+                .extend(list.into_iter().map(|e| feed::Held::Event(Box::new(e))));
+        }
+        feed::trim(&mut self.feed, feed::KEEP);
+        if self.ev_sel.is_some_and(|seq| !feed::holds(&self.feed, seq)) {
+            self.ev_sel = None;
         }
     }
 
@@ -185,6 +301,9 @@ impl App {
     }
 
     pub fn key(&mut self, code: KeyCode) -> Act {
+        if self.events {
+            return self.event_key(code);
+        }
         if self.asks {
             return self.ask_key(code);
         }
@@ -198,8 +317,10 @@ impl App {
         self.typed_at = self.numbers.renumbered;
         let Some((b, p)) = self.settle(&blocks) else {
             let act = self.input.key(code, 0);
-            if act == Act::Asks {
-                self.flip();
+            match act {
+                Act::Asks => self.flip(),
+                Act::Events => self.open_events(),
+                _ => {}
             }
             return act;
         };
@@ -242,6 +363,7 @@ impl App {
                 self.scroll = 0;
             }
             Act::Asks => self.flip(),
+            Act::Events => self.open_events(),
             Act::Find(d) => {
                 let query = self.input.query.to_lowercase();
                 let snap = self.snap.as_ref();
@@ -314,6 +436,7 @@ impl App {
         let before = self.ask_sel.clone();
         match act {
             Act::Asks => self.flip(),
+            Act::Events => self.open_events(),
             Act::Move(d) if self.full => {
                 self.scroll = self.scroll.saturating_add_signed(d as isize);
             }
@@ -365,6 +488,70 @@ impl App {
         act
     }
 
+    /* the events screen over the jobs or the asks, following the newest */
+    fn open_events(&mut self) {
+        self.events = true;
+        self.ev_sel = None;
+        self.full = false;
+        self.scroll = 0;
+    }
+
+    /* the events screen's keys: j/k move toward newer and older, the newest row following the
+    newest again; e goes to the jobs, a to the asks */
+    fn event_key(&mut self, code: KeyCode) -> Act {
+        let seqs: Vec<u64> = feed::items(&self.feed)
+            .iter()
+            .filter_map(|item| item.seq())
+            .collect();
+        let act = self.input.key(code, 0);
+        /* the events carry no numbers, letters or search */
+        self.input.mode = Mode::Normal;
+        let at = self
+            .ev_sel
+            .and_then(|seq| seqs.iter().position(|s| *s == seq))
+            .unwrap_or(seqs.len().saturating_sub(1));
+        let before = self.ev_sel;
+        match act {
+            Act::Events => {
+                self.events = false;
+                self.asks = false;
+                self.full = false;
+                self.scroll = 0;
+            }
+            Act::Asks => {
+                self.events = false;
+                self.full = false;
+                self.scroll = 0;
+                if !self.asks {
+                    self.flip();
+                }
+            }
+            Act::Move(d) if self.full => {
+                self.scroll = self.scroll.saturating_add_signed(d as isize);
+            }
+            Act::Page(d) if self.full => {
+                self.scroll = self
+                    .scroll
+                    .saturating_add_signed(d as isize * self.page as isize);
+            }
+            Act::Edge(d) if self.full => self.scroll = if d < 0 { 0 } else { usize::MAX },
+            Act::Card(open) => {
+                self.full = open;
+                self.scroll = 0;
+            }
+            _ if seqs.is_empty() => {}
+            Act::Move(d) => {
+                let next = (at as i32 + d).clamp(0, seqs.len() as i32 - 1) as usize;
+                self.ev_sel = (next + 1 < seqs.len()).then(|| seqs[next]);
+            }
+            _ => {}
+        }
+        if self.ev_sel != before {
+            self.scroll = 0;
+        }
+        act
+    }
+
     /* the design's screen: the selected job's chain alone under its header, the flow, then
     the card; Tab moves to the next chain */
     pub fn screen(&mut self, cols: usize, rows: usize, tick: usize) -> Vec<Line<'static>> {
@@ -372,7 +559,7 @@ impl App {
         let blocks = self.blocks();
         /* settling picks a job and starts its card at the top; the asks screen keeps its own
         place in the card it shows */
-        let settled = if self.asks {
+        let settled = if self.asks || self.events {
             None
         } else {
             self.settle(&blocks)
@@ -400,6 +587,9 @@ impl App {
                 self.held = (lines.len(), self.snaps);
             }
             peer_rows = self.held.0.min(cap);
+        }
+        if self.events {
+            return self.events_screen(g, peer_rows, cols, rows);
         }
         if self.asks {
             return self.asks_screen(g, peer_rows, cols, rows, tick);
@@ -905,11 +1095,127 @@ impl App {
         lines
     }
 
-    /* the full texts the card wants: the selected job's, or on the asks screen the ask's */
-    fn wanted(&self) -> Option<String> {
-        match self.asks {
-            true => self.ask_sel.as_ref().map(|cid| format!("ask={cid}")),
-            false => self.sel.as_ref().map(|id| format!("detail={id}")),
+    /* the hub's events under their header and the rule, the newest at the bottom, then the
+    selected one's card; the list and the card share the pane as on the asks screen */
+    fn events_screen(
+        &mut self,
+        mut g: Grid,
+        peer_rows: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Vec<Line<'static>> {
+        let head = feed::header(&self.feed, self.opts.circle.is_none());
+        g.put(peer_rows, 0, &layout::fit(&head, cols), Tone::Plain);
+        g.put(peer_rows + 1, 0, &"─".repeat(cols), Tone::Line);
+        if let Some(tag) = self
+            .snap
+            .as_ref()
+            .and_then(asks::tag)
+            .filter(|_| self.error.is_none())
+        {
+            let piece = format!(" {tag} ");
+            if layout::width(&piece) + 1 + RULE_MIN <= cols {
+                g.put(
+                    peer_rows + 1,
+                    cols - layout::width(&piece) - 1,
+                    &piece,
+                    Tone::Near,
+                );
+            }
+        }
+        /* a hub that numbers no events cannot tell one from the next, so the selection stays
+        on the newest; the screen says why */
+        let problem = match (&self.error, &self.ev_error) {
+            (Some(error), _) => Some((self.stale(error), Tone::Warn)),
+            (None, Some(error)) => Some((format!("! events: {error}"), Tone::Warn)),
+            (None, None) if feed::unnumbered(&self.feed) => Some((
+                "this hub numbers no events, so only the newest opens; restart it on the current amesh"
+                    .to_string(),
+                Tone::Dim,
+            )),
+            (None, None) => None,
+        };
+        if let Some((problem, tone)) = &problem {
+            g.put(peer_rows + 2, 0, &layout::fit(problem, cols), *tone);
+        }
+        let footer = match self.full {
+            true if cols >= 96 => "j/k ↑↓ scroll  space/b page  g/G top/end  esc back",
+            true => "j/k scroll  space/b page  esc back",
+            false if cols >= 96 => "j/k ↑↓ move  enter card  esc back  e jobs  a asks",
+            false => "j/k move  enter card  e jobs  a asks",
+        };
+        g.put(rows - 1, 0, &layout::fit(footer, cols), Tone::Dim);
+        let top = peer_rows + 3;
+        let avail = rows - 1 - top;
+        let items = feed::items(&self.feed);
+        if items.is_empty() {
+            g.put(top, 0, &layout::fit("no events yet", cols), Tone::Warn);
+            let hint = "events appear as peers ask, ack, notify and broadcast; e: back to the jobs";
+            for (r, line) in layout::wrap(hint, cols).iter().enumerate() {
+                g.put(top + 1 + r, 0, line, Tone::Dim);
+            }
+            return self.lines(&g, cols, rows);
+        }
+        let at = self
+            .ev_sel
+            .and_then(|seq| items.iter().position(|item| item.seq() == Some(seq)))
+            .unwrap_or(items.len() - 1);
+        let list = feed::rows(&items, cols);
+        let card = |fit| feed::card(&items[at], cols, fit);
+        let list_h = if self.full { 0 } else { list.len() + 1 };
+        let least = if self.full {
+            0
+        } else {
+            card(Fit::Rows(0)).height()
+        };
+        let view_h = if list_h + least <= avail {
+            list_h
+        } else {
+            list_h.min(avail.saturating_sub(least).max(avail / 2))
+        };
+        let card = match self.full {
+            true => match card(Fit::Whole) {
+                whole if whole.height() > avail => whole,
+                _ => card(Fit::Rows(avail)),
+            },
+            false => card(Fit::Rows(avail - view_h)),
+        };
+        let shown = view_h.min(list.len());
+        let first = at
+            .saturating_sub(shown / 2)
+            .min(list.len().saturating_sub(shown));
+        for (i, row) in list.iter().skip(first).take(shown).enumerate() {
+            let mut c = 0;
+            for (text, tone) in row {
+                c = g.put(top + i, c, text, *tone);
+            }
+        }
+        self.place(&mut g, &card, top, view_h, avail, cols);
+        let mut lines = self.lines(&g, cols, rows);
+        if !self.full && (first..first + shown).contains(&at) {
+            if let Some(line) = lines.get_mut(top + at - first) {
+                for span in &mut line.spans {
+                    span.style = match self.opts.color {
+                        true => span.style.bg(self.opts.theme.select_bg),
+                        false => span.style.add_modifier(Modifier::REVERSED),
+                    };
+                }
+            }
+        }
+        lines
+    }
+
+    /* the full texts the card wants: the selected job's, or on the asks screen the ask's; the
+    events screen wants the events instead */
+    fn wanted(&self) -> Want {
+        let detail = match (self.events, self.asks) {
+            (true, _) => None,
+            (false, true) => self.ask_sel.as_ref().map(|cid| format!("ask={cid}")),
+            (false, false) => self.sel.as_ref().map(|id| format!("detail={id}")),
+        };
+        Want {
+            detail,
+            events: self.events,
         }
     }
 
@@ -1079,6 +1385,7 @@ fn ascii(ch: char) -> char {
         '⠙' | '⠴' | '⠏' => '/',
         '⠹' | '⠦' => '-',
         '⠸' | '⠧' => '\\',
+        '✉' => '+',
         other => other,
     }
 }
@@ -1117,44 +1424,93 @@ fn parse(args: &[String]) -> Result<Opts> {
     Ok(opts)
 }
 
+/* what the fetch thread reads besides the snapshot: the full text the card wants, and the
+events while their screen is up */
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Want {
+    pub detail: Option<String>,
+    pub events: bool,
+}
+
+/* what the fetch thread sends: a snapshot, or the events read after it */
+enum Got {
+    Snap(Box<std::result::Result<Snapshot, String>>),
+    Events(std::result::Result<Vec<model::Event>, String>),
+}
+
+/* GET /events for the view's circle, after `since` */
+fn read_events(
+    circle: Option<&str>,
+    since: Option<u64>,
+) -> std::result::Result<Vec<model::Event>, String> {
+    let mut query: Vec<String> = Vec::new();
+    if let Some(c) = circle {
+        query.push(format!("circle={c}"));
+    }
+    if let Some(s) = since {
+        query.push(format!("since={s}"));
+    }
+    let path = match query.is_empty() {
+        true => "/events".to_string(),
+        false => format!("/events?{}", query.join("&")),
+    };
+    crate::cli::request("GET", &path, None)
+        .map_err(|e| e.to_string())
+        .and_then(|v| serde_json::from_value::<Vec<model::Event>>(v).map_err(|e| e.to_string()))
+}
+
 /* a request a second on a background thread, so the screen never waits for the network;
-a poke (r, or a new selection) asks sooner, at most five times a second */
+a poke (r, or a new selection) asks sooner, at most five times a second. While the events
+screen is up the events follow each snapshot, only those after the newest seq read */
 fn fetch(
     circle: Option<String>,
-    want: Arc<Mutex<Option<String>>>,
-    tx: mpsc::Sender<std::result::Result<Snapshot, String>>,
+    want: Arc<Mutex<Want>>,
+    tx: mpsc::Sender<Got>,
     poke: mpsc::Receiver<()>,
 ) {
-    std::thread::spawn(move || loop {
-        let started = Instant::now();
-        let mut query: Vec<String> = Vec::new();
-        if let Some(c) = &circle {
-            query.push(format!("circle={c}"));
+    std::thread::spawn(move || {
+        let mut since: Option<u64> = None;
+        loop {
+            let started = Instant::now();
+            let wanted = want.lock().map(|w| w.clone()).unwrap_or_default();
+            let mut query: Vec<String> = Vec::new();
+            if let Some(c) = &circle {
+                query.push(format!("circle={c}"));
+            }
+            if let Some(d) = &wanted.detail {
+                query.push(d.clone());
+            }
+            let path = if query.is_empty() {
+                "/snapshot".to_string()
+            } else {
+                format!("/snapshot?{}", query.join("&"))
+            };
+            let got = crate::cli::request("GET", &path, None)
+                .map_err(|e| e.to_string())
+                .and_then(|v| serde_json::from_value::<Snapshot>(v).map_err(|e| e.to_string()));
+            if tx.send(Got::Snap(Box::new(got))).is_err() {
+                return;
+            }
+            if wanted.events {
+                let events = read_events(circle.as_deref(), since);
+                if let Ok(list) = &events {
+                    since = list.iter().filter_map(|e| e.seq).max().or(since);
+                }
+                if tx.send(Got::Events(events)).is_err() {
+                    return;
+                }
+            }
+            let _ = poke.recv_timeout(Duration::from_secs(1));
+            /* a held key pokes on every step; five fetches a second follow it well enough */
+            std::thread::sleep(Duration::from_millis(200).saturating_sub(started.elapsed()));
+            while poke.try_recv().is_ok() {}
         }
-        if let Some(d) = want.lock().ok().and_then(|w| w.clone()) {
-            query.push(d);
-        }
-        let path = if query.is_empty() {
-            "/snapshot".to_string()
-        } else {
-            format!("/snapshot?{}", query.join("&"))
-        };
-        let got = crate::cli::request("GET", &path, None)
-            .map_err(|e| e.to_string())
-            .and_then(|v| serde_json::from_value::<Snapshot>(v).map_err(|e| e.to_string()));
-        if tx.send(got).is_err() {
-            return;
-        }
-        let _ = poke.recv_timeout(Duration::from_secs(1));
-        /* a held key pokes on every step; five fetches a second follow it well enough */
-        std::thread::sleep(Duration::from_millis(200).saturating_sub(started.elapsed()));
-        while poke.try_recv().is_ok() {}
     });
 }
 
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let opts = parse(args)?;
-    let want = Arc::new(Mutex::new(None));
+    let want = Arc::new(Mutex::new(Want::default()));
     let (tx, rx) = mpsc::channel();
     let (poke_tx, poke_rx) = mpsc::channel();
     fetch(opts.circle.clone(), want.clone(), tx, poke_rx);
@@ -1164,11 +1520,14 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let mut app = App::new(opts);
     let mut terminal = ratatui::try_init()?;
     let mut tick = 0usize;
-    let mut asked: Option<String> = None;
+    let mut asked = Want::default();
     let result = (|| -> Result<()> {
         while !stop.load(Ordering::Relaxed) {
             while let Ok(got) = rx.try_recv() {
-                app.apply(got);
+                match got {
+                    Got::Snap(snap) => app.apply(*snap),
+                    Got::Events(events) => app.take_events(events),
+                }
             }
             /* a new selection fetches its full text now instead of on the next second */
             let wanted = app.wanted();

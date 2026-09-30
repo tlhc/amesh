@@ -81,6 +81,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - Text fields, titles included, are cut to 400 characters, with `*_len` giving the full length; references that no longer resolve are listed under `missing`.
   - An ask's `to_peer_id` is matched by peer id only, so a recipient that left is listed under `missing` even when another peer has taken its name since. Assignees and senders are names, resolved the way the hub resolves them next.
   - Each peer carries its `activity` (below), or null while unknown, and `running`: its running jobs in every circle, counted by recipient (a job run by hand, which has no ask, by its assignee), so a filtered view can tell whether a job is its only one.
+  - Each peer also says how the hub reaches it: `push` (a live WebSocket now), `acks` (that connection confirms each frame with recv) and `queued` (the records in its inbox it has not taken; for a peer that confirms, everything sent and not yet confirmed). `capabilities.delivery` marks hubs that send them.
   - It never probes peers, settles jobs, drains inboxes, writes the state file or records an event.
   - `roster` lists every peer in the requested circle (every peer without `circle`), sorted by `peer_id`, in the shape of `peers`; a monitor judges who is online from it.
   - `event_count` is the number of events `GET /events` would list for the same `circle`.
