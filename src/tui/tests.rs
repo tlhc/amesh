@@ -1478,7 +1478,7 @@ fn cards_say_what_the_worker_is_doing() {
     let synth = card("synth");
     assert!(
         synth.contains(
-            "worker w4 IDLE! 2m · turn ended ask synt w4 · 00:15 · unacked ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ waiting 1m"
+            "worker w4 IDLE! 1m · not picked up ask synt w4 · 00:15 · unacked ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ waiting 1m"
         ) && synth.contains("nudge amesh peer notify w4 'synth?'"),
         "{synth}"
     );
@@ -5241,4 +5241,263 @@ fn a_hub_upgraded_to_number_its_events_is_read_by_seq_again() {
         !lines.iter().any(|l| l.contains("numbers no events")),
         "the unnumbered events of an earlier ring say nothing about this one: {lines:?}"
     );
+}
+
+#[test]
+fn a_failed_close_crosses_the_arrow_and_holds_it_still() {
+    let closed = |by: &str, failed: bool| {
+        let mut snap = proto_s1();
+        let now = snap.captured_at;
+        let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-5b1");
+        let ask = ask.unwrap();
+        ask.closed_at = Some(now);
+        ask.closed_by = Some(by.into());
+        ask.failed = failed;
+        snap
+    };
+    /* hub closures always set failed; acks may too */
+    for by in ["hub", "recipient", "hand"] {
+        let mut snap = closed(by, true);
+        snap.fresh = true;
+        let ask = snap.ask(Some("ask-5b1")).unwrap();
+        assert_eq!(
+            layout::arrow(&snap, ask, false),
+            ("─×─".into(), layout::Tone::Fail),
+            "a failed close by {by} is no answer walking back"
+        );
+        let mut app = app_with(closed(by, true));
+        app.sel = Some("func".into());
+        for tick in [0, 2, 4] {
+            let line = line_with(&mut app, 100, tick, "5b1 ");
+            assert!(
+                line.contains("5b1 cc─×─codex "),
+                "{by}, tick {tick}: {line}"
+            );
+        }
+    }
+    let mut snap = closed("hand", false);
+    snap.fresh = true;
+    let ask = snap.ask(Some("ask-5b1")).unwrap();
+    assert_eq!(
+        layout::arrow(&snap, ask, false),
+        ("─◂─".into(), layout::Tone::Back),
+        "an operator's good ack goes back to the sender like the recipient's"
+    );
+}
+
+#[test]
+fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
+    use layout::Tone;
+    /* synth's worker w4 has been idle since 880 */
+    let synth = |captured: u64, opened: u64| {
+        let mut snap = busy();
+        snap.captured_at = captured;
+        let ask = snap
+            .asks
+            .iter_mut()
+            .find(|a| a.correlation_id == "ask-synth");
+        ask.unwrap().opened_at = Some(opened);
+        snap
+    };
+    let card = |snap: &Snapshot| {
+        let (chain, num) = numbered(snap);
+        let view = View {
+            snap,
+            chain: &chain,
+            num: &num,
+            base: 0,
+            sel: "synth",
+        };
+        flat(&layout::card(&view, "synth", 46, None, Fit::Whole).text())
+    };
+    let just_sent = synth(1000, 995);
+    let job = just_sent.job("synth").unwrap();
+    assert!(
+        layout::alarm(&just_sent, job).is_none(),
+        "sent 5s ago to a worker idle from before: it may still pick it up"
+    );
+    let text = card(&just_sent);
+    assert!(
+        text.contains("worker w4 · now IDLE") && !text.contains("IDLE!"),
+        "{text}"
+    );
+    let text = card(&synth(1020, 995));
+    assert!(
+        text.contains("worker w4 IDLE! 25s · not picked up"),
+        "25s later it still has not: the age counts from the ask: {text}"
+    );
+    let text = card(&synth(1000, 870));
+    assert!(
+        text.contains("worker w4 IDLE! 2m · turn ended"),
+        "idle since after the ask opened: its turn ended with the ask open: {text}"
+    );
+    let mut tie = synth(1010, 1000);
+    let w4 = tie.peers.iter_mut().find(|p| p.peer_id == "w4").unwrap();
+    w4.activity.as_mut().unwrap().since = 1000;
+    let text = card(&tie);
+    assert!(
+        text.contains("worker w4 IDLE! 10s · ask still open"),
+        "idle in the second the ask opened: {text}"
+    );
+    let plain = |since: u64, opened: u64, captured: u64| {
+        with_asks(
+            Snapshot {
+                captured_at: captured,
+                ..Default::default()
+            },
+            vec![lone("ask-x", CC, PI, Some(opened))],
+            vec![doing(PI, "idle", since, None)],
+        )
+    };
+    let state = |snap: &Snapshot| super::asks::state(snap, &snap.asks[0]);
+    let ask_card = |snap: &Snapshot| {
+        flat(&super::asks::card(snap, &snap.asks[0], 1, 100, None, Fit::Whole).text())
+    };
+    let early = plain(880, 995, 1000);
+    assert_eq!(state(&early), ("waiting 5s".into(), Tone::Run));
+    assert!(
+        !ask_card(&early).contains("IDLE!") && !ask_card(&early).contains("nudge"),
+        "{}",
+        ask_card(&early)
+    );
+    let late = plain(880, 995, 1020);
+    assert_eq!(state(&late), ("IDLE! 25s".into(), Tone::Fail));
+    assert!(
+        ask_card(&late).contains("IDLE! 25s · not picked up") && ask_card(&late).contains("nudge"),
+        "{}",
+        ask_card(&late)
+    );
+    let ended = plain(990, 980, 1000);
+    assert_eq!(state(&ended), ("IDLE! 10s".into(), Tone::Fail));
+    assert!(
+        ask_card(&ended).contains("IDLE! 10s · turn ended"),
+        "{}",
+        ask_card(&ended)
+    );
+    let tie = plain(1000, 1000, 1010);
+    assert_eq!(state(&tie), ("IDLE! 10s".into(), Tone::Fail));
+    assert!(
+        ask_card(&tie).contains("IDLE! 10s · ask still open"),
+        "{}",
+        ask_card(&tie)
+    );
+}
+
+#[test]
+fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
+    let frames = |app: &mut App| (0..6).map(|t| screen_at(app, 100, t)).collect::<Vec<_>>();
+    /* frame 0 is the same either way */
+    /* fresh for two seconds */
+    let aged =
+        |ms: u64| std::time::Instant::now().checked_sub(std::time::Duration::from_millis(ms));
+    let check = |app: &mut App, what: &str| {
+        app.last_ok = aged(1500);
+        let live = frames(app);
+        assert!(
+            live.windows(2).any(|w| w[0] != w[1]),
+            "{what}: a snapshot 1.5s old still moves"
+        );
+        app.opts.anim = false;
+        let still = screen_at(app, 100, 0);
+        app.opts.anim = true;
+        app.last_ok = aged(2100);
+        for (tick, frame) in frames(app).iter().enumerate().skip(1) {
+            assert_eq!(
+                frame, &still,
+                "{what}, tick {tick}: a snapshot 2.1s old shows the --no-anim frame"
+            );
+        }
+    };
+    let mut walking = app_with(proto_s1());
+    walking.sel = Some("upg".into());
+    check(&mut walking, "jobs, arrow");
+    let mut waiting = app_with(busy());
+    waiting.sel = Some("fix".into());
+    assert!(
+        screen_at(&mut waiting, 100, 0)
+            .iter()
+            .any(|l| l.contains("WAIT!")),
+        "the jobs fixture shows WAIT!"
+    );
+    check(&mut waiting, "jobs, WAIT!");
+    let mut asks = app_with(with_asks(
+        Snapshot {
+            captured_at: 1000,
+            ..Default::default()
+        },
+        vec![
+            lone("ask-x", CC, PI, Some(900)),
+            lone("ask-y", CC, PI2, Some(900)),
+        ],
+        vec![
+            doing(CC, "work", 900, None),
+            doing(PI, "work", 900, None),
+            doing(PI2, "wait", 950, Some("Bash")),
+        ],
+    ));
+    asks.key(KeyCode::Char('a'));
+    assert!(
+        screen_at(&mut asks, 100, 0)
+            .iter()
+            .any(|l| l.contains("WAIT! 50s")),
+        "the asks fixture shows WAIT!"
+    );
+    check(&mut asks, "asks");
+}
+
+#[test]
+fn pickup_counts_from_the_ask_and_a_turn_end_from_the_worker() {
+    let at = |captured: u64| Snapshot {
+        captured_at: captured,
+        ..Default::default()
+    };
+    let ask = |opened: Option<u64>, open: bool| Ask {
+        correlation_id: "ask-x".into(),
+        open,
+        opened_at: opened,
+        ..Default::default()
+    };
+    let is = |state: &str, since: u64| Activity {
+        state: state.into(),
+        since,
+        reason: None,
+    };
+    let sent = ask(Some(1000), true);
+    /* idle before the ask */
+    assert_eq!(at(1009).stalled(&sent, &is("idle", 990)), None);
+    assert_eq!(
+        at(1010).stalled(&sent, &is("idle", 990)),
+        Some((1000, "not picked up"))
+    );
+    assert_eq!(
+        at(1011).stalled(&sent, &is("idle", 990)),
+        Some((1000, "not picked up"))
+    );
+    /* idle in the ask's own second */
+    assert_eq!(at(1009).stalled(&sent, &is("idle", 1000)), None);
+    assert_eq!(
+        at(1010).stalled(&sent, &is("idle", 1000)),
+        Some((1000, "ask still open"))
+    );
+    /* idle after the ask */
+    assert_eq!(
+        at(1001).stalled(&sent, &is("idle", 1001)),
+        Some((1001, "turn ended"))
+    );
+    /* an ask stamped after the capture, a hub without ask times, a closed ask, a busy worker */
+    assert_eq!(
+        at(1000).stalled(&ask(Some(1030), true), &is("idle", 990)),
+        None
+    );
+    assert_eq!(
+        at(1000).stalled(&ask(None, true), &is("idle", 990)),
+        Some((990, "turn ended"))
+    );
+    assert_eq!(
+        at(1100).stalled(&ask(Some(1000), false), &is("idle", 990)),
+        None
+    );
+    for state in ["work", "wait"] {
+        assert_eq!(at(1100).stalled(&sent, &is(state, 990)), None, "{state}");
+    }
 }

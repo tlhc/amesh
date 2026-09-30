@@ -82,20 +82,24 @@ fn doing<'a>(snap: &'a Snapshot, ask: &Ask) -> Option<&'a Activity> {
         .and_then(|p| p.activity.as_ref())
 }
 
-/* the job card's words for an ask; idle means the recipient's turn ended with the ask open */
+fn stalled(snap: &Snapshot, ask: &Ask) -> Option<(u64, &'static str)> {
+    doing(snap, ask).and_then(|a| snap.stalled(ask, a))
+}
+
+/* the job card's words for an ask */
 pub(crate) fn state(snap: &Snapshot, ask: &Ask) -> (String, Tone) {
     let now = snap.captured_at;
     if ask.open {
         return match (recipient(snap, ask), doing(snap, ask)) {
             (None, _) => ("left the hub".into(), Tone::Fail),
             (Some(p), _) if p.status != "online" => ("offline".into(), Tone::Fail),
-            (_, Some(a)) if a.state == "idle" => {
-                (format!("IDLE! {}", ago(now, Some(a.since))), Tone::Fail)
-            }
             (_, Some(a)) if a.state == "wait" => {
                 (format!("WAIT! {}", ago(now, Some(a.since))), Tone::Wait)
             }
-            _ => (format!("waiting {}", ago(now, ask.opened_at)), Tone::Run),
+            _ => match stalled(snap, ask) {
+                Some((at, _)) => (format!("IDLE! {}", ago(now, Some(at))), Tone::Fail),
+                None => (format!("waiting {}", ago(now, ask.opened_at)), Tone::Run),
+            },
         };
     }
     let outcome = |ok: &str, bad: &str| match ask.failed {
@@ -314,14 +318,14 @@ pub(crate) fn card(
         room,
     ));
     let to = recipient(snap, ask);
-    let status = match doing(snap, ask) {
-        Some(a) if a.state == "idle" => vec![
-            (format!("IDLE! {}", ago(now, Some(a.since))), Tone::Fail),
-            (" · turn ended".into(), Tone::Dim),
-        ],
-        Some(a) if a.state == "wait" => {
+    let status = match (doing(snap, ask), stalled(snap, ask)) {
+        (Some(a), _) if a.state == "wait" => {
             vec![(format!("WAIT! {}", ago(now, Some(a.since))), Tone::Wait)]
         }
+        (_, Some((at, why))) => vec![
+            (format!("IDLE! {}", ago(now, Some(at))), Tone::Fail),
+            (format!(" · {why}"), Tone::Dim),
+        ],
         _ => now_doing(snap, to),
     };
     left.extend(party("to", &ask.to_peer_id, status, room));
@@ -356,7 +360,7 @@ pub(crate) fn card(
             colw,
             usize::MAX,
         );
-    } else if doing(snap, ask).is_some_and(|a| a.state == "idle") {
+    } else if stalled(snap, ask).is_some() {
         let command = format!(
             "amesh peer notify {} {}",
             layout::quote(&ask.to_peer_id),

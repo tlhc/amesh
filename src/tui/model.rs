@@ -1,6 +1,9 @@
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+/* seconds an idle recipient gets to pick up a new ask before IDLE! */
+const PICKUP_FOR: u64 = 10;
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub(crate) struct Snapshot {
     #[serde(default)]
@@ -233,6 +236,24 @@ impl Snapshot {
             && at
                 .and_then(|at| self.captured_at.checked_sub(at))
                 .is_some_and(|ago| ago <= 1)
+    }
+
+    /* an open ask its idle recipient leaves waiting: since when, and why. Hub stamps are whole
+    seconds, so idle in the ask's own second may be either order */
+    pub fn stalled(&self, ask: &Ask, activity: &Activity) -> Option<(u64, &'static str)> {
+        if !ask.open || activity.state != "idle" {
+            return None;
+        }
+        match ask.opened_at {
+            Some(at) if activity.since <= at => {
+                let why = match activity.since < at {
+                    true => "not picked up",
+                    false => "ask still open",
+                };
+                (self.captured_at.saturating_sub(at) >= PICKUP_FOR).then_some((at, why))
+            }
+            _ => Some((activity.since, "turn ended")),
+        }
     }
 
     pub fn spinning(&self, job: &Job) -> bool {

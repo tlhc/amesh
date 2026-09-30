@@ -572,7 +572,7 @@ impl App {
         and keeps at least three rows */
         let mut peer_rows = 1;
         if let Some(snap) = &self.snap {
-            let moving = self.opts.anim;
+            let moving = self.moving();
             let spin = SPINNER[if moving { tick % SPINNER.len() } else { 0 }];
             let lit = !(moving && tick / 4 % 2 == 1);
             let cap = PEER_ROWS.min(rows - 7);
@@ -814,7 +814,7 @@ impl App {
             .map(|id| (cur.base + cur.num[id], id))
             .collect();
         /* a pane without focus keeps turning: in a split screen the monitor is the other pane */
-        let moving = self.opts.anim;
+        let moving = self.moving();
         let mut sent = Vec::new();
         for (r, row) in g.rows.iter_mut() {
             for (c, cell) in row.iter_mut() {
@@ -1073,14 +1073,14 @@ impl App {
         };
         g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
         /* WAIT! blinks once a second, as on the job screen */
-        if self.opts.anim && tick / 4 % 2 == 1 {
+        if self.moving() && tick / 4 % 2 == 1 {
             for cell in g.rows.values_mut().flat_map(|row| row.values_mut()) {
                 if cell.tone == Tone::Wait {
                     cell.ch = ' ';
                 }
             }
         }
-        walk(&mut g, tick, self.opts.anim);
+        walk(&mut g, tick, self.moving());
         let mut lines = self.lines(&g, cols, rows);
         if !self.full && (first..first + shown).contains(&at) {
             if let Some(line) = lines.get_mut(top + at - first) {
@@ -1222,6 +1222,11 @@ impl App {
     fn fresh(&self) -> bool {
         self.last_ok
             .is_some_and(|t| t.elapsed() <= Duration::from_secs(2))
+    }
+
+    /* a stale snapshot holds all motion still */
+    fn moving(&self) -> bool {
+        self.opts.anim && self.fresh()
     }
 
     /* the hub did not answer: say so, and how old the snapshot on screen is */

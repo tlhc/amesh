@@ -391,12 +391,14 @@ pub(crate) fn events_tag(snap: &Snapshot) -> Option<String> {
 
 /* the mark between an ask's sender and recipient: an open ask's steps toward the recipient
 while it works and rests while it does not; one the hub closed within the second before a
-fresh snapshot steps back to the sender, and an older one reads > */
+fresh snapshot steps back to the sender, or crosses out when it closed failed, and an older
+one reads > */
 pub(crate) fn arrow(snap: &Snapshot, ask: &Ask, working: bool) -> (String, Tone) {
     match ask.open {
         true => ("─▸─".into(), if working { Tone::Flow } else { Tone::Dim }),
-        false if snap.just_now(ask.closed_at) => ("─◂─".into(), Tone::Back),
-        false => (">".into(), Tone::Plain),
+        false if !snap.just_now(ask.closed_at) => (">".into(), Tone::Plain),
+        false if ask.failed => ("─×─".into(), Tone::Fail),
+        false => ("─◂─".into(), Tone::Back),
     }
 }
 
@@ -411,10 +413,10 @@ pub(crate) fn glyph(state: &str) -> (char, Tone) {
 }
 
 /* a running job whose worker needs a person: at a permission prompt (WAIT!, with what
-it asks), or idle with the ask still open (IDLE!) */
+it asks), or idle with the ask still open (IDLE!, since when and why) */
 pub(crate) enum Alarm {
     Wait(String),
-    Idle,
+    Idle(u64, &'static str),
 }
 
 pub(crate) fn alarm(snap: &Snapshot, job: &Job) -> Option<Alarm> {
@@ -422,7 +424,6 @@ pub(crate) fn alarm(snap: &Snapshot, job: &Job) -> Option<Alarm> {
         return None;
     }
     let activity = snap.worker(job)?.activity.as_ref()?;
-    let open = snap.ask(job.ask_id.as_deref()).is_some_and(|ask| ask.open);
     match activity.state.as_str() {
         "wait" => Some(Alarm::Wait(
             activity
@@ -430,7 +431,10 @@ pub(crate) fn alarm(snap: &Snapshot, job: &Job) -> Option<Alarm> {
                 .clone()
                 .unwrap_or_else(|| "needs your permission".into()),
         )),
-        "idle" if open => Some(Alarm::Idle),
+        "idle" => snap
+            .ask(job.ask_id.as_deref())
+            .and_then(|ask| snap.stalled(ask, activity))
+            .map(|(at, why)| Alarm::Idle(at, why)),
         _ => None,
     }
 }
@@ -1193,7 +1197,7 @@ pub(crate) fn card(
     let worker = job.assigned_peer.as_deref().unwrap_or("-");
     let state = job.state.as_str();
     let alarm = alarm(snap, job);
-    let idle = matches!(alarm, Some(Alarm::Idle));
+    let idle = matches!(alarm, Some(Alarm::Idle(..)));
     let sent = ask.and_then(|a| a.opened_at).filter(|_| state != "queued");
     /* up to three items share a line, so each name gets its share of the card's width */
     let share = |count: usize| {
@@ -1280,11 +1284,11 @@ pub(crate) fn card(
                     ]);
                     wrapped(&mut left, "", reason, Tone::Warn, colw, 2);
                 }
-                Some(Alarm::Idle) => left.push(vec![
+                Some(Alarm::Idle(at, why)) => left.push(vec![
                     key("worker", true),
                     name,
-                    (format!("IDLE! {since}"), Tone::Fail),
-                    (" · turn ended".into(), Tone::Dim),
+                    (format!("IDLE! {}", ago(now, Some(*at))), Tone::Fail),
+                    (format!(" · {why}"), Tone::Dim),
                 ]),
                 None if snap.spinning(job) => left.push(vec![
                     key("worker", true),
