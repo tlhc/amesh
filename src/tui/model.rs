@@ -24,6 +24,10 @@ pub(crate) struct Snapshot {
     pub ask_detail: Option<AskDetail>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /* set on the copy the TUI draws when the snapshot came in within the last two seconds:
+    only then does what it reports as just now still move */
+    #[serde(skip)]
+    pub fresh: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -177,6 +181,15 @@ impl Snapshot {
 
     /* a spinner on a job says its worker is busy with it: in a turn, and on no other
     running job */
+    /* the hub stamped `at` within the second before this snapshot, and the snapshot is fresh;
+    a time after the capture, or a hub that sends none, is never just now */
+    pub fn just_now(&self, at: Option<u64>) -> bool {
+        self.fresh
+            && at
+                .and_then(|at| self.captured_at.checked_sub(at))
+                .is_some_and(|ago| ago <= 1)
+    }
+
     pub fn spinning(&self, job: &Job) -> bool {
         let Some(worker) = self.worker(job) else {
             return false;

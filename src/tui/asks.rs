@@ -186,16 +186,19 @@ fn one_line(text: &str) -> String {
 the reply; the route gives way to the state */
 pub(crate) fn rows(snap: &Snapshot, order: &[&Ask], cols: usize) -> Vec<Row> {
     let prefix = prefix(snap, order);
-    let routes: Vec<String> = order
+    let routes: Vec<(String, (String, Tone), String)> = order
         .iter()
         .map(|ask| {
-            format!(
-                "{}>{}",
+            let working = doing(snap, ask).is_some_and(|a| a.state == "work");
+            (
                 shown(snap, &ask.from_peer, &prefix),
-                shown(snap, &ask.to_peer_id, &prefix)
+                layout::arrow(snap, ask, working),
+                shown(snap, &ask.to_peer_id, &prefix),
             )
         })
         .collect();
+    let whole =
+        |(from, (mark, _), to): &(String, (String, Tone), String)| format!("{from}{mark}{to}");
     let states: Vec<(String, Tone)> = order.iter().map(|ask| state(snap, ask)).collect();
     let digits = order.len().to_string().len();
     let sw = states
@@ -205,7 +208,7 @@ pub(crate) fn rows(snap: &Snapshot, order: &[&Ask], cols: usize) -> Vec<Row> {
         .unwrap_or(0);
     let rw = routes
         .iter()
-        .map(|route| width(route))
+        .map(|route| width(&whole(route)))
         .max()
         .unwrap_or(0)
         .min(cols.saturating_sub(digits + 8 + 2 + sw));
@@ -220,10 +223,21 @@ pub(crate) fn rows(snap: &Snapshot, order: &[&Ask], cols: usize) -> Vec<Row> {
                 (format!("{:>digits$} ", i + 1), Tone::Dim),
                 (ch.to_string(), gt),
                 (format!(" {} ", short(&ask.correlation_id)), Tone::Dim),
-                (pad(&fit_end(&route, rw), rw), Tone::Plain),
-                ("  ".into(), Tone::Plain),
-                (pad(&st, sw), tone),
             ];
+            /* a route cut to fit keeps its end and reads > */
+            if width(&whole(&route)) <= rw {
+                let (from, (mark, flow), to) = route;
+                let rest = rw - width(&from) - width(&mark);
+                row.extend([
+                    (from, Tone::Plain),
+                    (mark, flow),
+                    (pad(&to, rest), Tone::Plain),
+                ]);
+            } else {
+                let (from, _, to) = route;
+                row.push((pad(&fit_end(&format!("{from}>{to}"), rw), rw), Tone::Plain));
+            }
+            row.extend([("  ".into(), Tone::Plain), (pad(&st, sw), tone)]);
             let used: usize = row.iter().map(|(text, _)| width(text)).sum();
             let rest = cols.saturating_sub(used + 2);
             if rest >= PREVIEW_MIN {

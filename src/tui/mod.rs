@@ -464,7 +464,8 @@ impl App {
             }
             return self.lines(&g, cols, rows);
         };
-        let snap = self.snap.clone().expect("blocks come from a snapshot");
+        let mut snap = self.snap.clone().expect("blocks come from a snapshot");
+        snap.fresh = self.fresh();
         let sel = self.sel.clone().expect("settle picked a job");
         let cur = &blocks[b];
         let mut count: HashMap<&str, usize> = HashMap::new();
@@ -624,8 +625,9 @@ impl App {
             .collect();
         /* a pane without focus keeps turning: in a split screen the monitor is the other pane */
         let moving = self.opts.anim;
-        for row in g.rows.values_mut() {
-            for cell in row.values_mut() {
+        let mut sent = Vec::new();
+        for (r, row) in g.rows.iter_mut() {
+            for (c, cell) in row.iter_mut() {
                 if cell.tone == Tone::Wait && moving && tick / 4 % 2 == 1 {
                     cell.ch = ' ';
                 }
@@ -638,6 +640,23 @@ impl App {
                 if job.state == "running" && snap.spinning(job) {
                     cell.ch = SPINNER[if moving { tick % SPINNER.len() } else { 0 }];
                 }
+                if moving && job.state == "running" && just_sent(&snap, job) {
+                    sent.push((*r, *c));
+                }
+            }
+        }
+        walk(&mut g, tick, moving);
+        /* a job the hub sent within the last second: a dot runs along the rail into it, then
+        its glyph lights */
+        for (r, c) in sent {
+            let path = rail_into(&g, r, c);
+            let (at, ch) = match path.get(tick / 2 % (path.len() + 1)) {
+                Some(&at) => (at, '•'),
+                None => ((r, c), '◉'),
+            };
+            if let Some(cell) = g.rows.get_mut(&at.0).and_then(|row| row.get_mut(&at.1)) {
+                cell.ch = ch;
+                cell.tone = Tone::Near;
             }
         }
         let jumping: Vec<usize> = self
@@ -764,7 +783,8 @@ impl App {
             }
             return self.lines(&g, cols, rows);
         }
-        let snap = self.snap.clone().expect("checked above");
+        let mut snap = self.snap.clone().expect("checked above");
+        snap.fresh = self.fresh();
         let order = asks::order(&snap);
         let at = match self
             .ask_sel
@@ -870,6 +890,7 @@ impl App {
                 }
             }
         }
+        walk(&mut g, tick, self.opts.anim);
         let mut lines = self.lines(&g, cols, rows);
         if !self.full && (first..first + shown).contains(&at) {
             if let Some(line) = lines.get_mut(top + at - first) {
@@ -890,6 +911,11 @@ impl App {
             true => self.ask_sel.as_ref().map(|cid| format!("ask={cid}")),
             false => self.sel.as_ref().map(|id| format!("detail={id}")),
         }
+    }
+
+    fn fresh(&self) -> bool {
+        self.last_ok
+            .is_some_and(|t| t.elapsed() <= Duration::from_secs(2))
     }
 
     /* the hub did not answer: say so, and how old the snapshot on screen is */
@@ -948,7 +974,8 @@ impl App {
             Tone::Fail => fg(t.fail),
             Tone::Warn | Tone::Wait => fg(t.wait),
             Tone::Soft => fg(t.worker),
-            Tone::Near => fg(t.near),
+            Tone::Near | Tone::Flow => fg(t.near),
+            Tone::Back => fg(t.done),
             Tone::Select => fg(t.select).bg(t.select_bg),
         }
     }
@@ -980,12 +1007,61 @@ fn draw(frame: &mut Frame, app: &mut App, tick: usize) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/* an ask's arrow steps every other frame, Flow toward the recipient and Back toward the
+sender; a still pane, and the first frame, show the arrowhead in the middle */
+fn walk(g: &mut Grid, tick: usize, moving: bool) {
+    let step = if moving { tick / 2 + 1 } else { 1 };
+    for row in g.rows.values_mut() {
+        let marked: Vec<usize> = row
+            .iter()
+            .filter(|(_, cell)| matches!(cell.tone, Tone::Flow | Tone::Back))
+            .map(|(c, _)| *c)
+            .collect();
+        for run in marked.chunk_by(|a, b| *b == a + 1) {
+            for (i, c) in run.iter().enumerate() {
+                let cell = row.get_mut(c).expect("collected from this row");
+                let (at, head) = match cell.tone {
+                    Tone::Back => (run.len() - 1 - step % run.len(), '◂'),
+                    _ => (step % run.len(), '▸'),
+                };
+                cell.ch = if i == at { head } else { '─' };
+            }
+        }
+    }
+}
+
+/* the rail cells that lead into the glyph at (r, c), in the order work travels them: the
+spine above it in the vertical flow, the connector on its left in the horizontal one */
+fn rail_into(g: &Grid, r: usize, c: usize) -> Vec<(usize, usize)> {
+    let rail = |r: usize, c: usize, chars: &str| {
+        g.rows
+            .get(&r)
+            .and_then(|row| row.get(&c))
+            .is_some_and(|cell| cell.tone == Tone::Line && chars.contains(cell.ch))
+    };
+    if r > 0 && rail(r - 1, c, "│┼┬┴┌┐") {
+        return vec![(r - 1, c)];
+    }
+    [3, 2]
+        .into_iter()
+        .filter(|d| c >= *d && rail(r, c - d, "─┬├└┤┘"))
+        .map(|d| (r, c - d))
+        .collect()
+}
+
+fn just_sent(snap: &Snapshot, job: &model::Job) -> bool {
+    snap.just_now(
+        snap.ask(job.ask_id.as_deref())
+            .and_then(|ask| ask.opened_at),
+    )
+}
+
 fn ascii(ch: char) -> char {
     match ch {
         '─' => '-',
         '│' => '|',
         '┌' | '┐' | '└' | '┘' | '┬' | '┴' | '┼' | '├' | '┤' => '+',
-        '◀' | '←' => '<',
+        '◀' | '←' | '◂' => '<',
         '●' => '*',
         '◆' => '>',
         '⣿' => '#',
@@ -996,7 +1072,9 @@ fn ascii(ch: char) -> char {
         '·' => '|',
         '…' => '~',
         '↑' => '^',
-        '→' => '>',
+        '→' | '▸' => '>',
+        '•' => '.',
+        '◉' => '@',
         '⠋' | '⠼' | '⠇' => '|',
         '⠙' | '⠴' | '⠏' => '/',
         '⠹' | '⠦' => '-',

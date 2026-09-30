@@ -4,9 +4,7 @@ Local hub that lets `pi`, Codex, and Claude Code sessions on one machine `ask` /
 
 One Rust binary, SQLite state, HTTP + WebSocket on `127.0.0.1:8378`. Each running session is a **peer**; peers in the same git repo share a **circle**.
 
-![demo](docs/demo.gif)
-
-`amesh tui` in the demo is optional and only watches. Without it the hub runs quietly in the background and relays asks, acks, notifies and jobs between agents on its own.
+![demo](docs/demo.svg)
 
 ## How agents work together
 
@@ -145,6 +143,8 @@ amesh tui --all --ascii      # every circle, ASCII only
   - `r`: refresh; `q`: quit
 - Activity:
   - spinner: the worker is busy with this job (`--no-anim` freezes it)
+  - `sender─▸─recipient` on an open ask: the arrowhead steps toward a recipient that is working and holds still otherwise; for a second after the ack it steps back (`─◂─`)
+  - a dot on the rail into a job the hub has just sent, then its glyph lights
   - `IDLE!`: the worker stopped with the ask open; the card gives a nudge command
   - blinking `WAIT!`: Claude Code waits on a permission
   - hooks installed before this reporting send none; rerun `amesh setup`

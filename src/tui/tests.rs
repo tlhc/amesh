@@ -2010,7 +2010,7 @@ chain deploy · 3/9 done · 1 fail · 2 run
 
 ┌◆ 3 perf · running 12m · stage 2 of 5 ──────┐
 │ worker  codex IDLE! 5m · turn ended        │
-│ ask     9a1 cc>codex · 13:30 · unacked     │
+│ ask     9a1 cc─▸─codex · 13:30 · unacked   │
 │         ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ waiting 12m           │
 │ needs   1 scope ●                          │
 │ blocks  7 synth ○                          │
@@ -2065,7 +2065,7 @@ chain verify · 4/6 done · 1 run
 ┌◆ 5 deploy · running 1m · stage 4 of 5 ─────┐
 │ worker  cc WAIT! 40s                       │
 │         needs your Bash permission         │
-│ ask     d3a9 codex>cc · 13:41 · unacked    │
+│ ask     d3a9 codex─▸─cc · 13:41 · unacked  │
 │ needs   4 review ●                         │
 │ blocks  6 verify ○                         │
 │ times   sent 13:41 · running 1m            │
@@ -2150,7 +2150,7 @@ chain deploy · 3/9 done · 1 fail · 2 run
 
 ┌◆ 6 upg · running 6m · stage 2 of 5 ──────────────────────────────────────────────────────────────┐
 │ worker  pi-3 WORK · turn 6m                     │ prompt  review the upgrade path for old state  │
-│ ask     7c2 cc>pi-3 · 13:36 · unacked           │         files and mixed versions               │
+│ ask     7c2 cc─▸─pi-3 · 13:36 · unacked         │         files and mixed versions               │
 │ needs   1 scope ●                               │                                                │
 │ blocks  7 synth ○                               │                                                │
 │ times   sent 13:36 · running 6m                 │                                                │
@@ -2262,7 +2262,7 @@ chain verify · 4/6 done · 1 run
 ┌◆ 5 deploy · running 1m · stage 4 of 5 ───────────────────────────────────────────────────────────┐
 │ worker  cc WAIT! 40s                            │ prompt  install the build and restart the hub  │
 │         needs your Bash permission              │                                                │
-│ ask     d3a9 codex>cc · 13:41 · unacked         │                                                │
+│ ask     d3a9 codex─▸─cc · 13:41 · unacked       │                                                │
 │ needs   4 review ●                              │                                                │
 │ blocks  6 verify ○                              │                                                │
 │ times   sent 13:41 · running 1m                 │                                                │
@@ -3763,7 +3763,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     };
     let wide = text(100);
     assert!(
-        wide[0].starts_with("1 ◆ 1223 …claude-code>…pi-2  "),
+        wide[0].starts_with("1 ◆ 1223 …claude-code─▸─…pi-2  "),
         "{}",
         wide[0]
     );
@@ -3811,7 +3811,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     let rows = super::asks::rows(&anon, &order, 100);
     assert!(
         rows.iter()
-            .any(|row| row.iter().any(|(t, _)| t.starts_with("anonymous>…pi "))),
+            .any(|row| row_text(row).contains(" anonymous─▸─…pi ")),
         "a name without a row keeps the prefix: {:?}",
         rows.iter().map(|r| row_text(r)).collect::<Vec<_>>()
     );
@@ -3824,8 +3824,8 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
         .map(|row| row_text(row))
         .collect();
     assert!(
-        rows.iter().any(|r| r.contains("far>…pi "))
-            && rows.iter().any(|r| r.contains("…claude-code>…pi-2")),
+        rows.iter().any(|r| r.contains("far─▸─…pi "))
+            && rows.iter().any(|r| r.contains("…claude-code─▸─…pi-2")),
         "a sender from another circle keeps its name and leaves the prefix to the circle's own: {rows:?}"
     );
     let mut all = fan_out();
@@ -3862,16 +3862,17 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
         .map(|row| row_text(row))
         .collect();
     assert!(
-        rows.iter().any(|r| r.contains(" anonymous>…pi-2 ")),
+        rows.iter().any(|r| r.contains(" anonymous─▸─…pi-2 ")),
         "anonymous keeps its name and leaves the prefix alone: {rows:?}"
     );
     assert!(
-        rows.iter().any(|r| r.contains(&format!(" {foreign}>…pi "))),
+        rows.iter()
+            .any(|r| r.contains(&format!(" {foreign}─▸─…pi "))),
         "a name from another circle keeps its whole name: {rows:?}"
     );
     assert!(
         rows.iter()
-            .any(|r| r.contains(" …claude-code>openhitls-sm2-opt-pi-3 ")),
+            .any(|r| r.contains(" …claude-code─▸─openhitls-sm2-opt-pi-3 ")),
         "a peer that left keeps its whole name: {rows:?}"
     );
 }
@@ -4144,7 +4145,7 @@ fn the_asks_screen_speaks_for_old_hubs_and_empty_views() {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("1 > 1223 ~claude-code>~pi-2")),
+            .any(|l| l.starts_with("1 > 1223 ~claude-code->-~pi-2")),
         "ASCII glyphs: {lines:?}"
     );
 }
@@ -4298,4 +4299,257 @@ fn the_smallest_pane_still_lists_the_selected_ask() {
         lines.iter().any(|l| l.starts_with("2 ◆ a3a0")),
         "the one row there is the selected ask: {lines:?}"
     );
+}
+
+/* the screen at `tick`, one string a line */
+fn screen_at(app: &mut App, cols: usize, tick: usize) -> Vec<String> {
+    app.screen(cols, 40, tick)
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect()
+}
+
+fn line_with(app: &mut App, cols: usize, tick: usize, needle: &str) -> String {
+    let lines = screen_at(app, cols, tick);
+    lines
+        .iter()
+        .find(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no line with {needle}:\n{}", lines.join("\n")))
+        .clone()
+}
+
+#[test]
+fn an_open_asks_arrow_walks_to_a_working_recipient_and_rests_otherwise() {
+    let mut app = app_with(proto_s1());
+    app.sel = Some("upg".into());
+    let at = |app: &mut App, tick| line_with(app, 100, tick, "7c2 ");
+    assert!(
+        at(&mut app, 0).contains("7c2 cc─▸─pi-3 "),
+        "the first frame holds it in the middle"
+    );
+    assert!(
+        at(&mut app, 2).contains("7c2 cc──▸pi-3 "),
+        "it steps toward the recipient"
+    );
+    assert!(
+        at(&mut app, 4).contains("7c2 cc▸──pi-3 "),
+        "and comes round again"
+    );
+    app.sel = Some("perf".into());
+    assert!(
+        line_with(&mut app, 100, 2, "9a1 ").contains("9a1 cc─▸─codex "),
+        "a recipient that is not working holds it still"
+    );
+    app.sel = Some("upg".into());
+    app.opts.anim = false;
+    assert!(
+        at(&mut app, 2).contains("7c2 cc─▸─pi-3 "),
+        "--no-anim holds it still"
+    );
+}
+
+#[test]
+fn an_ack_the_hub_just_took_walks_the_arrow_back_to_the_sender() {
+    let closed = |ago: u64| {
+        let mut snap = proto_s1();
+        let now = snap.captured_at;
+        let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-5b1");
+        ask.unwrap().closed_at = Some(now - ago);
+        let mut app = app_with(snap);
+        app.sel = Some("func".into());
+        app
+    };
+    let mut app = closed(0);
+    let at = |app: &mut App, tick| line_with(app, 100, tick, "5b1 ");
+    assert!(
+        at(&mut app, 0).contains("5b1 cc─◂─codex "),
+        "{}",
+        at(&mut app, 0)
+    );
+    assert!(
+        at(&mut app, 2).contains("5b1 cc◂──codex "),
+        "it steps toward the sender"
+    );
+    assert!(
+        at(&mut app, 4).contains("5b1 cc──◂codex "),
+        "and comes round again"
+    );
+    assert!(
+        at(&mut closed(2), 2).contains("5b1 cc>codex "),
+        "an ack from before the last second reads >"
+    );
+}
+
+#[test]
+fn the_asks_screen_walks_the_arrow_of_an_ask_whose_recipient_works() {
+    let mut app = app_with(fan_out());
+    app.key(KeyCode::Char('a'));
+    assert!(line_with(&mut app, 100, 0, " 1223 ").contains("…claude-code─▸─…pi-2 "));
+    assert!(
+        line_with(&mut app, 100, 2, " 1223 ").contains("…claude-code──▸…pi-2 "),
+        "the recipient works on it: the arrow steps"
+    );
+    assert!(
+        line_with(&mut app, 100, 2, " a3a0 ").contains("…claude-code─▸─…pi "),
+        "an idle recipient holds it still"
+    );
+}
+
+#[test]
+fn a_job_the_hub_just_sent_gets_a_dot_along_its_rail_then_lights() {
+    let mut snap = proto_s1();
+    let now = snap.captured_at;
+    let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-7c2");
+    ask.unwrap().opened_at = Some(now);
+    let mut app = app_with(snap);
+    let has = |lines: Vec<String>, want: &str| lines.iter().any(|l| l.trim_end() == want);
+    /* the vertical flow: the spine above upg is the end of the fan-out bracket */
+    assert!(
+        has(
+            screen_at(&mut app, 46, 0),
+            "    ┌───────┬───────┼───────┬───────•"
+        ),
+        "the dot on the rail into it"
+    );
+    assert!(
+        has(
+            screen_at(&mut app, 46, 2),
+            "    ●       ◆       ●       ×       ◉"
+        ),
+        "then its glyph lights"
+    );
+    /* the horizontal flow: the connector on its left, cell by cell */
+    let row = |app: &mut App, tick| line_with(app, 100, tick, "6 upg");
+    assert!(
+        row(&mut app, 0).contains("•─ ⠋ 6 upg"),
+        "{}",
+        row(&mut app, 0)
+    );
+    assert!(
+        row(&mut app, 2).contains("└• ⠹ 6 upg"),
+        "{}",
+        row(&mut app, 2)
+    );
+    assert!(
+        row(&mut app, 4).contains("└─ ◉ 6 upg"),
+        "{}",
+        row(&mut app, 4)
+    );
+    app.opts.anim = false;
+    assert!(
+        has(
+            screen_at(&mut app, 46, 2),
+            "    ●       ◆       ●       ×       ⠋"
+        ),
+        "--no-anim leaves it still"
+    );
+    let mut earlier = app_with(proto_s1());
+    assert!(
+        has(
+            screen_at(&mut earlier, 46, 0),
+            "    ┌───────┬───────┼───────┬───────┐"
+        ),
+        "a job sent before the last second gets none"
+    );
+    assert_eq!(['▸', '◂', '•', '◉'].map(super::ascii), ['>', '<', '.', '@']);
+}
+
+#[test]
+fn a_card_route_too_wide_for_its_column_cuts_the_sender_and_keeps_the_recipient() {
+    let mut snap = proto_s1();
+    let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-7c2");
+    let ask = ask.unwrap();
+    ask.from_peer = "amesh-claude-code-22".into();
+    ask.to_peer = "amesh-codex-2".into();
+    let mut app = app_with(snap);
+    app.sel = Some("upg".into());
+    let line = line_with(&mut app, 100, 0, "7c2 ");
+    assert!(
+        line.contains("7c2 amesh-claude-code-…─▸─amesh-codex-2 "),
+        "{line}"
+    );
+    let mut snap = proto_s1();
+    let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-7c2");
+    let ask = ask.unwrap();
+    ask.from_peer = "amesh-claude-code-2".into();
+    ask.to_peer = "amesh-pi-2".into();
+    let mut app = app_with(snap);
+    app.sel = Some("upg".into());
+    let line = line_with(&mut app, 46, 0, "7c2 ");
+    assert!(
+        line.contains("7c2 amesh-claude-cod…─▸─amesh-pi-2 "),
+        "a one-column card too: {line}"
+    );
+    let mut snap = proto_s1();
+    let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-7c2");
+    ask.unwrap().to_peer = "amesh-recipient-name-123456".into();
+    let mut app = app_with(snap);
+    app.sel = Some("upg".into());
+    let line = line_with(&mut app, 46, 0, "7c2 ");
+    assert!(
+        line.contains("7c2 ─▸─amesh-recipient-name-123456") && !line.contains('…'),
+        "no room left for the sender: it goes, not the end of the recipient: {line}"
+    );
+}
+
+#[test]
+fn a_stale_snapshot_moves_nothing_it_reports_as_just_now() {
+    let mut snap = proto_s1();
+    let now = snap.captured_at;
+    let find = |snap: &Snapshot, cid: &str| {
+        let at = snap.asks.iter().position(|a| a.correlation_id == cid);
+        at.unwrap()
+    };
+    let (acked, sent) = (find(&snap, "ask-5b1"), find(&snap, "ask-7c2"));
+    snap.asks[acked].closed_at = Some(now);
+    snap.asks[sent].opened_at = Some(now);
+    let mut app = app_with(snap);
+    app.last_ok = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
+    app.sel = Some("func".into());
+    assert!(
+        line_with(&mut app, 100, 2, "5b1 ").contains("5b1 cc>codex "),
+        "the hub stopped answering: no walk back"
+    );
+    let lines = screen_at(&mut app, 46, 0);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.trim_end() == "    ┌───────┬───────┼───────┬───────┐"),
+        "and no dot into the job it sent"
+    );
+}
+
+#[test]
+fn nothing_is_just_now_after_the_capture_or_from_a_hub_without_one() {
+    for captured_at in [0, at(13, 42)] {
+        let mut snap = proto_s1();
+        snap.captured_at = captured_at;
+        let later = if captured_at == 0 {
+            at(13, 43)
+        } else {
+            captured_at + 1
+        };
+        for ask in snap.asks.iter_mut() {
+            match ask.correlation_id.as_str() {
+                "ask-5b1" => ask.closed_at = Some(later),
+                "ask-7c2" => ask.opened_at = Some(later),
+                _ => {}
+            }
+        }
+        let mut app = app_with(snap);
+        app.sel = Some("func".into());
+        assert!(
+            line_with(&mut app, 100, 2, "5b1 ").contains("5b1 cc>codex "),
+            "captured at {captured_at}: an ack stamped after it is not just now"
+        );
+        assert!(
+            !screen_at(&mut app, 46, 2).iter().any(|l| l.contains('◉')),
+            "captured at {captured_at}: nor a job sent after it"
+        );
+    }
 }

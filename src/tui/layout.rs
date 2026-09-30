@@ -1,4 +1,4 @@
-use super::model::{Chain, Job, Peer, Snapshot};
+use super::model::{Ask, Chain, Job, Peer, Snapshot};
 use std::collections::{BTreeMap, HashMap};
 use unicode_width::UnicodeWidthChar;
 
@@ -19,6 +19,10 @@ pub(crate) enum Tone {
     Wait,
     /* what a worker is doing now */
     Soft,
+    /* an ask's arrow: Flow steps toward the recipient while it works, Back toward the sender
+    once the ack is in */
+    Flow,
+    Back,
 }
 
 /* a wide character fills its cell and leaves the next one as a spacer the renderer skips */
@@ -343,6 +347,17 @@ pub(crate) fn events_tag(snap: &Snapshot) -> Option<String> {
         let n = snap.event_count;
         format!("{n} event{}", if n == 1 { "" } else { "s" })
     })
+}
+
+/* the mark between an ask's sender and recipient: an open ask's steps toward the recipient
+while it works and rests while it does not; one the hub closed within the second before a
+fresh snapshot steps back to the sender, and an older one reads > */
+pub(crate) fn arrow(snap: &Snapshot, ask: &Ask, working: bool) -> (String, Tone) {
+    match ask.open {
+        true => ("─▸─".into(), if working { Tone::Flow } else { Tone::Dim }),
+        false if snap.just_now(ask.closed_at) => ("─◂─".into(), Tone::Back),
+        false => (">".into(), Tone::Plain),
+    }
 }
 
 pub(crate) fn glyph(state: &str) -> (char, Tone) {
@@ -1256,19 +1271,22 @@ pub(crate) fn card(
         } else {
             &ask.to_peer
         };
-        let route = if ask.from_peer.is_empty() {
-            to.clone()
-        } else {
-            format!("{}>{to}", ask.from_peer)
-        };
+        let mut route = vec![(format!("{} ", short(&ask.correlation_id)), Tone::Plain)];
+        if !ask.from_peer.is_empty() {
+            let mark = arrow(snap, ask, snap.spinning(job));
+            /* the sender gives way first, so the recipient stays whole */
+            let room = colw.saturating_sub(KEY + width(&route[0].0) + width(&mark.0) + width(to));
+            if room > 0 {
+                route.push((fit(&ask.from_peer, room), Tone::Plain));
+            }
+            route.push(mark);
+        }
+        route.push((to.clone(), Tone::Plain));
         packed(
             &mut left,
             "ask",
             vec![
-                vec![(
-                    format!("{} {route}", short(&ask.correlation_id)),
-                    Tone::Plain,
-                )],
+                route,
                 vec![(format!("· {}", clock(ask.opened_at)), Tone::Plain)],
                 vec![("· ".into(), Tone::Plain), (tail, tone)],
             ],
