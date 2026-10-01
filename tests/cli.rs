@@ -1236,6 +1236,20 @@ impl Drop for Sandbox {
 
 struct KillChild(Option<Child>);
 
+/* a socket file that refuses every stream connect, even through an fd a spawned child inherited */
+fn dead_inbox(path: &Path) {
+    drop(std::os::unix::net::UnixDatagram::bind(path).unwrap());
+}
+
+/* renamed into place, so a running drainer never finds its inbox path missing and yields */
+fn live_inbox(path: &Path) -> std::os::unix::net::UnixListener {
+    let fresh = path.with_extension("new");
+    let listener = std::os::unix::net::UnixListener::bind(&fresh).unwrap();
+    fs::rename(&fresh, path).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    listener
+}
+
 /* what a test made outside its sandbox, removed even when the test ends in a panic */
 struct Remove(Vec<PathBuf>);
 
@@ -3078,6 +3092,7 @@ fn hook_ws_injects_notify_into_claude_socket() {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 std::io::BufReader::new(stream)
                     .read_line(&mut line)
                     .unwrap();
@@ -3113,7 +3128,6 @@ fn hook_ws_injects_notify_into_claude_socket() {
 #[test]
 fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     use std::io::BufRead;
-    use std::os::unix::net::UnixListener;
     let mut sandbox = Sandbox::new();
     let worker = sandbox.id("worker");
     sandbox.start();
@@ -3136,7 +3150,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
     let _ = fs::remove_file(&sock);
-    drop(UnixListener::bind(&sock).unwrap());
+    dead_inbox(&sock);
     let mut child = sandbox
         .command()
         .args(["hook", "ws", "--peer-id", worker])
@@ -3178,9 +3192,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
         None,
     );
     let cid = opened["correlation_id"].as_str().unwrap().to_string();
-    let _ = fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).unwrap();
-    listener.set_nonblocking(true).unwrap();
+    let listener = live_inbox(&sock);
     assert_eq!(
         sandbox.json(
             &["peer", "notify", worker, "c-fail-c", "--from-peer", "boss"],
@@ -3193,6 +3205,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     while contents.len() < 3 && Instant::now() < accept_deadline {
         match listener.accept() {
             Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 let mut line = String::new();
                 std::io::BufReader::new(stream)
                     .read_line(&mut line)
@@ -3323,6 +3336,7 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
     while Instant::now() < accept_deadline && !saw_notify {
         match listener.accept() {
             Ok((stream, _)) => {
+                stream.set_nonblocking(false).unwrap();
                 let mut line = String::new();
                 std::io::BufReader::new(stream)
                     .read_line(&mut line)
@@ -3577,7 +3591,7 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
     let worker = sandbox.id("worker");
     let socket_path = PathBuf::from(format!("/tmp/ar-{}.sock", uuid::Uuid::new_v4().simple()));
     if inbox == "refused" {
-        drop(std::os::unix::net::UnixListener::bind(&socket_path).unwrap());
+        dead_inbox(&socket_path);
     }
     let frame = if kind == "invalid" {
         "{invalid".to_string()
@@ -3839,7 +3853,7 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
         });
         let mut sink_tx = Some(sink_tx);
         if queued_first {
-            drop(tokio::net::UnixListener::bind(&path).unwrap());
+            dead_inbox(&path);
         } else {
             sink_tx
                 .take()
@@ -4697,7 +4711,7 @@ fn claude_across_a_reconnect(
         &uuid::Uuid::new_v4().simple().to_string()[..8]
     ));
     /* the messaging socket is there but nobody listens, so what reaches A stays queued */
-    drop(std::os::unix::net::UnixListener::bind(&inbox).unwrap());
+    dead_inbox(&inbox);
     let (_hub, release, progress) = fake_hub(&sandbox, claude_x, json!([]), first, before, after);
     let _drainer = KillChild(Some(
         sandbox
@@ -4717,11 +4731,7 @@ fn claude_across_a_reconnect(
     progress
         .recv_timeout(Duration::from_secs(10))
         .expect("the drainer reconnects");
-    /* renamed into place, so the drainer never finds its inbox gone and yields */
-    let fresh = inbox.with_extension("new");
-    let live = std::os::unix::net::UnixListener::bind(&fresh).unwrap();
-    fs::rename(&fresh, &inbox).unwrap();
-    live.set_nonblocking(true).unwrap();
+    let live = live_inbox(&inbox);
     let collect = || {
         progress
             .recv_timeout(Duration::from_secs(10))
