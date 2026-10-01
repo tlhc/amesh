@@ -1543,6 +1543,141 @@ async fn job_and_schedule() {
     assert_eq!(st, StatusCode::OK);
 }
 
+async fn schedule_worker_app() -> (Router, TempState) {
+    let (app, state) = test_app();
+    let _ = json_req(
+        app.clone(),
+        "POST",
+        "/peers",
+        json!({"name": "worker", "backend": "pi"}),
+    )
+    .await;
+    (app, state)
+}
+
+#[tokio::test]
+async fn http_rejects_every_seconds_zero() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = json_req(
+        app,
+        "POST",
+        "/schedules",
+        json!({"to_peer": "worker", "text": "wake", "in_seconds": 60, "every_seconds": 0}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mcp_rejects_negative_fire_at() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = mcp_tool(
+        app,
+        "amesh_schedule_create",
+        json!({"to_peer": "worker", "text": "wake", "fire_at": -1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mcp_rejects_negative_in_seconds() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = mcp_tool(
+        app,
+        "amesh_schedule_create",
+        json!({"to_peer": "worker", "text": "wake", "in_seconds": -1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn mcp_rejects_negative_every_seconds() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = mcp_tool(
+        app,
+        "amesh_schedule_create",
+        json!({"to_peer": "worker", "text": "wake", "in_seconds": 60, "every_seconds": -5}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn schedule_range_rejects_fire_at() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = json_req(
+        app,
+        "POST",
+        "/schedules",
+        json!({"to_peer": "worker", "text": "wake", "fire_at": (i64::MAX as u64) + 1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn schedule_range_rejects_in_seconds() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = json_req(
+        app,
+        "POST",
+        "/schedules",
+        json!({"to_peer": "worker", "text": "wake", "in_seconds": u64::MAX}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn schedule_range_rejects_every_seconds() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = json_req(
+        app,
+        "POST",
+        "/schedules",
+        json!({"to_peer": "worker", "text": "wake", "every_seconds": (i64::MAX as u64) + 1}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn schedule_range_recurring_next_fire_round_trips() {
+    let (app, path) = schedule_worker_app().await;
+    let (_, body) = json_req(
+        app,
+        "POST",
+        "/schedules",
+        json!({"to_peer": "worker", "text": "wake", "fire_at": 0,
+               "every_seconds": i64::MAX as u64}),
+    )
+    .await;
+    let id = body["schedule_id"].as_str().unwrap();
+    let app = App {
+        inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    tick_schedules(&app).await;
+    drop(app);
+    let hub = Hub::open(&path).unwrap();
+    assert_eq!(hub.schedules[id].fire_at, i64::MAX as u64);
+}
+
+#[tokio::test]
+async fn mcp_rejects_non_integer_fire_at() {
+    let (app, _state) = schedule_worker_app().await;
+    let (st, _) = mcp_tool(
+        app,
+        "amesh_schedule_create",
+        json!({"to_peer": "worker", "text": "wake", "fire_at": 1.5}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+}
+
 #[tokio::test]
 async fn ws_unicast_not_broadcast() {
     use futures_util::{SinkExt, StreamExt};
@@ -6626,6 +6761,71 @@ fn a2_negative_stamp_reads_as_zero() {
     drop(hub);
     let hub = Hub::open_at(&path, 200).unwrap();
     assert_eq!(hub.inbox.stuck("w", 200), Some((1, 0)));
+}
+
+fn sched_row(id: &str, fire_at: u64, every_seconds: Option<u64>) -> Schedule {
+    Schedule {
+        schedule_id: id.into(),
+        from_peer: "boss".into(),
+        to_peer: "w".into(),
+        text: "wake".into(),
+        kind: "notify".into(),
+        fire_at,
+        every_seconds,
+        circle: "default".into(),
+    }
+}
+
+#[test]
+fn negative_schedule_fire_at_reads_as_zero() {
+    let path = temp_state("sched-neg-fire");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    hub.schedules
+        .insert("s-past".into(), sched_row("s-past", 50, None));
+    persist(&mut hub).unwrap();
+    hub.db
+        .execute(
+            "UPDATE schedules SET fire_at = -1 WHERE schedule_id = 's-past'",
+            [],
+        )
+        .unwrap();
+    drop(hub);
+    let hub = Hub::open_at(&path, 200).unwrap();
+    assert_eq!(hub.schedules["s-past"].fire_at, 0);
+}
+
+#[test]
+fn negative_schedule_every_seconds_drops_the_row() {
+    let path = temp_state("sched-neg-every");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    hub.schedules
+        .insert("s-loop".into(), sched_row("s-loop", 100, Some(60)));
+    persist(&mut hub).unwrap();
+    hub.db
+        .execute(
+            "UPDATE schedules SET every_seconds = -5 WHERE schedule_id = 's-loop'",
+            [],
+        )
+        .unwrap();
+    drop(hub);
+    let hub = Hub::open_at(&path, 200).unwrap();
+    assert!(
+        !hub.schedules.contains_key("s-loop"),
+        "negative every_seconds must drop the row, got {:?}",
+        hub.schedules.get("s-loop").map(|s| s.every_seconds)
+    );
+}
+
+#[test]
+fn zero_schedule_every_seconds_still_loads() {
+    let path = temp_state("sched-zero-every");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    hub.schedules
+        .insert("s-zero".into(), sched_row("s-zero", 100, Some(0)));
+    persist(&mut hub).unwrap();
+    drop(hub);
+    let hub = Hub::open_at(&path, 200).unwrap();
+    assert_eq!(hub.schedules["s-zero"].every_seconds, Some(0));
 }
 
 #[test]

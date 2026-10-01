@@ -677,21 +677,28 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
-            Ok(Schedule {
-                schedule_id: r.get(0)?,
+            let schedule_id: String = r.get(0)?;
+            let every_seconds = r.get::<_, Option<i64>>(6)?;
+            if every_seconds.is_some_and(|v| v < 0) {
+                eprintln!("amesh: dropping schedule {schedule_id:?}: negative every_seconds");
+                return Ok(None);
+            }
+            Ok(Some(Schedule {
+                schedule_id,
                 from_peer: r.get(1)?,
                 to_peer: r.get(2)?,
                 text: r.get(3)?,
                 kind: r.get(4)?,
-                fire_at: r.get::<_, i64>(5)? as u64,
-                every_seconds: r.get::<_, Option<i64>>(6)?.map(|v| v as u64),
+                fire_at: r.get::<_, i64>(5)?.max(0) as u64,
+                every_seconds: every_seconds.map(|v| v as u64),
                 circle: r.get(7).unwrap_or_default(),
-            })
+            }))
         })
         .map_err(|e| e.to_string())?;
     for row in rows {
-        let s = row.map_err(|e| e.to_string())?;
-        disk.schedules.insert(s.schedule_id.clone(), s);
+        if let Some(s) = row.map_err(|e| e.to_string())? {
+            disk.schedules.insert(s.schedule_id.clone(), s);
+        }
     }
     let mut stmt = db
         .prepare("SELECT peer_id,seq,payload,queued_at FROM inbox ORDER BY peer_id, seq")
@@ -3618,6 +3625,21 @@ async fn create_schedule(
             Json(json!({"error": "kind must be notify or ask"})),
         ));
     }
+    if req.every_seconds == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "every_seconds must be positive"})),
+        ));
+    }
+    if req
+        .every_seconds
+        .is_some_and(|every| every > i64::MAX as u64)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "every_seconds must fit in a signed 64-bit integer"})),
+        ));
+    }
     let mut hub = app.inner.lock().await;
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
     let Some(target) = resolve(&hub, &req.to_peer) else {
@@ -3647,7 +3669,14 @@ async fn create_schedule(
     };
     let fire_at = req
         .fire_at
-        .unwrap_or_else(|| now_unix() + req.in_seconds.unwrap_or(0));
+        .or_else(|| now_unix().checked_add(req.in_seconds.unwrap_or(0)))
+        .filter(|at| *at <= i64::MAX as u64)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "fire_at must fit in a signed 64-bit integer"})),
+            )
+        })?;
     let schedule_id = format!("sched-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let sched = Schedule {
         schedule_id: schedule_id.clone(),
@@ -4333,7 +4362,7 @@ async fn tick_schedules(app: &App) {
         };
         if let Some(every) = sched.every_seconds {
             if let Some(row) = hub.schedules.get_mut(&sched.schedule_id) {
-                row.fire_at = now + every;
+                row.fire_at = now.saturating_add(every).min(i64::MAX as u64);
             }
         } else {
             hub.schedules.remove(&sched.schedule_id);
@@ -4398,6 +4427,18 @@ async fn mcp_job_scope(app: &App, args: &Value, id: &str) -> Result<(), (StatusC
         }
     }
     Ok(())
+}
+
+fn mcp_u64(args: &Value, key: &str) -> Result<Option<u64>, (StatusCode, Json<Value>)> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_u64().map(Some).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{key} must be an unsigned integer")})),
+            )
+        }),
+    }
 }
 
 fn mcp_scope(hub: &Hub, args: &Value) -> Result<Option<String>, (StatusCode, Json<Value>)> {
@@ -4956,9 +4997,9 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .and_then(Value::as_str)
                         .map(str::to_string),
                     kind: args.get("kind").and_then(Value::as_str).map(str::to_string),
-                    in_seconds: args.get("in_seconds").and_then(Value::as_u64),
-                    fire_at: args.get("fire_at").and_then(Value::as_u64),
-                    every_seconds: args.get("every_seconds").and_then(Value::as_u64),
+                    in_seconds: mcp_u64(&args, "in_seconds")?,
+                    fire_at: mcp_u64(&args, "fire_at")?,
+                    every_seconds: mcp_u64(&args, "every_seconds")?,
                     cross_circle: args
                         .get("cross_circle")
                         .and_then(Value::as_bool)
