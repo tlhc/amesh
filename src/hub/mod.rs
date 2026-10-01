@@ -4139,19 +4139,26 @@ fn advance_jobs(hub: &mut Hub) {
         let peer = job.assigned_peer.as_deref().unwrap_or_default();
         let stall = if job.state == "running" {
             format!("{peer} has not acked")
-        } else if let crate::wire::DispatchState::Blocked {
-            dependency, reason, ..
-        } = derive::assess_dispatch(hub, job).state
-        {
-            let state = match reason {
-                crate::wire::BlockReason::Failed => "failed",
-                crate::wire::BlockReason::Cancelled => "cancelled",
-                crate::wire::BlockReason::Deleted => "deleted",
-                crate::wire::BlockReason::Unknown => "unknown",
-            };
-            format!("blocked by {dependency} ({state})")
         } else {
-            format!("{peer} cannot be reached")
+            match derive::assess_dispatch(hub, job).state {
+                crate::wire::DispatchState::Blocked {
+                    dependency, reason, ..
+                } => {
+                    let state = match reason {
+                        crate::wire::BlockReason::Failed => "failed",
+                        crate::wire::BlockReason::Cancelled => "cancelled",
+                        crate::wire::BlockReason::Deleted => "deleted",
+                        crate::wire::BlockReason::Unknown => "unknown",
+                    };
+                    format!("blocked by {dependency} ({state})")
+                }
+                crate::wire::DispatchState::OtherCircle { peer_id } => {
+                    format!("{peer_id} is in another circle")
+                }
+                crate::wire::DispatchState::NoPeer { name } => format!("no peer named {name}"),
+                crate::wire::DispatchState::Unassigned => "no assignee".into(),
+                _ => format!("{peer} cannot be reached"),
+            }
         };
         /* the reminder follows the creator's recorded peer id, as its ask's ack does */
         if hub.peers.contains_key(&job.from_peer) {

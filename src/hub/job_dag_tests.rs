@@ -692,7 +692,7 @@ async fn job_nudges_orchestrator() {
     assert!(
         notes
             .iter()
-            .any(|m| m.contains(&c) && m.contains("w3 cannot be reached")),
+            .any(|m| m.contains(&c) && m.contains("no peer named w3")),
         "{notes:?}"
     );
     let next = f.row(&a).await.nudge_at.unwrap();

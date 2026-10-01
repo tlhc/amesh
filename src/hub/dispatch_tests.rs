@@ -769,3 +769,35 @@ fn scheduler_reminder_deleted_first() {
             .as_str()
             .is_some_and(|message| message.contains("blocked by first (deleted)"))));
 }
+
+#[test]
+fn scheduler_reminder_other_circle() {
+    let (mut hub, _path, mut job) = fixture();
+    hub.peers.get_mut("worker").unwrap().circle = "other".into();
+    job.nudge_at = Some(1);
+    hub.jobs.insert("j".into(), job);
+    advance_jobs(&mut hub);
+    assert!(hub
+        .inbox
+        .take("creator")
+        .iter()
+        .any(|record| record.event()["message"]
+            .as_str()
+            .is_some_and(|message| message == "job j dispatch is queued: worker is in another circle; amesh_job_update can retry, reassign or cancel")));
+}
+
+#[test]
+fn scheduler_reminder_unassigned() {
+    let (mut hub, _path, mut job) = fixture();
+    job.assigned_peer = None;
+    job.nudge_at = Some(1);
+    hub.jobs.insert("j".into(), job);
+    advance_jobs(&mut hub);
+    assert!(hub
+        .inbox
+        .take("creator")
+        .iter()
+        .any(|record| record.event()["message"]
+            .as_str()
+            .is_some_and(|message| message == "job j dispatch is queued: no assignee; amesh_job_update can retry, reassign or cancel")));
+}
