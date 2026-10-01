@@ -1,0 +1,529 @@
+{
+ "_scenario": "Queued jobs and their dispatch_state. Blocked lists every unfinished dependency in depends_on order and names the first failed, cancelled or deleted one. Ready needs no online peer: the scheduler does not check it. View: GET /snapshot?circle=c.",
+ "schema_version": 2,
+ "captured_at": 1000,
+ "hub_epoch": "fixture",
+ "event_count": 0,
+ "capabilities": {
+  "job_created_at": true,
+  "ask_opened_at": true,
+  "ask_closed_by": true,
+  "peer_activity": true,
+  "roster": true,
+  "event_count": true,
+  "ask_list": true,
+  "delivery": true
+ },
+ "jobs": [
+  {
+   "job_id": "d-cancelled",
+   "title": "job d-cancelled",
+   "title_len": 15,
+   "state": "cancelled",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": 900,
+   "prompt": "do d-cancelled",
+   "prompt_len": 14,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": null,
+   "actions": []
+  },
+  {
+   "job_id": "d-done",
+   "title": "job d-done",
+   "title_len": 10,
+   "state": "done",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": 900,
+   "prompt": "do d-done",
+   "prompt_len": 9,
+   "result": "ok",
+   "result_len": 2,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": null,
+   "actions": []
+  },
+  {
+   "job_id": "d-failed",
+   "title": "job d-failed",
+   "title_len": 12,
+   "state": "failed",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": 900,
+   "prompt": "do d-failed",
+   "prompt_len": 11,
+   "result": "boom",
+   "result_len": 4,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": null,
+   "actions": [
+    {
+     "kind": "retry",
+     "needs_assignee": false
+    }
+   ]
+  },
+  {
+   "job_id": "d-queued",
+   "title": "job d-queued",
+   "title_len": 12,
+   "state": "queued",
+   "assigned_peer": null,
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": false,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do d-queued",
+   "prompt_len": 11,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": null,
+   "assignee_id": null,
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "unassigned"
+   },
+   "actions": [
+    {
+     "kind": "send"
+    }
+   ],
+   "_note": "dispatch off, no assignee"
+  },
+  {
+   "job_id": "q-blocked",
+   "title": "job q-blocked",
+   "title_len": 13,
+   "state": "queued",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [
+    "d-queued",
+    "d-cancelled",
+    "d-failed",
+    "d-deleted"
+   ],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do q-blocked",
+   "prompt_len": 12,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "blocked",
+    "dependencies": [
+     "d-queued",
+     "d-cancelled",
+     "d-failed",
+     "d-deleted"
+    ],
+    "dependency": "d-cancelled",
+    "reason": "cancelled"
+   },
+   "actions": [],
+   "_note": "first blocker in depends_on order is d-cancelled (intentional change 6)"
+  },
+  {
+   "job_id": "q-held",
+   "title": "job q-held",
+   "title_len": 10,
+   "state": "queued",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": false,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do q-held",
+   "prompt_len": 9,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "held"
+   },
+   "actions": [
+    {
+     "kind": "send"
+    }
+   ]
+  },
+  {
+   "job_id": "q-no-peer",
+   "title": "job q-no-peer",
+   "title_len": 13,
+   "state": "queued",
+   "assigned_peer": "ghost",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do q-no-peer",
+   "prompt_len": 12,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": null,
+   "assignee_id": null,
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "no_peer",
+    "name": "ghost"
+   },
+   "actions": []
+  },
+  {
+   "job_id": "q-other-circle",
+   "title": "job q-other-circle",
+   "title_len": 18,
+   "state": "queued",
+   "assigned_peer": "far",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do q-other-circle",
+   "prompt_len": 17,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "far",
+   "assignee_id": "far",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "other_circle",
+    "peer_id": "far"
+   },
+   "actions": []
+  },
+  {
+   "job_id": "q-ready",
+   "title": "job q-ready",
+   "title_len": 11,
+   "state": "queued",
+   "assigned_peer": "w-off",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do q-ready",
+   "prompt_len": 10,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w-off",
+   "assignee_id": "w-off",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "ready",
+    "peer_id": "w-off"
+   },
+   "actions": [],
+   "_note": "valid assignee that is offline is still ready"
+  },
+  {
+   "job_id": "q-unassigned-on",
+   "title": "job q-unassigned-on",
+   "title_len": 19,
+   "state": "queued",
+   "assigned_peer": null,
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do q-unassigned-on",
+   "prompt_len": 18,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": null,
+   "assignee_id": null,
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "unassigned"
+   },
+   "actions": [],
+   "_note": "dispatch on but no assignee (A2)"
+  },
+  {
+   "job_id": "q-waiting",
+   "title": "job q-waiting",
+   "title_len": 13,
+   "state": "queued",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [
+    "d-done",
+    "d-queued"
+   ],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do q-waiting",
+   "prompt_len": 12,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "waiting",
+    "dependencies": [
+     "d-queued"
+    ]
+   },
+   "actions": []
+  }
+ ],
+ "asks": [],
+ "peers": [
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "far",
+   "name": "far",
+   "backend": "codex",
+   "circle": "d",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w-off",
+   "name": "w-off",
+   "backend": "codex",
+   "circle": "c",
+   "status": "offline",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": false,
+   "acks": false,
+   "queued": 0,
+   "liveness": {
+    "kind": "offline"
+   },
+   "delivery": {
+    "condition": "offline",
+    "stuck": null
+   }
+  }
+ ],
+ "roster": [
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w-off",
+   "name": "w-off",
+   "backend": "codex",
+   "circle": "c",
+   "status": "offline",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": false,
+   "acks": false,
+   "queued": 0,
+   "liveness": {
+    "kind": "offline"
+   },
+   "delivery": {
+    "condition": "offline",
+    "stuck": null
+   }
+  }
+ ],
+ "missing": {
+  "asks": [],
+  "peers": [
+   "ghost"
+  ],
+  "jobs": [
+   "d-deleted"
+  ]
+ },
+ "detail": null,
+ "ask_detail": null
+}

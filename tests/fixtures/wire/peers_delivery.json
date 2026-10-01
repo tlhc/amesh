@@ -1,0 +1,242 @@
+{
+ "_scenario": "Peer liveness and delivery (A13, A14). stuck = the oldest retained record waited >= 2 s; count is every retained record. Name 'x' resolves to the peer whose id is 'x' (resolve(): exact id first). View: GET /snapshot?circle=c.",
+ "schema_version": 2,
+ "captured_at": 1000,
+ "hub_epoch": "fixture",
+ "event_count": 0,
+ "capabilities": {
+  "job_created_at": true,
+  "ask_opened_at": true,
+  "ask_closed_by": true,
+  "peer_activity": true,
+  "roster": true,
+  "event_count": true,
+  "ask_list": true,
+  "delivery": true
+ },
+ "jobs": [],
+ "asks": [
+  {
+   "correlation_id": "a-from-x",
+   "from_peer": "x",
+   "to_peer": "s-push",
+   "to_peer_id": "s-push",
+   "open": true,
+   "failed": false,
+   "opened_at": 999,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-from-x",
+   "text_len": 17,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "x",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "pending",
+     "since": 999
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": true,
+   "_note": "sender name 'x' is peer x by id, not q whose name is 'x'; opened 1 s before capture: just now"
+  }
+ ],
+ "peers": [
+  {
+   "peer_id": "s-push",
+   "name": "s-push",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "push socket, empty queue"
+  },
+  {
+   "peer_id": "x",
+   "name": "alpha",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  }
+ ],
+ "roster": [
+  {
+   "peer_id": "q",
+   "name": "x",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "its name equals another peer's id"
+  },
+  {
+   "peer_id": "s-fresh",
+   "name": "s-fresh",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "work",
+    "since": 990,
+    "observed_at": 990,
+    "source": "x-work"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 1,
+   "liveness": {
+    "kind": "work",
+    "since": 990
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "one record queued at 999, younger than 2 s: not stuck"
+  },
+  {
+   "peer_id": "s-nopush",
+   "name": "s-nopush",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 950,
+    "observed_at": 950,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": false,
+   "acks": false,
+   "queued": 3,
+   "liveness": {
+    "kind": "idle",
+    "since": 950
+   },
+   "delivery": {
+    "condition": "no_push",
+    "stuck": {
+     "count": 3,
+     "since": 990
+    }
+   },
+   "_note": "no push, oldest of 3 records queued at 990: stuck"
+  },
+  {
+   "peer_id": "s-off",
+   "name": "s-off",
+   "backend": "codex",
+   "circle": "c",
+   "status": "offline",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": false,
+   "acks": false,
+   "queued": 2,
+   "liveness": {
+    "kind": "offline"
+   },
+   "delivery": {
+    "condition": "offline",
+    "stuck": {
+     "count": 2,
+     "since": 900
+    }
+   },
+   "_note": "offline with an old backlog: stuck is a fact, the view hides the row"
+  },
+  {
+   "peer_id": "s-push",
+   "name": "s-push",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "push socket, empty queue"
+  },
+  {
+   "peer_id": "x",
+   "name": "alpha",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  }
+ ],
+ "missing": {
+  "asks": [],
+  "peers": [],
+  "jobs": []
+ },
+ "detail": null,
+ "ask_detail": null
+}

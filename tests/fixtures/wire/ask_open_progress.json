@@ -1,0 +1,748 @@
+{
+ "_scenario": "Open asks covering every progress rule (spec-v4 section 3), captured_at 1000. Recipients are fixed ids; p-left is gone while another peer took the name 'reused'. View: GET /snapshot?circle=c.",
+ "schema_version": 2,
+ "captured_at": 1000,
+ "hub_epoch": "fixture",
+ "event_count": 0,
+ "capabilities": {
+  "job_created_at": true,
+  "ask_opened_at": true,
+  "ask_closed_by": true,
+  "peer_activity": true,
+  "roster": true,
+  "event_count": true,
+  "ask_list": true,
+  "delivery": true
+ },
+ "jobs": [],
+ "asks": [
+  {
+   "correlation_id": "a-empty-recipient",
+   "from_peer": "boss",
+   "to_peer": "legacy-name",
+   "to_peer_id": "",
+   "open": true,
+   "failed": false,
+   "opened_at": 905,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-empty-recipient",
+   "text_len": 26,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "gone"
+    }
+   },
+   "actions": [
+    {
+     "kind": "close_left"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "legacy row with an empty recipient id: gone (A17), no assignee fallback"
+  },
+  {
+   "correlation_id": "a-gone",
+   "from_peer": "boss",
+   "to_peer": "reused",
+   "to_peer_id": "p-left",
+   "open": true,
+   "failed": false,
+   "opened_at": 910,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-gone",
+   "text_len": 15,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "gone"
+    }
+   },
+   "actions": [
+    {
+     "kind": "close_left"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "recipient id p-left is gone; p-new holds the name 'reused' now and is not the recipient"
+  },
+  {
+   "correlation_id": "a-grace",
+   "from_peer": "boss",
+   "to_peer": "p-idle-early",
+   "to_peer_id": "p-idle-early",
+   "open": true,
+   "failed": false,
+   "opened_at": 991,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-grace",
+   "text_len": 16,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "pending",
+     "since": 991
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "idle since 980 <= opened 991, age 9 < 10: pending"
+  },
+  {
+   "correlation_id": "a-no-activity",
+   "from_peer": "boss",
+   "to_peer": "p-none",
+   "to_peer_id": "p-none",
+   "open": true,
+   "failed": false,
+   "opened_at": 920,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-no-activity",
+   "text_len": 22,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "pending",
+     "since": 920
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "online recipient that never reported activity: pending"
+  },
+  {
+   "correlation_id": "a-not-picked",
+   "from_peer": "boss",
+   "to_peer": "p-idle-early",
+   "to_peer_id": "p-idle-early",
+   "open": true,
+   "failed": false,
+   "opened_at": 990,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-not-picked",
+   "text_len": 21,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "idle",
+     "since": 990,
+     "why": "not_picked_up"
+    }
+   },
+   "actions": [
+    {
+     "kind": "nudge",
+     "to": "p-idle-early"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "idle since 980 < opened 990, age 10: idle not_picked_up, since opened"
+  },
+  {
+   "correlation_id": "a-offline",
+   "from_peer": "boss",
+   "to_peer": "p-off",
+   "to_peer_id": "p-off",
+   "open": true,
+   "failed": false,
+   "opened_at": 930,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-offline",
+   "text_len": 18,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "offline"
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "recipient offline with a remembered wait: offline beats wait"
+  },
+  {
+   "correlation_id": "a-same-second",
+   "from_peer": "boss",
+   "to_peer": "p-idle-eq",
+   "to_peer_id": "p-idle-eq",
+   "open": true,
+   "failed": false,
+   "opened_at": 985,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-same-second",
+   "text_len": 22,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "idle",
+     "since": 985,
+     "why": "ask_still_open"
+    }
+   },
+   "actions": [
+    {
+     "kind": "nudge",
+     "to": "p-idle-eq"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "idle since 985 == opened 985, age 15: idle ask_still_open"
+  },
+  {
+   "correlation_id": "a-turn-ended",
+   "from_peer": "boss",
+   "to_peer": "p-idle-late",
+   "to_peer_id": "p-idle-late",
+   "open": true,
+   "failed": false,
+   "opened_at": 960,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-turn-ended",
+   "text_len": 21,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "idle",
+     "since": 995,
+     "why": "turn_ended"
+    }
+   },
+   "actions": [
+    {
+     "kind": "nudge",
+     "to": "p-idle-late"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "idle since 995 > opened 960: idle turn_ended, since activity.since"
+  },
+  {
+   "correlation_id": "a-wait",
+   "from_peer": "boss",
+   "to_peer": "p-wait",
+   "to_peer_id": "p-wait",
+   "open": true,
+   "failed": false,
+   "opened_at": 950,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-wait",
+   "text_len": 15,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "wait",
+     "since": 990,
+     "reason": "Bash"
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "recipient at a permission prompt since 990"
+  },
+  {
+   "correlation_id": "a-work",
+   "from_peer": "boss",
+   "to_peer": "p-work",
+   "to_peer_id": "p-work",
+   "open": true,
+   "failed": false,
+   "opened_at": 940,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-work",
+   "text_len": 15,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "work",
+     "since": 970
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "recipient in a turn since 970"
+  }
+ ],
+ "peers": [
+  {
+   "peer_id": "p-idle-early",
+   "name": "p-idle-early",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 980,
+    "observed_at": 980,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 980
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-idle-eq",
+   "name": "p-idle-eq",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 985,
+    "observed_at": 985,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 985
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-idle-late",
+   "name": "p-idle-late",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 995,
+    "observed_at": 995,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 995
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-none",
+   "name": "p-none",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-off",
+   "name": "p-off",
+   "backend": "codex",
+   "circle": "c",
+   "status": "offline",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 900,
+    "observed_at": 900,
+    "source": "claude-permission",
+    "reason": "Bash"
+   },
+   "running": 0,
+   "push": false,
+   "acks": false,
+   "queued": 0,
+   "liveness": {
+    "kind": "offline"
+   },
+   "delivery": {
+    "condition": "offline",
+    "stuck": null
+   },
+   "_note": "offline keeps its last activity; liveness says offline"
+  },
+  {
+   "peer_id": "p-wait",
+   "name": "p-wait",
+   "backend": "claude-code",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 990,
+    "observed_at": 990,
+    "source": "claude-permission",
+    "reason": "Bash"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "wait",
+    "since": 990,
+    "reason": "Bash"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-work",
+   "name": "p-work",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "work",
+    "since": 970,
+    "observed_at": 970,
+    "source": "x-work"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "work",
+    "since": 970
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  }
+ ],
+ "roster": [
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "p-idle-early",
+   "name": "p-idle-early",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 980,
+    "observed_at": 980,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 980
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-idle-eq",
+   "name": "p-idle-eq",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 985,
+    "observed_at": 985,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 985
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-idle-late",
+   "name": "p-idle-late",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 995,
+    "observed_at": 995,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 995
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-new",
+   "name": "reused",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "took the name of the departed recipient; in no lookup, so roster only"
+  },
+  {
+   "peer_id": "p-none",
+   "name": "p-none",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-off",
+   "name": "p-off",
+   "backend": "codex",
+   "circle": "c",
+   "status": "offline",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 900,
+    "observed_at": 900,
+    "source": "claude-permission",
+    "reason": "Bash"
+   },
+   "running": 0,
+   "push": false,
+   "acks": false,
+   "queued": 0,
+   "liveness": {
+    "kind": "offline"
+   },
+   "delivery": {
+    "condition": "offline",
+    "stuck": null
+   },
+   "_note": "offline keeps its last activity; liveness says offline"
+  },
+  {
+   "peer_id": "p-wait",
+   "name": "p-wait",
+   "backend": "claude-code",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 990,
+    "observed_at": 990,
+    "source": "claude-permission",
+    "reason": "Bash"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "wait",
+    "since": 990,
+    "reason": "Bash"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "p-work",
+   "name": "p-work",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "work",
+    "since": 970,
+    "observed_at": 970,
+    "source": "x-work"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "work",
+    "since": 970
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  }
+ ],
+ "missing": {
+  "asks": [],
+  "peers": [
+   "p-left"
+  ],
+  "jobs": []
+ },
+ "detail": null,
+ "ask_detail": null
+}

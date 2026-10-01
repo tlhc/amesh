@@ -2,6 +2,7 @@ mod bridge;
 mod cli;
 mod hub;
 mod tui;
+mod wire;
 
 #[tokio::main]
 async fn main() {

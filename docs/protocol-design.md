@@ -25,7 +25,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `POST /ask-many` checks every recipient and the cross-circle rule before it opens any ask; one that still fails after others went out returns its error with `parent_id` and the `asks` already opened. Batches live in memory: after a restart `GET /ask-many/{id}` is 404, and the asks are waited on by id.
 - The hub closes an open ask, failed and `closed_by: "hub"`, when its recipient's session is replaced under the same name, did not come back within 24 h, or its recipient left with no session to come back for; the asker's copy reads `[failed] <reason>`.
 - `GET /asks/pending?peer_id=` returns open asks for that peer. With an acknowledging WebSocket attached, the inbox is empty here; only WS `recv` retires those copies.
-- `POST /asks/{id}/wait` waits on that id.
+- `POST /asks/{id}/wait` waits on that id. While the ask is open the answer also carries `schema_version`, `captured_at`, its `state`, `from_peer_id`, `actions` and `for_secs` (seconds since the ask opened while it awaits pickup, otherwise since the recipient's current activity began; null when gone, offline or unstamped), all read at the final check; a closed ask's answer is unchanged. MCP `amesh_wait` adds the same fields.
 - `POST /ack` with `correlation_id` closes the ask:
   - omitting `message` still closes
   - a body that names `from_peer` must name the recipient, otherwise 403; MCP always names the caller
@@ -78,7 +78,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 
 - `GET /snapshot` is the read-only view for monitors such as `amesh tui`: the jobs, the asks they point at, the asks no job points at and the peers they name, copied under one lock.
   - `?circle=NAME` filters the jobs, and keeps the asks no job points at whose sender's name or recipient's id is a peer in that circle (every such ask without `circle`); `?detail=JOB_ID` also returns that job's title, prompt and result in full, `?ask=ASK_ID` that ask's `text` and `reply` in full as `ask_detail`.
-  - Text fields, titles included, are cut to 400 characters, with `*_len` giving the full length; references that no longer resolve are listed under `missing`.
+  - Text fields, titles included, are cut to 400 characters, with `*_len` giving the full length; references that no longer resolve are listed under `missing` by kind: `asks`, `peers`, and `jobs` for a dependency the hub no longer has.
   - An ask's `to_peer_id` is matched by peer id only, so a recipient that left is listed under `missing` even when another peer has taken its name since. Assignees and senders are names, resolved the way the hub resolves them next.
   - Each peer carries its `activity` (below), or null while unknown, and `running`: its running jobs in every circle, counted by recipient (a job run by hand, which has no ask, by its assignee), so a filtered view can tell whether a job is its only one.
   - Each peer also says how the hub reaches it: `push` (a live WebSocket now), `acks` (that connection confirms each frame with recv) and `queued` (the records in its inbox it has not taken; for a peer that confirms, everything sent and not yet confirmed). `capabilities.delivery` marks hubs that send them.
@@ -86,6 +86,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - `roster` lists every peer in the requested circle (every peer without `circle`), sorted by `peer_id`, in the shape of `peers`; a monitor judges who is online from it.
   - `event_count` is the number of events `GET /events` would list for the same `circle`.
   - `hub_epoch` changes when the hub restarts; `capabilities` says which optional fields are filled (`roster`, `event_count`, `peer_activity`, ...); `ask_list` marks hubs that send the asks no job points at and each ask's `text`.
+  - `schema_version` 2: every row also carries what the hub decides once for every reader, with one clock reading per snapshot. An ask has `state` (open with its recipient's `progress`, or closed with `outcome` and `failed_effective`), `actions`, `closed_just_now`, `opened_just_now` and `from_peer_id`. A job has `relation` to its ask, `progress` while it runs, `dispatch_state` while it is queued (the scheduler uses the same assessment), `worker`, `assignee_id` and `actions`. A peer has `liveness` and `delivery` (`condition`, and `stuck` once the oldest queued record has waited two seconds). The rules live in `src/hub/derive.rs`, the types in `src/wire.rs`; a version 1 reader ignores them, and `wire::decode_snapshot` reads a version 1 snapshot as neutral and a later one as unsupported.
 
 ## Activity
 

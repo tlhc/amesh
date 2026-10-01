@@ -1,0 +1,8 @@
+{
+ "_scenario": "A hub newer than this reader: unsupported.",
+ "schema_version": 3,
+ "captured_at": 1000,
+ "jobs": [],
+ "asks": [],
+ "peers": []
+}

@@ -1,3 +1,4 @@
+mod derive;
 mod inbox;
 
 use inbox::{Inbox, Outbound, QueuedRecord};
@@ -1639,173 +1640,11 @@ async fn snapshot(
     State(app): State<App>,
     headers: HeaderMap,
     Query(q): Query<SnapshotQuery>,
-) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+) -> Result<Json<crate::wire::SnapshotView>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
-    let circle = q.circle.filter(|c| !c.is_empty());
     let hub = app.inner.lock().await;
-    let mut jobs: Vec<&Job> = hub
-        .jobs
-        .values()
-        .filter(|job| circle.as_deref().is_none_or(|c| job.circle == c))
-        .collect();
-    jobs.sort_by(|a, b| a.job_id.cmp(&b.job_id));
-    let ask_ids: BTreeSet<&String> = jobs.iter().filter_map(|job| job.ask_id.as_ref()).collect();
-    let (mut asks, mut missing_asks) = (Vec::new(), Vec::new());
-    for cid in ask_ids {
-        match hub.asks.get(cid) {
-            Some(ask) => asks.push(ask),
-            None => missing_asks.push(cid.clone()),
-        }
-    }
-    /* and the asks no job points at, for the TUI's asks screen: in the view's circle when the
-    sender's name resolves to a row there or the recipient's id is one there; all of them
-    without a circle. An omitted sender is stored as anonymous and names no circle, whoever
-    took that name */
-    let taken: HashSet<&str> = hub
-        .jobs
-        .values()
-        .filter_map(|job| job.ask_id.as_deref())
-        .collect();
-    let mut loose: Vec<&Ask> = hub
-        .asks
-        .values()
-        .filter(|ask| !taken.contains(ask.correlation_id.as_str()))
-        .filter(|ask| {
-            circle.as_deref().is_none_or(|c| {
-                (ask.from_peer != "anonymous"
-                    && resolve(&hub, &ask.from_peer).is_some_and(|peer| peer.circle == c))
-                    || hub
-                        .peers
-                        .get(&ask.to_peer_id)
-                        .is_some_and(|peer| peer.circle == c)
-            })
-        })
-        .collect();
-    loose.sort_by(|a, b| a.correlation_id.cmp(&b.correlation_id));
-    asks.extend(loose);
-    /* a recipient is a fixed peer_id: once that peer is gone, whoever took its name since is
-    someone else. Assignees and senders are names, resolved the way the hub will use them */
-    let recipients: BTreeSet<&str> = asks.iter().map(|ask| ask.to_peer_id.as_str()).collect();
-    let mut names: BTreeSet<&str> = BTreeSet::new();
-    for job in &jobs {
-        names.extend(job.assigned_peer.as_deref());
-        names.insert(&job.from_peer);
-    }
-    for ask in &asks {
-        names.insert(&ask.from_peer);
-    }
-    /* a worker's running jobs in every circle, so a filtered view can still tell whether
-    the one job it shows is the worker's only one */
-    let mut running: HashMap<&str, usize> = HashMap::new();
-    for job in hub.jobs.values().filter(|job| job.state == "running") {
-        /* a job run by hand has no ask and counts for whoever its assignee's name resolves
-        to, as the TUI reads it; a job whose ask is gone counts for nobody */
-        let worker = match &job.ask_id {
-            Some(cid) => hub.asks.get(cid).map(|ask| ask.to_peer_id.as_str()),
-            None => job
-                .assigned_peer
-                .as_deref()
-                .and_then(|name| resolve(&hub, name))
-                .map(|peer| peer.peer_id.as_str()),
-        };
-        if let Some(worker) = worker {
-            *running.entry(worker).or_default() += 1;
-        }
-    }
-    let lookups = recipients
-        .into_iter()
-        .map(|id| (id, hub.peers.get(id), false))
-        .chain(
-            names
-                .into_iter()
-                .map(|name| (name, resolve(&hub, name), true)),
-        );
-    /* and how the hub reaches each: a live socket now, whether that socket confirms each
-    frame, and the records in its inbox it has not taken */
-    let row = |peer: &Peer| {
-        json!({
-            "peer_id": peer.peer_id, "name": peer.name, "backend": peer.backend,
-            "circle": peer.circle, "status": peer.status, "last_seen": peer.last_seen,
-            "activity": hub.activity.get(&peer.peer_id),
-            "running": running.get(peer.peer_id.as_str()).copied().unwrap_or(0),
-            "push": hub.sockets.contains_key(&peer.peer_id),
-            "acks": hub.recv_live.contains(&peer.peer_id),
-            "queued": hub.inbox.count(&peer.peer_id),
-        })
-    };
-    let (mut peers, mut missing_peers, mut seen) = (Vec::new(), BTreeSet::new(), HashSet::new());
-    for (reference, found, name) in lookups.filter(|(reference, _, _)| !reference.is_empty()) {
-        match found {
-            Some(peer) if seen.insert(peer.peer_id.clone()) => peers.push(row(peer)),
-            Some(_) => {}
-            /* "anonymous" as a name stands for no sender, unless a peer really took it; a
-            recipient id that is gone is missing whatever it reads */
-            None if name && reference == "anonymous" => {}
-            None => {
-                missing_peers.insert(reference.to_string());
-            }
-        }
-    }
-    /* every row in the view's circle, for the TUI's line of who is online; peers stays what
-    the jobs and the listed asks refer to */
-    let mut listed: Vec<&Peer> = hub
-        .peers
-        .values()
-        .filter(|peer| circle.as_deref().is_none_or(|c| peer.circle == c))
-        .collect();
-    listed.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-    let roster: Vec<Value> = listed.into_iter().map(row).collect();
-    /* what GET /events?circle= would list, counted */
-    let event_count = hub
-        .events
-        .iter()
-        .filter(|event| circle.as_deref().is_none_or(|c| event_in_circle(event, c)))
-        .count();
-    let detail = q
-        .detail
-        .as_deref()
-        .and_then(|id| jobs.iter().find(|job| job.job_id == id))
-        .map(|job| {
-            json!({
-                "job_id": job.job_id, "title": job.title, "prompt": job.prompt, "result": job.result_summary,
-            })
-        });
-    let ask_detail = q
-        .ask
-        .as_deref()
-        .and_then(|id| asks.iter().find(|ask| ask.correlation_id == id))
-        .map(|ask| json!({"correlation_id": ask.correlation_id, "text": ask.text, "reply": ask.reply}));
-    let body = json!({
-        "schema_version": 1,
-        "captured_at": now_unix(),
-        "hub_epoch": hub.epoch,
-        "event_count": event_count,
-        "capabilities": {"job_created_at": true, "ask_opened_at": true, "ask_closed_by": true, "peer_activity": true, "roster": true, "event_count": true, "ask_list": true, "delivery": true},
-        "jobs": jobs.iter().map(|job| json!({
-            "job_id": job.job_id, "title": preview(&job.title), "title_len": job.title.chars().count(), "state": job.state,
-            "assigned_peer": job.assigned_peer, "from_peer": job.from_peer, "circle": job.circle,
-            "depends_on": job.depends_on, "ask_id": job.ask_id, "dispatch": job.dispatch,
-            "created_at": job.created_at, "finished_at": job.finished_at,
-            "prompt": preview(&job.prompt), "prompt_len": job.prompt.chars().count(),
-            "result": job.result_summary.as_deref().map(preview),
-            "result_len": job.result_summary.as_deref().map_or(0, |r| r.chars().count()),
-        })).collect::<Vec<_>>(),
-        "asks": asks.iter().map(|ask| json!({
-            "correlation_id": ask.correlation_id, "from_peer": ask.from_peer, "to_peer": ask.to_peer,
-            "to_peer_id": ask.to_peer_id, "open": ask.open, "failed": ask.failed,
-            "opened_at": ask.opened_at, "closed_at": ask.closed_at, "closed_by": ask.closed_by,
-            "text": preview(&ask.text), "text_len": ask.text.chars().count(),
-            "reply": ask.reply.as_deref().map(preview),
-            "reply_len": ask.reply.as_deref().map_or(0, |r| r.chars().count()),
-        })).collect::<Vec<_>>(),
-        "peers": peers,
-        "roster": roster,
-        "missing": {"asks": missing_asks, "peers": missing_peers},
-        "detail": detail,
-        "ask_detail": ask_detail,
-    });
-    drop(hub);
-    Ok(Json(body))
+    let now = now_unix();
+    Ok(Json(derive::ReadModel::new(&hub, now).snapshot(&q)))
 }
 
 async fn health() -> Json<Value> {
@@ -2749,22 +2588,81 @@ fn wait_default_secs(backend: Option<&str>) -> u64 {
 The ack goes to the asker alone and only a live socket carries it now; a recv peer that
 is away gets it on reconnect, which may never come, so only a connected asker gets the
 hint */
-fn wait_summary(ask: &Value, timeout: u64, pushed: bool) -> Value {
-    let open = ask["open"].as_bool().unwrap_or(false);
+struct CapturedWait {
+    ask: Ask,
+    derived: Option<crate::wire::WaitDerived>,
+    pushed: bool,
+}
+
+#[derive(Serialize)]
+struct HttpAskWait<'a> {
+    #[serde(flatten)]
+    ask: &'a Ask,
+    #[serde(flatten)]
+    derived: &'a Option<crate::wire::WaitDerived>,
+}
+
+fn capture_wait(hub: &Hub, ask: &Ask, caller: Option<&str>, now: u64) -> CapturedWait {
+    let model = derive::ReadModel::new(hub, now);
+    CapturedWait {
+        ask: ask.clone(),
+        derived: ask.open.then(|| model.wait(ask)),
+        pushed: model.wait_push_hint(ask, caller),
+    }
+}
+
+fn wait_summary(captured: &CapturedWait, timeout: u64) -> Value {
+    let ask = &captured.ask;
     let mut summary = json!({
-        "correlation_id": ask["correlation_id"],
-        "from_peer": ask["from_peer"],
-        "to_peer": ask["to_peer"],
-        "open": open,
-        "timed_out": open,
-        "reply": ask["reply"],
-        "failed": ask["failed"],
+        "correlation_id": ask.correlation_id,
+        "from_peer": ask.from_peer,
+        "to_peer": ask.to_peer,
+        "open": ask.open,
+        "timed_out": ask.open,
+        "reply": ask.reply,
+        "failed": ask.failed,
         "timeout_seconds": timeout,
     });
-    if open && pushed {
+    if let Some(derived) = &captured.derived {
+        #[derive(Serialize)]
+        struct OpenSummary<'a> {
+            #[serde(flatten)]
+            summary: &'a Value,
+            #[serde(flatten)]
+            derived: &'a crate::wire::WaitDerived,
+        }
+        summary = json!(OpenSummary {
+            summary: &summary,
+            derived
+        });
+    }
+    if ask.open && captured.pushed {
         summary["hint"] = json!(WAIT_OPEN_HINT);
     }
     summary
+}
+
+async fn wait_capture(
+    app: &App,
+    id: &str,
+    wait: u64,
+    caller: Option<&str>,
+) -> Result<CapturedWait, (StatusCode, Json<Value>)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    loop {
+        {
+            let hub = app.inner.lock().await;
+            let ask = hub
+                .asks
+                .get(id)
+                .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": "unknown ask"}))))?;
+            if !ask.open || tokio::time::Instant::now() >= deadline {
+                let now = now_unix();
+                return Ok(capture_wait(&hub, ask, caller, now));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 async fn wait_ask(
@@ -2778,24 +2676,11 @@ async fn wait_ask(
         .timeout_seconds
         .unwrap_or(WAIT_DEFAULT_SECS)
         .min(WAIT_MAX_SECS);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
-    loop {
-        {
-            let hub = app.inner.lock().await;
-            if let Some(ask) = hub.asks.get(&id) {
-                if !ask.open {
-                    return Ok(Json(json!(ask)));
-                }
-            } else {
-                return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown ask"}))));
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            let hub = app.inner.lock().await;
-            return Ok(Json(json!(hub.asks.get(&id))));
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    let captured = wait_capture(&app, &id, wait, None).await?;
+    Ok(Json(json!(HttpAskWait {
+        ask: &captured.ask,
+        derived: &captured.derived
+    })))
 }
 
 async fn ask_blocking(
@@ -4190,21 +4075,15 @@ fn advance_jobs(hub: &mut Hub) {
         let Some(job) = hub.jobs.get(id).filter(|job| job.state == "queued") else {
             continue;
         };
-        let ready = job.depends_on.iter().all(|dependency| {
-            hub.jobs
-                .get(dependency)
-                .is_some_and(|dependency| dependency.state == "done")
-        });
-        let target = job.assigned_peer.clone().unwrap_or_default();
-        /* the name is resolved again at dispatch, so the circle checked at creation is
-        checked again: the name may have passed to a peer in another circle */
-        let worker = resolve(hub, &target)
-            .filter(|peer| job.circle.is_empty() || peer.circle == job.circle)
-            .map(|peer| peer.peer_id.clone())
-            .filter(|_| ready);
-        let Some(worker) = worker else {
-            let stalled = ready || blocking_dependency(hub, job).is_some();
-            let nudge_at = stalled.then(|| job.nudge_at.unwrap_or(now + config.job_nudge_secs));
+        let assessment = derive::assess_dispatch(hub, job);
+        let derive::DispatchAssessment {
+            state: crate::wire::DispatchState::Ready { peer_id: worker },
+            ..
+        } = assessment
+        else {
+            let nudge_at = assessment
+                .nudge_eligible
+                .then(|| job.nudge_at.unwrap_or(now + config.job_nudge_secs));
             if job.nudge_at != nudge_at {
                 if let Some(job) = hub.jobs.get_mut(id) {
                     job.nudge_at = nudge_at;
@@ -4213,6 +4092,7 @@ fn advance_jobs(hub: &mut Hub) {
             }
             continue;
         };
+        let target = job.assigned_peer.clone().unwrap_or_default();
         let text = job_ask_text(hub, job);
         let from = Some(job.from_peer.clone())
             .filter(|peer| !peer.is_empty())
@@ -4259,7 +4139,16 @@ fn advance_jobs(hub: &mut Hub) {
         let peer = job.assigned_peer.as_deref().unwrap_or_default();
         let stall = if job.state == "running" {
             format!("{peer} has not acked")
-        } else if let Some((dependency, state)) = blocking_dependency(hub, job) {
+        } else if let crate::wire::DispatchState::Blocked {
+            dependency, reason, ..
+        } = derive::assess_dispatch(hub, job).state
+        {
+            let state = match reason {
+                crate::wire::BlockReason::Failed => "failed",
+                crate::wire::BlockReason::Cancelled => "cancelled",
+                crate::wire::BlockReason::Deleted => "deleted",
+                crate::wire::BlockReason::Unknown => "unknown",
+            };
             format!("blocked by {dependency} ({state})")
         } else {
             format!("{peer} cannot be reached")
@@ -4313,16 +4202,6 @@ fn advance_jobs(hub: &mut Hub) {
             eprintln!("amesh: {error}");
         }
     }
-}
-
-fn blocking_dependency<'a>(hub: &'a Hub, job: &'a Job) -> Option<(&'a str, &'a str)> {
-    job.depends_on.iter().find_map(|id| match hub.jobs.get(id) {
-        None => Some((id.as_str(), "deleted")),
-        Some(dependency) if matches!(dependency.state.as_str(), "failed" | "cancelled") => {
-            Some((id.as_str(), dependency.state.as_str()))
-        }
-        Some(_) => None,
-    })
 }
 
 /* characters a reader may take as a line break, besides the \n and \r\n that str::lines
@@ -5160,31 +5039,14 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 }
             }
             .min(WAIT_MAX_SECS);
-            let res = wait_ask(
-                State(app.clone()),
-                auth_headers(app),
-                AxumPath(id),
-                Json(WaitReq {
-                    timeout_seconds: Some(timeout),
-                }),
+            let captured = wait_capture(
+                app,
+                &id,
+                timeout,
+                args.get("from_peer").and_then(Value::as_str),
             )
             .await?;
-            /* checked when the wait ends: a socket seen before the wait says nothing about
-            where the ack can go now */
-            let pushed = {
-                let hub = app.inner.lock().await;
-                let caller = args
-                    .get("from_peer")
-                    .and_then(Value::as_str)
-                    .and_then(|caller| resolve(&hub, caller));
-                let asker = res.0["from_peer"]
-                    .as_str()
-                    .and_then(|asker| resolve(&hub, asker));
-                caller.zip(asker).is_some_and(|(me, asker)| {
-                    me.peer_id == asker.peer_id && hub.sockets.contains_key(&me.peer_id)
-                })
-            };
-            wait_summary(&res.0, timeout, pushed).to_string()
+            wait_summary(&captured, timeout).to_string()
         }
         "amesh_events" => {
             let mut q = HashMap::new();
@@ -5507,3 +5369,9 @@ mod job_dag_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod dispatch_tests;
+
+#[cfg(test)]
+mod b2_tests;

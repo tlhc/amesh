@@ -1,0 +1,143 @@
+{
+ "_scenario": "A v1 hub: raw facts only; the decoder clears derived fields and the TUI renders neutral. View: GET /snapshot?circle=c.",
+ "schema_version": 1,
+ "captured_at": 1000,
+ "hub_epoch": "fixture",
+ "event_count": 0,
+ "capabilities": {
+  "job_created_at": true,
+  "ask_opened_at": true,
+  "ask_closed_by": true,
+  "peer_activity": true,
+  "roster": true,
+  "event_count": true,
+  "ask_list": true,
+  "delivery": true
+ },
+ "jobs": [
+  {
+   "job_id": "v-job",
+   "title": "job v-job",
+   "title_len": 9,
+   "state": "running",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "v-ask",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do v-job",
+   "prompt_len": 8,
+   "result": null,
+   "result_len": 0
+  }
+ ],
+ "asks": [
+  {
+   "correlation_id": "v-ask",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": true,
+   "failed": false,
+   "opened_at": 950,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question v-ask",
+   "text_len": 14,
+   "reply": null,
+   "reply_len": 0
+  },
+  {
+   "correlation_id": "v-closed",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 960,
+   "closed_by": "hub",
+   "text": "question v-closed",
+   "text_len": 17,
+   "reply": null,
+   "reply_len": 0
+  }
+ ],
+ "peers": [
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 990,
+    "observed_at": 990,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0
+  },
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "_note": "the sender of every ask; online, no activity"
+  }
+ ],
+ "roster": [
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 990,
+    "observed_at": 990,
+    "source": "x-idle"
+   },
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0
+  }
+ ],
+ "missing": {
+  "asks": [],
+  "peers": []
+ },
+ "detail": null,
+ "ask_detail": null
+}

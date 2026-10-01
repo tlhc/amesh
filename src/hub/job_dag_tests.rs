@@ -1736,7 +1736,7 @@ async fn snapshot_returns_jobs_their_asks_and_peers() {
     f.advance().await;
     let loose = f.open_ask("boss", "two").await;
     let s = snapshot_of(&f, "").await;
-    assert_eq!(s["schema_version"], 1);
+    assert_eq!(s["schema_version"], 2);
     assert!(!s["hub_epoch"].as_str().unwrap().is_empty());
     assert_eq!(s["capabilities"]["peer_activity"], true);
     let jobs = s["jobs"].as_array().unwrap();
@@ -1763,17 +1763,20 @@ async fn snapshot_returns_jobs_their_asks_and_peers() {
         .map(|peer| peer["peer_id"].as_str().unwrap())
         .collect();
     assert_eq!(peers, BTreeSet::from(["boss", "one", "two"]));
-    assert_eq!(s["missing"], json!({"asks": [], "peers": []}));
+    assert_eq!(s["missing"], json!({"asks": [], "peers": [], "jobs": []}));
     {
         let mut hub = f.0.inner.lock().await;
         let job = hub.jobs.get_mut(&b).unwrap();
         job.ask_id = Some("ask-gone".into());
         job.assigned_peer = Some("ghost".into());
+        job.depends_on
+            .extend(["job-gone".into(), "job-also-gone".into()]);
+        hub.jobs.get_mut(&a).unwrap().depends_on = vec!["job-gone".into()];
     }
     let s = snapshot_of(&f, "").await;
     assert_eq!(
         s["missing"],
-        json!({"asks": ["ask-gone"], "peers": ["ghost"]})
+        json!({"asks": ["ask-gone"], "peers": ["ghost"], "jobs": ["job-also-gone", "job-gone"]})
     );
 }
 
@@ -1864,6 +1867,17 @@ async fn snapshot_filters_by_circle_and_cuts_previews() {
     );
     let s = snapshot_of(&f, &format!("?circle=c1&detail={other}")).await;
     assert_eq!(s["detail"], Value::Null, "detail follows the circle filter");
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.jobs.get_mut(&a).unwrap().depends_on = vec!["gone-here".into()];
+        hub.jobs.get_mut(&other).unwrap().depends_on = vec!["gone-there".into()];
+    }
+    let s = snapshot_of(&f, "?circle=c1").await;
+    assert_eq!(
+        s["missing"]["jobs"],
+        json!(["gone-here"]),
+        "missing follows the circle filter"
+    );
 }
 
 #[tokio::test]

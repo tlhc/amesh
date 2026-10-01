@@ -1,0 +1,229 @@
+{
+ "_scenario": "A v2 snapshot whose derived values come from a newer hub: every unknown kind or value decodes to Unknown and renders neutral, never an alarm or a command. View: GET /snapshot?circle=c.",
+ "schema_version": 2,
+ "captured_at": 1000,
+ "hub_epoch": "fixture",
+ "event_count": 0,
+ "capabilities": {
+  "job_created_at": true,
+  "ask_opened_at": true,
+  "ask_closed_by": true,
+  "peer_activity": true,
+  "roster": true,
+  "event_count": true,
+  "ask_list": true,
+  "delivery": true
+ },
+ "jobs": [
+  {
+   "job_id": "u-job",
+   "title": "job u-job",
+   "title_len": 9,
+   "state": "running",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "u-ask",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do u-job",
+   "prompt_len": 8,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "later"
+   },
+   "progress": {
+    "state": {
+     "kind": "later"
+    },
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [
+    {
+     "kind": "later"
+    }
+   ]
+  },
+  {
+   "job_id": "u-queued",
+   "title": "job u-queued",
+   "title_len": 12,
+   "state": "queued",
+   "assigned_peer": "w",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do u-queued",
+   "prompt_len": 11,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w",
+   "assignee_id": "w",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": {
+    "kind": "later"
+   },
+   "actions": []
+  }
+ ],
+ "asks": [
+  {
+   "correlation_id": "u-ask",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": true,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question u-ask",
+   "text_len": 14,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "later"
+   },
+   "actions": [
+    {
+     "kind": "later"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "u-closed",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 900,
+   "closed_by": "recipient",
+   "text": "question u-closed",
+   "text_len": 17,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "later",
+    "failed_effective": false
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  }
+ ],
+ "peers": [
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "later"
+   },
+   "delivery": {
+    "condition": "later",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  }
+ ],
+ "roster": [
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "later"
+   },
+   "delivery": {
+    "condition": "later",
+    "stuck": null
+   }
+  }
+ ],
+ "missing": {
+  "asks": [],
+  "peers": [],
+  "jobs": []
+ },
+ "detail": null,
+ "ask_detail": null
+}

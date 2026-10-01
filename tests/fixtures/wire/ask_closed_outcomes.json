@@ -1,0 +1,285 @@
+{
+ "_scenario": "Closed asks: outcome from closed_by then failed; failed_effective true for acked_failed, hand_failed, hub and closed_failed (A1). closed_just_now = closed_at <= 1000 and 1000 - closed_at <= 1 (A10). View: GET /snapshot?circle=c.",
+ "schema_version": 2,
+ "captured_at": 1000,
+ "hub_epoch": "fixture",
+ "event_count": 0,
+ "capabilities": {
+  "job_created_at": true,
+  "ask_opened_at": true,
+  "ask_closed_by": true,
+  "peer_activity": true,
+  "roster": true,
+  "event_count": true,
+  "ask_list": true,
+  "delivery": true
+ },
+ "jobs": [],
+ "asks": [
+  {
+   "correlation_id": "c-acked-failed",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": true,
+   "opened_at": 900,
+   "closed_at": 900,
+   "closed_by": "recipient",
+   "text": "question c-acked-failed",
+   "text_len": 23,
+   "reply": "could not",
+   "reply_len": 9,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "acked_failed",
+    "failed_effective": true
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "c-acked-ok",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 999,
+   "closed_by": "recipient",
+   "text": "question c-acked-ok",
+   "text_len": 19,
+   "reply": "done",
+   "reply_len": 4,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "acked_ok",
+    "failed_effective": false
+   },
+   "actions": [],
+   "closed_just_now": true,
+   "opened_just_now": false,
+   "_note": "closed one second before capture: just now"
+  },
+  {
+   "correlation_id": "c-closed-failed",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": true,
+   "opened_at": 900,
+   "closed_at": 900,
+   "closed_by": null,
+   "text": "question c-closed-failed",
+   "text_len": 24,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "closed_failed",
+    "failed_effective": true
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "c-closed-ok",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 998,
+   "closed_by": null,
+   "text": "question c-closed-ok",
+   "text_len": 20,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "closed_ok",
+    "failed_effective": false
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "legacy row without closed_by; 2 s ago: not just now"
+  },
+  {
+   "correlation_id": "c-hand-failed",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": true,
+   "opened_at": 900,
+   "closed_at": 900,
+   "closed_by": "hand",
+   "text": "question c-hand-failed",
+   "text_len": 22,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "hand_failed",
+    "failed_effective": true
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "c-hand-ok",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 1001,
+   "closed_by": "hand",
+   "text": "question c-hand-ok",
+   "text_len": 18,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "hand_ok",
+    "failed_effective": false
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "closed_at after capture (clock skew): not just now"
+  },
+  {
+   "correlation_id": "c-hub",
+   "from_peer": "boss",
+   "to_peer": "w",
+   "to_peer_id": "w",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 900,
+   "closed_by": "hub",
+   "text": "question c-hub",
+   "text_len": 14,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "hub",
+    "failed_effective": true
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false,
+   "_note": "closed by the hub with failed false still counts as failed"
+  }
+ ],
+ "peers": [
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  }
+ ],
+ "roster": [
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "w",
+   "name": "w",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  }
+ ],
+ "missing": {
+  "asks": [],
+  "peers": [],
+  "jobs": []
+ },
+ "detail": null,
+ "ask_detail": null
+}

@@ -58,7 +58,6 @@ impl Inbox {
         self.records(peer).len()
     }
 
-    #[allow(dead_code)]
     pub(super) fn stuck(&self, peer: &str, now: u64) -> Option<(usize, u64)> {
         let records = self.records(peer);
         let oldest = records.iter().map(QueuedRecord::queued_at).min()?;

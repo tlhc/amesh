@@ -1,0 +1,1124 @@
+{
+ "_scenario": "Jobs across every relation (A11). Running counts are global: an ask present counts for its recipient id (closed too), a hand-run job for its resolved assignee, a missing ask for nobody. busy = running, relation open or none, progress work, count 1. View: GET /snapshot?circle=c.",
+ "schema_version": 2,
+ "captured_at": 1000,
+ "hub_epoch": "fixture",
+ "event_count": 0,
+ "capabilities": {
+  "job_created_at": true,
+  "ask_opened_at": true,
+  "ask_closed_by": true,
+  "peer_activity": true,
+  "roster": true,
+  "event_count": true,
+  "ask_list": true,
+  "delivery": true
+ },
+ "jobs": [
+  {
+   "job_id": "j-busy",
+   "title": "job j-busy",
+   "title_len": 10,
+   "state": "running",
+   "assigned_peer": "w1",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-busy",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-busy",
+   "prompt_len": 9,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w1",
+   "assignee_id": "w1",
+   "relation": {
+    "kind": "open"
+   },
+   "progress": {
+    "state": {
+     "kind": "work",
+     "since": 950
+    },
+    "busy": true
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "only running job of w1, which works: busy"
+  },
+  {
+   "job_id": "j-cleaned",
+   "title": "job j-cleaned",
+   "title_len": 13,
+   "state": "done",
+   "assigned_peer": "w1",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-gone3",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": 980,
+   "prompt": "do j-cleaned",
+   "prompt_len": 12,
+   "result": "ok",
+   "result_len": 2,
+   "from_peer_id": "boss",
+   "worker": "w1",
+   "assignee_id": "w1",
+   "relation": {
+    "kind": "cleaned_up"
+   },
+   "progress": null,
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "settled job whose ask was swept"
+  },
+  {
+   "job_id": "j-closed-held",
+   "title": "job j-closed-held",
+   "title_len": 17,
+   "state": "running",
+   "assigned_peer": "w6",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-closed",
+   "dispatch": false,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-closed-held",
+   "prompt_len": 16,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w6",
+   "assignee_id": "w6",
+   "relation": {
+    "kind": "closed"
+   },
+   "progress": {
+    "state": null,
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "ask acked, dispatch off: automatic settlement disabled (A15)"
+  },
+  {
+   "job_id": "j-failed-auto",
+   "title": "job j-failed-auto",
+   "title_len": 17,
+   "state": "failed",
+   "assigned_peer": "w1",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": 970,
+   "prompt": "do j-failed-auto",
+   "prompt_len": 16,
+   "result": "boom",
+   "result_len": 4,
+   "from_peer_id": "boss",
+   "worker": "w1",
+   "assignee_id": "w1",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": null,
+   "actions": [
+    {
+     "kind": "retry",
+     "needs_assignee": false
+    }
+   ]
+  },
+  {
+   "job_id": "j-failed-held",
+   "title": "job j-failed-held",
+   "title_len": 17,
+   "state": "failed",
+   "assigned_peer": "w1",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": false,
+   "created_at": 800,
+   "finished_at": 970,
+   "prompt": "do j-failed-held",
+   "prompt_len": 16,
+   "result": "boom",
+   "result_len": 4,
+   "from_peer_id": "boss",
+   "worker": "w1",
+   "assignee_id": "w1",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": null,
+   "dispatch_state": null,
+   "actions": [
+    {
+     "kind": "retry",
+     "needs_assignee": true
+    }
+   ]
+  },
+  {
+   "job_id": "j-gone-recipient",
+   "title": "job j-gone-recipient",
+   "title_len": 20,
+   "state": "running",
+   "assigned_peer": "w-left",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-left",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-gone-recipient",
+   "prompt_len": 19,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w-left",
+   "assignee_id": null,
+   "relation": {
+    "kind": "open"
+   },
+   "progress": {
+    "state": {
+     "kind": "gone"
+    },
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [
+    {
+     "kind": "resend"
+    }
+   ],
+   "_note": "recipient left with the ask open: worker keeps the fixed id; resend"
+  },
+  {
+   "job_id": "j-hand",
+   "title": "job j-hand",
+   "title_len": 10,
+   "state": "running",
+   "assigned_peer": "hand",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": null,
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-hand",
+   "prompt_len": 9,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "hand",
+   "assignee_id": "hand",
+   "relation": {
+    "kind": "none"
+   },
+   "progress": {
+    "state": {
+     "kind": "wait",
+     "since": 995,
+     "reason": "Edit"
+    },
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "run by hand, no ask: worker is the resolved assignee, at a permission prompt"
+  },
+  {
+   "job_id": "j-missing-auto",
+   "title": "job j-missing-auto",
+   "title_len": 18,
+   "state": "running",
+   "assigned_peer": "w1",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-gone1",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-missing-auto",
+   "prompt_len": 17,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": null,
+   "assignee_id": "w1",
+   "relation": {
+    "kind": "missing",
+    "will_fail": true
+   },
+   "progress": {
+    "state": null,
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "ask record gone, dispatch on: the next check fails it; counts for nobody"
+  },
+  {
+   "job_id": "j-missing-held",
+   "title": "job j-missing-held",
+   "title_len": 18,
+   "state": "running",
+   "assigned_peer": "w1",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-gone2",
+   "dispatch": false,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-missing-held",
+   "prompt_len": 17,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": null,
+   "assignee_id": "w1",
+   "relation": {
+    "kind": "missing",
+    "will_fail": false
+   },
+   "progress": {
+    "state": null,
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "ask record gone, dispatch off: automatic settlement disabled"
+  },
+  {
+   "job_id": "j-offline",
+   "title": "job j-offline",
+   "title_len": 13,
+   "state": "running",
+   "assigned_peer": "w3",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-off",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-offline",
+   "prompt_len": 12,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w3",
+   "assignee_id": "w3",
+   "relation": {
+    "kind": "open"
+   },
+   "progress": {
+    "state": {
+     "kind": "offline"
+    },
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "offline recipient with a remembered wait: offline (intentional change 2)"
+  },
+  {
+   "job_id": "j-settling",
+   "title": "job j-settling",
+   "title_len": 14,
+   "state": "running",
+   "assigned_peer": "w5",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-settle",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-settling",
+   "prompt_len": 13,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w5",
+   "assignee_id": "w5",
+   "relation": {
+    "kind": "settling"
+   },
+   "progress": {
+    "state": null,
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "ask acked, dispatch on: settles on the next pass"
+  },
+  {
+   "job_id": "j-stalled",
+   "title": "job j-stalled",
+   "title_len": 13,
+   "state": "running",
+   "assigned_peer": "w4",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-stall",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-stalled",
+   "prompt_len": 12,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w4",
+   "assignee_id": "w4",
+   "relation": {
+    "kind": "open"
+   },
+   "progress": {
+    "state": {
+     "kind": "idle",
+     "since": 990,
+     "why": "turn_ended"
+    },
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [
+    {
+     "kind": "nudge",
+     "to": "w4"
+    }
+   ],
+   "_note": "turn ended with the ask open: nudge"
+  },
+  {
+   "job_id": "j-two-a",
+   "title": "job j-two-a",
+   "title_len": 11,
+   "state": "running",
+   "assigned_peer": "w2",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-two-a",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-two-a",
+   "prompt_len": 10,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w2",
+   "assignee_id": "w2",
+   "relation": {
+    "kind": "open"
+   },
+   "progress": {
+    "state": {
+     "kind": "work",
+     "since": 940
+    },
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": [],
+   "_note": "w2 runs two jobs: not busy"
+  },
+  {
+   "job_id": "j-two-b",
+   "title": "job j-two-b",
+   "title_len": 11,
+   "state": "running",
+   "assigned_peer": "w2",
+   "from_peer": "boss",
+   "circle": "c",
+   "depends_on": [],
+   "ask_id": "a-two-b",
+   "dispatch": true,
+   "created_at": 800,
+   "finished_at": null,
+   "prompt": "do j-two-b",
+   "prompt_len": 10,
+   "result": null,
+   "result_len": 0,
+   "from_peer_id": "boss",
+   "worker": "w2",
+   "assignee_id": "w2",
+   "relation": {
+    "kind": "open"
+   },
+   "progress": {
+    "state": {
+     "kind": "work",
+     "since": 940
+    },
+    "busy": false
+   },
+   "dispatch_state": null,
+   "actions": []
+  }
+ ],
+ "asks": [
+  {
+   "correlation_id": "a-busy",
+   "from_peer": "boss",
+   "to_peer": "w1",
+   "to_peer_id": "w1",
+   "open": true,
+   "failed": false,
+   "opened_at": 940,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-busy",
+   "text_len": 15,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "work",
+     "since": 950
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "a-closed",
+   "from_peer": "boss",
+   "to_peer": "w6",
+   "to_peer_id": "w6",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 990,
+   "closed_by": "recipient",
+   "text": "question a-closed",
+   "text_len": 17,
+   "reply": "done",
+   "reply_len": 4,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "acked_ok",
+    "failed_effective": false
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "a-left",
+   "from_peer": "boss",
+   "to_peer": "w-left",
+   "to_peer_id": "w-left",
+   "open": true,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-left",
+   "text_len": 15,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "gone"
+    }
+   },
+   "actions": [
+    {
+     "kind": "close_left"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "a-off",
+   "from_peer": "boss",
+   "to_peer": "w3",
+   "to_peer_id": "w3",
+   "open": true,
+   "failed": false,
+   "opened_at": 920,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-off",
+   "text_len": 14,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "offline"
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "a-settle",
+   "from_peer": "boss",
+   "to_peer": "w5",
+   "to_peer_id": "w5",
+   "open": false,
+   "failed": false,
+   "opened_at": 900,
+   "closed_at": 990,
+   "closed_by": "recipient",
+   "text": "question a-settle",
+   "text_len": 17,
+   "reply": "done",
+   "reply_len": 4,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "closed",
+    "outcome": "acked_ok",
+    "failed_effective": false
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "a-stall",
+   "from_peer": "boss",
+   "to_peer": "w4",
+   "to_peer_id": "w4",
+   "open": true,
+   "failed": false,
+   "opened_at": 950,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-stall",
+   "text_len": 16,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "idle",
+     "since": 990,
+     "why": "turn_ended"
+    }
+   },
+   "actions": [
+    {
+     "kind": "nudge",
+     "to": "w4"
+    }
+   ],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "a-two-a",
+   "from_peer": "boss",
+   "to_peer": "w2",
+   "to_peer_id": "w2",
+   "open": true,
+   "failed": false,
+   "opened_at": 930,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-two-a",
+   "text_len": 16,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "work",
+     "since": 940
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  },
+  {
+   "correlation_id": "a-two-b",
+   "from_peer": "boss",
+   "to_peer": "w2",
+   "to_peer_id": "w2",
+   "open": true,
+   "failed": false,
+   "opened_at": 931,
+   "closed_at": null,
+   "closed_by": null,
+   "text": "question a-two-b",
+   "text_len": 16,
+   "reply": null,
+   "reply_len": 0,
+   "from_peer_id": "boss",
+   "state": {
+    "kind": "open",
+    "progress": {
+     "kind": "work",
+     "since": 940
+    }
+   },
+   "actions": [],
+   "closed_just_now": false,
+   "opened_just_now": false
+  }
+ ],
+ "peers": [
+  {
+   "peer_id": "w1",
+   "name": "w1",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "work",
+    "since": 950,
+    "observed_at": 950,
+    "source": "x-work"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "work",
+    "since": 950
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w2",
+   "name": "w2",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "work",
+    "since": 940,
+    "observed_at": 940,
+    "source": "x-work"
+   },
+   "running": 2,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "work",
+    "since": 940
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w3",
+   "name": "w3",
+   "backend": "codex",
+   "circle": "c",
+   "status": "offline",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 900,
+    "observed_at": 900,
+    "source": "claude-permission",
+    "reason": "Bash"
+   },
+   "running": 1,
+   "push": false,
+   "acks": false,
+   "queued": 0,
+   "liveness": {
+    "kind": "offline"
+   },
+   "delivery": {
+    "condition": "offline",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w4",
+   "name": "w4",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 990,
+    "observed_at": 990,
+    "source": "x-idle"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 990
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w5",
+   "name": "w5",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 991,
+    "observed_at": 991,
+    "source": "x-idle"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 991
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w6",
+   "name": "w6",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 991,
+    "observed_at": 991,
+    "source": "x-idle"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 991
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "hand",
+   "name": "hand",
+   "backend": "claude-code",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 995,
+    "observed_at": 995,
+    "source": "claude-permission",
+    "reason": "Edit"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "wait",
+    "since": 995,
+    "reason": "Edit"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  }
+ ],
+ "roster": [
+  {
+   "peer_id": "boss",
+   "name": "boss",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": null,
+   "running": 0,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "online"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   },
+   "_note": "the sender of every ask; online, no activity"
+  },
+  {
+   "peer_id": "hand",
+   "name": "hand",
+   "backend": "claude-code",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 995,
+    "observed_at": 995,
+    "source": "claude-permission",
+    "reason": "Edit"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "wait",
+    "since": 995,
+    "reason": "Edit"
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w1",
+   "name": "w1",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "work",
+    "since": 950,
+    "observed_at": 950,
+    "source": "x-work"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "work",
+    "since": 950
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w2",
+   "name": "w2",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "work",
+    "since": 940,
+    "observed_at": 940,
+    "source": "x-work"
+   },
+   "running": 2,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "work",
+    "since": 940
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w3",
+   "name": "w3",
+   "backend": "codex",
+   "circle": "c",
+   "status": "offline",
+   "last_seen": 999,
+   "activity": {
+    "state": "wait",
+    "since": 900,
+    "observed_at": 900,
+    "source": "claude-permission",
+    "reason": "Bash"
+   },
+   "running": 1,
+   "push": false,
+   "acks": false,
+   "queued": 0,
+   "liveness": {
+    "kind": "offline"
+   },
+   "delivery": {
+    "condition": "offline",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w4",
+   "name": "w4",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 990,
+    "observed_at": 990,
+    "source": "x-idle"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 990
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w5",
+   "name": "w5",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 991,
+    "observed_at": 991,
+    "source": "x-idle"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 991
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  },
+  {
+   "peer_id": "w6",
+   "name": "w6",
+   "backend": "codex",
+   "circle": "c",
+   "status": "online",
+   "last_seen": 999,
+   "activity": {
+    "state": "idle",
+    "since": 991,
+    "observed_at": 991,
+    "source": "x-idle"
+   },
+   "running": 1,
+   "push": true,
+   "acks": true,
+   "queued": 0,
+   "liveness": {
+    "kind": "idle",
+    "since": 991
+   },
+   "delivery": {
+    "condition": "push",
+    "stuck": null
+   }
+  }
+ ],
+ "missing": {
+  "asks": [
+   "a-gone1",
+   "a-gone2",
+   "a-gone3"
+  ],
+  "peers": [
+   "w-left"
+  ],
+  "jobs": []
+ },
+ "detail": null,
+ "ask_detail": null
+}

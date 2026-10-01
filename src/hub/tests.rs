@@ -4804,7 +4804,18 @@ async fn mcp_wait_reports_the_answer_without_the_question() {
         hint.contains("peer-message") && hint.contains("wait again only if"),
         "an open wait must tell a connected asker the ack is normally pushed, with waiting as the fallback: {open}"
     );
-    assert!(body["result"]["content"][0]["text"].as_str().unwrap().len() < 300);
+    let mut legacy = open.clone();
+    for field in [
+        "schema_version",
+        "captured_at",
+        "state",
+        "from_peer_id",
+        "actions",
+        "for_secs",
+    ] {
+        legacy.as_object_mut().unwrap().remove(field);
+    }
+    assert!(legacy.to_string().len() < 300);
     let _ = json_req(
         app.clone(),
         "POST",
