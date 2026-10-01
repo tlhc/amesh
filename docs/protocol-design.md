@@ -106,6 +106,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `GET /ws`. The first text frame must be `{"type":"connect","peer_id":"…"}` (or `name`), with optional `auth_token` and `recv`. The hub replies `{"type":"connected","peer_id":"…","name":"…"}`.
 - If `recv` is true, the peer promises `{"type":"recv","id":"…"}` for each event with an id:
   - the hub drops the durable inbox row only on that recv (`acknowledge_event`)
+  - each inbox row keeps the time its delivery was first owed (`queued_at`), through replay, requeue, transfer and restart; rows from before this field count from the upgrade
   - the CLI `amesh hook ws` sends it once it has tried to hand the frame to the runtime, so a drainer that dies mid-inject leaves the record owed; what the runtime could not take waits in a process-local FIFO, which restarting that process drops
 
 ## MCP

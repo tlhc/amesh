@@ -256,8 +256,14 @@ async fn events_legacy_online_success_remains_outside_the_ring() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut hub = f.0.inner.lock().await;
     hub.sockets.insert("legacy".into(), (1, tx));
-    persist_then_deliver(&mut hub, "legacy", json!({"id":"live", "to_peer":"legacy"})).unwrap();
-    assert_eq!(rx.try_recv().unwrap()["id"], "live");
+    persist_then_deliver(
+        &mut hub,
+        "legacy",
+        json!({"id":"live", "to_peer":"legacy"}),
+        now_unix(),
+    )
+    .unwrap();
+    assert_eq!(rx.try_recv().unwrap().event()["id"], "live");
     assert!(hub.events.is_empty());
 }
 

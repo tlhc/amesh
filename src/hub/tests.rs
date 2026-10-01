@@ -339,20 +339,28 @@ fn a_restart_gives_persisted_peers_a_reconnect_window() {
 fn a_full_inbox_drops_chatter_before_an_ask() {
     let path = temp_state("inbox");
     let mut hub = Hub::open(&path).unwrap();
-    queue_inbox(&mut hub, "w", [json!({"type": "ask", "id": "keep-me"})]);
+    queue_inbox(
+        &mut hub,
+        "w",
+        [json!({"type": "ask", "id": "keep-me"})],
+        now_unix(),
+    );
     let chatter = (0..INBOX_MAX * 2).map(|n| json!({"type": "broadcast", "id": n}));
-    queue_inbox(&mut hub, "w", chatter);
-    let queue = &hub.inbox["w"];
+    queue_inbox(&mut hub, "w", chatter, now_unix());
+    let queue = &hub.inbox.records("w");
     assert_eq!(queue.len(), INBOX_MAX);
     assert!(
-        queue.iter().any(|held| held["id"] == "keep-me"),
+        queue.iter().any(|held| held.event()["id"] == "keep-me"),
         "chatter must be evicted before the ask someone is waiting on"
     );
-    assert_eq!(queue.last().unwrap()["id"], json!(INBOX_MAX * 2 - 1));
-    let asks = (0..INBOX_MAX * 2).map(|n| json!({"type": "ask", "id": n}));
-    queue_inbox(&mut hub, "x", asks);
     assert_eq!(
-        hub.inbox["x"].len(),
+        queue.last().unwrap().event()["id"],
+        json!(INBOX_MAX * 2 - 1)
+    );
+    let asks = (0..INBOX_MAX * 2).map(|n| json!({"type": "ask", "id": n}));
+    queue_inbox(&mut hub, "x", asks, now_unix());
+    assert_eq!(
+        hub.inbox.records("x").len(),
         INBOX_MAX * 2,
         "a queue of nothing but asks grows past the cap instead of stranding an asker"
     );
@@ -451,7 +459,7 @@ fn an_older_state_file_is_compacted_once() {
     let other = Connection::open(&path).unwrap();
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
     let started = std::time::Instant::now();
-    let again = open_db(&path);
+    let again = open_db(&path, now_unix());
     let took = started.elapsed();
     other.execute_batch("ROLLBACK").unwrap();
     assert!(
@@ -468,7 +476,7 @@ fn a_compacted_state_file_opens_beside_another_writer() {
     let other = Connection::open(&path).unwrap();
     other.execute_batch("BEGIN IMMEDIATE").unwrap();
     let started = std::time::Instant::now();
-    let opened = open_db(&path);
+    let opened = open_db(&path, now_unix());
     let took = started.elapsed();
     other.execute_batch("ROLLBACK").unwrap();
     assert!(
@@ -481,7 +489,7 @@ fn a_compacted_state_file_opens_beside_another_writer() {
 #[test]
 fn a_log_a_reader_still_holds_is_reported_not_cut() {
     let path = temp_state("reader");
-    let db = open_db(&path).unwrap();
+    let db = open_db(&path, now_unix()).unwrap();
     db.busy_timeout(Duration::from_millis(50)).unwrap();
     let reader = Connection::open(&path).unwrap();
     reader
@@ -518,19 +526,25 @@ fn a_restart_ignores_inbox_keys_without_a_peer() {
             last_seen: now_unix(),
         },
     );
-    hub.inbox.insert(
-        "offline".into(),
-        vec![json!({"type": "notify", "id": "keep"})],
+    hub.inbox.put(
+        "offline",
+        vec![QueuedRecord::new(
+            json!({"type": "notify", "id": "keep"}),
+            now_unix(),
+        )],
     );
-    hub.inbox.insert(
-        "old-name".into(),
-        vec![json!({"type": "ack", "id": "legacy-reply"})],
+    hub.inbox.put(
+        "old-name",
+        vec![QueuedRecord::new(
+            json!({"type": "ack", "id": "legacy-reply"}),
+            now_unix(),
+        )],
     );
     persist(&mut hub).unwrap();
     let reopened = Hub::open(&path).unwrap();
-    assert_eq!(reopened.inbox["offline"][0]["id"], "keep");
+    assert_eq!(reopened.inbox.records("offline")[0].event()["id"], "keep");
     assert!(
-        !reopened.inbox.contains_key("old-name"),
+        reopened.inbox.count("old-name") == 0,
         "inbox keys that are not a registered peer_id must not reload"
     );
     let _ = fs::remove_file(&path);
@@ -590,7 +604,7 @@ async fn a_reply_to_a_departed_peer_leaves_no_permanent_queue() {
     assert!(!ask.open, "ack must persist the closed ask");
     assert_eq!(ask.reply.as_deref(), Some("answer"));
     assert!(
-        !reopened.inbox.contains_key("amesh-cli"),
+        reopened.inbox.count("amesh-cli") == 0,
         "a target that is no peer must not open a queue nothing will ever collect"
     );
     let _ = fs::remove_file(&path);
@@ -817,12 +831,11 @@ async fn mcp_schedule_hidden_message_alias_and_long_bodies_persist() {
     assert_eq!(disk.asks[&cid].text, long);
     let inbox_ask = disk
         .inbox
-        .get("worker")
-        .into_iter()
-        .flatten()
-        .find(|e| e["type"] == "ask" && e["correlation_id"] == cid)
+        .records("worker")
+        .iter()
+        .find(|e| e.event()["type"] == "ask" && e.event()["correlation_id"] == cid)
         .expect("ask must be persisted on inbox before pending consumes it");
-    assert_eq!(inbox_ask["text"].as_str().unwrap(), long);
+    assert_eq!(inbox_ask.event()["text"].as_str().unwrap(), long);
     drop(disk);
 
     let (_, events) = json_req(app.clone(), "GET", "/events", json!({})).await;
@@ -2227,9 +2240,13 @@ fn undelivered_hub() -> (Hub, TempState) {
 fn undelivered_events_for_an_unknown_peer_are_dropped() {
     let (mut hub, _state) = undelivered_hub();
     let owed = vec![json!({"type": "notify", "id": "x"})];
-    assert!(!return_undelivered(&mut hub, "ghost", owed));
+    assert!(!return_undelivered(
+        &mut hub,
+        "ghost",
+        owed.into_iter().map(test_outbound).collect()
+    ));
     assert!(
-        hub.inbox.get("ghost").is_none(),
+        hub.inbox.records("ghost").is_empty(),
         "unknown canonical peer_id must not grow an inbox"
     );
 }
@@ -2245,8 +2262,9 @@ fn check_queued_reply_after_socket_closes(acknowledging: bool) {
     let queued = queue_replies(
         &mut hub,
         vec![json!({"type": "ack", "to_peer": "worker", "message": "expired"})],
+        now_unix(),
     );
-    let ack = queued[0].1.clone();
+    let ack = queued[0].1.event().clone();
     persist(&mut hub).unwrap();
     drop(rx);
     deliver_queued(&mut hub, queued);
@@ -2254,9 +2272,22 @@ fn check_queued_reply_after_socket_closes(acknowledging: bool) {
         !hub.sockets.contains_key("worker"),
         "the failed socket must be removed"
     );
-    assert_eq!(hub.inbox["worker"], vec![ack.clone()]);
+    assert_eq!(
+        hub.inbox
+            .records("worker")
+            .iter()
+            .map(QueuedRecord::event)
+            .collect::<Vec<_>>(),
+        vec![&ack]
+    );
     let disk = read_snapshot(&hub.db).unwrap();
-    assert_eq!(disk.inbox["worker"], vec![ack]);
+    assert_eq!(
+        disk.inbox["worker"]
+            .iter()
+            .map(QueuedRecord::event)
+            .collect::<Vec<_>>(),
+        vec![&ack]
+    );
 }
 
 #[test]
@@ -2276,11 +2307,15 @@ fn undelivered_events_return_to_the_inbox() {
         json!({"type": "notify", "id": "a"}),
         json!({"type": "notify", "id": "b"}),
     ];
-    assert!(return_undelivered(&mut hub, "worker", owed));
-    let queued = hub.inbox.get("worker").expect("events must be recoverable");
+    assert!(return_undelivered(
+        &mut hub,
+        "worker",
+        owed.into_iter().map(test_outbound).collect()
+    ));
+    let queued = hub.inbox.records("worker");
     assert_eq!(queued.len(), 2);
-    assert_eq!(queued[0]["id"], "a");
-    assert_eq!(queued[1]["id"], "b");
+    assert_eq!(queued[0].event()["id"], "a");
+    assert_eq!(queued[1].event()["id"], "b");
 }
 
 #[test]
@@ -2289,10 +2324,14 @@ fn undelivered_events_reach_the_successor_socket() {
     let (tx, mut rx) = mpsc::unbounded_channel();
     hub.sockets.insert("worker".into(), (7, tx));
     let owed = vec![json!({"type": "notify", "id": "a"})];
-    assert!(!return_undelivered(&mut hub, "worker", owed));
-    assert_eq!(rx.try_recv().unwrap()["id"], "a");
+    assert!(!return_undelivered(
+        &mut hub,
+        "worker",
+        owed.into_iter().map(test_outbound).collect()
+    ));
+    assert_eq!(rx.try_recv().unwrap().event()["id"], "a");
     assert!(
-        hub.inbox.get("worker").is_none(),
+        hub.inbox.records("worker").is_empty(),
         "successor must not double-queue"
     );
 }
@@ -2308,20 +2347,21 @@ fn undelivered_events_survive_a_dead_successor() {
         json!({"type": "notify", "id": "b"}),
     ];
     assert!(
-        return_undelivered(&mut hub, "worker", owed),
+        return_undelivered(
+            &mut hub,
+            "worker",
+            owed.into_iter().map(test_outbound).collect()
+        ),
         "falling back to the inbox changes hub state and must be persisted"
     );
-    let queued = hub
-        .inbox
-        .get("worker")
-        .expect("a dead successor must not eat events");
+    let queued = hub.inbox.records("worker");
     assert_eq!(
         queued.len(),
         2,
         "the rejected event and the rest must both survive"
     );
-    assert_eq!(queued[0]["id"], "a");
-    assert_eq!(queued[1]["id"], "b");
+    assert_eq!(queued[0].event()["id"], "a");
+    assert_eq!(queued[1].event()["id"], "b");
     assert!(
         hub.sockets.get("worker").is_none(),
         "the dead socket must be dropped"
@@ -2332,21 +2372,80 @@ fn undelivered_events_survive_a_dead_successor() {
 fn displaced_notice_is_never_replayed() {
     let (mut hub, _state) = undelivered_hub();
     let notice = vec![json!({"type": DISPLACED, "peer_id": "worker"})];
-    assert!(!return_undelivered(&mut hub, "worker", notice.clone()));
+    assert!(!return_undelivered(
+        &mut hub,
+        "worker",
+        notice.clone().into_iter().map(test_outbound).collect()
+    ));
     assert!(
-        hub.inbox.get("worker").is_none(),
+        hub.inbox.records("worker").is_empty(),
         "notice must not reach the inbox"
     );
 
     let (tx, mut rx) = mpsc::unbounded_channel();
     hub.sockets.insert("worker".into(), (7, tx));
     let mixed = vec![notice[0].clone(), json!({"type": "notify", "id": "real"})];
-    assert!(!return_undelivered(&mut hub, "worker", mixed));
-    assert_eq!(rx.try_recv().unwrap()["id"], "real");
+    assert!(!return_undelivered(
+        &mut hub,
+        "worker",
+        mixed.into_iter().map(test_outbound).collect()
+    ));
+    assert_eq!(rx.try_recv().unwrap().event()["id"], "real");
     assert!(
         rx.try_recv().is_err(),
         "only the real event may be forwarded"
     );
+}
+
+#[tokio::test]
+async fn schedule_queue_timestamp_starts_after_lock_wait() {
+    use std::future::Future;
+    use std::task::{Context, Waker};
+
+    let path = temp_state("schedule-queue-time");
+    let mut hub = Hub::open(&path).unwrap();
+    let _rx = recv_peer(&mut hub, "worker");
+    hub.schedules.insert(
+        "s1".into(),
+        Schedule {
+            schedule_id: "s1".into(),
+            from_peer: "boss".into(),
+            to_peer: "worker".into(),
+            text: "wake".into(),
+            kind: "notify".into(),
+            fire_at: 0,
+            every_seconds: Some(60),
+            circle: "default".into(),
+        },
+    );
+    let app = App {
+        inner: Arc::new(Mutex::new(hub)),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    let held = app.inner.lock().await;
+    let mut tick = Box::pin(tick_schedules(&app));
+    let mut contender = Box::pin(app.inner.lock());
+    let mut context = Context::from_waker(Waker::noop());
+    assert!(tick.as_mut().poll(&mut context).is_pending());
+    assert!(contender.as_mut().poll(&mut context).is_pending());
+    drop(held);
+    let cutoff_start = now_unix();
+    assert!(tick.as_mut().poll(&mut context).is_pending());
+    let held = contender.await;
+    let cutoff_end = now_unix();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let released_at = now_unix();
+    assert!(released_at.saturating_sub(cutoff_end) >= 2);
+    drop(held);
+    tick.await;
+
+    let hub = app.inner.lock().await;
+    let queued = hub.inbox.records("worker");
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].queued_at() >= released_at);
+    assert_eq!(hub.inbox.stuck("worker", released_at), None);
+    assert!((cutoff_start + 60..=cutoff_end + 60).contains(&hub.schedules["s1"].fire_at));
 }
 
 #[tokio::test]
@@ -2400,7 +2499,7 @@ async fn a_due_schedule_waits_for_an_absent_target() {
         "fire_at must not move while the target is away"
     );
     assert!(
-        !reopened.inbox.contains_key("later"),
+        reopened.inbox.count("later") == 0,
         "waiting must not open an inbox for a peer that is not there"
     );
     let state = app_for(reopened);
@@ -2418,19 +2517,19 @@ async fn a_due_schedule_waits_for_an_absent_target() {
             !hub.schedules.contains_key("s1"),
             "a one-shot schedule is consumed once it fires"
         );
-        let held = &hub.inbox["later"];
+        let held = &hub.inbox.records("later");
         assert_eq!(
             held.len(),
             1,
             "a second tick must not deliver a consumed schedule again"
         );
-        assert_eq!(held[0]["type"], "notify");
-        assert_eq!(held[0]["message"], "wake");
+        assert_eq!(held[0].event()["type"], "notify");
+        assert_eq!(held[0].event()["message"], "wake");
     }
     let settled = Hub::open(&path).unwrap();
     assert!(!settled.schedules.contains_key("s1"));
     assert_eq!(
-        settled.inbox["later"].len(),
+        settled.inbox.records("later").len(),
         1,
         "the delivery has to be on disk, not only in memory"
     );
@@ -2577,6 +2676,7 @@ fn owed_hub(path: &Path, session: &str) -> Hub {
             &mut hub,
             "tmp-pi",
             json!({"type": "notify", "message": text}),
+            now_unix(),
         )
         .unwrap();
     }
@@ -2643,7 +2743,7 @@ fn a_session_bound_backlog_outlives_its_pruned_row() {
         "the row itself is pruned as before"
     );
     assert_eq!(
-        hub.inbox["tmp-pi"].len(),
+        hub.inbox.records("tmp-pi").len(),
         2,
         "what the session was owed stays behind for it"
     );
@@ -2655,7 +2755,7 @@ fn a_session_bound_backlog_outlives_its_pruned_row() {
     let sessionless = temp_state("owed1b");
     let mut hub = owed_hub(&sessionless, "");
     assert!(refresh_peers(&mut hub).0);
-    assert!(!hub.inbox.contains_key("tmp-pi"));
+    assert!(hub.inbox.count("tmp-pi") == 0);
     assert!(!hub.owed.contains_key("tmp-pi"));
     let _ = fs::remove_file(&path);
     let _ = fs::remove_file(&sessionless);
@@ -2675,7 +2775,7 @@ fn a_pruned_backlog_keeps_its_clock_across_a_restart() {
         "the clock started at the first prune and does not restart"
     );
     assert_eq!(reopened.owed["tmp-pi"].owner, "S1");
-    assert_eq!(reopened.inbox["tmp-pi"].len(), 2);
+    assert_eq!(reopened.inbox.records("tmp-pi").len(), 2);
     assert!(reopened.recv_known.contains("tmp-pi"));
     assert!(
         !refresh_peers(&mut reopened).0 || reopened.owed["tmp-pi"].since == since,
@@ -2811,27 +2911,27 @@ async fn ownership_expiry_notifies_the_connected_asker_after_commit() {
     {
         let hub = hub.lock().await;
         assert!(hub.asks.values().next().unwrap().open);
-        assert!(!hub.inbox.contains_key("boss"));
+        assert!(hub.inbox.count("boss") == 0);
         hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
     }
     let (status, _) = json_req(app, "GET", "/peers", json!({})).await;
     assert_eq!(status, StatusCode::OK);
     let ack = rx.try_recv().expect("the asker must receive the expiry");
-    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack.event()["type"], "ack");
     let hub = hub.lock().await;
     let disk = read_snapshot(&hub.db).unwrap();
     let ask = disk.asks.values().next().unwrap();
     assert!(!ask.open);
-    assert_eq!(ack["correlation_id"], ask.correlation_id);
+    assert_eq!(ack.event()["correlation_id"], ask.correlation_id);
     assert_eq!(
-        ack["message"],
+        ack.event()["message"],
         format!("[failed] {}", ask.reply.as_deref().unwrap())
     );
-    assert!(ack["message"]
+    assert!(ack.event()["message"]
         .as_str()
         .unwrap()
         .contains("did not come back"));
-    assert_eq!(disk.inbox["boss"][0], ack);
+    assert_eq!(disk.inbox["boss"][0].event(), ack.event());
 }
 
 #[tokio::test]
@@ -2847,14 +2947,11 @@ async fn ownership_expiry_retains_the_offline_askers_ack_across_restart() {
     assert_eq!(status, StatusCode::OK);
     let reopened = Hub::open(Path::new(&path)).unwrap();
     let ask = reopened.asks.values().next().unwrap();
-    let ack = &reopened
-        .inbox
-        .get("boss")
-        .expect("the offline asker must retain its expiry")[0];
-    assert_eq!(ack["type"], "ack");
-    assert_eq!(ack["correlation_id"], ask.correlation_id);
+    let ack = &reopened.inbox.records("boss")[0];
+    assert_eq!(ack.event()["type"], "ack");
+    assert_eq!(ack.event()["correlation_id"], ask.correlation_id);
     assert_eq!(
-        ack["message"],
+        ack.event()["message"],
         format!("[failed] {}", ask.reply.as_deref().unwrap())
     );
     assert!(!ask.open);
@@ -2892,14 +2989,14 @@ async fn ownership_expiry_sends_ack_from_the_schedule_tick() {
     let ack = rx
         .try_recv()
         .expect("the scheduler must deliver the expiry");
-    assert_eq!(ack["type"], "ack");
-    assert!(ack["message"]
+    assert_eq!(ack.event()["type"], "ack");
+    assert!(ack.event()["message"]
         .as_str()
         .unwrap()
         .contains("did not come back"));
     let hub = hub.lock().await;
     let disk = read_snapshot(&hub.db).unwrap();
-    assert_eq!(disk.inbox["boss"][0], ack);
+    assert_eq!(disk.inbox["boss"][0].event(), ack.event());
     drop(hub);
     tick_schedules(&app).await;
     assert!(rx.try_recv().is_err(), "an expiry is delivered once");
@@ -2992,7 +3089,10 @@ async fn ownership_failed_claim_keeps_the_reservation_after_restart() {
         allocate_peer_id(&reopened, "/tmp", "codex", "B", None),
         "tmp-codex-2"
     );
-    assert_eq!(reopened.inbox["tmp-codex"][0]["message"], "for A only");
+    assert_eq!(
+        reopened.inbox.records("tmp-codex")[0].event()["message"],
+        "for A only"
+    );
     let _ = fs::remove_file(path);
 }
 
@@ -3059,23 +3159,27 @@ async fn ownership_replacement_notifies_the_connected_asker_after_commit() {
     {
         let hub = hub.lock().await;
         assert!(hub.asks.values().next().unwrap().open);
-        assert!(!hub.inbox.contains_key("boss"));
+        assert!(hub.inbox.count("boss") == 0);
         hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
     }
     let (status, _) = json_req(app, "POST", "/peers", claim).await;
     assert_eq!(status, StatusCode::OK);
     let ack = rx.try_recv().expect("the asker must receive the closure");
-    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack.event()["type"], "ack");
     let hub = hub.lock().await;
     let disk = read_snapshot(&hub.db).unwrap();
     let ask = disk.asks.values().next().unwrap();
     assert!(!ask.open);
-    assert_eq!(ack["correlation_id"], ask.correlation_id);
+    assert_eq!(ack.event()["correlation_id"], ask.correlation_id);
     assert_eq!(
-        ack["message"],
+        ack.event()["message"],
         format!("[failed] {}", ask.reply.as_deref().unwrap())
     );
-    assert_eq!(disk.inbox["boss"][0], ack, "recv retires the durable copy");
+    assert_eq!(
+        disk.inbox["boss"][0].event(),
+        ack.event(),
+        "recv retires the durable copy"
+    );
 }
 
 #[tokio::test]
@@ -3096,6 +3200,7 @@ async fn ownership_replacement_waits_for_the_askers_reserved_session() {
             &mut hub,
             "boss",
             [json!({"type": "notify", "message": "held for asker"})],
+            now_unix(),
         );
         persist(&mut hub).unwrap();
         rx
@@ -3108,19 +3213,22 @@ async fn ownership_replacement_waits_for_the_askers_reserved_session() {
         rx.try_recv().is_err(),
         "the closure must wait for the asker's session"
     );
-    assert_eq!(hub.lock().await.inbox["boss"][1]["type"], "ack");
+    assert_eq!(
+        hub.lock().await.inbox.records("boss")[1].event()["type"],
+        "ack"
+    );
     let claim = json!({"peer_id": "boss", "backend": "pi", "session_id": "asker"});
     let (status, _) = json_req(app, "POST", "/peers", claim).await;
     assert_eq!(status, StatusCode::OK);
     let bound = rx
         .try_recv()
         .expect("binding precedes the reserved replies");
-    assert_eq!(bound["type"], "bound");
-    assert_eq!(bound["session_id"], "asker");
-    assert_eq!(rx.try_recv().unwrap()["type"], "notify");
+    assert_eq!(bound.event()["type"], "bound");
+    assert_eq!(bound.event()["session_id"], "asker");
+    assert_eq!(rx.try_recv().unwrap().event()["type"], "notify");
     let ack = rx.try_recv().unwrap();
-    assert_eq!(ack["type"], "ack");
-    assert!(ack["message"]
+    assert_eq!(ack.event()["type"], "ack");
+    assert!(ack.event()["message"]
         .as_str()
         .unwrap()
         .contains("session was replaced"));
@@ -3145,9 +3253,9 @@ async fn ownership_replacement_delivers_once_to_a_legacy_asker() {
     let ack = rx
         .try_recv()
         .expect("the legacy asker must receive the closure");
-    assert_eq!(ack["type"], "ack");
+    assert_eq!(ack.event()["type"], "ack");
     let hub = hub.lock().await;
-    assert!(!hub.inbox.contains_key("boss"));
+    assert!(hub.inbox.count("boss") == 0);
     assert!(!read_snapshot(&hub.db).unwrap().inbox.contains_key("boss"));
 }
 
@@ -3226,18 +3334,21 @@ async fn ownership_session_change_closes_asks_even_when_the_pin_is_connected() {
     let notice = rx
         .try_recv()
         .expect("the connection must learn that its session changed");
-    assert_eq!(notice["type"], "replaced");
-    assert_eq!(notice["session_id"], "B");
+    assert_eq!(notice.event()["type"], "replaced");
+    assert_eq!(notice.event()["session_id"], "B");
     let hub = hub.lock().await;
     let ask = hub.asks.values().next().unwrap();
     assert!(
         !ask.open,
         "changing sessions retires the old ask even with a socket"
     );
-    assert!(!hub.inbox.contains_key("tmp-codex"));
-    assert_eq!(hub.inbox["boss"][0]["correlation_id"], ask.correlation_id);
+    assert!(hub.inbox.count("tmp-codex") == 0);
     assert_eq!(
-        hub.inbox["boss"][0]["message"],
+        hub.inbox.records("boss")[0].event()["correlation_id"],
+        ask.correlation_id
+    );
+    assert_eq!(
+        hub.inbox.records("boss")[0].event()["message"],
         format!("[failed] {}", ask.reply.as_deref().unwrap())
     );
     assert!(hub.sockets.contains_key("tmp-codex"));
@@ -3257,13 +3368,14 @@ async fn ownership_expired_reservation_keeps_the_live_receivers_receipts() {
     hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
     assert!(refresh_peers(&mut hub).0);
     assert!(!hub.owed.contains_key("tmp-codex"));
-    assert!(!hub.inbox.contains_key("tmp-codex"));
+    assert!(hub.inbox.count("tmp-codex") == 0);
     queue_inbox(
         &mut hub,
         "tmp-codex",
         (0..=INBOX_MAX).map(|id| json!({"type": "notify", "id": id})),
+        now_unix(),
     );
-    assert_eq!(hub.inbox["tmp-codex"].len(), INBOX_MAX + 1);
+    assert_eq!(hub.inbox.records("tmp-codex").len(), INBOX_MAX + 1);
 }
 
 #[test]
@@ -3275,17 +3387,17 @@ fn ownership_legacy_retry_discards_frames_before_the_last_replacement() {
         &mut hub,
         "w",
         vec![
-            json!({"type": "notify", "message": "A"}),
-            json!({"type": "replaced"}),
-            json!({"type": "notify", "message": "B"}),
-            json!({"type": "replaced"}),
-            json!({"type": "notify", "message": "C"}),
-            json!({"type": "bound", "session_id": "C"}),
-            json!({"type": "notify", "message": "C after binding"}),
+            test_outbound(json!({"type": "notify", "message": "A"})),
+            test_outbound(json!({"type": "replaced"})),
+            test_outbound(json!({"type": "notify", "message": "B"})),
+            test_outbound(json!({"type": "replaced"})),
+            test_outbound(json!({"type": "notify", "message": "C"})),
+            test_outbound(json!({"type": "bound", "session_id": "C"})),
+            test_outbound(json!({"type": "notify", "message": "C after binding"})),
         ],
     );
-    assert_eq!(rx.try_recv().unwrap()["message"], "C");
-    assert_eq!(rx.try_recv().unwrap()["message"], "C after binding");
+    assert_eq!(rx.try_recv().unwrap().event()["message"], "C");
+    assert_eq!(rx.try_recv().unwrap().event()["message"], "C after binding");
     assert!(rx.try_recv().is_err());
     let _ = fs::remove_file(&path);
 }
@@ -3299,21 +3411,31 @@ async fn ownership_legacy_retry_waits_for_the_reserved_session() {
     assert!(return_undelivered(
         &mut hub,
         "tmp-codex",
-        vec![json!({"type": "notify", "message": "late A"})]
+        vec![test_outbound(
+            json!({"type": "notify", "message": "late A"})
+        )]
     ));
     assert!(
         rx.try_recv().is_err(),
         "a successor socket still has to prove the reserved session"
     );
-    assert_eq!(hub.inbox["tmp-codex"].last().unwrap()["message"], "late A");
+    assert_eq!(
+        hub.inbox.records("tmp-codex").last().unwrap().event()["message"],
+        "late A"
+    );
     hub.peers.remove("tmp-codex");
     hub.sockets.remove("tmp-codex");
     assert!(return_undelivered(
         &mut hub,
         "tmp-codex",
-        vec![json!({"type": "notify", "message": "later A"})]
+        vec![test_outbound(
+            json!({"type": "notify", "message": "later A"})
+        )]
     ));
-    assert_eq!(hub.inbox["tmp-codex"].last().unwrap()["message"], "later A");
+    assert_eq!(
+        hub.inbox.records("tmp-codex").last().unwrap().event()["message"],
+        "later A"
+    );
 }
 
 #[tokio::test]
@@ -3368,15 +3490,15 @@ async fn ownership_first_session_binding_keeps_queued_asks() {
     let bound = rx
         .try_recv()
         .expect("first binding names the stream session");
-    assert_eq!(bound["type"], "bound");
-    assert_eq!(bound["session_id"], "A");
+    assert_eq!(bound.event()["type"], "bound");
+    assert_eq!(bound.event()["session_id"], "A");
     let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
     assert_eq!(
         pending["asks"][0]["text"], "waiting for binding",
         "{pending}"
     );
     assert_eq!(
-        hub.lock().await.inbox["tmp-codex"][0]["text"],
+        hub.lock().await.inbox.records("tmp-codex")[0].event()["text"],
         "waiting for binding"
     );
 }
@@ -3402,7 +3524,7 @@ async fn ownership_unproven_socket_closes_old_asks_on_a_different_session() {
     let (_, pending) = json_req(app, "GET", "/asks/pending?peer_id=tmp-codex", json!({})).await;
     assert!(pending["asks"].as_array().unwrap().is_empty(), "{pending}");
     let hub = hub.lock().await;
-    assert!(!hub.inbox.contains_key("tmp-codex"));
+    assert!(hub.inbox.count("tmp-codex") == 0);
     assert!(hub.recv_known.contains("tmp-codex"));
 }
 
@@ -3424,8 +3546,9 @@ fn ownership_rollback_keeps_the_live_receivers_unacknowledged_queue() {
         &mut hub,
         "w",
         (0..=INBOX_MAX).map(|n| json!({"type": "notify", "id": n})),
+        now_unix(),
     );
-    assert_eq!(hub.inbox["w"].len(), INBOX_MAX + 1);
+    assert_eq!(hub.inbox.records("w").len(), INBOX_MAX + 1);
     let _ = fs::remove_file(path);
 }
 
@@ -3462,7 +3585,10 @@ async fn ownership_rollback_keeps_an_unproven_rows_reservation() {
     let hub = hub.lock().await;
     let reopened = Hub::open(Path::new(hub.db.path().unwrap())).unwrap();
     assert_eq!(reopened.owed["tmp-codex"].owner, "A");
-    assert_eq!(reopened.inbox["tmp-codex"][0]["message"], "for A only");
+    assert_eq!(
+        reopened.inbox.records("tmp-codex")[0].event()["message"],
+        "for A only"
+    );
 }
 
 #[tokio::test]
@@ -3510,7 +3636,7 @@ async fn claiming_the_name_with_another_session_discards_the_backlog() {
     assert_eq!(body["peer_id"], "tmp-pi");
     let hub = state.inner.lock().await;
     assert!(
-        !hub.inbox.contains_key("tmp-pi"),
+        hub.inbox.count("tmp-pi") == 0,
         "another session's messages are not handed over"
     );
     assert!(!hub.owed.contains_key("tmp-pi"));
@@ -3554,7 +3680,7 @@ async fn the_owner_session_comes_back_to_its_backlog() {
         let hub = state.inner.lock().await;
         assert!(!hub.owed.contains_key("tmp-pi"), "adopted");
         assert_eq!(
-            hub.inbox["tmp-pi"].len(),
+            hub.inbox.records("tmp-pi").len(),
             2,
             "and everything it was owed is still there"
         );
@@ -3593,7 +3719,7 @@ async fn the_owner_session_comes_back_to_its_backlog() {
         .unwrap();
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.inbox.contains_key("tmp-pi") {
+    while state.inner.lock().await.inbox.count("tmp-pi") > 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "recv never drained the replayed backlog"
@@ -3659,7 +3785,7 @@ async fn unproven_connection_waits_for_its_session(recv: bool) {
         Some(0),
         "the hook must not leak an unsettled backlog"
     );
-    assert_eq!(state.inner.lock().await.inbox["tmp-pi"].len(), 2);
+    assert_eq!(state.inner.lock().await.inbox.records("tmp-pi").len(), 2);
     let (socket, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
     let (mut w, mut r) = socket.split();
     w.send(WsMsg::Text(
@@ -3681,13 +3807,14 @@ async fn unproven_connection_waits_for_its_session(recv: bool) {
         nothing.is_err(),
         "nothing is replayed before the owner is proved: {nothing:?}"
     );
-    assert_eq!(state.inner.lock().await.inbox["tmp-pi"].len(), 2);
+    assert_eq!(state.inner.lock().await.inbox.records("tmp-pi").len(), 2);
     {
         let mut hub = state.inner.lock().await;
         persist_then_deliver(
             &mut hub,
             "tmp-pi",
             json!({"type": "notify", "message": "still for S1"}),
+            now_unix(),
         )
         .unwrap();
     }
@@ -3733,7 +3860,7 @@ async fn unproven_connection_waits_for_its_session(recv: bool) {
         }
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.inbox.contains_key("tmp-pi") {
+    while state.inner.lock().await.inbox.count("tmp-pi") > 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "recv never drained the adopted backlog"
@@ -3767,6 +3894,7 @@ fn abandoned_hub(path: &Path) -> Hub {
         &mut hub,
         "tmp-pi",
         json!({"type": "ask", "correlation_id": "ask-y", "text": "still open"}),
+        now_unix(),
     )
     .unwrap();
     refresh_peers(&mut hub);
@@ -3796,21 +3924,22 @@ async fn a_backlog_follows_its_session_to_a_new_name() {
     );
     {
         let hub = state.inner.lock().await;
-        let moved = &hub.inbox["tmp-pi-2"];
+        let moved = &hub.inbox.records("tmp-pi-2");
         assert_eq!(
             moved.len(),
             3,
             "everything left behind for the session is now under its new name"
         );
         assert!(
-            moved
-                .iter()
-                .all(|r| r["id"].as_str().map(|s| !s.is_empty()).unwrap_or(false)),
+            moved.iter().all(|r| r.event()["id"]
+                .as_str()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)),
             "every moved record can be acknowledged"
         );
         assert!(
             !hub.owed.contains_key("tmp-pi")
-                && !hub.inbox.contains_key("tmp-pi")
+                && hub.inbox.count("tmp-pi") == 0
                 && !hub.recv_known.contains("tmp-pi"),
             "nothing stays under the old name"
         );
@@ -3839,7 +3968,7 @@ async fn a_backlog_follows_its_session_to_a_new_name() {
     );
     let reopened = Hub::open(&path).unwrap();
     assert!(
-        !reopened.owed.contains_key("tmp-pi") && !reopened.inbox.contains_key("tmp-pi"),
+        !reopened.owed.contains_key("tmp-pi") && reopened.inbox.count("tmp-pi") == 0,
         "the move is on disk"
     );
     let _ = fs::remove_file(&path);
@@ -3864,8 +3993,8 @@ async fn a_backlog_does_not_follow_another_session_or_no_session() {
             hub.owed.contains_key("tmp-pi"),
             "only the owning session may take the backlog"
         );
-        assert_eq!(hub.inbox["tmp-pi"].len(), 3);
-        assert!(!hub.inbox.contains_key("tmp-pi-2") && !hub.inbox.contains_key("tmp-pi-3"));
+        assert_eq!(hub.inbox.records("tmp-pi").len(), 3);
+        assert!(hub.inbox.count("tmp-pi-2") == 0 && hub.inbox.count("tmp-pi-3") == 0);
         assert_eq!(hub.asks["ask-y"].to_peer_id, "tmp-pi");
     }
     let _ = fs::remove_file(&path);
@@ -3875,7 +4004,7 @@ async fn a_backlog_does_not_follow_another_session_or_no_session() {
 async fn a_moved_backlog_is_deduplicated_by_id_and_only_the_new_part_is_pushed() {
     let path = temp_state("dedupe");
     let mut hub = abandoned_hub(&path);
-    let duplicate = hub.inbox["tmp-pi"][0].clone();
+    let duplicate = hub.inbox.records("tmp-pi")[0].clone();
     /* the new name is already attached and acknowledging, with one record in flight and
     one that is the same as a record the old name holds */
     let mut rx = recv_peer(&mut hub, "tmp-pi-2");
@@ -3884,13 +4013,11 @@ async fn a_moved_backlog_is_deduplicated_by_id_and_only_the_new_part_is_pushed()
         &mut hub,
         "tmp-pi-2",
         json!({"type": "notify", "message": "already-in-flight"}),
+        now_unix(),
     )
     .unwrap();
     let _ = rx.try_recv().unwrap();
-    hub.inbox
-        .get_mut("tmp-pi-2")
-        .unwrap()
-        .push(duplicate.clone());
+    hub.inbox.enqueue("tmp-pi-2", [duplicate.clone()], true);
     let state = App {
         inner: Arc::new(Mutex::new(hub)),
         token: None,
@@ -3905,9 +4032,11 @@ async fn a_moved_backlog_is_deduplicated_by_id_and_only_the_new_part_is_pushed()
     .await;
     assert_eq!(status, StatusCode::OK);
     let hub = state.inner.lock().await;
-    let ids: Vec<String> = hub.inbox["tmp-pi-2"]
+    let ids: Vec<String> = hub
+        .inbox
+        .records("tmp-pi-2")
         .iter()
-        .map(|r| r["id"].as_str().unwrap().to_string())
+        .map(|r| r.event()["id"].as_str().unwrap().to_string())
         .collect();
     let unique: HashSet<&String> = ids.iter().collect();
     assert_eq!(
@@ -3922,14 +4051,14 @@ async fn a_moved_backlog_is_deduplicated_by_id_and_only_the_new_part_is_pushed()
     );
     let mut pushed = Vec::new();
     while let Ok(copy) = rx.try_recv() {
-        pushed.push(copy["id"].as_str().unwrap().to_string());
+        pushed.push(copy.event()["id"].as_str().unwrap().to_string());
     }
     assert_eq!(
         pushed.len(),
         2,
         "only what was newly moved goes down the socket, not the queue it already had: {pushed:?}"
     );
-    assert!(!pushed.contains(&duplicate["id"].as_str().unwrap().to_string()));
+    assert!(!pushed.contains(&duplicate.event()["id"].as_str().unwrap().to_string()));
     let _ = fs::remove_file(&path);
 }
 
@@ -3942,7 +4071,7 @@ fn a_backlog_nobody_returns_for_expires() {
     assert!(refresh_peers(&mut hub).0);
     assert!(!hub.owed.contains_key("tmp-pi"));
     assert!(
-        !hub.inbox.contains_key("tmp-pi"),
+        hub.inbox.count("tmp-pi") == 0,
         "an expired backlog is not kept"
     );
     assert!(!hub.recv_known.contains("tmp-pi"));
@@ -3964,6 +4093,7 @@ async fn the_hook_does_not_take_what_an_attached_acknowledger_is_still_owed() {
             &mut hub,
             "w",
             json!({"type": "notify", "message": "in flight"}),
+            now_unix(),
         )
         .unwrap();
         rx
@@ -3982,7 +4112,7 @@ async fn the_hook_does_not_take_what_an_attached_acknowledger_is_still_owed() {
         "a copy already on the socket must not also come back through the hook"
     );
     assert_eq!(
-        state.inner.lock().await.inbox["w"].len(),
+        state.inner.lock().await.inbox.records("w").len(),
         1,
         "the record stays until the peer's recv"
     );
@@ -4004,7 +4134,7 @@ async fn the_hook_does_not_take_what_an_attached_acknowledger_is_still_owed() {
         Some(1),
         "with nobody attached the hook is the delivery"
     );
-    assert!(!state.inner.lock().await.inbox.contains_key("w"));
+    assert!(state.inner.lock().await.inbox.count("w") == 0);
     let _ = fs::remove_file(&path);
 }
 
@@ -4020,17 +4150,23 @@ async fn a_closing_acknowledging_connection_hands_nothing_back() {
         let mut hub = state.inner.lock().await;
         let rx = recv_peer(&mut hub, "w");
         let gen = hub.conn_gen;
-        persist_then_deliver(&mut hub, "w", json!({"type": "notify", "message": "m"})).unwrap();
+        persist_then_deliver(
+            &mut hub,
+            "w",
+            json!({"type": "notify", "message": "m"}),
+            now_unix(),
+        )
+        .unwrap();
         (rx, gen)
     };
     let copy = rx.try_recv().unwrap();
-    assert_eq!(state.inner.lock().await.inbox["w"].len(), 1);
+    assert_eq!(state.inner.lock().await.inbox.records("w").len(), 1);
     /* the write of that copy fails and the link dies: the record is already in the
     inbox, so handing the copy back must not make a second one */
     close_connection(&state, "w", gen, true, rx, vec![copy]).await;
     let hub = state.inner.lock().await;
     assert_eq!(
-        hub.inbox["w"].len(),
+        hub.inbox.records("w").len(),
         1,
         "a closing acknowledging connection must not duplicate its records"
     );
@@ -4054,12 +4190,16 @@ fn an_absent_acknowledging_peer_is_owed_records_it_can_name() {
         &mut hub,
         "w",
         json!({"type": "ask", "correlation_id": "ask-1", "text": "q"}),
+        now_unix(),
     )
     .unwrap();
-    let owed = &hub.inbox["w"];
+    let owed = &hub.inbox.records("w");
     assert_eq!(owed.len(), 1);
     assert!(
-        owed[0]["id"].as_str().unwrap_or("").starts_with("evt-"),
+        owed[0].event()["id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("evt-"),
         "what an absent acknowledger is owed still needs an id it can recv: {owed:?}"
     );
     let _ = fs::remove_file(&path);
@@ -4104,7 +4244,7 @@ async fn a_first_time_acknowledger_gets_ids_on_its_backlog() {
     assert_eq!(status, StatusCode::OK);
     let legacy = Hub::open(&path).unwrap();
     assert!(
-        legacy.inbox["p-worker"][0]["id"].is_null(),
+        legacy.inbox.records("p-worker")[0].event()["id"].is_null(),
         "precondition: the backlog has no id"
     );
 
@@ -4137,7 +4277,7 @@ async fn a_first_time_acknowledger_gets_ids_on_its_backlog() {
         "the backlog is replayed with an id the peer can name: {replayed}"
     );
     assert_eq!(
-        Hub::open(&path).unwrap().inbox["p-worker"][0]["id"].as_str(),
+        Hub::open(&path).unwrap().inbox.records("p-worker")[0].event()["id"].as_str(),
         Some(id.as_str()),
         "the id is on the record on disk, not only on the copy"
     );
@@ -4147,7 +4287,7 @@ async fn a_first_time_acknowledger_gets_ids_on_its_backlog() {
     .await
     .unwrap();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.inbox.contains_key("p-worker") {
+    while state.inner.lock().await.inbox.count("p-worker") > 0 {
         assert!(
             std::time::Instant::now() < deadline,
             "recv of a backlog record never drained it"
@@ -4157,7 +4297,7 @@ async fn a_first_time_acknowledger_gets_ids_on_its_backlog() {
     let _ = fs::remove_file(&path);
 }
 
-fn recv_peer(hub: &mut Hub, id: &str) -> mpsc::UnboundedReceiver<Value> {
+fn recv_peer(hub: &mut Hub, id: &str) -> mpsc::UnboundedReceiver<Outbound> {
     hub.peers.insert(
         id.into(),
         Peer {
@@ -4186,30 +4326,37 @@ fn an_acknowledging_peer_is_owed_every_event_until_it_says_recv() {
     let path = temp_state("recv");
     let mut hub = Hub::open(&path).unwrap();
     let mut rx = recv_peer(&mut hub, "w");
-    persist_then_deliver(&mut hub, "w", json!({"type": "ack", "message": "reply"})).unwrap();
-    let owed = hub.inbox["w"].clone();
+    persist_then_deliver(
+        &mut hub,
+        "w",
+        json!({"type": "ack", "message": "reply"}),
+        now_unix(),
+    )
+    .unwrap();
+    let owed = hub.inbox.records("w").to_vec();
     assert_eq!(
         owed.len(),
         1,
         "the record is written before anything goes down the socket"
     );
-    let id = owed[0]["id"].as_str().unwrap().to_string();
+    let id = owed[0].event()["id"].as_str().unwrap().to_string();
     assert!(
         id.starts_with("evt-"),
         "an event without an id gets one the peer can name"
     );
     let copy = rx.try_recv().unwrap();
     assert_eq!(
-        copy["id"], id,
+        copy.event()["id"],
+        id,
         "what goes down the socket is a copy of the same record"
     );
     assert_eq!(
-        Hub::open(&path).unwrap().inbox["w"].len(),
+        Hub::open(&path).unwrap().inbox.records("w").len(),
         1,
         "the record is on disk before the send"
     );
     assert!(acknowledge_event(&mut hub, "w", &id));
-    assert!(!hub.inbox.contains_key("w"), "recv takes the record away");
+    assert!(hub.inbox.count("w") == 0, "recv takes the record away");
     assert!(
         !acknowledge_event(&mut hub, "w", &id),
         "a repeated recv is a no-op"
@@ -4219,7 +4366,7 @@ fn an_acknowledging_peer_is_owed_every_event_until_it_says_recv() {
         "an unknown id is a no-op"
     );
     persist(&mut hub).unwrap();
-    assert!(!Hub::open(&path).unwrap().inbox.contains_key("w"));
+    assert!(Hub::open(&path).unwrap().inbox.count("w") == 0);
     let _ = fs::remove_file(&path);
 }
 
@@ -4232,9 +4379,9 @@ fn what_an_acknowledging_peer_is_owed_is_never_evicted() {
     hub.sockets.remove("w");
     hub.recv_live.remove("w");
     let chatter = |n: usize| (0..n).map(|i| json!({"type": "notify", "id": format!("n{i}")}));
-    queue_inbox(&mut hub, "w", chatter(INBOX_MAX + 10));
+    queue_inbox(&mut hub, "w", chatter(INBOX_MAX + 10), now_unix());
     assert_eq!(
-        hub.inbox["w"].len(),
+        hub.inbox.records("w").len(),
         INBOX_MAX + 10,
         "no cap while the peer is away"
     );
@@ -4244,10 +4391,10 @@ fn what_an_acknowledging_peer_is_owed_is_never_evicted() {
         reopened.recv_known.contains("w"),
         "the promise survives a restart"
     );
-    assert_eq!(reopened.inbox["w"].len(), INBOX_MAX + 10);
-    queue_inbox(&mut reopened, "w", chatter(10));
+    assert_eq!(reopened.inbox.records("w").len(), INBOX_MAX + 10);
+    queue_inbox(&mut reopened, "w", chatter(10), now_unix());
     assert_eq!(
-        reopened.inbox["w"].len(),
+        reopened.inbox.records("w").len(),
         INBOX_MAX + 20,
         "no cap after a restart either"
     );
@@ -4255,8 +4402,8 @@ fn what_an_acknowledging_peer_is_owed_is_never_evicted() {
     reopened
         .peers
         .insert("x".into(), reopened.peers["w"].clone());
-    queue_inbox(&mut reopened, "x", chatter(INBOX_MAX + 10));
-    assert_eq!(reopened.inbox["x"].len(), INBOX_MAX);
+    queue_inbox(&mut reopened, "x", chatter(INBOX_MAX + 10), now_unix());
+    assert_eq!(reopened.inbox.records("x").len(), INBOX_MAX);
     let _ = fs::remove_file(&path);
 }
 
@@ -4309,7 +4456,7 @@ async fn a_reconnecting_acknowledging_client_gets_copies_not_duplicates() {
         let state = state.clone();
         async move {
             let hub = state.inner.lock().await;
-            hub.inbox.get("p-worker").map(Vec::len).unwrap_or(0)
+            hub.inbox.count("p-worker")
         }
     };
     async fn read_ids<S>(r: &mut S, n: usize) -> Vec<String>
@@ -4388,7 +4535,7 @@ async fn a_reconnecting_acknowledging_client_gets_copies_not_duplicates() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        !Hub::open(&path).unwrap().inbox.contains_key("p-worker"),
+        Hub::open(&path).unwrap().inbox.count("p-worker") == 0,
         "acknowledged records leave the disk too"
     );
     drop(r2);
@@ -4440,21 +4587,32 @@ async fn a_dropped_link_owes_its_events_to_the_inbox_not_to_itself() {
     /* one event the socket task had taken off the channel and failed to write, and one
     still sitting in the channel when the link died: both are owed to the peer */
     let taken = vec![json!({"type": "notify", "message": "owed-taken"})];
-    tx.send(json!({"type": "notify", "message": "owed-buffered"}))
-        .unwrap();
+    tx.send(test_outbound(
+        json!({"type": "notify", "message": "owed-buffered"}),
+    ))
+    .unwrap();
     drop(tx);
-    close_connection(&state, "worker", gen, false, rx, taken).await;
+    close_connection(
+        &state,
+        "worker",
+        gen,
+        false,
+        rx,
+        taken.into_iter().map(test_outbound).collect(),
+    )
+    .await;
     let hub = state.inner.lock().await;
     let held: Vec<String> = hub
         .inbox
-        .get("worker")
-        .map(|queue| {
-            queue
-                .iter()
-                .map(|event| event["message"].as_str().unwrap_or_default().to_string())
-                .collect()
+        .records("worker")
+        .iter()
+        .map(|event| {
+            event.event()["message"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
         })
-        .unwrap_or_default();
+        .collect();
     assert_eq!(
         held,
         vec!["owed-taken".to_string(), "owed-buffered".to_string()],
@@ -4463,7 +4621,7 @@ async fn a_dropped_link_owes_its_events_to_the_inbox_not_to_itself() {
     assert!(!hub.sockets.contains_key("worker"));
     assert_eq!(hub.peers["worker"].status, "offline");
     drop(hub);
-    assert!(Hub::open(&path).unwrap().inbox.contains_key("worker"));
+    assert!(Hub::open(&path).unwrap().inbox.count("worker") > 0);
     let _ = fs::remove_file(&path);
 }
 
@@ -5265,8 +5423,13 @@ async fn legacy_ids_with_control_characters_never_reach_a_primer() {
         let mut dirty_circle = row("cleanid", "cleanid-session");
         dirty_circle.circle = "safe\nSYSTEM injected".into();
         hub.peers.insert("cleanid".into(), dirty_circle);
-        hub.inbox
-            .insert(bad.clone(), vec![json!({"type": "notify", "message": "x"})]);
+        hub.inbox.put(
+            &bad,
+            vec![QueuedRecord::new(
+                json!({"type": "notify", "message": "x"}),
+                now_unix(),
+            )],
+        );
         hub.recv_known.insert(bad.clone());
         for (cid, id) in [
             ("ask-tobad", bad.as_str()),
@@ -5299,7 +5462,7 @@ async fn legacy_ids_with_control_characters_never_reach_a_primer() {
             !hub.peers.contains_key(&bad),
             "a row with control characters is dropped on load"
         );
-        assert!(!hub.inbox.contains_key(&bad) && !hub.recv_known.contains(&bad));
+        assert!(hub.inbox.count(&bad) == 0 && !hub.recv_known.contains(&bad));
         assert!(
             hub.peers.contains_key(&long),
             "an over-long clean row is kept"
@@ -5522,9 +5685,12 @@ async fn over_long_legacy_backlogs_are_kept_for_their_session() {
                 owner: "owner-session".into(),
             },
         );
-        hub.inbox.insert(
-            long.clone(),
-            vec![json!({"id": "evt-1", "type": "notify", "message": "kept"})],
+        hub.inbox.put(
+            &long,
+            vec![QueuedRecord::new(
+                json!({"id": "evt-1", "type": "notify", "message": "kept"}),
+                now_unix(),
+            )],
         );
         hub.recv_known.insert(long.clone());
         hub.asks.insert(
@@ -5552,7 +5718,7 @@ async fn over_long_legacy_backlogs_are_kept_for_their_session() {
             hub.owed.contains_key(&long),
             "a clean over-long backlog survives the upgrade"
         );
-        assert!(hub.inbox.contains_key(&long), "and so does what it is owed");
+        assert!(hub.inbox.count(&long) > 0, "and so does what it is owed");
         assert!(
             hub.asks["ask-owed"].open,
             "its ask is not closed behind its back"
@@ -5664,7 +5830,7 @@ fn a_reply_enters_the_ring_when_delivered_not_when_queued() {
     let (mut hub, _state) = undelivered_hub();
     let reply = json!({"type": "ack", "correlation_id": "ask-x", "from_peer": "amesh",
                        "to_peer": "worker", "message": "closed"});
-    let queued = queue_replies(&mut hub, vec![reply]);
+    let queued = queue_replies(&mut hub, vec![reply], now_unix());
     assert!(hub.events.is_empty(), "queued, and not yet on disk");
     deliver_queued(&mut hub, queued);
     assert_eq!(hub.events.len(), 1);
@@ -5681,11 +5847,11 @@ async fn the_snapshot_says_how_each_peer_is_reached() {
         let mut hub = inner.lock().await;
         hub.sockets.insert("worker".into(), (1, tx));
         hub.recv_live.insert("worker".into());
-        hub.inbox.insert(
-            "worker".into(),
+        hub.inbox.put(
+            "worker",
             vec![
-                json!({"type": "notify", "id": "n1"}),
-                json!({"type": "notify", "id": "n2"}),
+                QueuedRecord::new(json!({"type": "notify", "id": "n1"}), now_unix()),
+                QueuedRecord::new(json!({"type": "notify", "id": "n2"}), now_unix()),
             ],
         );
     }
@@ -5752,26 +5918,24 @@ async fn patch_job(app: &Router, jid: &str, body: Value) -> (StatusCode, Value) 
 /* the handoff notices a peer holds for one job */
 fn handoffs(hub: &Hub, peer: &str, jid: &str) -> Vec<Value> {
     hub.inbox
-        .get(peer)
-        .into_iter()
-        .flatten()
+        .records(peer)
+        .iter()
         .filter(|e| {
-            e["type"] == "notify"
-                && e["topic"] == jid
-                && e["message"]
+            e.event()["type"] == "notify"
+                && e.event()["topic"] == jid
+                && e.event()["message"]
                     .as_str()
                     .is_some_and(|m| m.contains("you coordinate it now"))
         })
-        .cloned()
+        .map(|record| record.event().clone())
         .collect()
 }
 
 fn acked_to(hub: &Hub, peer: &str, cid: &str) -> bool {
     hub.inbox
-        .get(peer)
-        .into_iter()
-        .flatten()
-        .any(|e| e["type"] == "ack" && e["correlation_id"] == cid)
+        .records(peer)
+        .iter()
+        .any(|e| e.event()["type"] == "ack" && e.event()["correlation_id"] == cid)
 }
 
 async fn running(hub: &Arc<Mutex<Hub>>, jid: &str) -> String {
@@ -5909,11 +6073,13 @@ async fn a_coordinator_only_update_never_touches_the_jobs_run() {
     {
         let hub = hub.lock().await;
         assert_eq!(hub.asks[&cid].from_peer, "deputy");
-        let sent = hub.inbox["worker"]
+        let sent = hub
+            .inbox
+            .records("worker")
             .iter()
-            .find(|e| e["type"] == "ask" && e["correlation_id"] == cid.as_str())
+            .find(|e| e.event()["type"] == "ask" && e.event()["correlation_id"] == cid.as_str())
             .expect("the worker got the dispatch");
-        assert_eq!(sent["from_peer"], "deputy");
+        assert_eq!(sent.event()["from_peer"], "deputy");
     }
     /* running: the hub dispatched after the caller last looked; the handoff keeps the run */
     let before = hub.lock().await.jobs[&jid].clone();
@@ -5930,9 +6096,11 @@ async fn a_coordinator_only_update_never_touches_the_jobs_run() {
             .filter(|a| a.to_peer_id == "worker")
             .count();
         assert_eq!(asks, 1, "no second dispatch");
-        let told = hub.inbox["worker"]
+        let told = hub
+            .inbox
+            .records("worker")
             .iter()
-            .filter(|e| e["type"] == "notify")
+            .filter(|e| e.event()["type"] == "notify")
             .count();
         assert_eq!(told, 0, "the worker hears nothing");
     }
@@ -6063,10 +6231,10 @@ async fn reminders_and_retries_follow_the_new_coordinator() {
         hub.jobs.get_mut(&jid).unwrap().nudge_at = Some(now_unix() - 1);
         advance_jobs(&mut hub);
         let reminded = |peer: &str| {
-            hub.inbox.get(peer).into_iter().flatten().any(|e| {
-                e["type"] == "notify"
-                    && e["topic"] == jid.as_str()
-                    && e["message"]
+            hub.inbox.records(peer).iter().any(|e| {
+                e.event()["type"] == "notify"
+                    && e.event()["topic"] == jid.as_str()
+                    && e.event()["message"]
                         .as_str()
                         .is_some_and(|m| m.contains("has not acked"))
             })
@@ -6192,10 +6360,20 @@ async fn a_handoff_notice_outlives_the_inbox_cap() {
             .map(|i| json!({"type": "notify", "id": format!("chat-{i}"), "message": "noise"}))
             .collect::<Vec<_>>()
     };
-    queue_inbox(&mut *hub.lock().await, "deputy", chatter(INBOX_MAX));
+    queue_inbox(
+        &mut *hub.lock().await,
+        "deputy",
+        chatter(INBOX_MAX),
+        now_unix(),
+    );
     let (st, _) = patch_job(&app, &jid, json!({"coordinator": "deputy"})).await;
     assert_eq!(st, StatusCode::OK);
-    queue_inbox(&mut *hub.lock().await, "deputy", chatter(INBOX_MAX));
+    queue_inbox(
+        &mut *hub.lock().await,
+        "deputy",
+        chatter(INBOX_MAX),
+        now_unix(),
+    );
     let hub = hub.lock().await;
     assert_eq!(
         handoffs(&hub, "deputy", &jid).len(),
@@ -6203,7 +6381,7 @@ async fn a_handoff_notice_outlives_the_inbox_cap() {
         "chatter gives way to the notice, as to an ask"
     );
     assert!(
-        hub.inbox["deputy"].len() <= INBOX_MAX,
+        hub.inbox.records("deputy").len() <= INBOX_MAX,
         "the cap still holds"
     );
 }
@@ -6340,9 +6518,9 @@ async fn two_links(order: &str) -> (Vec<Value>, Value) {
     let (tx2, mut rx2) = mpsc::unbounded_channel();
     {
         let mut hub = hub.lock().await;
-        let _ = hub.sockets["deputy"]
-            .1
-            .send(json!({"type": DISPLACED, "peer_id": "deputy"}));
+        let _ = hub.sockets["deputy"].1.send(Outbound::Control(
+            json!({"type": DISPLACED, "peer_id": "deputy"}),
+        ));
         hub.sockets.insert("deputy".into(), (2, tx2));
     }
     let owner = App {
@@ -6367,15 +6545,15 @@ async fn two_links(order: &str) -> (Vec<Value>, Value) {
         .await;
         return (
             handoffs(&Hub::open(&state).unwrap(), "deputy", &jid),
-            newest,
+            newest.event().clone(),
         );
     }
     let _ = patch_job(&app, &jid, json!({"coordinator": "boss"})).await;
     let _ = patch_job(&app, &jid, json!({"state": "done"})).await;
     let _ = patch_job(&app, &jid, json!({"coordinator": "deputy"})).await;
     let newest = rx2.try_recv().unwrap();
-    assert_ne!(old["id"], newest["id"]);
-    assert!(newest["message"]
+    assert_ne!(old.event()["id"], newest.event()["id"]);
+    assert!(newest.event()["message"]
         .as_str()
         .unwrap()
         .contains("result is ready"));
@@ -6388,7 +6566,7 @@ async fn two_links(order: &str) -> (Vec<Value>, Value) {
     }
     (
         handoffs(&Hub::open(&state).unwrap(), "deputy", &jid),
-        newest,
+        newest.event().clone(),
     )
 }
 
@@ -6408,4 +6586,341 @@ async fn an_old_frame_forwarded_to_the_new_link_cannot_replace_the_newest_notice
 async fn links_handing_back_in_order_keep_the_newest_notice() {
     let (kept, newest) = two_links("old link first").await;
     assert_eq!(kept, vec![newest]);
+}
+
+#[test]
+fn a2_reopen_preserves_queue_time() {
+    let path = temp_state("a2-reopen");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    let _rx = recv_peer(&mut hub, "w");
+    queue_inbox(&mut hub, "w", [json!({"type": "notify", "id": "one"})], 100);
+    persist(&mut hub).unwrap();
+    let expected = hub.inbox.clone();
+    drop(hub);
+    let hub = Hub::open_at(&path, 500).unwrap();
+    assert_eq!(hub.inbox, expected);
+    assert_eq!(hub.inbox.stuck("w", 500), Some((1, 100)));
+}
+
+#[test]
+fn a2_negative_stamp_reads_as_zero() {
+    let path = temp_state("a2-negative");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    let _rx = recv_peer(&mut hub, "w");
+    queue_inbox(&mut hub, "w", [json!({"type": "notify", "id": "one"})], 100);
+    persist(&mut hub).unwrap();
+    hub.db
+        .execute("UPDATE inbox SET queued_at = -1", [])
+        .unwrap();
+    drop(hub);
+    let hub = Hub::open_at(&path, 200).unwrap();
+    assert_eq!(hub.inbox.stuck("w", 200), Some((1, 0)));
+}
+
+#[test]
+fn a2_legacy_schema_backfills_once() {
+    let path = temp_state("a2-legacy");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch("CREATE TABLE inbox(peer_id TEXT, seq INTEGER, payload TEXT); INSERT INTO inbox VALUES ('w', 0, '{}');").unwrap();
+    drop(db);
+    let hub = Hub::open_at(&path, 777).unwrap();
+    let stamp: i64 = hub
+        .db
+        .query_row("SELECT queued_at FROM inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stamp, 777);
+    drop(hub);
+    let hub = Hub::open_at(&path, 900).unwrap();
+    let stamp: i64 = hub
+        .db
+        .query_row("SELECT queued_at FROM inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stamp, 777);
+    hub.db
+        .execute_batch("INSERT INTO inbox VALUES ('w', 1, '{}', NULL), ('w', 2, '{}', 0);")
+        .unwrap();
+    drop(hub);
+    let hub = Hub::open_at(&path, 1000).unwrap();
+    let mut stmt = hub
+        .db
+        .prepare("SELECT queued_at FROM inbox ORDER BY seq")
+        .unwrap();
+    let stamps = stmt
+        .query_map([], |r| r.get::<_, i64>(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(stamps, vec![777, 1000, 0]);
+}
+
+#[test]
+fn a2_payload_stays_raw_with_independent_time() {
+    let path = temp_state("a2-payload");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    let _rx = recv_peer(&mut hub, "w");
+    let event = json!({"event": 1, "queued_at": 5, "type": "notify"});
+    hub.inbox
+        .put("w", vec![QueuedRecord::new(event.clone(), 100)]);
+    persist(&mut hub).unwrap();
+    let (payload, stamp): (String, i64) = hub
+        .db
+        .query_row("SELECT payload, queued_at FROM inbox", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(payload, event.to_string());
+    assert_eq!(serde_json::from_str::<Value>(&payload).unwrap(), event);
+    assert_eq!(stamp, 100);
+    drop(hub);
+    let hub = Hub::open_at(&path, 500).unwrap();
+    assert_eq!(hub.inbox.records("w"), &[QueuedRecord::new(event, 100)]);
+}
+
+#[test]
+fn a2_json_import_stamps_import_instant() {
+    let path = temp_state("a2-json");
+    let event = json!({"event": 1, "queued_at": 5, "type": "notify"});
+    fs::write(path.with_extension("json"), json!({
+        "peers": {"w": {"peer_id": "w", "name": "w", "path": "/tmp", "backend": "pi", "circle": "default", "status": "online", "description": "", "session_id": "", "last_seen": 0}},
+        "asks": {}, "jobs": {}, "schedules": {}, "inbox": {"w": [event.clone()]}
+    }).to_string()).unwrap();
+    let hub = Hub::open_at(&path, 333).unwrap();
+    assert_eq!(
+        hub.inbox.records("w"),
+        &[QueuedRecord::new(event.clone(), 333)]
+    );
+    drop(hub);
+    let hub = Hub::open_at(&path, 900).unwrap();
+    assert_eq!(hub.inbox.records("w"), &[QueuedRecord::new(event, 333)]);
+}
+
+#[test]
+fn a2_failed_persist_restores_exact_queue_times() {
+    let path = temp_state("a2-rollback");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    let _rx = recv_peer(&mut hub, "w");
+    hub.inbox.put(
+        "w",
+        vec![
+            QueuedRecord::new(json!({"id": "first"}), 100),
+            QueuedRecord::new(json!({"id": "second"}), 70),
+        ],
+    );
+    persist(&mut hub).unwrap();
+    let expected = hub.inbox.clone();
+    hub.inbox.take("w");
+    hub.inbox
+        .put("w", vec![QueuedRecord::new(json!({"id": "new"}), 500)]);
+    hub.db.execute_batch("PRAGMA query_only = ON").unwrap();
+    assert!(persist_ok(&mut hub).is_err());
+    assert_eq!(hub.inbox, expected);
+}
+
+#[test]
+fn a2_migration_failure_rolls_back_column_and_rows() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE inbox(peer_id TEXT, seq INTEGER, payload TEXT); INSERT INTO inbox VALUES ('w', 0, '{}'); CREATE TRIGGER fail_backfill BEFORE UPDATE ON inbox BEGIN SELECT RAISE(ABORT, 'a2 backfill failure'); END;").unwrap();
+    let error = migrate_inbox_queued_at(&db, 777).unwrap_err();
+    assert!(error.contains("a2 backfill failure"), "{error}");
+    let columns: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('inbox') WHERE name = 'queued_at'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(columns, 0);
+    let row: (String, i64, String) = db
+        .query_row("SELECT peer_id, seq, payload FROM inbox", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(row, ("w".into(), 0, "{}".into()));
+    db.execute_batch("DROP TRIGGER fail_backfill").unwrap();
+    migrate_inbox_queued_at(&db, 777).unwrap();
+    let stamp: i64 = db
+        .query_row("SELECT queued_at FROM inbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(stamp, 777);
+}
+
+#[test]
+fn a3_legacy_send_failure_first_time() {
+    let (mut hub, _path) = undelivered_hub();
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("worker".into(), (1, tx));
+    drop(rx);
+    persist_then_deliver(&mut hub, "worker", json!({"type":"notify"}), 17).unwrap();
+    let held = &hub.inbox.records("worker")[0];
+    assert_eq!(held.queued_at(), 17);
+    assert!(held.event().get("id").is_none());
+}
+
+#[test]
+fn a3_dropped_link_return_time() {
+    let (mut hub, _path) = undelivered_hub();
+    let record = QueuedRecord::new(json!({"type":"notify"}), 17);
+    assert!(return_undelivered(
+        &mut hub,
+        "worker",
+        vec![Outbound::Record(record.clone())]
+    ));
+    assert_eq!(hub.inbox.records("worker"), &[record]);
+}
+
+#[test]
+fn a3_successor_second_failure_time() {
+    let (mut hub, _path) = undelivered_hub();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("worker".into(), (2, tx));
+    let record = QueuedRecord::new(json!({"type":"notify"}), 17);
+    assert!(!return_undelivered(
+        &mut hub,
+        "worker",
+        vec![Outbound::Record(record.clone())]
+    ));
+    let forwarded = rx.try_recv().unwrap();
+    drop(rx);
+    assert!(return_undelivered(&mut hub, "worker", vec![forwarded]));
+    assert_eq!(hub.inbox.records("worker"), &[record]);
+}
+
+#[test]
+fn a3_recv_copy_time_equals_original() {
+    let (mut hub, _path) = undelivered_hub();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("worker".into(), (1, tx));
+    hub.recv_live.insert("worker".into());
+    hub.recv_known.insert("worker".into());
+    persist_then_deliver(&mut hub, "worker", json!({"type":"notify"}), 17).unwrap();
+    let Outbound::Record(copy) = rx.try_recv().unwrap() else {
+        panic!("record expected")
+    };
+    assert_eq!(&copy, &hub.inbox.records("worker")[0]);
+    assert_eq!(copy.queued_at(), 17);
+    assert!(copy.event()["id"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn a3_pending_failure_restores_exact_image() {
+    let (mut hub, path) = undelivered_hub();
+    hub.inbox.put(
+        "worker",
+        vec![
+            QueuedRecord::new(json!({"type":"ask", "correlation_id":"stale"}), 11),
+            QueuedRecord::new(json!({"type":"notify", "id":"valid"}), 17),
+        ],
+    );
+    persist(&mut hub).unwrap();
+    let expected = hub.inbox.clone();
+    hub.db.execute_batch("PRAGMA query_only = ON").unwrap();
+    let app = App {
+        inner: Arc::new(Mutex::new(hub)),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    assert!(pending_asks(
+        State(app.clone()),
+        HeaderMap::new(),
+        Query(PendingQuery {
+            peer_id: Some("worker".into())
+        })
+    )
+    .await
+    .is_err());
+    assert_eq!(app.inner.lock().await.inbox, expected);
+}
+
+#[tokio::test]
+async fn a3_recovery_write_failure_keeps_inflight_memory() {
+    let (mut hub, path) = undelivered_hub();
+    persist(&mut hub).unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("worker".into(), (1, tx));
+    hub.db.execute_batch("PRAGMA query_only = ON").unwrap();
+    let record = QueuedRecord::new(json!({"type":"notify"}), 17);
+    let app = App {
+        inner: Arc::new(Mutex::new(hub)),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    close_connection(
+        &app,
+        "worker",
+        1,
+        false,
+        rx,
+        vec![Outbound::Record(record.clone())],
+    )
+    .await;
+    assert_eq!(app.inner.lock().await.inbox.records("worker"), &[record]);
+}
+
+#[test]
+fn a3_transfer_duplicate_keeps_earliest_time() {
+    let mut inbox = Inbox::default();
+    let payload = json!({"id":"same", "message":"target"});
+    inbox.put(
+        "target",
+        vec![
+            QueuedRecord::new(payload.clone(), 90),
+            QueuedRecord::new(payload.clone(), 100),
+        ],
+    );
+    inbox.put(
+        "old",
+        vec![QueuedRecord::new(json!({"id":"same", "message":"old"}), 17)],
+    );
+    inbox.transfer_owed("old", "target");
+    assert_eq!(
+        inbox.records("target"),
+        &[
+            QueuedRecord::new(payload.clone(), 17),
+            QueuedRecord::new(payload, 17)
+        ]
+    );
+}
+
+fn test_outbound(event: Value) -> Outbound {
+    if matches!(event["type"].as_str(), Some(DISPLACED | REPLACED | "bound")) {
+        Outbound::Control(event)
+    } else {
+        Outbound::Record(QueuedRecord::new(event, 0))
+    }
+}
+
+#[tokio::test]
+async fn a3_register_copy_uses_merged_time() {
+    let (mut hub, path) = undelivered_hub();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("worker".into(), (1, tx));
+    hub.recv_live.insert("worker".into());
+    for id in ["worker", "old"] {
+        hub.owed.insert(
+            id.into(),
+            Owed {
+                owner: "session".into(),
+                since: now_unix(),
+            },
+        );
+    }
+    let event = json!({"id":"same", "type":"notify"});
+    hub.inbox
+        .put("worker", vec![QueuedRecord::new(event.clone(), 90)]);
+    hub.inbox.put("old", vec![QueuedRecord::new(event, 17)]);
+    persist(&mut hub).unwrap();
+    let app = App {
+        inner: Arc::new(Mutex::new(hub)),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    let (status, _) = json_req(router(app.clone()), "POST", "/peers", json!({"peer_id":"worker", "name":"worker", "backend":"pi", "path":"/tmp", "session_id":"session"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let copy = loop {
+        if let Outbound::Record(record) = rx.try_recv().unwrap() {
+            break record;
+        }
+    };
+    assert_eq!(copy.queued_at(), 17);
+    assert_eq!(app.inner.lock().await.inbox.records("worker"), &[copy]);
 }

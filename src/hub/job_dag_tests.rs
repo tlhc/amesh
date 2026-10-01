@@ -104,9 +104,10 @@ impl Fixture {
             .lock()
             .await
             .inbox
-            .get(peer)
-            .cloned()
-            .unwrap_or_default()
+            .records(peer)
+            .iter()
+            .map(|record| record.event().clone())
+            .collect()
     }
 
     async fn ack(&self, cid: &str, mut body: Value) -> (StatusCode, Value) {
@@ -1106,7 +1107,7 @@ async fn closed_ask_is_not_returned_from_a_dropped_link() {
     }
     assert!(on_the_link
         .iter()
-        .any(|e| e["type"] == "ask" && e["correlation_id"] == cid.as_str()));
+        .any(|e| e.event()["type"] == "ask" && e.event()["correlation_id"] == cid.as_str()));
 
     f.set_state(&a, json!({"state": "cancelled"})).await;
     {
@@ -1494,13 +1495,14 @@ async fn closed_or_swept_asks_are_not_delivered() {
     let gone = f.open_ask("boss", "w1").await;
     f.ack(&answered, json!({"message": "by an operator"})).await;
     f.0.inner.lock().await.asks.remove(&gone);
-    f.0.inner
-        .lock()
-        .await
-        .inbox
-        .entry("w1".into())
-        .or_default()
-        .push(json!({"type": "ask", "text": "no id"}));
+    f.0.inner.lock().await.inbox.enqueue(
+        "w1",
+        [QueuedRecord::new(
+            json!({"type": "ask", "text": "no id"}),
+            now_unix(),
+        )],
+        true,
+    );
     let (_, pending) = f
         .request("GET", "/asks/pending?peer_id=w1", json!({}))
         .await;
@@ -1681,9 +1683,11 @@ async fn failed_gc_write_keeps_asks_inbox_and_batches() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     let hub = f.0.inner.lock().await;
     assert!(hub.asks.contains_key(&cid) && hub.batches.contains_key("batch"));
-    assert!(hub.inbox["w1"]
+    assert!(hub
+        .inbox
+        .records("w1")
         .iter()
-        .any(|event| event["correlation_id"] == cid.as_str()));
+        .any(|event| event.event()["correlation_id"] == cid.as_str()));
 }
 
 #[tokio::test]
@@ -1805,7 +1809,7 @@ async fn snapshot_changes_nothing() {
         let hub = f.0.inner.lock().await;
         (hub.db.total_changes(), hub.events.len(), hub.inbox.clone())
     };
-    assert!(!inbox.is_empty());
+    assert!(inbox.iter().next().is_some());
     for _ in 0..3 {
         snapshot_of(&f, "").await;
         snapshot_of(&f, &format!("?ask={loose}")).await;
@@ -2987,7 +2991,7 @@ async fn ask_many_opens_nothing_when_a_recipient_is_refused() {
     );
     let hub = f.0.inner.lock().await;
     assert!(
-        hub.asks.is_empty() && hub.inbox.get("worker").is_none_or(Vec::is_empty),
+        hub.asks.is_empty() && hub.inbox.records("worker").is_empty(),
         "a refused fan-out opens no ask at all"
     );
 }

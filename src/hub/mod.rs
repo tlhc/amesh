@@ -1,3 +1,7 @@
+mod inbox;
+
+use inbox::{Inbox, Outbound, QueuedRecord};
+
 use rusqlite::{params, Connection};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -34,7 +38,7 @@ struct Hub {
     asks: HashMap<String, Ask>,
     jobs: HashMap<String, Job>,
     schedules: HashMap<String, Schedule>,
-    sockets: HashMap<String, (u64, mpsc::UnboundedSender<Value>)>,
+    sockets: HashMap<String, (u64, mpsc::UnboundedSender<Outbound>)>,
     /* recv_live: peers whose current connection acknowledges every frame with a recv, so
     the inbox is the record of what they are owed and a send is only a copy of it.
     recv_known: every peer that ever made that promise; persisted, so what they are owed
@@ -42,7 +46,7 @@ struct Hub {
     recv_live: HashSet<String>,
     recv_known: HashSet<String>,
     owed: HashMap<String, Owed>,
-    inbox: HashMap<String, Vec<Value>>,
+    inbox: Inbox,
     conn_gen: u64,
     events: Vec<Value>,
     /* the seq of the newest ring entry, seeded from the clock at start so a cursor issued
@@ -156,8 +160,20 @@ struct Schedule {
     circle: String,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Default)]
 struct DiskState {
+    peers: HashMap<String, Peer>,
+    asks: HashMap<String, Ask>,
+    jobs: HashMap<String, Job>,
+    schedules: HashMap<String, Schedule>,
+    inbox: HashMap<String, Vec<QueuedRecord>>,
+    mcp_servers: HashMap<String, Vec<Value>>,
+    recv_peers: HashSet<String>,
+    owed: HashMap<String, Owed>,
+}
+
+#[derive(Deserialize)]
+struct LegacyDiskState {
     peers: HashMap<String, Peer>,
     asks: HashMap<String, Ask>,
     jobs: HashMap<String, Job>,
@@ -169,6 +185,33 @@ struct DiskState {
     recv_peers: HashSet<String>,
     #[serde(default)]
     owed: HashMap<String, Owed>,
+}
+
+impl LegacyDiskState {
+    fn into_disk(self, now: u64) -> DiskState {
+        DiskState {
+            peers: self.peers,
+            asks: self.asks,
+            jobs: self.jobs,
+            schedules: self.schedules,
+            inbox: self
+                .inbox
+                .into_iter()
+                .map(|(peer, events)| {
+                    (
+                        peer,
+                        events
+                            .into_iter()
+                            .map(|event| QueuedRecord::new(event, now))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            mcp_servers: self.mcp_servers,
+            recv_peers: self.recv_peers,
+            owed: self.owed,
+        }
+    }
 }
 
 /* a backlog whose peer row was pruned: it waits for the session that owned it, and no
@@ -291,6 +334,7 @@ CREATE TABLE IF NOT EXISTS inbox (
   peer_id TEXT NOT NULL,
   seq INTEGER NOT NULL,
   payload TEXT NOT NULL,
+  queued_at INTEGER,
   PRIMARY KEY (peer_id, seq)
 );
 CREATE TABLE IF NOT EXISTS recv_peers (
@@ -336,7 +380,7 @@ fn attachments_dir(app: &App) -> PathBuf {
 
 const WAL_LIMIT: i64 = 1 << 20;
 
-fn open_db(path: &Path) -> Result<Connection, String> {
+fn open_db(path: &Path, now: u64) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -392,6 +436,7 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     ] {
         let _ = db.execute(column, []);
     }
+    migrate_inbox_queued_at(&db, now)?;
     /* a file with free pages, or left in auto_vacuum by an earlier amesh, is rebuilt; nothing
     is written otherwise, so another writer never stops a start. Best effort: a file busy
     with another connection stays as it is, still usable, and is tried again next start */
@@ -487,10 +532,15 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     for (peer_id, events) in &disk.inbox {
-        for (seq, payload) in events.iter().enumerate() {
+        for (seq, record) in events.iter().enumerate() {
             tx.execute(
-                "INSERT INTO inbox(peer_id,seq,payload) VALUES (?,?,?)",
-                params![peer_id, seq as i64, payload.to_string()],
+                "INSERT INTO inbox(peer_id,seq,payload,queued_at) VALUES (?,?,?,?)",
+                params![
+                    peer_id,
+                    seq as i64,
+                    record.event().to_string(),
+                    record.queued_at() as i64
+                ],
             )
             .map_err(|e| e.to_string())?;
         }
@@ -643,7 +693,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
         disk.schedules.insert(s.schedule_id.clone(), s);
     }
     let mut stmt = db
-        .prepare("SELECT peer_id,seq,payload FROM inbox ORDER BY peer_id, seq")
+        .prepare("SELECT peer_id,seq,payload,queued_at FROM inbox ORDER BY peer_id, seq")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -651,13 +701,17 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
                 r.get::<_, String>(0)?,
                 r.get::<_, i64>(1)?,
                 r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?.max(0) as u64,
             ))
         })
         .map_err(|e| e.to_string())?;
     for row in rows {
-        let (peer_id, _, payload) = row.map_err(|e| e.to_string())?;
+        let (peer_id, _, payload, queued_at) = row.map_err(|e| e.to_string())?;
         let value = serde_json::from_str(&payload).unwrap_or(Value::String(payload));
-        disk.inbox.entry(peer_id).or_default().push(value);
+        disk.inbox
+            .entry(peer_id)
+            .or_default()
+            .push(QueuedRecord::new(value, queued_at));
     }
     let mut stmt = db
         .prepare("SELECT peer_id,payload FROM mcp_servers")
@@ -735,8 +789,9 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
             && (disk.inbox.get(peer_id).is_some_and(|q| !q.is_empty())
                 || has_open_ask(&disk.asks, peer_id))
     });
-    disk.inbox
-        .retain(|peer_id, _| disk.peers.contains_key(peer_id) || disk.owed.contains_key(peer_id));
+    disk.inbox.retain(|peer_id, records| {
+        !records.is_empty() && (disk.peers.contains_key(peer_id) || disk.owed.contains_key(peer_id))
+    });
     disk.recv_peers
         .retain(|peer_id| disk.peers.contains_key(peer_id) || disk.owed.contains_key(peer_id));
     Ok(disk)
@@ -747,16 +802,51 @@ fn apply_disk(hub: &mut Hub, disk: DiskState) {
     hub.asks = disk.asks;
     hub.jobs = disk.jobs;
     hub.schedules = disk.schedules;
-    hub.inbox = disk.inbox;
+    hub.inbox = Inbox::from_map(disk.inbox);
     hub.mcp_servers = disk.mcp_servers;
     hub.owed = disk.owed;
     hub.recv_known = disk.recv_peers;
     hub.recv_known.extend(hub.recv_live.iter().cloned());
 }
 
+fn migrate_inbox_queued_at(db: &Connection, now: u64) -> Result<(), String> {
+    let tx = db.unchecked_transaction().map_err(|e| e.to_string())?;
+    let has_column: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('inbox') WHERE name = 'queued_at')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if !has_column {
+        tx.execute("ALTER TABLE inbox ADD COLUMN queued_at INTEGER", [])
+            .map_err(|e| e.to_string())?;
+    }
+    /* a fully migrated database can open while another connection holds the write lock */
+    let has_null: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM inbox WHERE queued_at IS NULL)",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if has_null {
+        tx.execute(
+            "UPDATE inbox SET queued_at = ? WHERE queued_at IS NULL",
+            [now as i64],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
 impl Hub {
     fn open(path: &Path) -> Result<Self, String> {
-        let mut db = open_db(path)?;
+        Self::open_at(path, now_unix())
+    }
+
+    fn open_at(path: &Path, now: u64) -> Result<Self, String> {
+        let mut db = open_db(path, now)?;
         let count: i64 = db
             .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
             .unwrap_or(0);
@@ -764,8 +854,8 @@ impl Hub {
             let json_path = path.with_extension("json");
             if json_path.is_file() {
                 if let Ok(bytes) = fs::read(&json_path) {
-                    if let Ok(disk) = serde_json::from_slice::<DiskState>(&bytes) {
-                        write_snapshot(&mut db, &disk)?;
+                    if let Ok(disk) = serde_json::from_slice::<LegacyDiskState>(&bytes) {
+                        write_snapshot(&mut db, &disk.into_disk(now))?;
                     }
                 }
             }
@@ -775,10 +865,9 @@ impl Hub {
         last mutation; without a fresh stamp the first read after a restart would prune
         every peer before its drainer reconnects, and the drainer's announce would then
         rebuild the record without its session */
-        let loaded_at = now_unix();
         let mut peers = disk.peers;
         for peer in peers.values_mut() {
-            peer.last_seen = loaded_at;
+            peer.last_seen = now;
         }
         Ok(Hub {
             db,
@@ -786,7 +875,7 @@ impl Hub {
             asks: disk.asks,
             jobs: disk.jobs,
             schedules: disk.schedules,
-            inbox: disk.inbox,
+            inbox: Inbox::from_map(disk.inbox),
             sockets: HashMap::new(),
             recv_live: HashSet::new(),
             recv_known: disk.recv_peers,
@@ -814,7 +903,7 @@ fn persist(hub: &mut Hub) -> Result<(), String> {
         asks: hub.asks.clone(),
         jobs: hub.jobs.clone(),
         schedules: hub.schedules.clone(),
-        inbox: hub.inbox.clone(),
+        inbox: hub.inbox.to_map(),
         mcp_servers: hub.mcp_servers.clone(),
         recv_peers: hub.recv_known.clone(),
         owed: hub.owed.clone(),
@@ -933,33 +1022,15 @@ fn with_event_id(mut event: Value) -> Value {
     event
 }
 
-fn queue_inbox(hub: &mut Hub, peer_id: &str, events: impl IntoIterator<Item = Value>) {
-    /* what an acknowledging peer is owed is never evicted: the cap would silently take back
-    the at-least-once promise, and pruning the peer is the only bound on that queue */
-    let owed = hub.recv_known.contains(peer_id);
-    let queue = hub.inbox.entry(peer_id.to_string()).or_default();
-    for event in events {
-        /* a newer handoff notice for a job replaces the one the queue holds: a link that
-        drops hands its frames back oldest first, so the newest is the one kept */
-        if event["handoff"] == true {
-            let topic = event["topic"].clone();
-            queue.retain(|held| held["handoff"] != true || held["topic"] != topic);
-        }
-        /* only an ask leaves someone blocked on an answer, so chatter gives way to it and a
-        queue of nothing but asks is allowed past the cap rather than strand an asker; a
-        handoff notice is kept the same way, since it is the new coordinator's only signal
-        and a retry of the handoff sends none */
-        while !owed && queue.len() >= INBOX_MAX {
-            let Some(chatter) = queue
-                .iter()
-                .position(|held| held["type"] != "ask" && held["handoff"] != true)
-            else {
-                break;
-            };
-            queue.remove(chatter);
-        }
-        queue.push(event);
-    }
+#[cfg(test)]
+fn queue_inbox(hub: &mut Hub, peer_id: &str, events: impl IntoIterator<Item = Value>, now: u64) {
+    hub.inbox.enqueue(
+        peer_id,
+        events
+            .into_iter()
+            .map(|event| QueuedRecord::new(event, now)),
+        hub.recv_known.contains(peer_id),
+    );
 }
 
 /* an ask copy is delivered only while its ask exists and is open, and a handoff notice only
@@ -983,39 +1054,49 @@ fn deliverable(hub: &Hub, event: &Value) -> bool {
 Those events are owed to the peer, not to the connection, so hand them to whoever
 holds the socket now and fall back to the inbox when nobody does. Returns whether
 hub state changed and needs persisting. */
-fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Value>) -> bool {
+fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Outbound>) -> bool {
     let start = undelivered
         .iter()
-        .rposition(|event| event["type"] == REPLACED)
+        .rposition(|event| event.event()["type"] == REPLACED)
         .map_or(0, |index| index + 1);
     /* a successor receives its own connection and binding notices; an ask closed while it
     sat on the link would come back as live work, so it stays behind */
-    let owed: Vec<Value> = undelivered
+    let owed: Vec<QueuedRecord> = undelivered
         .into_iter()
         .skip(start)
-        .filter(|event| event["type"] != DISPLACED && event["type"] != "bound")
-        .filter(|event| deliverable(hub, event))
+        .filter_map(|event| match event {
+            Outbound::Record(record) => Some(record),
+            Outbound::Control(_) => None,
+        })
+        .filter(|record| record.event()["type"] != DISPLACED && record.event()["type"] != "bound")
+        .filter(|event| deliverable(hub, event.event()))
         .collect();
     if owed.is_empty() {
         return false;
     }
     if hub.owed.contains_key(peer_id) {
-        queue_inbox(hub, peer_id, owed);
+        hub.inbox
+            .enqueue(peer_id, owed, hub.recv_known.contains(peer_id));
         return true;
     }
     if !hub.peers.contains_key(peer_id) {
         return false;
     }
     let Some(successor) = hub.sockets.get(peer_id).map(|(_, tx)| tx.clone()) else {
-        queue_inbox(hub, peer_id, owed);
+        hub.inbox
+            .enqueue(peer_id, owed, hub.recv_known.contains(peer_id));
         return true;
     };
     let mut owed = owed.into_iter();
     for event in owed.by_ref() {
-        if let Err(rejected) = successor.send(event) {
+        if let Err(rejected) = successor.send(Outbound::Record(event)) {
             /* the successor died too; keep its payload and stop trying the dead channel */
-            let stranded = std::iter::once(rejected.0).chain(owed);
-            queue_inbox(hub, peer_id, stranded);
+            let Outbound::Record(record) = rejected.0 else {
+                unreachable!()
+            };
+            let stranded = std::iter::once(record).chain(owed);
+            hub.inbox
+                .enqueue(peer_id, stranded, hub.recv_known.contains(peer_id));
             hub.sockets.remove(peer_id);
             return true;
         }
@@ -1037,6 +1118,7 @@ fn persist_then_deliver(
     hub: &mut Hub,
     to: &str,
     event: Value,
+    now: u64,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     /* an inbox keyed by anything other than a live peer_id is never collected: the prune
     path only drops the inbox of peers it removes. Callers that cannot check the target
@@ -1057,25 +1139,29 @@ fn persist_then_deliver(
         /* the inbox is the record of what this peer is owed; what goes down the socket is a
         copy, and only the peer's recv for this id takes the record away */
         let event = with_event_id(event);
-        queue_inbox(hub, &key, [event.clone()]);
+        let record = QueuedRecord::new(event.clone(), now);
+        hub.inbox
+            .enqueue(&key, [record.clone()], hub.recv_known.contains(&key));
         persist_ok(hub)?;
         push_event(hub, event.clone());
         if !unsettled {
             if let Some((_, tx)) = hub.sockets.get(&key) {
-                let _ = tx.send(event);
+                let _ = tx.send(Outbound::Record(record));
             }
         }
         return Ok(());
     }
+    let record = QueuedRecord::new(event.clone(), now);
     let live = hub.sockets.get(&key).map(|(_, tx)| tx.clone());
     if let Some(tx) = live {
         persist_ok(hub)?;
-        if tx.send(event.clone()).is_ok() {
+        if tx.send(Outbound::Record(record.clone())).is_ok() {
             return Ok(());
         }
         hub.sockets.remove(&key);
     }
-    queue_inbox(hub, &key, [event.clone()]);
+    hub.inbox
+        .enqueue(&key, [record], hub.recv_known.contains(&key));
     persist_ok(hub)?;
     push_event(hub, event);
     Ok(())
@@ -1103,7 +1189,7 @@ fn close_open_asks(asks: &mut HashMap<String, Ask>, peer_id: &str, reason: &str)
     replies
 }
 
-fn queue_replies(hub: &mut Hub, replies: Vec<Value>) -> Vec<(String, Value)> {
+fn queue_replies(hub: &mut Hub, replies: Vec<Value>, now: u64) -> Vec<(String, QueuedRecord)> {
     let mut queued = Vec::new();
     for event in replies {
         let to = event["to_peer"].as_str().unwrap_or_default();
@@ -1112,17 +1198,20 @@ fn queue_replies(hub: &mut Hub, replies: Vec<Value>) -> Vec<(String, Value)> {
             continue;
         };
         let event = with_event_id(event);
-        queue_inbox(hub, &target, [event.clone()]);
-        queued.push((target, event));
+        let record = QueuedRecord::new(event, now);
+        hub.inbox
+            .enqueue(&target, [record.clone()], hub.recv_known.contains(&target));
+        queued.push((target, record));
     }
     queued
 }
 
 /* callers persist the records and their state changes before this records them in the ring
 and sends any copy */
-fn deliver_queued(hub: &mut Hub, records: Vec<(String, Value)>) {
+fn deliver_queued(hub: &mut Hub, records: Vec<(String, QueuedRecord)>) {
     let mut retired = false;
-    for (target, event) in records {
+    for (target, record) in records {
+        let event = record.event();
         push_event(hub, event.clone());
         if hub.owed.contains_key(&target) {
             continue;
@@ -1130,7 +1219,7 @@ fn deliver_queued(hub: &mut Hub, records: Vec<(String, Value)>) {
         let Some((_, tx)) = hub.sockets.get(&target) else {
             continue;
         };
-        if tx.send(event.clone()).is_err() {
+        if tx.send(Outbound::Record(record.clone())).is_err() {
             hub.sockets.remove(&target);
             continue;
         }
@@ -1149,6 +1238,7 @@ fn deliver_notify(
     hub: &mut Hub,
     to: &str,
     message: String,
+    now: u64,
 ) -> Result<(), (StatusCode, Json<Value>)> {
     if to.is_empty() || resolve(hub, to).is_none() {
         persist_ok(hub)?;
@@ -1164,6 +1254,7 @@ fn deliver_notify(
             "to_peer": to,
             "message": message,
         }),
+        now,
     )
 }
 
@@ -1639,7 +1730,7 @@ async fn snapshot(
             "running": running.get(peer.peer_id.as_str()).copied().unwrap_or(0),
             "push": hub.sockets.contains_key(&peer.peer_id),
             "acks": hub.recv_live.contains(&peer.peer_id),
-            "queued": hub.inbox.get(&peer.peer_id).map_or(0, Vec::len),
+            "queued": hub.inbox.count(&peer.peer_id),
         })
     };
     let (mut peers, mut missing_peers, mut seen) = (Vec::new(), BTreeSet::new(), HashSet::new());
@@ -1828,6 +1919,7 @@ async fn register_peer(
         check_activity(report)?;
     }
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     /* a dead peer still holds its name until a read path prunes it; reclaim it here so a
     restarted runtime gets its own name back instead of drifting to -2, -3, ... */
     probe_peers(&mut hub)?;
@@ -1933,7 +2025,7 @@ async fn register_peer(
         eprintln!("amesh: dropping backlog of {peer_id}: it belongs to another session");
         hub.activity.remove(&peer_id);
         hub.owed.remove(&peer_id);
-        hub.inbox.remove(&peer_id);
+        hub.inbox.remove_peer(&peer_id);
         if !hub.recv_live.contains(&peer_id) {
             hub.recv_known.remove(&peer_id);
         }
@@ -1945,21 +2037,15 @@ async fn register_peer(
     }
     /* copies that may go down an attached acknowledging socket, but only once the records
     they stand for are on disk: what is sent must never be something a crash can forget */
-    let mut to_push: Vec<Value> = Vec::new();
+    let mut replay_start = hub.inbox.count(&peer_id);
     if hub
         .owed
         .get(&peer_id)
         .is_some_and(|owed| owed.owner == peer.session_id)
     {
         hub.owed.remove(&peer_id);
-        if let Some(queue) = hub.inbox.get_mut(&peer_id) {
-            for record in queue.iter_mut() {
-                if record["id"].as_str().map(str::is_empty).unwrap_or(true) {
-                    *record = with_event_id(record.take());
-                }
-            }
-            to_push = queue.clone();
-        }
+        hub.inbox.ensure_ids(&peer_id);
+        replay_start = 0;
     }
     /* the session came back under another name: what was left behind for it follows the
     session, not the name. Records are matched by id so nothing is delivered twice, open
@@ -1974,24 +2060,8 @@ async fn register_peer(
         for old in left_behind {
             hub.owed.remove(&old);
             hub.recv_known.remove(&old);
-            let moved = hub.inbox.remove(&old).unwrap_or_default();
-            let target = hub.inbox.entry(peer_id.clone()).or_default();
-            let present: HashSet<String> = target
-                .iter()
-                .filter_map(|held| held["id"].as_str().map(str::to_string))
-                .collect();
-            for record in moved {
-                let record = with_event_id(record);
-                let id = record["id"].as_str().unwrap_or_default().to_string();
-                if present.contains(&id) {
-                    continue;
-                }
-                target.push(record.clone());
-                to_push.push(record);
-            }
-            if hub.inbox.get(&peer_id).map(Vec::is_empty).unwrap_or(true) {
-                hub.inbox.remove(&peer_id);
-            } else {
+            hub.inbox.transfer_owed(&old, &peer_id);
+            if hub.inbox.count(&peer_id) > 0 {
                 hub.recv_known.insert(peer_id.clone());
             }
             for ask in hub.asks.values_mut() {
@@ -2001,9 +2071,10 @@ async fn register_peer(
             }
         }
     }
+    let to_push = hub.inbox.records(&peer_id)[replay_start..].to_vec();
     hub.peers.insert(peer_id.clone(), peer.clone());
-    let mut replies = queue_replies(&mut hub, replies);
-    replies.extend(to_push.into_iter().map(|event| (peer_id.clone(), event)));
+    let mut replies = queue_replies(&mut hub, replies, now);
+    replies.extend(to_push.into_iter().map(|record| (peer_id.clone(), record)));
     persist_ok(&mut hub)?;
     /* only once the registration is on disk: a failed one rolls the peer back to its old
     session, and activity kept in memory would outlive the rollback */
@@ -2013,8 +2084,9 @@ async fn register_peer(
     if replaced || binding {
         if let Some((_, tx)) = hub.sockets.get(&peer_id) {
             let kind = if replaced { REPLACED } else { "bound" };
-            let _ =
-                tx.send(json!({"type": kind, "peer_id": peer_id, "session_id": peer.session_id}));
+            let _ = tx.send(Outbound::Control(
+                json!({"type": kind, "peer_id": peer_id, "session_id": peer.session_id}),
+            ));
         }
     }
     deliver_queued(&mut hub, replies);
@@ -2029,7 +2101,7 @@ async fn register_peer(
 
 const PEER_ONLINE_SECS: u64 = 30;
 
-fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
+fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, QueuedRecord)>) {
     let now = now_unix();
     let online = crate::cli::env_secs("AMESH_PEER_ONLINE_SECS", PEER_ONLINE_SECS);
     let mut changed = false;
@@ -2070,8 +2142,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
         answered, stays behind for that session, drainer or not: freed, the name would hand
         it to the next session that takes it. A peer with no known session has nobody to
         hand it to, so its backlog is dropped and its asks are closed below */
-        let holds_backlog =
-            hub.inbox.get(id).is_some_and(|q| !q.is_empty()) || has_open_ask(&hub.asks, id);
+        let holds_backlog = hub.inbox.count(id) > 0 || has_open_ask(&hub.asks, id);
         if holds_backlog && !session.is_empty() {
             /* an owed record is persisted with the recv_known row, drainer or not */
             hub.recv_known.insert(id.clone());
@@ -2080,7 +2151,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
                 owner: session,
             });
         } else {
-            hub.inbox.remove(id);
+            hub.inbox.remove_peer(id);
             hub.recv_known.remove(id);
             hub.owed.remove(id);
         }
@@ -2095,7 +2166,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
         .collect();
     for id in &expired {
         hub.owed.remove(id);
-        hub.inbox.remove(id);
+        hub.inbox.remove_peer(id);
         if !hub.recv_live.contains(id) {
             hub.recv_known.remove(id);
         }
@@ -2128,7 +2199,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, Value)>) {
         ));
         changed = true;
     }
-    (changed, queue_replies(hub, replies))
+    (changed, queue_replies(hub, replies, now))
 }
 
 /* who an ask, a job or a schedule is from, as a peer id: its ack goes back to that peer, and
@@ -2169,6 +2240,7 @@ async fn open_ask(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
     let Some(target) = resolve(&hub, &req.to_peer) else {
         return Err(unknown_peer(&hub, req.from_peer.as_deref()));
@@ -2205,7 +2277,7 @@ async fn open_ask(
     if let Some(attachments) = req.attachments {
         event["attachments"] = attachments;
     }
-    persist_then_deliver(&mut hub, &to_peer_id, event)?;
+    persist_then_deliver(&mut hub, &to_peer_id, event, now)?;
     Ok(Json(json!({"correlation_id": cid, "ok": true})))
 }
 
@@ -2216,6 +2288,7 @@ async fn ack_ask(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     let Some(ask) = hub.asks.get(&req.correlation_id).cloned() else {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown ask"}))));
     };
@@ -2282,7 +2355,7 @@ async fn ack_ask(
         "to_peer": ask.from_peer,
         "message": message,
     });
-    persist_then_deliver(&mut hub, &ask.from_peer, event)?;
+    persist_then_deliver(&mut hub, &ask.from_peer, event, now)?;
     Ok(Json(
         json!({"ok": true, "correlation_id": req.correlation_id}),
     ))
@@ -2295,6 +2368,7 @@ async fn notify(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
     if resolve(&hub, &req.to_peer).is_none() {
         return Err(unknown_peer(&hub, req.from_peer.as_deref()));
@@ -2313,7 +2387,7 @@ async fn notify(
         "to_peer": req.to_peer,
         "message": req.message,
     });
-    persist_then_deliver(&mut hub, &req.to_peer, event)?;
+    persist_then_deliver(&mut hub, &req.to_peer, event, now)?;
     Ok(Json(json!({"ok": true, "id": id})))
 }
 
@@ -2342,6 +2416,7 @@ async fn broadcast(
         ));
     }
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     let from = req
         .from_peer
         .filter(|s| !s.is_empty())
@@ -2384,7 +2459,7 @@ async fn broadcast(
             "to_peer": to,
             "message": req.message,
         });
-        match persist_then_deliver(&mut hub, &to, event) {
+        match persist_then_deliver(&mut hub, &to, event, now) {
             Ok(()) => sent_to.push(to),
             Err((_, Json(err))) => failed.push(json!({"peer": to, "error": err})),
         }
@@ -2427,18 +2502,17 @@ async fn pending_asks(
     let inbox = if attached {
         Vec::new()
     } else {
-        let queue = hub.inbox.remove(&peer_id).unwrap_or_default();
+        let queue = hub.inbox.take(&peer_id);
         queue
             .into_iter()
-            .filter(|event| deliverable(&hub, event))
+            .filter(|record| deliverable(&hub, record.event()))
             .collect()
     };
-    if let Err(e) = persist_ok(&mut hub) {
-        if !attached {
-            hub.inbox.insert(peer_id, inbox);
-        }
-        return Err(e);
-    }
+    persist_ok(&mut hub)?;
+    let inbox: Vec<Value> = inbox
+        .into_iter()
+        .map(|record| record.event().clone())
+        .collect();
     Ok(Json(json!({"asks": open, "inbox": inbox})))
 }
 
@@ -2841,13 +2915,14 @@ async fn ingest_chat(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     let id = format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]);
     push_event(
         &mut hub,
         json!({"id": id, "type": "chat", "peer": req.peer, "role": req.role, "text": req.text}),
     );
     if !req.peer.is_empty() {
-        deliver_notify(&mut hub, &req.peer, req.text)?;
+        deliver_notify(&mut hub, &req.peer, req.text, now)?;
     }
     Ok(Json(json!({"ok": true, "id": id})))
 }
@@ -3332,9 +3407,10 @@ fn close_job_ask(hub: &mut Hub, job: &Job, reply: String, failed: bool) -> Optio
         "message": ask.reply,
     });
     /* a copy the worker has not taken yet would still be replayed to it and worked on */
-    if let Some(queue) = hub.inbox.get_mut(&worker) {
-        queue.retain(|held| !(held["type"] == "ask" && held["correlation_id"] == cid));
-    }
+    hub.inbox.retain(&worker, |record| {
+        let held = record.event();
+        !(held["type"] == "ask" && held["correlation_id"] == cid)
+    });
     Some(ack)
 }
 
@@ -3382,7 +3458,8 @@ async fn update_job(
             ));
         }
         let mut hub = app.inner.lock().await;
-        return hand_off(&mut hub, &id, to);
+        let now = now_unix();
+        return hand_off(&mut hub, &id, to, now);
     }
     let allowed = ["queued", "running", "done", "failed", "cancelled"];
     let Some(state) = req.state.filter(|state| allowed.contains(&state.as_str())) else {
@@ -3392,6 +3469,7 @@ async fn update_job(
         ));
     };
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     settle_job(&mut hub, &id);
     let Some(current) = hub.jobs.get(&id).cloned() else {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
@@ -3455,7 +3533,7 @@ async fn update_job(
         job.assigned_peer = Some(to);
     }
     let job = job.clone();
-    let replies = queue_replies(&mut hub, replies);
+    let replies = queue_replies(&mut hub, replies, now);
     /* the peer that held the job hears about the change, including where it went */
     let notice = match moved_to {
         Some(to) => format!(
@@ -3466,7 +3544,7 @@ async fn update_job(
     };
     let holder = job_holder(&hub, &current).or_else(|| job_holder(&hub, &job));
     if let Some(to) = holder {
-        deliver_notify(&mut hub, &to, notice)?;
+        deliver_notify(&mut hub, &to, notice, now)?;
     } else {
         persist_ok(&mut hub)?;
     }
@@ -3478,7 +3556,12 @@ async fn update_job(
 `to`, and nothing else about the job changes. The notice is queued in the same write as the
 new senders, so a crash before delivery loses neither, and naming the current coordinator
 again changes nothing */
-fn hand_off(hub: &mut Hub, id: &str, to: &str) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+fn hand_off(
+    hub: &mut Hub,
+    id: &str,
+    to: &str,
+    now: u64,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let Some(circle) = hub.jobs.get(id).map(|job| job.circle.clone()) else {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
     };
@@ -3541,7 +3624,7 @@ fn hand_off(hub: &mut Hub, id: &str, to: &str) -> Result<Json<Value>, (StatusCod
         ),
     });
     drop_handoff_notices(hub, |topic| topic == id);
-    let queued = queue_replies(hub, vec![notice]);
+    let queued = queue_replies(hub, vec![notice], now);
     persist_ok(hub)?;
     deliver_queued(hub, queued);
     Ok(Json(json!(hub.jobs[id])))
@@ -3550,11 +3633,10 @@ fn hand_off(hub: &mut Hub, id: &str, to: &str) -> Result<Json<Value>, (StatusCod
 /* a handoff notice holds only while its job exists and has not moved on again; the
 superseded ones go, so the notices kept past the inbox cap number at most one per job */
 fn drop_handoff_notices(hub: &mut Hub, gone: impl Fn(&str) -> bool) {
-    for queue in hub.inbox.values_mut() {
-        queue.retain(|event| {
-            event["handoff"] != true || event["topic"].as_str().is_none_or(|topic| !gone(topic))
-        });
-    }
+    hub.inbox.retain_all(|_, record| {
+        let event = record.event();
+        event["handoff"] != true || event["topic"].as_str().is_none_or(|topic| !gone(topic))
+    });
 }
 
 async fn cancel_job(
@@ -3584,6 +3666,7 @@ async fn delete_job(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
     let mut hub = app.inner.lock().await;
+    let now = now_unix();
     let Some(job) = hub.jobs.get(&id).cloned() else {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
     };
@@ -3614,13 +3697,14 @@ async fn delete_job(
     }
     hub.jobs.remove(&id);
     drop_handoff_notices(&mut hub, |topic| topic == id);
-    let replies = queue_replies(&mut hub, replies);
+    let replies = queue_replies(&mut hub, replies, now);
     /* a worker that already holds the ask hears that the job is gone */
     match job_holder(&hub, &job).filter(|_| running) {
         Some(to) => deliver_notify(
             &mut hub,
             &to,
             format!("job {} {} deleted", job.job_id, job.title),
+            now,
         )?,
         None => persist_ok(&mut hub)?,
     }
@@ -3984,14 +4068,13 @@ fn sweep(hub: &mut Hub, now: u64) -> Sweep {
     }
     let gone: HashSet<&str> = plan.asks.iter().map(String::as_str).collect();
     if !gone.is_empty() {
-        for queue in hub.inbox.values_mut() {
-            queue.retain(|event| {
-                event["type"] != "ask"
-                    || event["correlation_id"]
-                        .as_str()
-                        .is_none_or(|cid| !gone.contains(cid))
-            });
-        }
+        hub.inbox.retain_all(|_, record| {
+            let event = record.event();
+            event["type"] != "ask"
+                || event["correlation_id"]
+                    .as_str()
+                    .is_none_or(|cid| !gone.contains(cid))
+        });
     }
     plan
 }
@@ -4215,7 +4298,7 @@ fn advance_jobs(hub: &mut Hub) {
         }
         return;
     }
-    let queued = queue_replies(hub, events);
+    let queued = queue_replies(hub, events, now);
     if let Err((_, Json(error))) = persist_ok(hub) {
         eprintln!("amesh: could not persist jobs: {error}");
         return;
@@ -4317,6 +4400,7 @@ async fn tick_schedules(app: &App) {
     };
     for sched in due {
         let mut hub = app.inner.lock().await;
+        let queued_at = now_unix();
         if resolve(&hub, &sched.to_peer).is_none() {
             continue;
         }
@@ -4368,7 +4452,7 @@ async fn tick_schedules(app: &App) {
         } else {
             hub.schedules.remove(&sched.schedule_id);
         }
-        if let Err((_, Json(err))) = persist_then_deliver(&mut hub, &to, event) {
+        if let Err((_, Json(err))) = persist_then_deliver(&mut hub, &to, event, queued_at) {
             eprintln!("amesh persist: {err}");
         }
     }
@@ -5252,7 +5336,9 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
         /* tell the incumbent it lost the peer, otherwise it cannot tell displacement
         from a dropped link and a reconnecting client would fight us for the socket */
         if let Some((_, previous)) = hub.sockets.get(&peer.peer_id) {
-            let _ = previous.send(json!({"type": DISPLACED, "peer_id": peer.peer_id}));
+            let _ = previous.send(Outbound::Control(
+                json!({"type": DISPLACED, "peer_id": peer.peer_id}),
+            ));
         }
         hub.sockets.insert(peer.peer_id.clone(), (gen, tx));
         if let Some(p) = hub.peers.get_mut(&peer.peer_id) {
@@ -5271,30 +5357,29 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
             } else {
                 /* records queued before this peer ever promised to acknowledge carry no id;
                 the peer cannot name them, so they get one now, before persist and replay */
-                let queue = hub.inbox.remove(&peer.peer_id).unwrap_or_default();
-                let mut owed: Vec<Value> = queue
+                let queue = hub.inbox.take(&peer.peer_id);
+                let owed: Vec<QueuedRecord> = queue
                     .into_iter()
-                    .filter(|event| deliverable(&hub, event))
+                    .filter(|record| deliverable(&hub, record.event()))
                     .collect();
-                for record in owed.iter_mut() {
-                    if record["id"].as_str().map(str::is_empty).unwrap_or(true) {
-                        *record = with_event_id(record.take());
-                    }
-                }
-                if !owed.is_empty() {
-                    hub.inbox.insert(peer.peer_id.clone(), owed.clone());
-                }
-                owed
+                hub.inbox.put(&peer.peer_id, owed);
+                hub.inbox.ensure_ids(&peer.peer_id);
+                hub.inbox
+                    .records(&peer.peer_id)
+                    .iter()
+                    .cloned()
+                    .map(Outbound::Record)
+                    .collect::<Vec<_>>()
             }
         } else {
             hub.recv_live.remove(&peer.peer_id);
             if hub.owed.contains_key(&peer.peer_id) {
                 Vec::new()
             } else {
-                let mut taken = hub.inbox.remove(&peer.peer_id).unwrap_or_default();
-                taken.extend(hub.inbox.remove(&peer.name).unwrap_or_default());
-                taken.retain(|event| deliverable(&hub, event));
-                taken
+                let mut taken = hub.inbox.take(&peer.peer_id);
+                taken.extend(hub.inbox.take(&peer.name));
+                taken.retain(|record| deliverable(&hub, record.event()));
+                taken.into_iter().map(Outbound::Record).collect()
             }
         };
         if persist_ok(&mut hub).is_err() {
@@ -5312,7 +5397,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
     let mut remain = 0;
     while remain < drained.len() {
         if socket
-            .send(Message::Text(drained[remain].to_string().into()))
+            .send(Message::Text(drained[remain].event().to_string().into()))
             .await
             .is_err()
         {
@@ -5357,7 +5442,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
             event = rx.recv() => {
                 match event {
                     Some(v) => {
-                        if socket.send(Message::Text(v.to_string().into())).await.is_err() {
+                        if socket.send(Message::Text(v.event().to_string().into())).await.is_err() {
                             undelivered.push(v);
                             break;
                         }
@@ -5373,15 +5458,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
 /* the peer took the frame: the record it refers to is no longer owed. Unknown or repeated
 ids are a no-op so a client may safely acknowledge more than once. */
 fn acknowledge_event(hub: &mut Hub, peer_id: &str, id: &str) -> bool {
-    let Some(queue) = hub.inbox.get_mut(peer_id) else {
-        return false;
-    };
-    let before = queue.len();
-    queue.retain(|held| held["id"].as_str() != Some(id));
-    if queue.is_empty() {
-        hub.inbox.remove(peer_id);
-    }
-    before != hub.inbox.get(peer_id).map(Vec::len).unwrap_or(0)
+    hub.inbox.acknowledge(peer_id, id)
 }
 
 /* Unhook this connection before looking for anywhere to put what it owes: while the map
@@ -5393,8 +5470,8 @@ async fn close_connection(
     peer_id: &str,
     gen: u64,
     recv: bool,
-    mut rx: mpsc::UnboundedReceiver<Value>,
-    mut undelivered: Vec<Value>,
+    mut rx: mpsc::UnboundedReceiver<Outbound>,
+    mut undelivered: Vec<Outbound>,
 ) {
     let mut hub = app.inner.lock().await;
     let mut dirty = false;
