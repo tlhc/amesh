@@ -2327,6 +2327,11 @@ fn cli_routes_peer_jobs_and_schedule_to_the_daemon() {
     );
     let jid = job["job_id"].as_str().unwrap();
     assert_eq!(
+        sandbox.json(&["jobs", "update", jid, "--coordinator", "worker"], None)["from_peer"],
+        "worker-id",
+        "a coordinator-only update needs no --state and stores the peer id"
+    );
+    assert_eq!(
         sandbox.json(
             &[
                 "jobs",

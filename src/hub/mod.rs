@@ -138,6 +138,9 @@ struct Job {
     finished_at: Option<u64>,
     #[serde(default)]
     created_at: Option<u64>,
+    /* the id of the notice the job's last handoff queued: only that notice still holds */
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    handoff: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -271,7 +274,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   dispatch INTEGER NOT NULL DEFAULT 0,
   nudge_at INTEGER,
   finished_at INTEGER,
-  created_at INTEGER
+  created_at INTEGER,
+  handoff TEXT
 );
 CREATE TABLE IF NOT EXISTS schedules (
   schedule_id TEXT PRIMARY KEY,
@@ -384,6 +388,7 @@ fn open_db(path: &Path) -> Result<Connection, String> {
         "ALTER TABLE asks ADD COLUMN opened_at INTEGER",
         "ALTER TABLE asks ADD COLUMN closed_by TEXT",
         "ALTER TABLE jobs ADD COLUMN created_at INTEGER",
+        "ALTER TABLE jobs ADD COLUMN handoff TEXT",
     ] {
         let _ = db.execute(column, []);
     }
@@ -451,7 +456,7 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
     }
     for j in disk.jobs.values() {
         tx.execute(
-            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             params![
                 j.job_id,
                 j.title,
@@ -468,7 +473,8 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
                 j.dispatch as i32,
                 j.nudge_at.map(|v| v as i64),
                 j.finished_at.map(|v| v as i64),
-                j.created_at.map(|v| v as i64)
+                j.created_at.map(|v| v as i64),
+                j.handoff
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -572,7 +578,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
         disk.asks.insert(a.correlation_id.clone(), a);
     }
     let mut stmt = db
-        .prepare("SELECT job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at FROM jobs")
+        .prepare("SELECT job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff FROM jobs")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -607,6 +613,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
                     .get::<_, Option<i64>>(15)
                     .unwrap_or_default()
                     .map(|v| v.max(0) as u64),
+                handoff: r.get(16).unwrap_or_default(),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -932,10 +939,21 @@ fn queue_inbox(hub: &mut Hub, peer_id: &str, events: impl IntoIterator<Item = Va
     let owed = hub.recv_known.contains(peer_id);
     let queue = hub.inbox.entry(peer_id.to_string()).or_default();
     for event in events {
+        /* a newer handoff notice for a job replaces the one the queue holds: a link that
+        drops hands its frames back oldest first, so the newest is the one kept */
+        if event["handoff"] == true {
+            let topic = event["topic"].clone();
+            queue.retain(|held| held["handoff"] != true || held["topic"] != topic);
+        }
         /* only an ask leaves someone blocked on an answer, so chatter gives way to it and a
-        queue of nothing but asks is allowed past the cap rather than strand an asker */
+        queue of nothing but asks is allowed past the cap rather than strand an asker; a
+        handoff notice is kept the same way, since it is the new coordinator's only signal
+        and a retry of the handoff sends none */
         while !owed && queue.len() >= INBOX_MAX {
-            let Some(chatter) = queue.iter().position(|held| held["type"] != "ask") else {
+            let Some(chatter) = queue
+                .iter()
+                .position(|held| held["type"] != "ask" && held["handoff"] != true)
+            else {
                 break;
             };
             queue.remove(chatter);
@@ -944,8 +962,17 @@ fn queue_inbox(hub: &mut Hub, peer_id: &str, events: impl IntoIterator<Item = Va
     }
 }
 
-/* an ask copy is delivered only while its ask exists and is open */
+/* an ask copy is delivered only while its ask exists and is open, and a handoff notice only
+while its job exists and that notice is still the job's latest */
 fn deliverable(hub: &Hub, event: &Value) -> bool {
+    if event["handoff"] == true {
+        return event["topic"]
+            .as_str()
+            .and_then(|id| hub.jobs.get(id))
+            .is_some_and(|job| {
+                job.handoff.is_some() && event["id"].as_str() == job.handoff.as_deref()
+            });
+    }
     event["type"] != "ask"
         || event["correlation_id"]
             .as_str()
@@ -1240,13 +1267,17 @@ struct JobCreateReq {
 
 #[derive(Deserialize)]
 struct JobUpdateReq {
-    state: String,
+    #[serde(default)]
+    state: Option<String>,
     #[serde(default)]
     result_summary: Option<String>,
     #[serde(default)]
     assigned_peer: Option<String>,
     #[serde(default)]
     prompt: Option<String>,
+    /* hands the job's coordination to this peer; it comes alone */
+    #[serde(default)]
+    coordinator: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3203,6 +3234,7 @@ async fn create_job(
         nudge_at: None,
         finished_at: None,
         created_at: Some(now_unix()),
+        handoff: None,
     };
     hub.jobs.insert(job_id.clone(), job.clone());
     persist_ok(&mut hub)?;
@@ -3336,13 +3368,29 @@ async fn update_job(
     Json(req): Json<JobUpdateReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
+    if let Some(to) = req.coordinator.as_deref() {
+        let alone = req.state.is_none()
+            && req.result_summary.is_none()
+            && req.assigned_peer.is_none()
+            && req.prompt.is_none();
+        if !alone || to.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    json!({"error": "coordinator names a peer and comes alone, without state, result_summary, assigned_peer or prompt"}),
+                ),
+            ));
+        }
+        let mut hub = app.inner.lock().await;
+        return hand_off(&mut hub, &id, to);
+    }
     let allowed = ["queued", "running", "done", "failed", "cancelled"];
-    if !allowed.contains(&req.state.as_str()) {
+    let Some(state) = req.state.filter(|state| allowed.contains(&state.as_str())) else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "bad job state"})),
         ));
-    }
+    };
     let mut hub = app.inner.lock().await;
     settle_job(&mut hub, &id);
     let Some(current) = hub.jobs.get(&id).cloned() else {
@@ -3350,7 +3398,7 @@ async fn update_job(
     };
     /* running means the hub holds an ask for the job; set by hand, the loop would neither
     settle it, dispatch it nor remind anyone about it */
-    if current.dispatch && req.state == "running" && current.state != "running" {
+    if current.dispatch && state == "running" && current.state != "running" {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({"error": "the hub starts a dispatched job; set state queued"})),
@@ -3360,7 +3408,7 @@ async fn update_job(
     if let Some(to) = reassign.as_deref() {
         /* the running job's ask is already with its worker; moving the job needs a state
         that closes that ask first */
-        if req.state == "running" {
+        if state == "running" {
             return Err((
                 StatusCode::CONFLICT,
                 Json(json!({"error": "set state queued to reassign a job"})),
@@ -3370,29 +3418,24 @@ async fn update_job(
         check_job_assignee(&hub, creator, to, &current.circle)?;
     }
     /* a new prompt is for the next attempt; the running one already has its ask */
-    if req.prompt.is_some() && req.state == "running" {
+    if req.prompt.is_some() && state == "running" {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({"error": "set state queued to change a job's prompt"})),
         ));
     }
     let mut replies = Vec::new();
-    if current.state == "running" && req.state != "running" {
+    if current.state == "running" && state != "running" {
         let reply = match &req.result_summary {
-            Some(summary) => format!("amesh: job {id} set to {}: {summary}", req.state),
-            None => format!("amesh: job {id} set to {}", req.state),
+            Some(summary) => format!("amesh: job {id} set to {state}: {summary}"),
+            None => format!("amesh: job {id} set to {state}"),
         };
-        replies.extend(close_job_ask(
-            &mut hub,
-            &current,
-            reply,
-            req.state != "done",
-        ));
+        replies.extend(close_job_ask(&mut hub, &current, reply, state != "done"));
     }
     let Some(job) = hub.jobs.get_mut(&id) else {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
     };
-    set_job_state(job, &req.state, now_unix());
+    set_job_state(job, &state, now_unix());
     if req.result_summary.is_some() {
         job.result_summary = req.result_summary;
     }
@@ -3431,6 +3474,89 @@ async fn update_job(
     Ok(Json(json!(job)))
 }
 
+/* a coordinator-only update: the job's later acks, its reminders and its next dispatch go to
+`to`, and nothing else about the job changes. The notice is queued in the same write as the
+new senders, so a crash before delivery loses neither, and naming the current coordinator
+again changes nothing */
+fn hand_off(hub: &mut Hub, id: &str, to: &str) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let Some(circle) = hub.jobs.get(id).map(|job| job.circle.clone()) else {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
+    };
+    let Some(peer) = resolve(hub, to) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "unknown peer"})),
+        ));
+    };
+    if !circle.is_empty() && peer.circle != circle {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "coordinator is in another circle"})),
+        ));
+    }
+    let target = peer.peer_id.clone();
+    let settled = settle_job(hub, id);
+    let job = hub.jobs[id].clone();
+    if job.from_peer == target {
+        if settled {
+            persist_ok(hub)?;
+        }
+        return Ok(Json(json!(job)));
+    }
+    let notice_id = format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    if let Some(row) = hub.jobs.get_mut(id) {
+        row.from_peer = target.clone();
+        row.handoff = Some(notice_id.clone());
+    }
+    let open = job
+        .ask_id
+        .as_deref()
+        .and_then(|cid| hub.asks.get_mut(cid))
+        .filter(|ask| ask.open);
+    if let Some(ask) = open {
+        ask.from_peer = target.clone();
+    }
+    let ask = job
+        .ask_id
+        .as_deref()
+        .map_or(String::new(), |cid| format!(", ask {cid}"));
+    let was = Some(job.from_peer.as_str())
+        .filter(|old| !old.is_empty())
+        .map_or(String::new(), |old| format!(" from {old}"));
+    let ready = if terminal(&job.state) {
+        "; its result is ready"
+    } else {
+        ""
+    };
+    let notice = json!({
+        "type": "notify",
+        "id": notice_id,
+        "from_peer": "amesh",
+        "to_peer": target,
+        "topic": id,
+        "handoff": true,
+        "message": format!(
+            "job {id} {} is {}{ask}: you coordinate it now{was}. Later acks of its ask, its reminders and its next dispatch come to you; amesh_job_status shows where it stands{ready}",
+            job.title, job.state
+        ),
+    });
+    drop_handoff_notices(hub, |topic| topic == id);
+    let queued = queue_replies(hub, vec![notice]);
+    persist_ok(hub)?;
+    deliver_queued(hub, queued);
+    Ok(Json(json!(hub.jobs[id])))
+}
+
+/* a handoff notice holds only while its job exists and has not moved on again; the
+superseded ones go, so the notices kept past the inbox cap number at most one per job */
+fn drop_handoff_notices(hub: &mut Hub, gone: impl Fn(&str) -> bool) {
+    for queue in hub.inbox.values_mut() {
+        queue.retain(|event| {
+            event["handoff"] != true || event["topic"].as_str().is_none_or(|topic| !gone(topic))
+        });
+    }
+}
+
 async fn cancel_job(
     State(app): State<App>,
     headers: HeaderMap,
@@ -3441,10 +3567,11 @@ async fn cancel_job(
         headers,
         AxumPath(id),
         Json(JobUpdateReq {
-            state: "cancelled".into(),
+            state: Some("cancelled".into()),
             result_summary: None,
             assigned_peer: None,
             prompt: None,
+            coordinator: None,
         }),
     )
     .await
@@ -3486,6 +3613,7 @@ async fn delete_job(
         ));
     }
     hub.jobs.remove(&id);
+    drop_handoff_notices(&mut hub, |topic| topic == id);
     let replies = queue_replies(&mut hub, replies);
     /* a worker that already holds the ask hears that the job is gone */
     match job_holder(&hub, &job).filter(|_| running) {
@@ -3846,6 +3974,10 @@ fn sweep(hub: &mut Hub, now: u64) -> Sweep {
     }
     for id in &plan.jobs {
         hub.jobs.remove(id);
+    }
+    let ended: HashSet<&str> = plan.jobs.iter().map(String::as_str).collect();
+    if !ended.is_empty() {
+        drop_handoff_notices(hub, |topic| ended.contains(topic));
     }
     for id in &plan.asks {
         hub.asks.remove(id);
@@ -4453,16 +4585,17 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it); moving a running job to another state closes its open ask.",
+                "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it); moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.",
                 json!({
                     "job_id": {"type": "string"},
                     "state": {"type": "string"},
                     "result_summary": {"type": "string"},
                     "assigned_peer": {"type": "string"},
                     "prompt": {"type": "string"},
+                    "coordinator": {"type": "string"},
                     "cross_circle": {"type": "boolean"}
                 }),
-                &["job_id", "state"],
+                &["job_id"],
             );
             t["name"] = json!("amesh_job_update");
             t
@@ -4784,29 +4917,19 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 .unwrap_or("")
                 .to_string();
             mcp_job_scope(app, &args, &id).await?;
+            /* the same typed request as HTTP: a field of the wrong type is refused, never
+            read as absent, so it cannot slip past the coordinator-alone rule */
+            let req: JobUpdateReq = serde_json::from_value(args.clone()).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("bad job update: {error}")})),
+                )
+            })?;
             let res = update_job(
                 State(app.clone()),
                 auth_headers(app),
                 AxumPath(id),
-                Json(JobUpdateReq {
-                    state: args
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .into(),
-                    result_summary: args
-                        .get("result_summary")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    assigned_peer: args
-                        .get("assigned_peer")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    prompt: args
-                        .get("prompt")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                }),
+                Json(req),
             )
             .await?;
             res.0.to_string()

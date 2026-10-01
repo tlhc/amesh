@@ -106,6 +106,8 @@ assert.equal(schemas.amesh_events.properties.limit.type, "integer");
 assert.equal(schemas.amesh_ack.properties.failed.type, "boolean");
 assert.equal(schemas.amesh_job_create.properties.depends_on.type, "array");
 assert.equal(schemas.amesh_job_update.properties.assigned_peer.type, "string");
+assert.equal(schemas.amesh_job_update.properties.coordinator.type, "string");
+assert.deepEqual(schemas.amesh_job_update.required, ["job_id"]);
 await test("exec failures name the kill reason", () => {
   const killed = ExecError({ killed: true, signal: "SIGTERM", message: "Command failed: amesh mcp" }, "", "", 65000);
   assert.match(killed.message, /SIGTERM/);

@@ -105,6 +105,8 @@ The hub dispatches a job to `assigned_peer` as a tracked ask once all its `depen
 
 Failed or cancelled dependencies leave downstream jobs `queued`. Retry with `amesh_job_update` and `state=queued`; the same update can change `assigned_peer` or `prompt`.
 
+To hand a job to another coordinator, send `coordinator` alone (`amesh jobs update ID --coordinator PEER`): later acks of its open ask, its reminders and its next dispatch go to that peer, which gets one notice; results already delivered stay where they were.
+
 ```bash
 amesh jobs create audit --prompt "list stale docs" --assigned-peer amesh-codex --from-peer amesh-claude-code
 amesh jobs create fix --prompt "fix them" --assigned-peer amesh-pi --depends-on job-1a2b3c4d --from-peer amesh-claude-code
@@ -190,7 +192,7 @@ Set `AMESH_TOKEN` before exposing the port and restart the hub after changing it
 - The hub reclaims unused database space and trims its runtime logs.
 - On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.
-- An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) or how an ask closed (`closed_by`). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
+- An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) how an ask closed (`closed_by`) or a job's last handoff notice (`handoff`). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
 - `gc` and `uninstall` are dry-run until `--apply true`. Attachments are left alone unless `--attachments-days N`.
 
 ## Troubleshooting

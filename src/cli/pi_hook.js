@@ -466,14 +466,15 @@ export default function AmeshHooks(pi) {
         cross_circle: { type: "boolean" },
       }, []],
       ["job_status", "Show a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
-      ["job_update", "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it); moving a running job to another state closes its open ask.", {
+      ["job_update", "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it); moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.", {
         job_id: { type: "string" },
         state: { type: "string" },
         result_summary: { type: "string" },
         assigned_peer: { type: "string" },
         prompt: { type: "string" },
+        coordinator: { type: "string" },
         cross_circle: { type: "boolean" },
-      }, ["job_id", "state"]],
+      }, ["job_id"]],
       ["job_cancel", "Cancel a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
       ["job_delete", "Delete a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
       ["schedule_create", "Create a schedule", {

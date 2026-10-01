@@ -70,6 +70,7 @@ jobs
   jobs list|show ID|cancel ID|delete ID
   jobs update ID --state queued|running|done|failed|cancelled [--result-summary TEXT]
               [--assigned-peer ID] [--prompt TEXT]
+  jobs update ID --coordinator ID   later acks, reminders and dispatches of the job go there
   schedule create TO TEXT (--in-seconds N|--fire-at UNIX_SECONDS)
                   [--every-seconds N] [--kind notify|ask] [--from-peer ID]
                   [--cross-circle true]
@@ -1157,7 +1158,13 @@ fn jobs(raw: &[String]) -> Result<Value> {
             "depends-on",
             "from-peer",
         ],
-        "update" => &["state", "result-summary", "assigned-peer", "prompt"],
+        "update" => &[
+            "state",
+            "result-summary",
+            "assigned-peer",
+            "prompt",
+            "coordinator",
+        ],
         "list" | "show" | "cancel" | "delete" => &[],
         _ => return Err(format!("unknown jobs command: {command}").into()),
     };
@@ -1192,8 +1199,9 @@ fn jobs(raw: &[String]) -> Result<Value> {
                 "cancel" => request("POST", &format!("{path}/cancel"), Some(json!({}))),
                 "delete" => request("DELETE", &path, None),
                 _ => {
-                    if !args.flags.contains_key("state") {
-                        return Err("jobs update requires --state".into());
+                    if !args.flags.contains_key("state") && !args.flags.contains_key("coordinator")
+                    {
+                        return Err("jobs update requires --state or --coordinator".into());
                     }
                     let mut body = json!({});
                     args.copy(&mut body);
