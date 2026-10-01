@@ -2786,7 +2786,9 @@ fn codex_stop_blocks_when_ask_is_open() {
 #[test]
 fn installed_hooks_execute_against_the_daemon() {
     let mut sandbox = Sandbox::new();
-    sandbox.start();
+    /* the pi harness compares primers taken seconds apart, rosters included: the hook peers
+    below go quiet after registering and must not expire mid-run */
+    sandbox.start_with(&[("AMESH_PEER_ONLINE_SECS", "3600")]);
     let setup = sandbox.run(&["setup", "--home", sandbox.root.to_str().unwrap()], None);
     assert!(
         setup.status.success(),
