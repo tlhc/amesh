@@ -5459,10 +5459,16 @@ fn a_second_serve_on_a_taken_port_never_opens_its_state_file() {
         !other.exists() && !other.parent().unwrap().exists(),
         "a starter that lost the port must not have created, opened or migrated a state file"
     );
-    assert_eq!(
-        health_name(&sandbox.bind).as_deref(),
-        Some("amesh"),
-        "the winner keeps serving"
+    let winner = sandbox.daemon.as_mut().unwrap();
+    assert!(
+        winner.try_wait().unwrap().is_none(),
+        "the winner keeps running"
+    );
+    let pid = winner.id().to_string();
+    let holders = listen_pids(&sandbox.bind);
+    assert!(
+        holders.contains(&pid),
+        "the winner keeps the port: held by {holders:?}, not pid {pid}"
     );
 }
 
