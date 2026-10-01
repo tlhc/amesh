@@ -1,161 +1,6 @@
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-/* seconds an idle recipient gets to pick up a new ask before IDLE! */
-const PICKUP_FOR: u64 = 10;
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct Snapshot {
-    #[serde(default)]
-    pub captured_at: u64,
-    #[serde(default)]
-    pub jobs: Vec<Job>,
-    #[serde(default)]
-    pub asks: Vec<Ask>,
-    #[serde(default)]
-    pub peers: Vec<Peer>,
-    /* every peer in the view's circle, from hubs that list them */
-    #[serde(default)]
-    pub roster: Vec<Peer>,
-    /* the events the hub keeps for the view's circle, from hubs that count them */
-    #[serde(default)]
-    pub event_count: u64,
-    #[serde(default)]
-    pub detail: Option<Detail>,
-    /* the whole text and reply of the ask the asks screen selected, from hubs that list asks */
-    #[serde(default)]
-    pub ask_detail: Option<AskDetail>,
-    /* names the hub process: another name means the hub restarted */
-    #[serde(default)]
-    pub hub_epoch: String,
-    #[serde(default)]
-    pub capabilities: Capabilities,
-    /* set on the copy the TUI draws when the snapshot came in within the last two seconds:
-    only then does what it reports as just now still move */
-    #[serde(skip)]
-    pub fresh: bool,
-    /* set by the TUI on each snapshot it takes: the peers whose queue stayed non-empty over
-    several snapshots in a row, with the capture time of the first */
-    #[serde(skip)]
-    pub stuck: HashMap<String, u64>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct Capabilities {
-    #[serde(default)]
-    pub peer_activity: bool,
-    #[serde(default)]
-    pub roster: bool,
-    #[serde(default)]
-    pub event_count: bool,
-    #[serde(default)]
-    pub ask_list: bool,
-    #[serde(default)]
-    pub delivery: bool,
-}
-
-/* what a runtime last said it is doing; the hub keeps it in memory only */
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct Activity {
-    pub state: String,
-    #[serde(default)]
-    pub since: u64,
-    #[serde(default)]
-    pub reason: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct Job {
-    pub job_id: String,
-    pub title: String,
-    pub state: String,
-    #[serde(default)]
-    pub assigned_peer: Option<String>,
-    #[serde(default)]
-    pub circle: String,
-    #[serde(default)]
-    pub depends_on: Vec<String>,
-    #[serde(default)]
-    pub ask_id: Option<String>,
-    #[serde(default)]
-    pub dispatch: bool,
-    #[serde(default)]
-    pub created_at: Option<u64>,
-    #[serde(default)]
-    pub finished_at: Option<u64>,
-    #[serde(default)]
-    pub prompt: String,
-    #[serde(default)]
-    pub result: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct Ask {
-    pub correlation_id: String,
-    #[serde(default)]
-    pub from_peer: String,
-    #[serde(default)]
-    pub to_peer: String,
-    #[serde(default)]
-    pub to_peer_id: String,
-    #[serde(default)]
-    pub open: bool,
-    #[serde(default)]
-    pub failed: bool,
-    #[serde(default)]
-    pub opened_at: Option<u64>,
-    /* "recipient", "hand" or "hub", from hubs that record it */
-    #[serde(default)]
-    pub closed_by: Option<String>,
-    /* the question and the answer, cut to a preview; AskDetail has them whole */
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub reply: Option<String>,
-    #[serde(default)]
-    pub closed_at: Option<u64>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct Peer {
-    pub peer_id: String,
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub circle: String,
-    #[serde(default)]
-    pub status: String,
-    #[serde(default)]
-    pub activity: Option<Activity>,
-    /* its running jobs in every circle, from hubs that count them */
-    #[serde(default)]
-    pub running: Option<usize>,
-    /* how the hub reaches it, from hubs with capabilities.delivery: a live push socket, and
-    the records waiting in its inbox */
-    #[serde(default)]
-    pub push: bool,
-    #[serde(default)]
-    pub queued: usize,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct Detail {
-    pub job_id: String,
-    #[serde(default)]
-    pub prompt: String,
-    #[serde(default)]
-    pub result: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-pub(crate) struct AskDetail {
-    pub correlation_id: String,
-    #[serde(default)]
-    pub text: String,
-    #[serde(default)]
-    pub reply: Option<String>,
-}
-
 /* one record of the hub's event ring as GET /events lists it; ask and chat carry `text`, the
 others `message` */
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -186,7 +31,41 @@ pub(crate) struct Event {
     pub message: String,
 }
 
-impl Snapshot {
+#[cfg(test)]
+pub(crate) use crate::wire::Activity;
+pub(crate) use crate::wire::{
+    AskView as Ask, JobView as Job, PeerView as Peer, SnapshotView as Snapshot,
+};
+
+/* the wire snapshot plus whether this draw is still within the fresh window */
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Frame {
+    pub view: Snapshot,
+    pub fresh: bool,
+}
+
+impl std::ops::Deref for Frame {
+    type Target = Snapshot;
+
+    fn deref(&self) -> &Snapshot {
+        &self.view
+    }
+}
+
+impl std::ops::DerefMut for Frame {
+    fn deref_mut(&mut self) -> &mut Snapshot {
+        &mut self.view
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HubMode {
+    Neutral,
+    V2,
+    Unsupported(u64),
+}
+
+impl crate::wire::SnapshotView {
     pub fn job(&self, id: &str) -> Option<&Job> {
         self.jobs.iter().find(|job| job.job_id == id)
     }
@@ -211,73 +90,6 @@ impl Snapshot {
     /* an ask's recipient is a fixed peer_id; a name may have passed to another peer */
     pub fn peer_by_id(&self, id: &str) -> Option<&Peer> {
         self.peers.iter().find(|peer| peer.peer_id == id)
-    }
-
-    /* the peer that works on a job: its ask's recipient while it runs, else whoever the
-    assignee's name resolves to now */
-    pub fn worker(&self, job: &Job) -> Option<&Peer> {
-        match self.ask(job.ask_id.as_deref()) {
-            Some(ask) if job.state == "running" && !ask.to_peer_id.is_empty() => {
-                self.peer_by_id(&ask.to_peer_id)
-            }
-            _ => job
-                .assigned_peer
-                .as_deref()
-                .and_then(|name| self.peer(name)),
-        }
-    }
-
-    /* a spinner on a job says its worker is busy with it: in a turn, and on no other
-    running job */
-    /* the hub stamped `at` within the second before this snapshot, and the snapshot is fresh;
-    a time after the capture, or a hub that sends none, is never just now */
-    pub fn just_now(&self, at: Option<u64>) -> bool {
-        self.fresh
-            && at
-                .and_then(|at| self.captured_at.checked_sub(at))
-                .is_some_and(|ago| ago <= 1)
-    }
-
-    /* an open ask its idle recipient leaves waiting: since when, and why. Hub stamps are whole
-    seconds, so idle in the ask's own second may be either order */
-    pub fn stalled(&self, ask: &Ask, activity: &Activity) -> Option<(u64, &'static str)> {
-        if !ask.open || activity.state != "idle" {
-            return None;
-        }
-        match ask.opened_at {
-            Some(at) if activity.since <= at => {
-                let why = match activity.since < at {
-                    true => "not picked up",
-                    false => "ask still open",
-                };
-                (self.captured_at.saturating_sub(at) >= PICKUP_FOR).then_some((at, why))
-            }
-            _ => Some((activity.since, "turn ended")),
-        }
-    }
-
-    pub fn spinning(&self, job: &Job) -> bool {
-        let Some(worker) = self.worker(job) else {
-            return false;
-        };
-        let visible = || {
-            self.jobs
-                .iter()
-                .filter(|other| other.state == "running")
-                .filter_map(|other| self.worker(other))
-                .filter(|peer| peer.peer_id == worker.peer_id)
-                .count()
-        };
-        self.capabilities.peer_activity
-            && job.state == "running"
-            && worker.activity.as_ref().is_some_and(|a| a.state == "work")
-            && worker.running.unwrap_or_else(visible) == 1
-    }
-
-    pub fn peer(&self, name: &str) -> Option<&Peer> {
-        self.peers
-            .iter()
-            .find(|peer| peer.peer_id == name || peer.name == name)
     }
 }
 

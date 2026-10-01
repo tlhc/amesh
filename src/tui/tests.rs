@@ -120,6 +120,26 @@ fn numbered(snap: &Snapshot) -> (model::Chain, HashMap<String, usize>) {
     (chain, num)
 }
 
+fn card(snap: &Snapshot, id: &str) -> String {
+    let (chain, num) = numbered(snap);
+    flat(
+        &layout::card(
+            &View {
+                snap: as_frame(snap),
+                chain: &chain,
+                num: &num,
+                base: 0,
+                sel: id,
+            },
+            id,
+            46,
+            None,
+            Fit::Whole,
+        )
+        .text(),
+    )
+}
+
 #[test]
 fn chains_stage_and_number_in_topological_order() {
     let snap = s1();
@@ -229,7 +249,10 @@ fn vertical_flow_draws_brackets_rails_and_boxes() {
     let (chain, num) = numbered(&snap);
     let text = layout::vertical(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -266,7 +289,10 @@ fn vertical_flow_draws_brackets_rails_and_boxes() {
     let (chain, num) = numbered(&snap);
     let text = layout::vertical(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -290,7 +316,10 @@ fn vertical_flow_draws_brackets_rails_and_boxes() {
     let (chain, num) = numbered(&snap);
     let text = layout::vertical(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -315,7 +344,10 @@ fn horizontal_flow_annotates_skip_level_edges() {
     let (chain, num) = numbered(&snap);
     let text = layout::horizontal(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -374,6 +406,13 @@ fn prefix_jump_hints_and_search() {
     }
     assert_eq!(input.key(KeyCode::Enter, 14), Act::Find(0));
     assert_eq!(input.query, "upg");
+}
+
+fn as_frame(view: &Snapshot) -> model::Frame {
+    model::Frame {
+        view: view.clone(),
+        fresh: false,
+    }
 }
 
 fn app_with(snap: Snapshot) -> App {
@@ -722,11 +761,20 @@ fn control_characters_in_job_text_never_reach_the_terminal() {
 #[test]
 fn cards_lead_with_what_matters() {
     let mut snap = s1();
-    snap.jobs
-        .iter_mut()
-        .find(|j| j.job_id == "sec")
-        .unwrap()
-        .result = Some("no fixture".into());
+    let sec = snap.jobs.iter_mut().find(|j| j.job_id == "sec").unwrap();
+    sec.result = Some("no fixture".into());
+    sec.actions = Some(vec![crate::wire::JobAction::Retry {
+        needs_assignee: false,
+    }]);
+    set_dispatch(
+        &mut snap,
+        "synth",
+        crate::wire::DispatchState::Blocked {
+            dependencies: vec!["perf".into(), "sec".into(), "upg".into()],
+            dependency: "sec".into(),
+            reason: crate::wire::BlockReason::Failed,
+        },
+    );
     snap.jobs
         .iter_mut()
         .find(|j| j.job_id == "perf")
@@ -736,8 +784,17 @@ fn cards_lead_with_what_matters() {
         correlation_id: "ask-p".into(),
         open: false,
         opened_at: Some(900),
+        state: Some(crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::ClosedOk,
+            failed_effective: false,
+        }),
         ..Default::default()
     });
+    snap.jobs
+        .iter_mut()
+        .find(|j| j.job_id == "perf")
+        .unwrap()
+        .relation = Some(crate::wire::JobRelation::Settling);
     let synth = snap.jobs.iter_mut().find(|j| j.job_id == "synth").unwrap();
     synth.ask_id = Some("ask-old".into());
     snap.asks.push(Ask {
@@ -749,7 +806,10 @@ fn cards_lead_with_what_matters() {
     let (chain, num) = numbered(&snap);
     let card = |id: &str| {
         let v = View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -768,7 +828,10 @@ fn cards_lead_with_what_matters() {
     );
     let wide = layout::card(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -822,25 +885,13 @@ fn queued_cards_follow_the_hubs_blocking_rule() {
         status: "online".into(),
         ..Default::default()
     });
-    let card = |snap: &Snapshot, id: &str| {
-        let (chain, num) = numbered(snap);
-        flat(
-            &layout::card(
-                &View {
-                    snap,
-                    chain: &chain,
-                    num: &num,
-                    base: 0,
-                    sel: id,
-                },
-                id,
-                46,
-                None,
-                Fit::Whole,
-            )
-            .text(),
-        )
-    };
+    set_dispatch(
+        &mut snap,
+        "verify",
+        crate::wire::DispatchState::Waiting {
+            dependencies: vec!["deploy".into()],
+        },
+    );
     assert!(
         card(&snap, "verify").contains("waits 5 deploy ◆"),
         "{}",
@@ -851,6 +902,13 @@ fn queued_cards_follow_the_hubs_blocking_rule() {
         .find(|j| j.job_id == "deploy")
         .unwrap()
         .state = "done".into();
+    set_dispatch(
+        &mut snap,
+        "verify",
+        crate::wire::DispatchState::Ready {
+            peer_id: "cc".into(),
+        },
+    );
     assert!(
         card(&snap, "verify").contains("waits nothing: will be sent next tick"),
         "{}",
@@ -861,12 +919,25 @@ fn queued_cards_follow_the_hubs_blocking_rule() {
         .find(|j| j.job_id == "verify")
         .unwrap()
         .assigned_peer = Some("ghost".into());
+    set_dispatch(
+        &mut snap,
+        "verify",
+        crate::wire::DispatchState::NoPeer {
+            name: "ghost".into(),
+        },
+    );
     assert!(card(&snap, "verify").contains("no peer named ghost: not sent"));
     snap.jobs
         .iter_mut()
         .find(|j| j.job_id == "verify")
         .unwrap()
         .dispatch = false;
+    set_dispatch(&mut snap, "verify", crate::wire::DispatchState::Held);
+    snap.jobs
+        .iter_mut()
+        .find(|j| j.job_id == "verify")
+        .unwrap()
+        .actions = Some(vec![crate::wire::JobAction::Send]);
     let held = card(&snap, "verify");
     assert!(
         held.contains("held: set its assignee again to send it")
@@ -878,6 +949,7 @@ fn queued_cards_follow_the_hubs_blocking_rule() {
         .find(|j| j.job_id == "verify")
         .unwrap()
         .assigned_peer = None;
+    set_dispatch(&mut snap, "verify", crate::wire::DispatchState::Unassigned);
     let bare = card(&snap, "verify");
     assert!(
         bare.contains("not dispatched: name an assignee to send it")
@@ -889,18 +961,58 @@ fn queued_cards_follow_the_hubs_blocking_rule() {
         .find(|j| j.job_id == "deploy")
         .unwrap()
         .state = "cancelled".into();
+    set_dispatch(
+        &mut snap,
+        "verify",
+        crate::wire::DispatchState::Blocked {
+            dependencies: vec!["deploy".into()],
+            dependency: "deploy".into(),
+            reason: crate::wire::BlockReason::Cancelled,
+        },
+    );
     assert!(
         card(&snap, "verify").contains("blocked 5 deploy cancelled: retry it first"),
         "{}",
         card(&snap, "verify")
     );
     snap.jobs.retain(|j| j.job_id != "deploy");
+    snap.missing.jobs = vec!["deploy".into()];
+    set_dispatch(
+        &mut snap,
+        "verify",
+        crate::wire::DispatchState::Blocked {
+            dependencies: vec!["deploy".into()],
+            dependency: "deploy".into(),
+            reason: crate::wire::BlockReason::Deleted,
+        },
+    );
     let text = card(&snap, "verify");
     assert!(
         text.contains("waits deploy deleted")
             && text.contains("blocked deploy was deleted: this job cannot start"),
         "{text}"
     );
+}
+
+#[test]
+fn an_absent_dependency_is_deleted_only_when_the_hub_says_so() {
+    let mut snap = s4();
+    snap.jobs.retain(|j| j.job_id != "deploy");
+    set_dispatch(
+        &mut snap,
+        "verify",
+        crate::wire::DispatchState::Waiting {
+            dependencies: vec!["deploy".into()],
+        },
+    );
+    let text = card(&snap, "verify");
+    assert!(
+        text.contains("waits deploy") && !text.contains("deploy deleted"),
+        "outside the view is not deleted: {text}"
+    );
+    snap.missing.jobs = vec!["deploy".into()];
+    let text = card(&snap, "verify");
+    assert!(text.contains("waits deploy deleted"), "{text}");
 }
 
 #[test]
@@ -912,6 +1024,8 @@ fn commands_quote_what_they_copy() {
     let perf = snap.jobs.iter_mut().find(|j| j.job_id == "perf").unwrap();
     perf.ask_id = Some("ask-1".into());
     perf.title = "x\"; rm -rf ~; \"".into();
+    perf.relation = Some(crate::wire::JobRelation::Open);
+    perf.actions = Some(vec![crate::wire::JobAction::Nudge { to: "cc".into() }]);
     snap.asks.push(Ask {
         correlation_id: "ask-1".into(),
         to_peer_id: "cc".into(),
@@ -925,7 +1039,10 @@ fn commands_quote_what_they_copy() {
     let text = flat(
         &layout::card(
             &View {
-                snap: &snap,
+                snap: model::Frame {
+                    view: snap.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -947,10 +1064,20 @@ fn commands_quote_what_they_copy() {
         .find(|j| j.job_id == "sec")
         .unwrap()
         .dispatch = false;
+    snap.jobs
+        .iter_mut()
+        .find(|j| j.job_id == "sec")
+        .unwrap()
+        .actions = Some(vec![crate::wire::JobAction::Retry {
+        needs_assignee: true,
+    }]);
     let text = flat(
         &layout::card(
             &View {
-                snap: &snap,
+                snap: model::Frame {
+                    view: snap.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -1035,7 +1162,10 @@ fn real_titles_fit_the_pane() {
     for cols in [46, 60, 80] {
         let text = layout::vertical(
             &View {
-                snap: &snap,
+                snap: model::Frame {
+                    view: snap.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -1074,7 +1204,10 @@ fn real_titles_fit_the_pane() {
     let card = |cols| {
         layout::card(
             &View {
-                snap: &ended,
+                snap: model::Frame {
+                    view: ended.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -1099,7 +1232,10 @@ fn real_titles_fit_the_pane() {
     );
     let wide = layout::horizontal(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -1112,7 +1248,10 @@ fn real_titles_fit_the_pane() {
     assert!(
         layout::horizontal(
             &View {
-                snap: &snap,
+                snap: model::Frame {
+                    view: snap.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -1148,7 +1287,10 @@ fn skip_edges_beyond_the_rail_lanes_become_notes() {
     let (chain, num) = numbered(&snap);
     let text = layout::vertical(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -1249,22 +1391,21 @@ fn a_renumbering_cancels_a_half_typed_jump() {
 #[test]
 fn a_missing_ask_is_named() {
     let mut snap = s1();
-    snap.jobs
-        .iter_mut()
-        .find(|j| j.job_id == "perf")
-        .unwrap()
-        .ask_id = Some("ask-gone".into());
-    snap.jobs
-        .iter_mut()
-        .find(|j| j.job_id == "func")
-        .unwrap()
-        .ask_id = Some("ask-old".into());
+    let perf = snap.jobs.iter_mut().find(|j| j.job_id == "perf").unwrap();
+    perf.ask_id = Some("ask-gone".into());
+    perf.relation = Some(crate::wire::JobRelation::Missing { will_fail: true });
+    let func = snap.jobs.iter_mut().find(|j| j.job_id == "func").unwrap();
+    func.ask_id = Some("ask-old".into());
+    func.relation = Some(crate::wire::JobRelation::CleanedUp);
     let (chain, num) = numbered(&snap);
     let card = |id: &str| {
         flat(
             &layout::card(
                 &View {
-                    snap: &snap,
+                    snap: model::Frame {
+                        view: snap.clone(),
+                        ..Default::default()
+                    },
                     chain: &chain,
                     num: &num,
                     base: 0,
@@ -1303,6 +1444,16 @@ fn busy() -> Snapshot {
             state: state.into(),
             since: 880,
             reason: reason.map(Into::into),
+            ..Default::default()
+        }),
+        liveness: Some(match state {
+            "work" => crate::wire::Liveness::Work { since: 880 },
+            "wait" => crate::wire::Liveness::Wait {
+                since: 880,
+                reason: reason.map(Into::into),
+            },
+            "idle" => crate::wire::Liveness::Idle { since: 880 },
+            _ => crate::wire::Liveness::Online,
         }),
         ..Default::default()
     };
@@ -1326,6 +1477,23 @@ fn busy() -> Snapshot {
         let job = snap.jobs.iter_mut().find(|j| j.job_id == id).unwrap();
         job.state = "running".into();
         job.assigned_peer = Some(worker.into());
+        job.worker = Some(worker.into());
+        job.assignee_id = Some(worker.into());
+        job.relation = Some(crate::wire::JobRelation::Open);
+        job.progress = Some(crate::wire::JobProgress {
+            busy: id == "perf",
+            state: Some(match id {
+                "fix" => crate::wire::Progress::Wait {
+                    since: 880,
+                    reason: Some("Claude needs your permission to use Bash".into()),
+                },
+                "synth" => crate::wire::Progress::Idle {
+                    since: 900,
+                    why: crate::wire::IdleWhy::NotPickedUp,
+                },
+                _ => crate::wire::Progress::Work { since: 880 },
+            }),
+        });
         job.ask_id = Some(format!("ask-{id}"));
         snap.asks.push(Ask {
             correlation_id: format!("ask-{id}"),
@@ -1334,6 +1502,9 @@ fn busy() -> Snapshot {
             opened_at: Some(900),
             ..Default::default()
         });
+    }
+    if let Some(job) = snap.jobs.iter_mut().find(|j| j.job_id == "synth") {
+        job.actions = Some(vec![crate::wire::JobAction::Nudge { to: "w4".into() }]);
     }
     snap
 }
@@ -1409,11 +1580,14 @@ fn a_worker_busy_with_one_job_spins_it() {
     );
     let mut elsewhere = busy();
     elsewhere
-        .peers
+        .jobs
         .iter_mut()
-        .find(|p| p.peer_id == "w1")
+        .find(|j| j.job_id == "perf")
         .unwrap()
-        .running = Some(2);
+        .progress
+        .as_mut()
+        .unwrap()
+        .busy = false;
     let mut app = app_with(elsewhere);
     assert_eq!(
         glyph_of(&mut app, "3 perf", 1),
@@ -1422,6 +1596,12 @@ fn a_worker_busy_with_one_job_spins_it() {
     );
     let mut old = busy();
     old.capabilities.peer_activity = false;
+    for job in &mut old.jobs {
+        job.progress = None;
+    }
+    for peer in &mut old.peers {
+        peer.liveness = None;
+    }
     let mut app = app_with(old);
     assert_eq!(
         glyph_of(&mut app, "3 perf", 1),
@@ -1451,7 +1631,10 @@ fn cards_say_what_the_worker_is_doing() {
         flat(
             &layout::card(
                 &View {
-                    snap: &snap,
+                    snap: model::Frame {
+                        view: snap.clone(),
+                        ..Default::default()
+                    },
                     chain: &chain,
                     num: &num,
                     base: 0,
@@ -1489,7 +1672,10 @@ fn cards_say_what_the_worker_is_doing() {
     );
     let text = layout::vertical(
         &View {
-            snap: &snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -1504,11 +1690,20 @@ fn cards_say_what_the_worker_is_doing() {
     );
     let mut old = snap.clone();
     old.capabilities.peer_activity = false;
+    for job in &mut old.jobs {
+        job.progress = None;
+    }
+    for peer in &mut old.peers {
+        peer.liveness = None;
+    }
     let (chain, num) = numbered(&old);
     let before = flat(
         &layout::card(
             &View {
-                snap: &old,
+                snap: model::Frame {
+                    view: old.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -1533,11 +1728,20 @@ fn cards_say_what_the_worker_is_doing() {
         status: "online".into(),
         ..Default::default()
     });
+    set_progress(&mut left, "perf", crate::wire::Progress::Gone, false);
+    left.jobs
+        .iter_mut()
+        .find(|j| j.job_id == "perf")
+        .unwrap()
+        .actions = Some(vec![crate::wire::JobAction::Resend]);
     let (chain, num) = numbered(&left);
     let gone = flat(
         &layout::card(
             &View {
-                snap: &left,
+                snap: model::Frame {
+                    view: left.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -1571,11 +1775,25 @@ fn cards_say_what_the_worker_is_doing() {
         .unwrap();
     ask.open = false;
     ask.closed_by = Some("recipient".into());
+    ask.state = Some(crate::wire::AskState::Closed {
+        outcome: crate::wire::AskOutcome::AckedOk,
+        failed_effective: false,
+    });
+    let row = answered
+        .jobs
+        .iter_mut()
+        .find(|j| j.job_id == "perf")
+        .unwrap();
+    row.relation = Some(crate::wire::JobRelation::Settling);
+    row.actions = Some(vec![]);
     let (chain, num) = numbered(&answered);
     let settled = flat(
         &layout::card(
             &View {
-                snap: &answered,
+                snap: model::Frame {
+                    view: answered.clone(),
+                    ..Default::default()
+                },
                 chain: &chain,
                 num: &num,
                 base: 0,
@@ -1616,20 +1834,46 @@ fn add(
     job.finished_at = ended;
     job.prompt = prompt.into();
     job.result = (!text.is_empty()).then(|| text.into());
+    let has_ask = ask.is_some();
     if let Some((short, from, sent)) = ask {
         job.ask_id = Some(format!("ask-{short}"));
+        let open = state == "running";
+        let failed = state == "failed";
         snap.asks.push(Ask {
             correlation_id: format!("ask-{short}"),
             from_peer: from.into(),
             to_peer: peer.into(),
             to_peer_id: peer.into(),
-            open: state == "running",
-            failed: state == "failed",
+            open,
+            failed,
             opened_at: Some(sent),
-            closed_by: (state != "running").then(|| "recipient".into()),
+            closed_by: (!open).then(|| "recipient".into()),
+            state: Some(if open {
+                crate::wire::AskState::Open {
+                    progress: crate::wire::Progress::Pending { since: Some(sent) },
+                }
+            } else {
+                crate::wire::AskState::Closed {
+                    outcome: if failed {
+                        crate::wire::AskOutcome::AckedFailed
+                    } else {
+                        crate::wire::AskOutcome::AckedOk
+                    },
+                    failed_effective: failed,
+                }
+            }),
             ..Default::default()
         });
     }
+    job.worker = Some(peer.into());
+    job.assignee_id = Some(peer.into());
+    job.relation = Some(if state == "running" {
+        crate::wire::JobRelation::Open
+    } else if has_ask {
+        crate::wire::JobRelation::Closed
+    } else {
+        crate::wire::JobRelation::NoAsk
+    });
     snap.jobs.push(job);
 }
 
@@ -1642,8 +1886,32 @@ fn doing(id: &str, state: &str, since: u64, reason: Option<&str>) -> Peer {
             state: state.into(),
             since,
             reason: reason.map(Into::into),
+            ..Default::default()
         }),
         ..Default::default()
+    }
+}
+
+fn set_live(snap: &mut Snapshot, rows: &[(&str, crate::wire::Liveness)]) {
+    for peer in snap.peers.iter_mut().chain(snap.roster.iter_mut()) {
+        if let Some((_, kind)) = rows.iter().find(|(id, _)| *id == peer.peer_id) {
+            peer.liveness = Some(kind.clone());
+        }
+    }
+}
+
+fn set_progress(snap: &mut Snapshot, id: &str, state: crate::wire::Progress, busy: bool) {
+    if let Some(job) = snap.jobs.iter_mut().find(|job| job.job_id == id) {
+        job.progress = Some(crate::wire::JobProgress {
+            state: Some(state),
+            busy,
+        });
+    }
+}
+
+fn set_dispatch(snap: &mut Snapshot, id: &str, state: crate::wire::DispatchState) {
+    if let Some(job) = snap.jobs.iter_mut().find(|job| job.job_id == id) {
+        job.dispatch_state = Some(state);
     }
 }
 
@@ -1764,6 +2032,58 @@ fn proto_s1() -> Snapshot {
         doing("pi", "work", at(13, 40), None),
         doing("pi-3", "work", at(13, 36), None),
     ];
+    set_live(
+        &mut s,
+        &[
+            ("cc", crate::wire::Liveness::Work { since: at(13, 40) }),
+            ("codex", crate::wire::Liveness::Idle { since: at(13, 37) }),
+            ("pi", crate::wire::Liveness::Work { since: at(13, 40) }),
+            ("pi-3", crate::wire::Liveness::Work { since: at(13, 36) }),
+        ],
+    );
+    set_progress(
+        &mut s,
+        "perf",
+        crate::wire::Progress::Idle {
+            since: at(13, 37),
+            why: crate::wire::IdleWhy::TurnEnded,
+        },
+        false,
+    );
+    s.jobs
+        .iter_mut()
+        .find(|j| j.job_id == "perf")
+        .unwrap()
+        .actions = Some(vec![crate::wire::JobAction::Nudge { to: "codex".into() }]);
+    set_progress(
+        &mut s,
+        "upg",
+        crate::wire::Progress::Work { since: at(13, 36) },
+        true,
+    );
+    set_dispatch(
+        &mut s,
+        "synth",
+        crate::wire::DispatchState::Blocked {
+            dependencies: vec!["perf".into(), "sec".into(), "upg".into()],
+            dependency: "sec".into(),
+            reason: crate::wire::BlockReason::Failed,
+        },
+    );
+    set_dispatch(
+        &mut s,
+        "fix",
+        crate::wire::DispatchState::Waiting {
+            dependencies: vec!["synth".into()],
+        },
+    );
+    set_dispatch(
+        &mut s,
+        "deploy",
+        crate::wire::DispatchState::Waiting {
+            dependencies: vec!["fix".into()],
+        },
+    );
     s
 }
 
@@ -1847,6 +2167,37 @@ fn proto_s4() -> Snapshot {
         doing("pi", "work", at(13, 40), None),
         doing("pi-3", "idle", at(13, 36), None),
     ];
+    set_live(
+        &mut s,
+        &[
+            ("codex", crate::wire::Liveness::Idle { since: at(13, 39) }),
+            (
+                "cc",
+                crate::wire::Liveness::Wait {
+                    since: at(13, 41) + 20,
+                    reason: Some("needs your Bash permission".into()),
+                },
+            ),
+            ("pi", crate::wire::Liveness::Work { since: at(13, 40) }),
+            ("pi-3", crate::wire::Liveness::Idle { since: at(13, 36) }),
+        ],
+    );
+    set_progress(
+        &mut s,
+        "deploy",
+        crate::wire::Progress::Wait {
+            since: at(13, 41) + 20,
+            reason: Some("needs your Bash permission".into()),
+        },
+        false,
+    );
+    set_dispatch(
+        &mut s,
+        "verify",
+        crate::wire::DispatchState::Waiting {
+            dependencies: vec!["deploy".into()],
+        },
+    );
     s
 }
 
@@ -1950,6 +2301,44 @@ fn proto_s5() -> Snapshot {
         doing("u1", "work", at(13, 12), None),
         doing("u2", "work", at(13, 12), None),
     ];
+    set_live(
+        &mut s,
+        &[
+            ("cc", crate::wire::Liveness::Work { since: at(13, 25) }),
+            ("codex", crate::wire::Liveness::Idle { since: at(13, 20) }),
+            ("pi", crate::wire::Liveness::Idle { since: at(13, 22) }),
+            ("pi-3", crate::wire::Liveness::Idle { since: at(13, 20) }),
+            ("pi-2", crate::wire::Liveness::Idle { since: at(13, 20) }),
+            ("u1", crate::wire::Liveness::Work { since: at(13, 12) }),
+            ("u2", crate::wire::Liveness::Work { since: at(13, 12) }),
+        ],
+    );
+    set_progress(
+        &mut s,
+        "perf",
+        crate::wire::Progress::Idle {
+            since: at(13, 22),
+            why: crate::wire::IdleWhy::TurnEnded,
+        },
+        false,
+    );
+    set_progress(
+        &mut s,
+        "upg",
+        crate::wire::Progress::Work { since: at(13, 12) },
+        true,
+    );
+    set_progress(
+        &mut s,
+        "tests",
+        crate::wire::Progress::Work { since: at(13, 12) },
+        true,
+    );
+    if let Some(job) = s.jobs.iter_mut().find(|j| j.job_id == "job-58851116") {
+        job.actions = Some(vec![crate::wire::JobAction::Retry {
+            needs_assignee: false,
+        }]);
+    }
     s
 }
 
@@ -2497,7 +2886,10 @@ fn the_card_fills_the_rows_the_pane_leaves() {
     }
     let (chain, num) = numbered(&snap);
     let view = View {
-        snap: &snap,
+        snap: model::Frame {
+            view: snap.clone(),
+            ..Default::default()
+        },
         chain: &chain,
         num: &num,
         base: 0,
@@ -2595,18 +2987,40 @@ fn the_ask_line_says_who_closed_it() {
             .unwrap();
         ask.closed_by = by.map(Into::into);
         ask.failed = failed;
-        snap.jobs
+        ask.open = false;
+        ask.state = Some(crate::wire::AskState::Closed {
+            outcome: match (by, failed) {
+                (Some("recipient"), true) => crate::wire::AskOutcome::AckedFailed,
+                (Some("recipient"), false) => crate::wire::AskOutcome::AckedOk,
+                (Some("hand"), true) => crate::wire::AskOutcome::HandFailed,
+                (Some("hand"), false) => crate::wire::AskOutcome::HandOk,
+                (Some("hub"), _) => crate::wire::AskOutcome::Hub,
+                (_, true) => crate::wire::AskOutcome::ClosedFailed,
+                _ => crate::wire::AskOutcome::ClosedOk,
+            },
+            failed_effective: failed || by == Some("hub"),
+        });
+        let row = snap
+            .jobs
             .iter_mut()
             .find(|j| j.job_id == "job-58851116")
-            .unwrap()
-            .state = job.into();
+            .unwrap();
+        row.state = job.into();
+        row.relation = Some(if job == "running" {
+            crate::wire::JobRelation::Settling
+        } else {
+            crate::wire::JobRelation::Closed
+        });
     };
     let (chain, num) = numbered(&snap);
     let tail = |snap: &Snapshot| {
         let text = flat(
             &layout::card(
                 &View {
-                    snap,
+                    snap: model::Frame {
+                        view: snap.clone(),
+                        ..Default::default()
+                    },
                     chain: &chain,
                     num: &num,
                     base: 0,
@@ -2651,8 +3065,11 @@ fn widths_follow_the_pane() {
         ..Default::default()
     };
     let (chain, num) = numbered(&linear);
-    let view = |snap| View {
-        snap,
+    let view = |snap: &Snapshot| View {
+        snap: model::Frame {
+            view: snap.clone(),
+            ..Default::default()
+        },
         chain: &chain,
         num: &num,
         base: 0,
@@ -2925,10 +3342,11 @@ fn counts_wider_than_the_pane_keep_their_numbers() {
 #[test]
 fn the_full_card_reaches_the_end_of_a_long_text() {
     let mut snap = proto_s1();
-    snap.detail = Some(model::Detail {
+    snap.detail = Some(crate::wire::JobDetail {
         job_id: "func".into(),
         prompt: format!("{} TAIL_SENTINEL", "word ".repeat(20_000)),
         result: Some(format!("{} RESULT_END", "finding ".repeat(2_000))),
+        ..Default::default()
     });
     let mut app = app_with(snap);
     app.sel = Some("func".into());
@@ -2993,10 +3411,11 @@ fn a_card_that_takes_a_gone_jobs_place_starts_at_its_top() {
 #[test]
 fn the_card_under_the_flow_lays_out_only_its_rows() {
     let mut snap = proto_s1();
-    snap.detail = Some(model::Detail {
+    snap.detail = Some(crate::wire::JobDetail {
         job_id: "func".into(),
         prompt: "word ".repeat(200_000),
         result: None,
+        ..Default::default()
     });
     let mut app = app_with(snap);
     app.sel = Some("func".into());
@@ -3093,6 +3512,15 @@ fn peer(id: &str, status: &str, state: Option<&str>) -> Peer {
             state: s.into(),
             ..Default::default()
         }),
+        liveness: state.map(|s| match s {
+            "work" => crate::wire::Liveness::Work { since: 0 },
+            "wait" => crate::wire::Liveness::Wait {
+                since: 0,
+                reason: None,
+            },
+            "idle" => crate::wire::Liveness::Idle { since: 0 },
+            _ => crate::wire::Liveness::Unknown,
+        }),
         ..Default::default()
     }
 }
@@ -3120,7 +3548,7 @@ fn the_top_line_names_the_online_peers_and_what_each_does() {
             peer("d-quiet", "online", None),
         ],
     );
-    let pieces = layout::presence(&snap, 120, '⠹', true);
+    let pieces = layout::presence(&as_frame(&snap), 120, '⠹', true);
     assert_eq!(
         joined(&pieces),
         "4 online · ○ a-idle  ⠹ b-work  ! c-wait  ● d-quiet"
@@ -3136,7 +3564,7 @@ fn the_top_line_names_the_online_peers_and_what_each_does() {
     assert_eq!(tone("!"), Some(layout::Tone::Wait));
     assert_eq!(tone("●"), Some(layout::Tone::Soft));
     assert_eq!(
-        joined(&layout::presence(&snap, 120, '⠹', false)),
+        joined(&layout::presence(&as_frame(&snap), 120, '⠹', false)),
         "4 online · ○ a-idle  ⠹ b-work    c-wait  ● d-quiet",
         "the WAIT mark blinks"
     );
@@ -3156,16 +3584,16 @@ fn an_overflowing_top_line_keeps_the_peers_that_need_attention() {
     );
     /* the label, two tokens and "  +3" take exactly 33 columns */
     assert_eq!(
-        joined(&layout::presence(&snap, 33, '⠹', true)),
+        joined(&layout::presence(&as_frame(&snap), 33, '⠹', true)),
         "5 online · ⠹ d-work  ! e-wait  +3"
     );
     assert_eq!(
-        joined(&layout::presence(&snap, 32, '⠹', true)),
+        joined(&layout::presence(&as_frame(&snap), 32, '⠹', true)),
         "5 online · ! e-wait  +4",
         "waiting outranks working"
     );
     assert_eq!(
-        joined(&layout::presence(&snap, 20, '⠹', true)),
+        joined(&layout::presence(&as_frame(&snap), 20, '⠹', true)),
         "5 online",
         "no token fits: the count alone"
     );
@@ -3175,7 +3603,7 @@ fn an_overflowing_top_line_keeps_the_peers_that_need_attention() {
 fn the_top_line_says_so_when_nobody_is_online_or_the_hub_cannot_tell() {
     let nobody = with_roster(Snapshot::default(), vec![peer("gone", "offline", None)]);
     assert_eq!(
-        joined(&layout::presence(&nobody, 60, '⠹', true)),
+        joined(&layout::presence(&as_frame(&nobody), 60, '⠹', true)),
         "no peers online"
     );
     let old = Snapshot {
@@ -3183,10 +3611,10 @@ fn the_top_line_says_so_when_nobody_is_online_or_the_hub_cannot_tell() {
         ..Default::default()
     };
     assert_eq!(
-        joined(&layout::presence(&old, 80, '⠹', true)),
+        joined(&layout::presence(&as_frame(&old), 80, '⠹', true)),
         "peers: restart the hub on the current amesh to list them"
     );
-    assert!(width(&joined(&layout::presence(&old, 20, '⠹', true))) <= 20);
+    assert!(width(&joined(&layout::presence(&as_frame(&old), 20, '⠹', true))) <= 20);
 }
 
 #[test]
@@ -3261,7 +3689,7 @@ fn an_overflowing_top_line_counts_a_name_too_long_to_show_and_goes_on() {
         ],
     );
     assert_eq!(
-        joined(&layout::presence(&snap, 40, '⠹', true)),
+        joined(&layout::presence(&as_frame(&snap), 40, '⠹', true)),
         "2 online · ⠹ a  +1",
         "the name that cannot fit is counted, the next one still shows"
     );
@@ -3277,7 +3705,7 @@ fn the_top_line_falls_back_to_ids_and_keeps_to_its_width() {
     };
     let snap = with_roster(Snapshot::default(), vec![twin("x2"), unnamed, twin("x1")]);
     assert_eq!(
-        joined(&layout::presence(&snap, 80, '⠹', true)),
+        joined(&layout::presence(&as_frame(&snap), 80, '⠹', true)),
         "3 online · ● id-only  ○ same  ○ same"
     );
     let wide = with_roster(
@@ -3288,11 +3716,11 @@ fn the_top_line_falls_back_to_ids_and_keeps_to_its_width() {
         ],
     );
     for cols in [8, 10, 16, 19, 20, 30] {
-        let line = joined(&layout::presence(&wide, cols, '⠹', true));
+        let line = joined(&layout::presence(&as_frame(&wide), cols, '⠹', true));
         assert!(width(&line) <= cols, "{cols}: {line}");
     }
     assert_eq!(
-        joined(&layout::presence(&wide, 30, '⠹', true)),
+        joined(&layout::presence(&as_frame(&wide), 30, '⠹', true)),
         "2 online · ● 审查  ● 数据中心"
     );
 }
@@ -3311,7 +3739,8 @@ fn the_smallest_pane_keeps_the_top_line_and_the_header() {
 }
 
 fn grid_text(snap: &Snapshot, cols: usize, rows: usize) -> Vec<String> {
-    layout::presence_lines(snap, cols, rows, '⠹', true)
+    let frame = as_frame(snap);
+    layout::presence_lines(&frame, cols, rows, '⠹', true)
         .iter()
         .map(|line| joined(line).trim_end().to_string())
         .collect()
@@ -3347,8 +3776,8 @@ fn a_top_line_that_does_not_fit_wraps_into_aligned_columns() {
         }
     }
     assert_eq!(
-        layout::presence_lines(&snap, 80, 1, '⠹', true),
-        vec![layout::presence(&snap, 80, '⠹', true)],
+        layout::presence_lines(&as_frame(&snap), 80, 1, '⠹', true),
+        vec![layout::presence(&as_frame(&snap), 80, '⠹', true)],
         "a single row keeps the top line and its count"
     );
 }
@@ -3604,23 +4033,62 @@ fn with_asks(mut snap: Snapshot, asks: Vec<Ask>, peers: Vec<Peer>) -> Snapshot {
     snap
 }
 
+fn stamp(
+    mut ask: Ask,
+    state: crate::wire::AskState,
+    actions: Vec<crate::wire::AskAction>,
+    just: Option<bool>,
+) -> Ask {
+    ask.open = matches!(state, crate::wire::AskState::Open { .. });
+    ask.state = Some(state);
+    ask.actions = Some(actions);
+    ask.closed_just_now = just;
+    ask
+}
+
 /* the fan-out of the design: one question to three peers; codex has answered, pi's turn
 ended without an answer */
 fn fan_out() -> Snapshot {
-    with_asks(
+    use crate::wire::{AskAction, AskOutcome, AskState, IdleWhy, Liveness, Progress};
+    let mut snap = with_asks(
         Snapshot {
             captured_at: 1000,
             ..Default::default()
         },
         vec![
-            lone("ask-1223c9e0", CC, PI2, Some(820)),
-            lone("ask-a3a07b51", CC, PI, Some(820)),
-            closed(
-                lone("ask-a904f2d6", CC, CODEX, Some(820)),
-                950,
-                "recipient",
-                false,
-                "2 findings, both fixed",
+            stamp(
+                lone("ask-1223c9e0", CC, PI2, Some(820)),
+                AskState::Open {
+                    progress: Progress::Work { since: 830 },
+                },
+                vec![],
+                None,
+            ),
+            stamp(
+                lone("ask-a3a07b51", CC, PI, Some(820)),
+                AskState::Open {
+                    progress: Progress::Idle {
+                        since: 940,
+                        why: IdleWhy::TurnEnded,
+                    },
+                },
+                vec![AskAction::Nudge { to: PI.into() }],
+                None,
+            ),
+            stamp(
+                closed(
+                    lone("ask-a904f2d6", CC, CODEX, Some(820)),
+                    950,
+                    "recipient",
+                    false,
+                    "2 findings, both fixed",
+                ),
+                AskState::Closed {
+                    outcome: AskOutcome::AckedOk,
+                    failed_effective: false,
+                },
+                vec![],
+                Some(false),
             ),
         ],
         vec![
@@ -3629,7 +4097,20 @@ fn fan_out() -> Snapshot {
             doing(PI, "idle", 940, None),
             doing(PI2, "work", 830, None),
         ],
-    )
+    );
+    for peer in snap.peers.iter_mut().chain(snap.roster.iter_mut()) {
+        peer.liveness = Some(match peer.peer_id.as_str() {
+            PI2 => Liveness::Work { since: 830 },
+            CODEX => Liveness::Idle { since: 950 },
+            PI => Liveness::Idle { since: 940 },
+            _ => Liveness::Idle { since: 830 },
+        });
+    }
+    /* every sender here is a peer of the view whose name is its id, as the hub resolves it */
+    for ask in snap.asks.iter_mut() {
+        ask.from_peer_id = Some(ask.from_peer.clone());
+    }
+    snap
 }
 
 fn row_text(row: &[(String, layout::Tone)]) -> String {
@@ -3688,67 +4169,110 @@ fn the_asks_are_listed_open_by_age_then_closed_latest_first() {
 
 #[test]
 fn each_ask_reads_in_the_words_of_the_job_card() {
+    use crate::wire::{AskOutcome, AskState, IdleWhy, Progress};
     use layout::Tone;
-    let base = Snapshot {
+    let snap = Snapshot {
         captured_at: 1000,
         ..Default::default()
     };
-    let open = |p: Option<Peer>| {
-        let snap = with_asks(
-            base.clone(),
-            vec![lone("ask-x", CC, PI, Some(820))],
-            p.into_iter().collect(),
-        );
-        super::asks::state(&snap, &snap.asks[0])
+    let line = |state| {
+        super::asks::state(
+            &snap,
+            &stamp(lone("ask-x", CC, PI, Some(820)), state, vec![], None),
+        )
     };
     assert_eq!(
-        open(Some(doing(PI, "work", 900, None))),
+        line(AskState::Open {
+            progress: Progress::Work { since: 900 },
+        }),
         ("waiting 3m".into(), Tone::Run)
     );
     assert_eq!(
-        open(Some(doing(PI, "idle", 940, None))),
+        line(AskState::Open {
+            progress: Progress::Idle {
+                since: 940,
+                why: IdleWhy::TurnEnded,
+            },
+        }),
         ("IDLE! 1m".into(), Tone::Fail)
     );
     assert_eq!(
-        open(Some(doing(PI, "wait", 960, None))),
+        line(AskState::Open {
+            progress: Progress::Wait {
+                since: 960,
+                reason: None,
+            },
+        }),
         ("WAIT! 40s".into(), Tone::Wait)
     );
     assert_eq!(
-        open(Some(peer(PI, "offline", None))),
+        line(AskState::Open {
+            progress: Progress::Offline,
+        }),
         ("offline".into(), Tone::Fail)
     );
-    assert_eq!(open(None), ("left the hub".into(), Tone::Fail));
+    assert_eq!(
+        line(AskState::Open {
+            progress: Progress::Gone,
+        }),
+        ("left the hub".into(), Tone::Fail)
+    );
+    let pending = stamp(
+        lone("ask-x", CC, PI, Some(820)),
+        AskState::Open {
+            progress: Progress::Pending { since: Some(820) },
+        },
+        vec![],
+        None,
+    );
     let mut quiet = with_asks(
-        base.clone(),
-        vec![lone("ask-x", CC, PI, Some(820))],
+        snap.clone(),
+        vec![pending],
         vec![doing(PI, "idle", 940, None)],
     );
     quiet.capabilities.peer_activity = false;
     assert_eq!(
         super::asks::state(&quiet, &quiet.asks[0]),
-        ("waiting 3m".into(), Tone::Run),
-        "IDLE! needs the hub's activity reports"
+        ("waiting 3m".into(), Tone::Run)
     );
-    let shut = |by: &str, failed: bool| {
-        let snap = with_asks(
-            base.clone(),
-            vec![closed(
-                lone("ask-x", CC, PI, Some(820)),
-                950,
-                by,
-                failed,
-                "r",
-            )],
-            vec![],
-        );
-        super::asks::state(&snap, &snap.asks[0])
+    let shut = |outcome, failed| {
+        super::asks::state(
+            &snap,
+            &stamp(
+                closed(lone("ask-x", CC, PI, Some(820)), 950, "", failed, "r"),
+                AskState::Closed {
+                    outcome,
+                    failed_effective: failed,
+                },
+                vec![],
+                None,
+            ),
+        )
     };
-    assert_eq!(shut("recipient", false), ("acked ok".into(), Tone::Done));
-    assert_eq!(shut("recipient", true), ("acked failed".into(), Tone::Fail));
-    assert_eq!(shut("hand", false), ("closed by hand".into(), Tone::Done));
-    assert_eq!(shut("hub", true), ("closed by hub".into(), Tone::Fail));
-    assert_eq!(shut("", false), ("closed ok".into(), Tone::Done));
-    assert_eq!(shut("", true), ("closed failed".into(), Tone::Fail));
+    assert_eq!(
+        shut(AskOutcome::AckedOk, false),
+        ("acked ok".into(), Tone::Done)
+    );
+    assert_eq!(
+        shut(AskOutcome::AckedFailed, true),
+        ("acked failed".into(), Tone::Fail)
+    );
+    assert_eq!(
+        shut(AskOutcome::HandOk, false),
+        ("closed by hand".into(), Tone::Done)
+    );
+    assert_eq!(
+        shut(AskOutcome::Hub, true),
+        ("closed by hub".into(), Tone::Fail)
+    );
+    assert_eq!(
+        shut(AskOutcome::ClosedOk, false),
+        ("closed ok".into(), Tone::Done)
+    );
+    assert_eq!(
+        shut(AskOutcome::ClosedFailed, true),
+        ("closed failed".into(), Tone::Fail)
+    );
 }
 
 #[test]
@@ -3756,7 +4280,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     let snap = fan_out();
     let order = super::asks::order(&snap);
     let text = |cols: usize| -> Vec<String> {
-        super::asks::rows(&snap, &order, cols)
+        super::asks::rows(&as_frame(&snap), &order, cols)
             .iter()
             .map(|row| row_text(row))
             .collect()
@@ -3788,14 +4312,21 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
         narrow[0]
     );
     let mut far = fan_out();
-    far.asks.push(lone(
-        "ask-0594aa3c",
-        "crypto-software-agile-pi-2",
-        "crypto-software-agile-pi-3",
+    far.asks.push(stamp(
+        lone(
+            "ask-0594aa3c",
+            "crypto-software-agile-pi-2",
+            "crypto-software-agile-pi-3",
+            None,
+        ),
+        crate::wire::AskState::Open {
+            progress: crate::wire::Progress::Gone,
+        },
+        vec![],
         None,
     ));
     let order = super::asks::order(&far);
-    let rows: Vec<String> = super::asks::rows(&far, &order, 46)
+    let rows: Vec<String> = super::asks::rows(&as_frame(&far), &order, 46)
         .iter()
         .map(|row| row_text(row))
         .collect();
@@ -3808,7 +4339,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     anon.asks
         .push(lone("ask-anon0001", "anonymous", PI, Some(900)));
     let order = super::asks::order(&anon);
-    let rows = super::asks::rows(&anon, &order, 100);
+    let rows = super::asks::rows(&as_frame(&anon), &order, 100);
     assert!(
         rows.iter()
             .any(|row| row_text(row).contains(" anonymous─▸─…pi ")),
@@ -3819,7 +4350,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     across.asks.push(lone("ask-1167aa00", "far", PI, Some(900)));
     across.peers.push(doing("far", "idle", 900, None));
     let order = super::asks::order(&across);
-    let rows: Vec<String> = super::asks::rows(&across, &order, 46)
+    let rows: Vec<String> = super::asks::rows(&as_frame(&across), &order, 46)
         .iter()
         .map(|row| row_text(row))
         .collect();
@@ -3831,7 +4362,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     let mut all = fan_out();
     all.roster.clear();
     let order = super::asks::order(&all);
-    let rows: Vec<String> = super::asks::rows(&all, &order, 46)
+    let rows: Vec<String> = super::asks::rows(&as_frame(&all), &order, 46)
         .iter()
         .map(|row| row_text(row))
         .collect();
@@ -3857,7 +4388,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     kin.asks
         .push(lone("ask-f0000003", "anonymous", PI2, Some(900)));
     let order = super::asks::order(&kin);
-    let rows: Vec<String> = super::asks::rows(&kin, &order, 200)
+    let rows: Vec<String> = super::asks::rows(&as_frame(&kin), &order, 200)
         .iter()
         .map(|row| row_text(row))
         .collect();
@@ -3882,11 +4413,12 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
     let snap = fan_out();
     let find = |cid: &str| snap.asks.iter().find(|a| a.correlation_id == cid).unwrap();
     let text = |cid: &str, cols: usize| {
-        super::asks::card(&snap, find(cid), 1, cols, None, Fit::Rows(24)).text()
+        super::asks::card(&as_frame(&snap), find(cid), 1, cols, None, Fit::Rows(24)).text()
     };
     let mut long = fan_out();
     long.asks[2].reply = Some("word ".repeat(80));
-    let codex = super::asks::card(&long, &long.asks[2], 3, 46, None, Fit::Rows(30)).text();
+    let codex =
+        super::asks::card(&as_frame(&long), &long.asks[2], 3, 46, None, Fit::Rows(30)).text();
     let lines: Vec<&str> = codex.lines().collect();
     assert!(
         lines[0].starts_with("┌● 3 ask a904 · acked ok · took 2m"),
@@ -3902,7 +4434,7 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
         lines[4].contains('…') && !lines[5].contains("word"),
         "four lines of it under the list:\n{codex}"
     );
-    let whole = super::asks::card(&long, &long.asks[2], 3, 46, None, Fit::Whole).text();
+    let whole = super::asks::card(&as_frame(&long), &long.asks[2], 3, 46, None, Fit::Whole).text();
     assert!(
         whole.lines().filter(|l| l.contains("word")).count() > 4,
         "all of it in the full card:\n{whole}"
@@ -3933,8 +4465,16 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
         "a recipient at work needs no nudge"
     );
     let mut gone = fan_out();
-    gone.peers.retain(|p| p.peer_id != PI);
-    let left = super::asks::card(&gone, &gone.asks[1], 2, 90, None, Fit::Rows(12)).text();
+    gone.asks[1] = stamp(
+        gone.asks[1].clone(),
+        crate::wire::AskState::Open {
+            progress: crate::wire::Progress::Gone,
+        },
+        vec![crate::wire::AskAction::CloseLeft],
+        None,
+    );
+    let left =
+        super::asks::card(&as_frame(&gone), &gone.asks[1], 2, 90, None, Fit::Rows(12)).text();
     assert!(
         left.contains("openhitls-sm2-opt-pi · left the hub")
             && left.contains(
@@ -3944,7 +4484,8 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
     );
     let mut old = fan_out();
     old.asks[0].opened_at = None;
-    let legacy = super::asks::card(&old, &old.asks[0], 1, 46, None, Fit::Rows(20)).text();
+    let legacy =
+        super::asks::card(&as_frame(&old), &old.asks[0], 1, 46, None, Fit::Rows(20)).text();
     assert!(
         legacy.contains("open, age unknown")
             && legacy.contains("sent before the hub kept the time"),
@@ -4267,10 +4808,11 @@ fn the_full_ask_card_shows_the_whole_text_once_it_arrives() {
             .any(|l| l.contains("END")),
         "the preview until the detail comes"
     );
-    snap.ask_detail = Some(model::AskDetail {
+    snap.ask_detail = Some(crate::wire::AskDetail {
         correlation_id: "ask-1223c9e0".into(),
         text: format!("{}END", "x ".repeat(600)),
         reply: None,
+        ..Default::default()
     });
     app.apply(Ok(snap));
     app.key(KeyCode::Char('G'));
@@ -4355,11 +4897,18 @@ fn an_open_asks_arrow_walks_to_a_working_recipient_and_rests_otherwise() {
 
 #[test]
 fn an_ack_the_hub_just_took_walks_the_arrow_back_to_the_sender() {
+    /* the hub says whether the ack is just now; the arrow only reads it */
     let closed = |ago: u64| {
         let mut snap = proto_s1();
         let now = snap.captured_at;
         let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-5b1");
-        ask.unwrap().closed_at = Some(now - ago);
+        let ask = ask.unwrap();
+        ask.closed_at = Some(now - ago);
+        ask.state = Some(crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::AckedOk,
+            failed_effective: false,
+        });
+        ask.closed_just_now = Some(ago <= 1);
         let mut app = app_with(snap);
         app.sel = Some("func".into());
         app
@@ -4404,8 +4953,15 @@ fn the_asks_screen_walks_the_arrow_of_an_ask_whose_recipient_works() {
 fn a_job_the_hub_just_sent_gets_a_dot_along_its_rail_then_lights() {
     let mut snap = proto_s1();
     let now = snap.captured_at;
-    let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-7c2");
-    ask.unwrap().opened_at = Some(now);
+    let ask = snap
+        .asks
+        .iter_mut()
+        .find(|a| a.correlation_id == "ask-7c2")
+        .unwrap();
+    /* the hub's word decides, not the stamp: an ask opened a minute ago the hub calls just
+    sent still gets its dot */
+    ask.opened_at = Some(now - 60);
+    ask.opened_just_now = Some(true);
     let mut app = app_with(snap);
     let has = |lines: Vec<String>, want: &str| lines.iter().any(|l| l.trim_end() == want);
     /* the vertical flow: the spine above upg is the end of the fan-out bracket */
@@ -4507,7 +5063,9 @@ fn a_stale_snapshot_moves_nothing_it_reports_as_just_now() {
     };
     let (acked, sent) = (find(&snap, "ask-5b1"), find(&snap, "ask-7c2"));
     snap.asks[acked].closed_at = Some(now);
+    snap.asks[acked].closed_just_now = Some(true);
     snap.asks[sent].opened_at = Some(now);
+    snap.asks[sent].opened_just_now = Some(true);
     let mut app = app_with(snap);
     app.last_ok = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
     app.sel = Some("func".into());
@@ -4525,33 +5083,32 @@ fn a_stale_snapshot_moves_nothing_it_reports_as_just_now() {
 }
 
 #[test]
-fn nothing_is_just_now_after_the_capture_or_from_a_hub_without_one() {
-    for captured_at in [0, at(13, 42)] {
-        let mut snap = proto_s1();
-        snap.captured_at = captured_at;
-        let later = if captured_at == 0 {
-            at(13, 43)
-        } else {
-            captured_at + 1
-        };
-        for ask in snap.asks.iter_mut() {
-            match ask.correlation_id.as_str() {
-                "ask-5b1" => ask.closed_at = Some(later),
-                "ask-7c2" => ask.opened_at = Some(later),
-                _ => {}
+fn the_view_moves_only_what_the_hub_calls_just_now() {
+    let mut snap = proto_s1();
+    let now = snap.captured_at;
+    for ask in snap.asks.iter_mut() {
+        match ask.correlation_id.as_str() {
+            "ask-5b1" => {
+                ask.closed_at = Some(now);
+                ask.closed_just_now = Some(false);
             }
+            "ask-7c2" => {
+                ask.opened_at = Some(now);
+                ask.opened_just_now = Some(false);
+            }
+            _ => {}
         }
-        let mut app = app_with(snap);
-        app.sel = Some("func".into());
-        assert!(
-            line_with(&mut app, 100, 2, "5b1 ").contains("5b1 cc>codex "),
-            "captured at {captured_at}: an ack stamped after it is not just now"
-        );
-        assert!(
-            !screen_at(&mut app, 46, 2).iter().any(|l| l.contains('◉')),
-            "captured at {captured_at}: nor a job sent after it"
-        );
     }
+    let mut app = app_with(snap);
+    app.sel = Some("func".into());
+    assert!(
+        line_with(&mut app, 100, 2, "5b1 ").contains("5b1 cc>codex "),
+        "an ack stamped this second that the hub does not call just now walks nothing back"
+    );
+    assert!(
+        !screen_at(&mut app, 46, 2).iter().any(|l| l.contains('◉')),
+        "nor does a job sent this second light"
+    );
 }
 
 /* an online peer with a push channel or without, and the records waiting for it */
@@ -4604,63 +5161,33 @@ fn delivery_fields_read_from_hubs_that_send_them_and_default_otherwise() {
     assert!(old.hub_epoch.is_empty());
 }
 
-#[test]
-fn a_queue_is_stuck_once_it_stays_full_over_three_snapshots() {
-    let mut app = app_with(Snapshot::default());
-    let full = |at| delivering(Snapshot::default(), vec![reached("pi", true, 2)], at);
-    app.apply(Ok(full(100)));
-    app.apply(Ok(full(101)));
-    assert!(
-        app.snap.as_ref().unwrap().stuck.is_empty(),
-        "two snapshots may still be copies in flight"
-    );
-    app.apply(Ok(full(102)));
-    assert_eq!(
-        app.snap.as_ref().unwrap().stuck.get("pi"),
-        Some(&100),
-        "the third calls it stuck, dated from the first"
-    );
-    app.apply(Ok(delivering(
-        Snapshot::default(),
-        vec![reached("pi", true, 0)],
-        103,
-    )));
-    assert!(
-        app.snap.as_ref().unwrap().stuck.is_empty(),
-        "an empty queue ends the run"
-    );
-    app.apply(Ok(full(104)));
-    app.apply(Ok(full(105)));
-    assert!(
-        app.snap.as_ref().unwrap().stuck.is_empty(),
-        "a new run counts from its own start"
-    );
-}
-
-#[test]
-fn a_hub_without_delivery_calls_no_queue_stuck() {
-    let mut app = app_with(Snapshot::default());
-    for at in 100..105 {
-        let mut snap = delivering(Snapshot::default(), vec![reached("pi", true, 2)], at);
-        snap.capabilities.delivery = false;
-        app.apply(Ok(snap));
-    }
-    assert!(app.snap.as_ref().unwrap().stuck.is_empty());
+fn marked(
+    id: &str,
+    condition: crate::wire::DeliveryCondition,
+    stuck: Option<(usize, u64)>,
+) -> Peer {
+    let mut peer = reached(id, true, 0);
+    peer.liveness = Some(crate::wire::Liveness::Idle { since: 0 });
+    peer.delivery = Some(crate::wire::Delivery {
+        condition,
+        stuck: stuck.map(|(count, since)| crate::wire::Stuck { count, since }),
+    });
+    peer
 }
 
 #[test]
 fn the_top_line_marks_a_stuck_queue_and_dims_a_peer_without_push() {
-    let mut snap = delivering(
+    let snap = delivering(
         Snapshot::default(),
         vec![
-            reached("a-pi", true, 2),
-            reached("b-codex", false, 0),
-            reached("c-cc", true, 0),
+            marked("a-pi", crate::wire::DeliveryCondition::Push, Some((2, 160))),
+            marked("b-codex", crate::wire::DeliveryCondition::NoPush, None),
+            marked("c-cc", crate::wire::DeliveryCondition::Push, None),
         ],
         200,
     );
-    snap.stuck.insert("a-pi".into(), 160);
-    let pieces = layout::presence(&snap, 120, '⠹', true);
+    let mut frame = as_frame(&snap);
+    let pieces = layout::presence(&frame, 120, '⠹', true);
     assert_eq!(joined(&pieces), "3 online · ○ a-pi ✉2  ○ b-codex  ○ c-cc");
     let tone = |text: &str| {
         pieces
@@ -4675,8 +5202,10 @@ fn the_top_line_marks_a_stuck_queue_and_dims_a_peer_without_push() {
         "no push channel dims the name"
     );
     assert_eq!(tone(" c-cc"), Some(layout::Tone::Soft));
-    snap.capabilities.delivery = false;
-    let old = layout::presence(&snap, 120, '⠹', true);
+    for peer in frame.roster.iter_mut() {
+        peer.delivery = None;
+    }
+    let old = layout::presence(&frame, 120, '⠹', true);
     assert_eq!(
         joined(&old),
         "3 online · ○ a-pi  ○ b-codex  ○ c-cc",
@@ -4690,12 +5219,17 @@ fn the_top_line_marks_a_stuck_queue_and_dims_a_peer_without_push() {
 #[test]
 fn a_wrapped_top_line_keeps_its_columns_with_a_queue_mark() {
     let roster = (0..6)
-        .map(|i| reached(&format!("peer-{i}"), true, 0))
+        .map(|i| {
+            marked(
+                &format!("peer-{i}"),
+                crate::wire::DeliveryCondition::Push,
+                (i == 0).then_some((12, 150)),
+            )
+        })
         .collect();
-    let mut snap = delivering(Snapshot::default(), roster, 200);
-    snap.roster[0].queued = 12;
-    snap.stuck.insert("peer-0".into(), 150);
-    let lines: Vec<String> = layout::presence_lines(&snap, 50, 4, '⠹', true)
+    let snap = delivering(Snapshot::default(), roster, 200);
+    let frame = as_frame(&snap);
+    let lines: Vec<String> = layout::presence_lines(&frame, 50, 4, '⠹', true)
         .iter()
         .map(|line| joined(line))
         .collect();
@@ -4717,9 +5251,14 @@ fn the_job_card_says_why_its_open_ask_may_go_unseen() {
         p.push = true;
     }
     let w1 = snap.peers.iter_mut().find(|p| p.peer_id == "w1").unwrap();
-    w1.push = false;
-    w1.queued = 2;
-    let mut app = app_stuck(snap);
+    w1.delivery = Some(crate::wire::Delivery {
+        condition: crate::wire::DeliveryCondition::NoPush,
+        stuck: Some(crate::wire::Stuck {
+            count: 2,
+            since: snap.captured_at - 2,
+        }),
+    });
+    let mut app = app_with(snap);
     app.sel = Some("perf".into());
     let lines = screen_at(&mut app, 100, 0);
     let at = lines
@@ -4747,12 +5286,17 @@ fn the_ask_card_says_why_an_open_ask_may_go_unseen() {
     let mut snap = fan_out();
     snap.capabilities.delivery = true;
     for p in snap.peers.iter_mut().chain(snap.roster.iter_mut()) {
-        p.push = p.peer_id != PI2 && p.peer_id != CODEX;
         if p.peer_id == PI2 {
-            p.queued = 1;
+            p.delivery = Some(crate::wire::Delivery {
+                condition: crate::wire::DeliveryCondition::NoPush,
+                stuck: Some(crate::wire::Stuck {
+                    count: 1,
+                    since: snap.captured_at - 2,
+                }),
+            });
         }
     }
-    let mut app = app_stuck(snap);
+    let mut app = app_with(snap);
     app.key(KeyCode::Char('a'));
     let lines = screen_at(&mut app, 100, 0);
     let to = lines
@@ -4806,9 +5350,15 @@ fn a_healthy_mesh_draws_what_it_drew_before() {
 
 #[test]
 fn the_queue_mark_reads_plus_in_ascii() {
-    let mut snap = with_roster(busy(), vec![reached("pi", true, 3)]);
-    snap.capabilities.delivery = true;
-    let mut app = app_stuck(snap);
+    let snap = with_roster(
+        busy(),
+        vec![marked(
+            "pi",
+            crate::wire::DeliveryCondition::Push,
+            Some((3, 0)),
+        )],
+    );
+    let mut app = app_with(snap);
     app.opts.ascii = true;
     assert_eq!(screen_text(&mut app, 100, 40)[0], "1 online | o pi +3");
 }
@@ -5024,7 +5574,7 @@ fn the_selection_follows_the_newest_until_moved_and_holds_its_event() {
 #[test]
 fn a_hub_restart_leaves_a_divider_and_takes_the_new_ring() {
     let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
-    let mut snap = app.snap.clone().unwrap();
+    let mut snap = app.snap.clone().unwrap().view;
     snap.hub_epoch = "e2".into();
     snap.captured_at = 1200;
     app.apply(Ok(snap.clone()));
@@ -5126,25 +5676,6 @@ fn the_fetch_reads_events_only_while_their_screen_is_up() {
     assert!(!app.wanted().events, "the asks screen reads no events");
 }
 
-#[test]
-fn a_queue_seen_three_times_within_a_second_is_not_stuck_yet() {
-    let mut app = app_with(Snapshot::default());
-    let full = |at| delivering(Snapshot::default(), vec![reached("pi", true, 1)], at);
-    for _ in 0..3 {
-        app.apply(Ok(full(100)));
-    }
-    assert!(
-        app.snap.as_ref().unwrap().stuck.is_empty(),
-        "snapshots poked in quick succession leave a copy in flight alone"
-    );
-    app.apply(Ok(full(102)));
-    assert_eq!(
-        app.snap.as_ref().unwrap().stuck.get("pi"),
-        Some(&100),
-        "two seconds on, the same run is stuck"
-    );
-}
-
 fn unnumbered(text: &str) -> model::Event {
     model::Event {
         kind: "notify".into(),
@@ -5186,7 +5717,7 @@ fn the_events_screen_says_when_its_hub_numbers_no_events() {
 #[test]
 fn a_hub_that_numbers_no_events_keeps_what_came_before_its_restart() {
     let mut app = events_app(vec![unnumbered("before")]);
-    let mut snap = app.snap.clone().unwrap();
+    let mut snap = app.snap.clone().unwrap().view;
     snap.hub_epoch = "e2".into();
     snap.captured_at = 1200;
     app.apply(Ok(snap));
@@ -5209,7 +5740,7 @@ fn a_hub_that_numbers_no_events_keeps_what_came_before_its_restart() {
 fn each_restart_gets_its_divider_even_with_no_events_between() {
     let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
     for (epoch, at) in [("e2", 1200), ("e3", 1260)] {
-        let mut snap = app.snap.clone().unwrap();
+        let mut snap = app.snap.clone().unwrap().view;
         snap.hub_epoch = epoch.into();
         snap.captured_at = at;
         app.apply(Ok(snap));
@@ -5226,7 +5757,7 @@ fn each_restart_gets_its_divider_even_with_no_events_between() {
 #[test]
 fn a_hub_upgraded_to_number_its_events_is_read_by_seq_again() {
     let mut app = events_app(vec![unnumbered("old")]);
-    let mut snap = app.snap.clone().unwrap();
+    let mut snap = app.snap.clone().unwrap().view;
     snap.hub_epoch = "e2".into();
     snap.captured_at = 1200;
     app.apply(Ok(snap));
@@ -5245,27 +5776,42 @@ fn a_hub_upgraded_to_number_its_events_is_read_by_seq_again() {
 
 #[test]
 fn a_failed_close_crosses_the_arrow_and_holds_it_still() {
-    let closed = |by: &str, failed: bool| {
+    use crate::wire::{AskOutcome, AskState};
+    /* the hub's facts decide: closed a minute ago by the stamp, yet just now by the hub's
+    word, and failed by failed_effective, not the raw flag */
+    let closed = |by: &str, failed: bool, outcome: AskOutcome, effective: bool| {
         let mut snap = proto_s1();
         let now = snap.captured_at;
         let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-5b1");
         let ask = ask.unwrap();
-        ask.closed_at = Some(now);
+        ask.closed_at = Some(now - 60);
         ask.closed_by = Some(by.into());
         ask.failed = failed;
+        ask.state = Some(AskState::Closed {
+            outcome,
+            failed_effective: effective,
+        });
+        ask.closed_just_now = Some(true);
         snap
     };
-    /* hub closures always set failed; acks may too */
-    for by in ["hub", "recipient", "hand"] {
-        let mut snap = closed(by, true);
-        snap.fresh = true;
-        let ask = snap.ask(Some("ask-5b1")).unwrap();
+    let cases = [
+        ("hub", true, AskOutcome::Hub),
+        ("hub", false, AskOutcome::Hub),
+        ("recipient", true, AskOutcome::AckedFailed),
+        ("hand", true, AskOutcome::HandFailed),
+    ];
+    for (by, failed, outcome) in cases {
+        let frame = model::Frame {
+            view: closed(by, failed, outcome, true),
+            fresh: true,
+        };
+        let ask = frame.ask(Some("ask-5b1")).unwrap();
         assert_eq!(
-            layout::arrow(&snap, ask, false),
+            layout::arrow(&frame, ask, false),
             ("─×─".into(), layout::Tone::Fail),
-            "a failed close by {by} is no answer walking back"
+            "a failed close by {by} (raw failed {failed}) is no answer walking back"
         );
-        let mut app = app_with(closed(by, true));
+        let mut app = app_with(closed(by, failed, outcome, true));
         app.sel = Some("func".into());
         for tick in [0, 2, 4] {
             let line = line_with(&mut app, 100, tick, "5b1 ");
@@ -5275,11 +5821,13 @@ fn a_failed_close_crosses_the_arrow_and_holds_it_still() {
             );
         }
     }
-    let mut snap = closed("hand", false);
-    snap.fresh = true;
-    let ask = snap.ask(Some("ask-5b1")).unwrap();
+    let frame = model::Frame {
+        view: closed("hand", false, AskOutcome::HandOk, false),
+        fresh: true,
+    };
+    let ask = frame.ask(Some("ask-5b1")).unwrap();
     assert_eq!(
-        layout::arrow(&snap, ask, false),
+        layout::arrow(&frame, ask, false),
         ("─◂─".into(), layout::Tone::Back),
         "an operator's good ack goes back to the sender like the recipient's"
     );
@@ -5289,7 +5837,7 @@ fn a_failed_close_crosses_the_arrow_and_holds_it_still() {
 fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
     use layout::Tone;
     /* synth's worker w4 has been idle since 880 */
-    let synth = |captured: u64, opened: u64| {
+    let synth = |captured: u64, opened: u64, progress: crate::wire::Progress| {
         let mut snap = busy();
         snap.captured_at = captured;
         let ask = snap
@@ -5297,12 +5845,16 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
             .iter_mut()
             .find(|a| a.correlation_id == "ask-synth");
         ask.unwrap().opened_at = Some(opened);
+        set_progress(&mut snap, "synth", progress, false);
         snap
     };
     let card = |snap: &Snapshot| {
         let (chain, num) = numbered(snap);
         let view = View {
-            snap,
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
             chain: &chain,
             num: &num,
             base: 0,
@@ -5310,71 +5862,134 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
         };
         flat(&layout::card(&view, "synth", 46, None, Fit::Whole).text())
     };
-    let just_sent = synth(1000, 995);
-    let job = just_sent.job("synth").unwrap();
-    assert!(
-        layout::alarm(&just_sent, job).is_none(),
-        "sent 5s ago to a worker idle from before: it may still pick it up"
+    let just_sent = synth(
+        1000,
+        995,
+        crate::wire::Progress::Pending { since: Some(995) },
     );
     let text = card(&just_sent);
     assert!(
         text.contains("worker w4 · now IDLE") && !text.contains("IDLE!"),
         "{text}"
     );
-    let text = card(&synth(1020, 995));
+    let text = card(&synth(
+        1020,
+        995,
+        crate::wire::Progress::Idle {
+            since: 995,
+            why: crate::wire::IdleWhy::NotPickedUp,
+        },
+    ));
     assert!(
         text.contains("worker w4 IDLE! 25s · not picked up"),
-        "25s later it still has not: the age counts from the ask: {text}"
+        "{text}"
     );
-    let text = card(&synth(1000, 870));
-    assert!(
-        text.contains("worker w4 IDLE! 2m · turn ended"),
-        "idle since after the ask opened: its turn ended with the ask open: {text}"
+    let text = card(&synth(
+        1000,
+        870,
+        crate::wire::Progress::Idle {
+            since: 880,
+            why: crate::wire::IdleWhy::TurnEnded,
+        },
+    ));
+    assert!(text.contains("worker w4 IDLE! 2m · turn ended"), "{text}");
+    let tie = synth(
+        1010,
+        1000,
+        crate::wire::Progress::Idle {
+            since: 1000,
+            why: crate::wire::IdleWhy::AskStillOpen,
+        },
     );
-    let mut tie = synth(1010, 1000);
-    let w4 = tie.peers.iter_mut().find(|p| p.peer_id == "w4").unwrap();
-    w4.activity.as_mut().unwrap().since = 1000;
     let text = card(&tie);
     assert!(
         text.contains("worker w4 IDLE! 10s · ask still open"),
         "idle in the second the ask opened: {text}"
     );
-    let plain = |since: u64, opened: u64, captured: u64| {
+    use crate::wire::{AskAction, AskState, IdleWhy, Progress};
+    let scene = |captured: u64, opened: u64, state: AskState, nudge: bool| {
+        let actions = if nudge {
+            vec![AskAction::Nudge { to: PI.into() }]
+        } else {
+            vec![]
+        };
         with_asks(
             Snapshot {
                 captured_at: captured,
                 ..Default::default()
             },
-            vec![lone("ask-x", CC, PI, Some(opened))],
-            vec![doing(PI, "idle", since, None)],
+            vec![stamp(
+                lone("ask-x", CC, PI, Some(opened)),
+                state,
+                actions,
+                None,
+            )],
+            vec![doing(PI, "idle", 880, None)],
         )
     };
     let state = |snap: &Snapshot| super::asks::state(snap, &snap.asks[0]);
     let ask_card = |snap: &Snapshot| {
-        flat(&super::asks::card(snap, &snap.asks[0], 1, 100, None, Fit::Whole).text())
+        flat(&super::asks::card(&as_frame(snap), &snap.asks[0], 1, 100, None, Fit::Whole).text())
     };
-    let early = plain(880, 995, 1000);
+    let early = scene(
+        1000,
+        995,
+        AskState::Open {
+            progress: Progress::Pending { since: Some(995) },
+        },
+        false,
+    );
     assert_eq!(state(&early), ("waiting 5s".into(), Tone::Run));
     assert!(
         !ask_card(&early).contains("IDLE!") && !ask_card(&early).contains("nudge"),
         "{}",
         ask_card(&early)
     );
-    let late = plain(880, 995, 1020);
+    let late = scene(
+        1020,
+        995,
+        AskState::Open {
+            progress: Progress::Idle {
+                since: 995,
+                why: IdleWhy::NotPickedUp,
+            },
+        },
+        true,
+    );
     assert_eq!(state(&late), ("IDLE! 25s".into(), Tone::Fail));
     assert!(
         ask_card(&late).contains("IDLE! 25s · not picked up") && ask_card(&late).contains("nudge"),
         "{}",
         ask_card(&late)
     );
-    let ended = plain(990, 980, 1000);
+    let ended = scene(
+        1000,
+        980,
+        AskState::Open {
+            progress: Progress::Idle {
+                since: 990,
+                why: IdleWhy::TurnEnded,
+            },
+        },
+        false,
+    );
     assert_eq!(state(&ended), ("IDLE! 10s".into(), Tone::Fail));
     assert!(
         ask_card(&ended).contains("IDLE! 10s · turn ended"),
         "{}",
         ask_card(&ended)
     );
-    let tie = plain(1000, 1000, 1010);
+    let tie = scene(
+        1010,
+        1000,
+        AskState::Open {
+            progress: Progress::Idle {
+                since: 1000,
+                why: IdleWhy::AskStillOpen,
+            },
+        },
+        false,
+    );
     assert_eq!(state(&tie), ("IDLE! 10s".into(), Tone::Fail));
     assert!(
         ask_card(&tie).contains("IDLE! 10s · ask still open"),
@@ -5427,7 +6042,17 @@ fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
         },
         vec![
             lone("ask-x", CC, PI, Some(900)),
-            lone("ask-y", CC, PI2, Some(900)),
+            stamp(
+                lone("ask-y", CC, PI2, Some(900)),
+                crate::wire::AskState::Open {
+                    progress: crate::wire::Progress::Wait {
+                        since: 950,
+                        reason: Some("Bash".into()),
+                    },
+                },
+                vec![],
+                None,
+            ),
         ],
         vec![
             doing(CC, "work", 900, None),
@@ -5445,59 +6070,1365 @@ fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
     check(&mut asks, "asks");
 }
 
-#[test]
-fn pickup_counts_from_the_ask_and_a_turn_end_from_the_worker() {
-    let at = |captured: u64| Snapshot {
-        captured_at: captured,
-        ..Default::default()
-    };
-    let ask = |opened: Option<u64>, open: bool| Ask {
-        correlation_id: "ask-x".into(),
-        open,
+fn ask_with(state: crate::wire::AskState, opened: Option<u64>) -> Ask {
+    Ask {
+        correlation_id: "ask-row".into(),
+        from_peer: "amesh-claude-code".into(),
+        to_peer_id: "amesh-pi".into(),
+        open: matches!(state, crate::wire::AskState::Open { .. }),
         opened_at: opened,
+        state: Some(state),
+        ..Default::default()
+    }
+}
+
+fn b3b_snap(ask: Ask, peers: Vec<Peer>) -> Snapshot {
+    Snapshot {
+        captured_at: 1000,
+        asks: vec![ask],
+        peers: peers.clone(),
+        roster: peers,
+        ..Default::default()
+    }
+}
+
+fn b3b_row(ask: Ask, fresh: bool) -> Vec<(String, layout::Tone)> {
+    let snap = b3b_snap(ask, vec![]);
+    let mut frame = as_frame(&snap);
+    frame.fresh = fresh;
+    let order = super::asks::order(&snap);
+    super::asks::rows(&frame, &order, 80).remove(0)
+}
+
+fn b3b_card(ask: Ask, peers: Vec<Peer>) -> String {
+    let snap = b3b_snap(ask, peers);
+    super::asks::card(&as_frame(&snap), &snap.asks[0], 1, 90, None, Fit::Whole).text()
+}
+
+fn cell(row: &[(String, layout::Tone)], text: &str) -> layout::Tone {
+    row.iter()
+        .find(|(t, _)| t.contains(text))
+        .unwrap_or_else(|| panic!("no {text} in {row:?}"))
+        .1
+}
+
+#[test]
+fn b3b_glyph_open_is_run() {
+    let row = b3b_row(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Pending { since: Some(820) },
+            },
+            Some(820),
+        ),
+        false,
+    );
+    assert_eq!(cell(&row, "◆"), layout::Tone::Run);
+}
+
+#[test]
+fn b3b_glyph_failed_is_fail() {
+    let row = b3b_row(
+        ask_with(
+            crate::wire::AskState::Closed {
+                outcome: crate::wire::AskOutcome::Hub,
+                failed_effective: true,
+            },
+            Some(820),
+        ),
+        false,
+    );
+    assert_eq!(cell(&row, "×"), layout::Tone::Fail);
+}
+
+#[test]
+fn b3b_glyph_closed_ok_is_done() {
+    let row = b3b_row(
+        ask_with(
+            crate::wire::AskState::Closed {
+                outcome: crate::wire::AskOutcome::AckedOk,
+                failed_effective: false,
+            },
+            Some(820),
+        ),
+        false,
+    );
+    assert_eq!(cell(&row, "●"), layout::Tone::Done);
+}
+
+#[test]
+fn b3b_arrow_work_is_flow() {
+    let row = b3b_row(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Work { since: 990 },
+            },
+            Some(820),
+        ),
+        true,
+    );
+    assert_eq!(cell(&row, "─▸─"), layout::Tone::Flow);
+}
+
+#[test]
+fn b3b_arrow_pending_is_dim() {
+    let row = b3b_row(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Pending { since: Some(820) },
+            },
+            Some(820),
+        ),
+        true,
+    );
+    assert_eq!(cell(&row, "─▸─"), layout::Tone::Dim);
+}
+
+#[test]
+fn b3b_arrow_stale_close_is_plain() {
+    let mut ask = ask_with(
+        crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::AckedOk,
+            failed_effective: false,
+        },
+        Some(820),
+    );
+    ask.closed_just_now = Some(true);
+    let row = b3b_row(ask, false);
+    assert_eq!(cell(&row, ">"), layout::Tone::Plain);
+}
+
+#[test]
+fn b3b_arrow_just_failed_is_fail() {
+    let mut ask = ask_with(
+        crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::Hub,
+            failed_effective: true,
+        },
+        Some(820),
+    );
+    ask.closed_just_now = Some(true);
+    let row = b3b_row(ask, true);
+    assert_eq!(cell(&row, "─×─"), layout::Tone::Fail);
+}
+
+#[test]
+fn b3b_arrow_just_ok_is_back() {
+    let mut ask = ask_with(
+        crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::AckedOk,
+            failed_effective: false,
+        },
+        Some(820),
+    );
+    ask.closed_just_now = Some(true);
+    let row = b3b_row(ask, true);
+    assert_eq!(cell(&row, "─◂─"), layout::Tone::Back);
+}
+
+#[test]
+fn b3b_card_wait() {
+    let text = b3b_card(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Wait {
+                    since: 960,
+                    reason: None,
+                },
+            },
+            Some(820),
+        ),
+        vec![],
+    );
+    assert!(text.contains("WAIT! 40s"), "{text}");
+}
+
+fn b3b_idle(why: crate::wire::IdleWhy) -> String {
+    b3b_card(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Idle { since: 940, why },
+            },
+            Some(820),
+        ),
+        vec![],
+    )
+}
+
+#[test]
+fn b3b_card_idle_not_picked_up() {
+    let text = b3b_idle(crate::wire::IdleWhy::NotPickedUp);
+    assert!(text.contains("IDLE! 1m · not picked up"), "{text}");
+}
+
+#[test]
+fn b3b_card_idle_still_open() {
+    let text = b3b_idle(crate::wire::IdleWhy::AskStillOpen);
+    assert!(text.contains("IDLE! 1m · ask still open"), "{text}");
+}
+
+#[test]
+fn b3b_card_idle_turn_ended() {
+    let text = b3b_idle(crate::wire::IdleWhy::TurnEnded);
+    assert!(text.contains("IDLE! 1m · turn ended"), "{text}");
+}
+
+#[test]
+fn b3b_card_gone() {
+    let mut from = doing("amesh-claude-code", "work", 1, None);
+    from.liveness = Some(crate::wire::Liveness::Online);
+    let text = b3b_card(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Gone,
+            },
+            Some(820),
+        ),
+        vec![from],
+    );
+    assert!(text.contains("amesh-pi · left the hub"), "{text}");
+}
+
+#[test]
+fn b3b_card_offline() {
+    let text = b3b_card(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Offline,
+            },
+            Some(820),
+        ),
+        vec![],
+    );
+    assert!(text.contains("· offline"), "{text}");
+}
+
+fn b3b_pending_to(kind: crate::wire::Liveness) -> String {
+    let mut peer = doing("amesh-pi", "idle", 1, None);
+    peer.liveness = Some(kind);
+    b3b_card(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Pending { since: Some(820) },
+            },
+            Some(820),
+        ),
+        vec![peer],
+    )
+}
+
+#[test]
+fn b3b_card_now_work() {
+    let text = b3b_pending_to(crate::wire::Liveness::Work { since: 1 });
+    assert!(text.contains("· now WORK"), "{text}");
+}
+
+#[test]
+fn b3b_card_now_idle() {
+    let text = b3b_pending_to(crate::wire::Liveness::Idle { since: 1 });
+    assert!(text.contains("· now IDLE"), "{text}");
+}
+
+#[test]
+fn b3b_card_now_wait() {
+    let text = b3b_pending_to(crate::wire::Liveness::Wait {
+        since: 1,
+        reason: None,
+    });
+    assert!(text.contains("· now WAIT"), "{text}");
+}
+
+#[test]
+fn b3b_card_now_offline() {
+    let text = b3b_pending_to(crate::wire::Liveness::Offline);
+    assert!(text.contains("· offline"), "{text}");
+}
+
+#[test]
+fn b3b_card_online_is_empty() {
+    let text = b3b_pending_to(crate::wire::Liveness::Online);
+    assert!(!text.contains("· now"), "{text}");
+}
+
+#[test]
+fn b3b_times_open() {
+    let text = b3b_card(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Pending { since: Some(820) },
+            },
+            Some(820),
+        ),
+        vec![],
+    );
+    assert!(text.contains("sent 00:13 · waiting 3m"), "{text}");
+}
+
+#[test]
+fn b3b_times_unknown() {
+    let text = b3b_card(
+        ask_with(
+            crate::wire::AskState::Open {
+                progress: crate::wire::Progress::Pending { since: None },
+            },
+            None,
+        ),
+        vec![],
+    );
+    assert!(text.contains("sent before the hub kept the time"), "{text}");
+}
+
+#[test]
+fn b3b_times_closed() {
+    let mut ask = ask_with(
+        crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::AckedOk,
+            failed_effective: false,
+        },
+        Some(820),
+    );
+    ask.closed_at = Some(950);
+    let text = b3b_card(ask, vec![]);
+    assert!(
+        text.contains("sent 00:13 · closed 00:15 · took 2m"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3b_command_nudge() {
+    let mut ask = ask_with(
+        crate::wire::AskState::Open {
+            progress: crate::wire::Progress::Idle {
+                since: 940,
+                why: crate::wire::IdleWhy::TurnEnded,
+            },
+        },
+        Some(820),
+    );
+    ask.actions = Some(vec![crate::wire::AskAction::Nudge {
+        to: "amesh-pi".into(),
+    }]);
+    let text = b3b_card(ask, vec![]);
+    assert!(
+        text.contains("amesh peer notify amesh-pi 'ask row waits for your ack'"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3b_command_close_left() {
+    let mut ask = ask_with(
+        crate::wire::AskState::Open {
+            progress: crate::wire::Progress::Gone,
+        },
+        Some(820),
+    );
+    ask.actions = Some(vec![crate::wire::AskAction::CloseLeft]);
+    let text = b3b_card(ask, vec![]);
+    assert!(
+        text.contains("amesh peer ack ask-row --failed true --message 'recipient left'"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3b_header_counts_hub_as_failed() {
+    use crate::wire::{AskOutcome, AskState};
+    let snap = Snapshot {
+        asks: vec![
+            ask_with(
+                AskState::Open {
+                    progress: crate::wire::Progress::Pending { since: Some(1) },
+                },
+                Some(1),
+            ),
+            ask_with(
+                AskState::Closed {
+                    outcome: AskOutcome::Hub,
+                    failed_effective: true,
+                },
+                Some(1),
+            ),
+            ask_with(
+                AskState::Closed {
+                    outcome: AskOutcome::AckedOk,
+                    failed_effective: false,
+                },
+                Some(1),
+            ),
+        ],
         ..Default::default()
     };
-    let is = |state: &str, since: u64| Activity {
-        state: state.into(),
-        since,
-        reason: None,
+    let order = super::asks::order(&snap);
+    assert_eq!(
+        super::asks::header(&order, false),
+        "asks · 1 open · 1 answered · 1 failed"
+    );
+}
+
+fn b3c_card(job: Job, asks: Vec<Ask>) -> String {
+    let snap = Snapshot {
+        captured_at: 1000,
+        jobs: vec![job],
+        asks,
+        ..Default::default()
     };
-    let sent = ask(Some(1000), true);
-    /* idle before the ask */
-    assert_eq!(at(1009).stalled(&sent, &is("idle", 990)), None);
-    assert_eq!(
-        at(1010).stalled(&sent, &is("idle", 990)),
-        Some((1000, "not picked up"))
-    );
-    assert_eq!(
-        at(1011).stalled(&sent, &is("idle", 990)),
-        Some((1000, "not picked up"))
-    );
-    /* idle in the ask's own second */
-    assert_eq!(at(1009).stalled(&sent, &is("idle", 1000)), None);
-    assert_eq!(
-        at(1010).stalled(&sent, &is("idle", 1000)),
-        Some((1000, "ask still open"))
-    );
-    /* idle after the ask */
-    assert_eq!(
-        at(1001).stalled(&sent, &is("idle", 1001)),
-        Some((1001, "turn ended"))
-    );
-    /* an ask stamped after the capture, a hub without ask times, a closed ask, a busy worker */
-    assert_eq!(
-        at(1000).stalled(&ask(Some(1030), true), &is("idle", 990)),
-        None
-    );
-    assert_eq!(
-        at(1000).stalled(&ask(None, true), &is("idle", 990)),
-        Some((990, "turn ended"))
-    );
-    assert_eq!(
-        at(1100).stalled(&ask(Some(1000), false), &is("idle", 990)),
-        None
-    );
-    for state in ["work", "wait"] {
-        assert_eq!(at(1100).stalled(&sent, &is(state, 990)), None, "{state}");
+    let (chain, num) = numbered(&snap);
+    flat(
+        &layout::card(
+            &View {
+                snap: model::Frame {
+                    view: snap,
+                    ..Default::default()
+                },
+                chain: &chain,
+                num: &num,
+                base: 0,
+                sel: "job",
+            },
+            "job",
+            80,
+            None,
+            Fit::Whole,
+        )
+        .text(),
+    )
+}
+
+fn b3c_job(state: &str) -> Job {
+    Job {
+        job_id: "job".into(),
+        title: "title".into(),
+        state: state.into(),
+        assigned_peer: Some("codex".into()),
+        worker: Some("codex".into()),
+        assignee_id: Some("codex".into()),
+        ..Default::default()
     }
+}
+
+#[test]
+fn b3c_worker_queued() {
+    let text = b3c_card(b3c_job("queued"), vec![]);
+    assert!(text.contains("worker codex (when ready)"), "{text}");
+}
+
+#[test]
+fn b3c_worker_gone() {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Gone),
+        busy: false,
+    });
+    let ask = Ask {
+        correlation_id: "ask-1".into(),
+        to_peer_id: "pi".into(),
+        open: true,
+        ..Default::default()
+    };
+    let text = b3c_card(job, vec![ask]);
+    assert!(text.contains("worker pi left the hub"), "{text}");
+}
+
+#[test]
+fn b3c_worker_wait() {
+    let mut job = b3c_job("running");
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Wait {
+            since: 960,
+            reason: Some("Bash".into()),
+        }),
+        busy: false,
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("worker codex WAIT! 40s") && text.contains("Bash"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_worker_idle() {
+    let mut job = b3c_job("running");
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Idle {
+            since: 940,
+            why: crate::wire::IdleWhy::TurnEnded,
+        }),
+        busy: false,
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("worker codex IDLE! 1m · turn ended"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_worker_busy() {
+    let mut job = b3c_job("running");
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Work { since: 880 }),
+        busy: true,
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(text.contains("worker codex WORK · turn 2m"), "{text}");
+}
+
+#[test]
+fn b3c_worker_missing() {
+    let mut job = b3c_job("running");
+    job.worker = None;
+    job.relation = Some(crate::wire::JobRelation::Missing { will_fail: true });
+    job.ask_id = Some("ask-1".into());
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("worker codex")
+            && text.contains("ask-1 is missing: the hub fails this job at its next check")
+            && !text.contains("IDLE!"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_missing_settlement_disabled() {
+    let mut job = b3c_job("running");
+    job.relation = Some(crate::wire::JobRelation::Missing { will_fail: false });
+    job.ask_id = Some("ask-1".into());
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("ask-1 is missing; automatic settlement is disabled"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_cleaned_up() {
+    let mut job = b3c_job("done");
+    job.relation = Some(crate::wire::JobRelation::CleanedUp);
+    job.ask_id = Some("ask-1".into());
+    let text = b3c_card(job, vec![]);
+    assert!(text.contains("ask-1 was cleaned up"), "{text}");
+}
+
+#[test]
+fn b3c_settling() {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.relation = Some(crate::wire::JobRelation::Settling);
+    let ask = Ask {
+        correlation_id: "ask-1".into(),
+        open: false,
+        state: Some(crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::AckedOk,
+            failed_effective: false,
+        }),
+        ..Default::default()
+    };
+    let text = b3c_card(job, vec![ask]);
+    assert!(text.contains("acked ok, settling"), "{text}");
+}
+
+#[test]
+fn b3c_settlement_disabled() {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.relation = Some(crate::wire::JobRelation::Closed);
+    let ask = Ask {
+        correlation_id: "ask-1".into(),
+        open: false,
+        state: Some(crate::wire::AskState::Closed {
+            outcome: crate::wire::AskOutcome::AckedOk,
+            failed_effective: false,
+        }),
+        ..Default::default()
+    };
+    let text = b3c_card(job, vec![ask]);
+    assert!(
+        text.contains("acked ok; automatic settlement is disabled"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_dispatch_held() {
+    let mut job = b3c_job("queued");
+    job.dispatch_state = Some(crate::wire::DispatchState::Held);
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("held: set its assignee again to send it"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_dispatch_ready() {
+    let mut job = b3c_job("queued");
+    job.dispatch_state = Some(crate::wire::DispatchState::Ready {
+        peer_id: "codex".into(),
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(text.contains("nothing: will be sent next tick"), "{text}");
+}
+
+#[test]
+fn b3c_command_nudge() {
+    let mut job = b3c_job("running");
+    job.actions = Some(vec![crate::wire::JobAction::Nudge { to: "codex".into() }]);
+    let text = b3c_card(job, vec![]);
+    assert!(text.contains("amesh peer notify codex 'title?'"), "{text}");
+}
+
+#[test]
+fn b3c_command_resend() {
+    let mut job = b3c_job("running");
+    job.actions = Some(vec![crate::wire::JobAction::Resend]);
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("amesh jobs update job --state queued --assigned-peer PEER"),
+        "{text}"
+    );
+}
+
+fn b3c_scene(job: Job, asks: Vec<Ask>, peers: Vec<Peer>) -> (Snapshot, layout::Grid) {
+    let snap = Snapshot {
+        captured_at: 1000,
+        jobs: vec![job],
+        asks,
+        peers,
+        ..Default::default()
+    };
+    let (chain, num) = numbered(&snap);
+    let grid = layout::card(
+        &View {
+            snap: model::Frame {
+                view: snap.clone(),
+                ..Default::default()
+            },
+            chain: &chain,
+            num: &num,
+            base: 0,
+            sel: "job",
+        },
+        "job",
+        80,
+        None,
+        Fit::Whole,
+    );
+    (snap, grid)
+}
+
+fn b3c_text(job: Job, asks: Vec<Ask>, peers: Vec<Peer>) -> String {
+    flat(&b3c_scene(job, asks, peers).1.text())
+}
+
+fn b3c_tone(grid: &layout::Grid, needle: char) -> layout::Tone {
+    grid.rows
+        .values()
+        .flat_map(|row| row.values())
+        .find(|cell| cell.ch == needle)
+        .unwrap_or_else(|| panic!("no {needle}"))
+        .tone
+}
+
+fn b3c_word_tone(grid: &layout::Grid, word: &str) -> layout::Tone {
+    for row in grid.rows.values() {
+        let cells: Vec<_> = row.values().collect();
+        let text: String = cells.iter().map(|cell| cell.ch).collect();
+        if let Some(at) = text.find(word) {
+            let chars = text[..at].chars().count();
+            return cells[chars].tone;
+        }
+    }
+    panic!("no {word}");
+}
+
+fn b3c_ask(from: &str, to_id: &str, to_name: &str) -> Ask {
+    Ask {
+        correlation_id: "ask-1".into(),
+        from_peer: from.into(),
+        to_peer: to_name.into(),
+        to_peer_id: to_id.into(),
+        open: true,
+        opened_at: Some(820),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn b3c_offline_beats_a_remembered_wait() {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.worker = Some("codex".into());
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Offline),
+        busy: true,
+    });
+    job.actions = Some(vec![]);
+    let mut peer = doing("codex", "wait", 900, Some("Bash"));
+    peer.liveness = Some(crate::wire::Liveness::Wait {
+        since: 900,
+        reason: Some("Bash".into()),
+    });
+    let (text, grid) = {
+        let (snap, grid) = b3c_scene(job, vec![b3c_ask("cc", "codex", "codex")], vec![peer]);
+        let _ = snap;
+        (flat(&grid.text()), grid)
+    };
+    assert!(text.contains("worker codex · offline"), "{text}");
+    assert!(
+        !text.contains("WAIT!") && !text.contains('⣿') && !text.contains("nudge"),
+        "{text}"
+    );
+    assert_ne!(b3c_tone(&grid, '▸'), layout::Tone::Flow);
+}
+
+#[test]
+fn b3c_blocked_names_the_dependency() {
+    let mut job = b3c_job("queued");
+    job.depends_on = vec!["dep".into()];
+    job.dispatch_state = Some(crate::wire::DispatchState::Blocked {
+        dependencies: vec!["dep".into()],
+        dependency: "dep".into(),
+        reason: crate::wire::BlockReason::Failed,
+    });
+    let mut dep = b3c_job("failed");
+    dep.job_id = "dep".into();
+    dep.title = "sec".into();
+    let snap = Snapshot {
+        captured_at: 1000,
+        jobs: vec![dep, job],
+        ..Default::default()
+    };
+    let text = card(&snap, "job");
+    assert!(text.contains("sec failed: retry it first"), "{text}");
+}
+
+#[test]
+fn b3c_blocked_deleted_dependency() {
+    let mut job = b3c_job("queued");
+    job.dispatch_state = Some(crate::wire::DispatchState::Blocked {
+        dependencies: vec!["gone".into()],
+        dependency: "gone".into(),
+        reason: crate::wire::BlockReason::Deleted,
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("gone was deleted: this job cannot start"),
+        "{text}"
+    );
+}
+
+fn b3c_gone(to_id: &str, to_name: &str, assignee: Option<&str>) -> String {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.assigned_peer = assignee.map(str::to_string);
+    job.worker = None;
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Gone),
+        busy: false,
+    });
+    b3c_text(job, vec![b3c_ask("cc", to_id, to_name)], vec![])
+}
+
+#[test]
+fn b3c_gone_label_to_peer_id() {
+    let text = b3c_gone("pi", "display", Some("codex"));
+    assert!(text.contains("worker pi left the hub"), "{text}");
+}
+
+#[test]
+fn b3c_gone_label_to_peer() {
+    let text = b3c_gone("", "display", Some("codex"));
+    assert!(text.contains("worker display left the hub"), "{text}");
+}
+
+#[test]
+fn b3c_gone_label_assignee() {
+    let text = b3c_gone("", "", Some("codex"));
+    assert!(text.contains("worker codex left the hub"), "{text}");
+}
+
+#[test]
+fn b3c_gone_label_dash() {
+    let text = b3c_gone("", "", None);
+    assert!(text.contains("worker - left the hub"), "{text}");
+}
+
+#[test]
+fn b3c_worker_set_renders_doing() {
+    let mut job = b3c_job("done");
+    job.worker = Some("w9".into());
+    job.assigned_peer = Some("raw".into());
+    let mut peer = doing("w9", "idle", 1, None);
+    peer.name = "Ada".into();
+    peer.liveness = Some(crate::wire::Liveness::Idle { since: 1 });
+    let text = b3c_text(job, vec![], vec![peer]);
+    assert!(
+        text.contains("worker Ada · now IDLE") && !text.contains("raw"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_worker_null_renders_assignee() {
+    let mut job = b3c_job("done");
+    job.worker = None;
+    job.assigned_peer = Some("raw".into());
+    let text = b3c_text(job, vec![], vec![]);
+    assert!(
+        text.contains("worker raw") && !text.contains("· now"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_unassigned_dispatch_off() {
+    let mut job = b3c_job("queued");
+    job.dispatch = false;
+    job.dispatch_state = Some(crate::wire::DispatchState::Unassigned);
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("not dispatched: name an assignee to send it"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_no_peer() {
+    let mut job = b3c_job("queued");
+    job.dispatch_state = Some(crate::wire::DispatchState::NoPeer {
+        name: "ghost".into(),
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(text.contains("no peer named ghost: not sent"), "{text}");
+}
+
+#[test]
+fn b3c_other_circle() {
+    let mut job = b3c_job("queued");
+    job.dispatch_state = Some(crate::wire::DispatchState::OtherCircle {
+        peer_id: "codex".into(),
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("codex is in another circle: not sent"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_retry_without_assignee() {
+    let mut job = b3c_job("failed");
+    job.actions = Some(vec![crate::wire::JobAction::Retry {
+        needs_assignee: false,
+    }]);
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("amesh jobs update job --state queued") && !text.contains("assigned-peer"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_retry_with_assignee() {
+    let mut job = b3c_job("failed");
+    job.actions = Some(vec![crate::wire::JobAction::Retry {
+        needs_assignee: true,
+    }]);
+    let text = b3c_card(job, vec![]);
+    assert!(text.contains("--assigned-peer codex"), "{text}");
+}
+
+#[test]
+fn b3c_command_send() {
+    let mut job = b3c_job("queued");
+    job.actions = Some(vec![crate::wire::JobAction::Send]);
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("amesh jobs update job --state queued --assigned-peer codex"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_work_not_busy() {
+    let mut job = b3c_job("running");
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Work { since: 880 }),
+        busy: false,
+    });
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("· now WORK") && !text.contains("WORK · turn"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_pending_idle_word() {
+    let mut job = b3c_job("running");
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Pending { since: Some(820) }),
+        busy: false,
+    });
+    let mut peer = doing("codex", "idle", 1, None);
+    peer.liveness = Some(crate::wire::Liveness::Idle { since: 1 });
+    let text = b3c_text(job, vec![], vec![peer]);
+    assert!(
+        text.contains("· now IDLE") && !text.contains("IDLE!"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_pending_no_word() {
+    let mut job = b3c_job("running");
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Pending { since: Some(820) }),
+        busy: false,
+    });
+    let mut peer = doing("codex", "idle", 1, None);
+    peer.liveness = Some(crate::wire::Liveness::Online);
+    let text = b3c_text(job, vec![], vec![peer]);
+    assert!(
+        text.contains("worker codex") && !text.contains("· now"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3c_unacked_fail_when_idle() {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.relation = Some(crate::wire::JobRelation::Open);
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Idle {
+            since: 940,
+            why: crate::wire::IdleWhy::TurnEnded,
+        }),
+        busy: false,
+    });
+    let (_, grid) = b3c_scene(job, vec![b3c_ask("cc", "codex", "codex")], vec![]);
+    assert!(grid.text().contains("unacked"));
+    assert_eq!(b3c_word_tone(&grid, "unacked"), layout::Tone::Fail);
+}
+
+#[test]
+fn b3c_unacked_plain_otherwise() {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.relation = Some(crate::wire::JobRelation::Open);
+    job.progress = Some(crate::wire::JobProgress {
+        state: Some(crate::wire::Progress::Work { since: 900 }),
+        busy: false,
+    });
+    let (_, grid) = b3c_scene(job, vec![b3c_ask("cc", "codex", "codex")], vec![]);
+    assert!(grid.text().contains("unacked"));
+    assert_eq!(b3c_word_tone(&grid, "unacked"), layout::Tone::Plain);
+}
+
+#[test]
+fn b3c_previous_attempt() {
+    let mut job = b3c_job("queued");
+    job.ask_id = Some("ask-1".into());
+    let text = b3c_text(job, vec![b3c_ask("cc", "codex", "codex")], vec![]);
+    assert!(text.contains("previous attempt"), "{text}");
+}
+
+#[test]
+fn b3c_times_queued() {
+    let text = b3c_card(b3c_job("queued"), vec![]);
+    assert!(text.contains("not sent yet"), "{text}");
+}
+
+#[test]
+fn b3c_times_running() {
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    let text = b3c_text(job, vec![b3c_ask("cc", "codex", "codex")], vec![]);
+    assert!(
+        text.contains("sent 00:13") && text.contains("running 3m"),
+        "{text}"
+    );
+}
+
+fn b3d_row(condition: crate::wire::DeliveryCondition, stuck: Option<(usize, u64)>) -> String {
+    let mut peer = peer("pi", "online", None);
+    peer.delivery = Some(crate::wire::Delivery {
+        condition,
+        stuck: stuck.map(|(count, since)| crate::wire::Stuck { count, since }),
+    });
+    let frame = as_frame(&Snapshot {
+        captured_at: 1000,
+        ..Default::default()
+    });
+    joined(&layout::delivery(&frame, &peer))
+}
+
+#[test]
+fn b3d_delivery_no_push() {
+    assert_eq!(
+        b3d_row(crate::wire::DeliveryCondition::NoPush, None),
+        "no push"
+    );
+}
+
+#[test]
+fn b3e_v1_header_counts_closed() {
+    let ask = Ask {
+        correlation_id: "ask-1".into(),
+        open: false,
+        failed: true,
+        closed_by: Some("hub".into()),
+        ..Default::default()
+    };
+    let order = [&ask];
+    assert_eq!(
+        super::asks::header(&order, false),
+        "asks · 0 open · 1 closed"
+    );
+}
+
+#[test]
+fn b3e_v1_worker_is_the_raw_assignee() {
+    let mut job = b3c_job("running");
+    job.worker = None;
+    job.relation = None;
+    job.progress = None;
+    job.assigned_peer = Some("codex".into());
+    let text = b3c_card(job, vec![]);
+    assert!(
+        text.contains("worker codex") && !text.contains("IDLE!") && !text.contains("· now"),
+        "{text}"
+    );
+}
+
+#[test]
+fn b3e_v1_closed_ask_is_neutral() {
+    let ask = Ask {
+        correlation_id: "ask-1".into(),
+        open: false,
+        failed: true,
+        closed_by: Some("recipient".into()),
+        ..Default::default()
+    };
+    let (word, tone) = super::asks::state(&Snapshot::default(), &ask);
+    assert_eq!((word, tone), ("closed".into(), layout::Tone::Plain));
+}
+
+#[test]
+fn b3e_v1_closed_glyph_is_plain() {
+    let ask = Ask {
+        correlation_id: "ask-1".into(),
+        open: false,
+        failed: true,
+        ..Default::default()
+    };
+    let rows = super::asks::rows(&as_frame(&Snapshot::default()), &[&ask], 80);
+    assert!(rows[0]
+        .iter()
+        .any(|(text, tone)| text == "●" && *tone == layout::Tone::Plain));
+}
+
+#[test]
+fn an_unsupported_hub_shows_one_state_and_no_panel() {
+    let value =
+        serde_json::from_str(include_str!("../../tests/fixtures/wire/job_relations.json")).unwrap();
+    let mut app = app_with(Snapshot::default());
+    app.receive(super::decoded(value));
+    assert!(screen_text(&mut app, 140, 30).join("\n").contains("j-busy"));
+    app.receive(super::decoded(serde_json::json!({"schema_version": 3})));
+    let text = screen_text(&mut app, 140, 30).join("\n");
+    assert!(
+        text.contains("unsupported hub") && !text.contains("j-busy") && !text.contains("online"),
+        "no panel from the last frame: {text}"
+    );
+    app.asks = true;
+    let text = screen_text(&mut app, 140, 30).join("\n");
+    assert!(text.contains("unsupported hub"), "{text}");
+    app.asks = false;
+    app.events = true;
+    let text = screen_text(&mut app, 140, 30).join("\n");
+    assert!(
+        text.contains("unsupported hub") && !text.contains("showing the snapshot"),
+        "nothing from a snapshot is shown: {text}"
+    );
+}
+
+#[test]
+fn an_error_from_the_fetch_keeps_the_last_frame() {
+    let mut app = app_with(s1());
+    let before = app.snap.as_ref().unwrap().jobs[0].job_id.clone();
+    app.apply(Err("schema_version is not a number: \"no\"".into()));
+    assert_eq!(app.snap.as_ref().unwrap().jobs[0].job_id, before);
+    assert!(app.error.as_deref().unwrap().contains("schema_version"));
+}
+
+#[test]
+fn b3d_delivery_queued() {
+    assert_eq!(
+        b3d_row(crate::wire::DeliveryCondition::Push, Some((2, 940))),
+        "2 queued for 1m"
+    );
+}
+
+#[test]
+fn b3d_delivery_both() {
+    assert_eq!(
+        b3d_row(crate::wire::DeliveryCondition::NoPush, Some((2, 940))),
+        "no push · 2 queued for 1m"
+    );
+}
+
+#[test]
+fn b3d_delivery_offline_is_empty() {
+    assert!(b3d_row(crate::wire::DeliveryCondition::Offline, Some((2, 940))).is_empty());
+}
+
+#[test]
+fn b3d_delivery_unknown_is_empty() {
+    assert!(b3d_row(crate::wire::DeliveryCondition::Unknown, Some((2, 940))).is_empty());
+}
+
+#[test]
+fn b3d_mark_work() {
+    let mut peer = peer("pi", "online", None);
+    peer.liveness = Some(crate::wire::Liveness::Work { since: 1 });
+    let pieces = layout::presence(
+        &as_frame(&with_roster(Snapshot::default(), vec![peer])),
+        80,
+        '⠹',
+        true,
+    );
+    assert!(pieces
+        .iter()
+        .any(|(t, tone)| t == "⠹" && *tone == layout::Tone::Run));
+}
+
+#[test]
+fn b3d_mark_wait() {
+    let mut peer = peer("pi", "online", None);
+    peer.liveness = Some(crate::wire::Liveness::Wait {
+        since: 1,
+        reason: None,
+    });
+    let pieces = layout::presence(
+        &as_frame(&with_roster(Snapshot::default(), vec![peer])),
+        80,
+        '⠹',
+        true,
+    );
+    assert!(pieces
+        .iter()
+        .any(|(t, tone)| t == "!" && *tone == layout::Tone::Wait));
+}
+
+#[test]
+fn b3d_mark_online() {
+    let mut peer = peer("pi", "online", None);
+    peer.liveness = Some(crate::wire::Liveness::Online);
+    let pieces = layout::presence(
+        &as_frame(&with_roster(Snapshot::default(), vec![peer])),
+        80,
+        '⠹',
+        true,
+    );
+    assert!(pieces
+        .iter()
+        .any(|(t, tone)| t == "●" && *tone == layout::Tone::Soft));
+}
+
+#[test]
+fn b3d_stuck_under_nopush() {
+    let text = joined(&layout::presence(
+        &as_frame(&with_roster(
+            Snapshot::default(),
+            vec![marked(
+                "pi",
+                crate::wire::DeliveryCondition::NoPush,
+                Some((4, 900)),
+            )],
+        )),
+        80,
+        '⠹',
+        true,
+    ));
+    assert!(text.contains("✉4"), "{text}");
+}
+
+#[test]
+fn b3d_offline_hides_stuck() {
+    let text = joined(&layout::presence(
+        &as_frame(&with_roster(
+            Snapshot::default(),
+            vec![marked(
+                "pi",
+                crate::wire::DeliveryCondition::Offline,
+                Some((4, 900)),
+            )],
+        )),
+        80,
+        '⠹',
+        true,
+    ));
+    assert!(!text.contains('✉'), "{text}");
+}
+
+#[test]
+fn job_card_delivery_follows_the_fixed_worker() {
+    use crate::wire::*;
+    /* the name passed to another peer: the queue that matters is the recipient's */
+    let mut job = b3c_job("running");
+    job.ask_id = Some("ask-1".into());
+    job.worker = Some("old".into());
+    job.assignee_id = Some("new".into());
+    job.relation = Some(JobRelation::Open);
+    job.progress = Some(JobProgress {
+        state: Some(Progress::Pending { since: Some(990) }),
+        busy: false,
+    });
+    let mut old = peer("old", "online", None);
+    old.liveness = Some(Liveness::Online);
+    old.delivery = Some(Delivery {
+        condition: DeliveryCondition::NoPush,
+        stuck: Some(Stuck {
+            count: 7,
+            since: 940,
+        }),
+    });
+    let mut new = peer("new", "online", None);
+    new.name = "codex".into();
+    new.liveness = Some(Liveness::Online);
+    new.delivery = Some(Delivery {
+        condition: DeliveryCondition::Push,
+        stuck: None,
+    });
+    let text = b3c_text(job, vec![b3c_ask("boss", "old", "codex")], vec![old, new]);
+    assert!(
+        text.contains("7 queued for 1m") && text.contains("no push"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_v1_card_claims_nothing_about_present_peers() {
+    let ask = b3c_ask("boss", "old", "old");
+    let snap = Snapshot {
+        schema_version: 1,
+        captured_at: 1000,
+        asks: vec![ask],
+        peers: vec![peer("boss", "online", None), peer("old", "online", None)],
+        ..Default::default()
+    };
+    let crate::wire::Decoded::V1Neutral(decoded) =
+        crate::wire::decode_snapshot(serde_json::to_value(snap).unwrap()).unwrap()
+    else {
+        panic!("v1");
+    };
+    let text = super::asks::card(
+        &as_frame(&decoded),
+        &decoded.asks[0],
+        1,
+        90,
+        None,
+        Fit::Whole,
+    )
+    .text();
+    assert!(!text.contains("left the hub"), "{text}");
+}
+
+#[test]
+fn a_sender_the_hub_left_unresolved_is_not_looked_up_by_name() {
+    use crate::wire::*;
+    /* the sender's name equals another peer's id; the hub resolved it to nobody */
+    let mut ask = b3c_ask("x", "w", "w");
+    ask.state = Some(AskState::Open {
+        progress: Progress::Pending { since: Some(820) },
+    });
+    ask.from_peer_id = None;
+    let mut x = peer("x", "online", Some("work"));
+    x.name = "alpha".into();
+    let snap = Snapshot {
+        schema_version: 2,
+        captured_at: 1000,
+        asks: vec![ask],
+        peers: vec![x, peer("w", "online", None)],
+        ..Default::default()
+    };
+    let text = super::asks::card(&as_frame(&snap), &snap.asks[0], 1, 90, None, Fit::Whole).text();
+    assert!(!text.contains("now WORK"), "{text}");
+    assert!(text.contains("left the hub"), "{text}");
+}
+
+#[test]
+fn an_unknown_block_reason_renders_neutral() {
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/wire/job_dispatch.json")).unwrap();
+    let job = value["jobs"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|j| j["job_id"] == "q-blocked")
+        .unwrap();
+    job["dispatch_state"]["reason"] = serde_json::json!("quota");
+    let crate::wire::Decoded::V2(snap) = crate::wire::decode_snapshot(value).unwrap() else {
+        panic!("v2");
+    };
+    let chain = model::chains(&snap)
+        .into_iter()
+        .find(|c| c.topo().iter().any(|id| id == "q-blocked"))
+        .unwrap();
+    let num = model::Numbers::default()
+        .assign(&chain)
+        .into_iter()
+        .map(|(n, id)| (id, n))
+        .collect();
+    let view = View {
+        snap: as_frame(&snap),
+        chain: &chain,
+        num: &num,
+        base: 0,
+        sel: "q-blocked",
+    };
+    let text = flat(&layout::card(&view, "q-blocked", 120, None, Fit::Whole).text());
+    assert!(!text.contains("was deleted"), "{text}");
+    assert!(!text.contains("retry it first"), "{text}");
+    assert!(text.contains("blocked"), "{text}");
+    let mut job = b3c_job("queued");
+    job.dispatch_state = Some(crate::wire::DispatchState::Blocked {
+        dependencies: vec![],
+        dependency: "opaque-dep".into(),
+        reason: crate::wire::BlockReason::Unknown,
+    });
+    let (_, grid) = b3c_scene(job, vec![], vec![]);
+    assert_eq!(b3c_word_tone(&grid, "opaque-dep"), layout::Tone::Dim);
+}
+
+#[test]
+fn a_finished_jobs_offline_worker_keeps_its_word() {
+    let mut job = b3c_job("done");
+    job.relation = Some(crate::wire::JobRelation::NoAsk);
+    let mut p = peer("codex", "offline", None);
+    p.liveness = Some(crate::wire::Liveness::Offline);
+    let text = b3c_text(job, vec![], vec![p]);
+    assert!(text.contains("codex · offline"), "{text}");
+}
+
+#[test]
+fn a_malformed_v2_snapshot_keeps_the_last_frame_end_to_end() {
+    let mut app = app_with(s1());
+    let before = app.snap.as_ref().unwrap().jobs[0].job_id.clone();
+    let mut value: serde_json::Value =
+        serde_json::from_str(include_str!("../../tests/fixtures/wire/job_relations.json")).unwrap();
+    value["asks"][0].as_object_mut().unwrap().remove("state");
+    app.receive(super::decoded(value));
+    assert_eq!(app.snap.as_ref().unwrap().jobs[0].job_id, before);
+    assert!(
+        app.error.as_deref().unwrap().contains("lacks state"),
+        "{:?}",
+        app.error
+    );
 }

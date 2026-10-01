@@ -37,17 +37,12 @@ const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '�
 const PEER_ROWS: usize = 4;
 /* snapshots the peer rows are kept after the roster stopped needing them */
 const PEER_HOLD: u64 = 5;
-/* snapshots in a row a peer's queue stays non-empty before it counts as stuck, and the
-seconds they must span: what an acknowledging peer has in flight clears within one, and a key
-held down pokes several snapshots into one second */
-const STUCK_AFTER: u32 = 3;
-const STUCK_FOR: u64 = 2;
 /* rule characters that stay to the left of what the rule row says at its right end */
 const RULE_MIN: usize = 4;
 
 pub(crate) struct App {
     opts: Opts,
-    snap: Option<Snapshot>,
+    snap: Option<model::Frame>,
     error: Option<String>,
     last_ok: Option<Instant>,
     numbers: Numbers,
@@ -70,9 +65,6 @@ pub(crate) struct App {
     asks: bool,
     ask_sel: Option<String>,
     ask_order: Vec<String>,
-    /* each peer with a non-empty queue: the capture time of the first snapshot in its run of
-    them, and how many the run has lasted */
-    queues: HashMap<String, (u64, u32)>,
     /* the events screen is up instead of the jobs or the asks; the events it holds, the seq
     of the one selected (None follows the newest), the last read's error, and the hub process
     the snapshots came from */
@@ -92,7 +84,7 @@ struct Block {
 }
 
 impl Block {
-    fn view<'a>(&'a self, snap: &'a Snapshot, sel: &'a str) -> View<'a> {
+    fn view<'a>(&'a self, snap: model::Frame, sel: &'a str) -> View<'a> {
         View {
             snap,
             chain: &self.chain,
@@ -123,7 +115,6 @@ impl App {
             asks: false,
             ask_sel: None,
             ask_order: Vec::new(),
-            queues: HashMap::new(),
             events: false,
             feed: Vec::new(),
             ev_sel: None,
@@ -132,13 +123,32 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     pub fn apply(&mut self, fetched: std::result::Result<Snapshot, String>) {
-        match fetched {
-            Ok(mut snap) => {
+        self.receive(fetched.map(|snap| {
+            let mode = match snap.schema_version {
+                v if v > crate::wire::SNAPSHOT_VERSION => model::HubMode::Unsupported(v),
+                crate::wire::SNAPSHOT_VERSION => model::HubMode::V2,
+                _ => model::HubMode::Neutral,
+            };
+            (mode, snap)
+        }));
+    }
+
+    /* an error keeps the last frame */
+    pub fn receive(&mut self, got: std::result::Result<(model::HubMode, Snapshot), String>) {
+        match got {
+            Ok((mode, view)) => {
+                /* a newer hub: one notice, nothing from the last frame */
+                if matches!(mode, model::HubMode::Unsupported(_)) {
+                    self.snap = None;
+                    self.error = Some("unsupported hub".into());
+                    return;
+                }
+                let frame = model::Frame { view, fresh: false };
                 self.snaps += 1;
-                self.track_queues(&mut snap);
-                self.mark_restart(&snap);
-                self.snap = Some(snap);
+                self.mark_restart(&frame);
+                self.snap = Some(frame);
                 self.error = None;
                 self.last_ok = Some(Instant::now());
             }
@@ -156,43 +166,9 @@ impl App {
         }
     }
 
-    /* a peer's queue is stuck once it stayed non-empty over STUCK_AFTER snapshots in a row that
-    span STUCK_FOR seconds; the snapshot keeps each stuck peer with its run's first capture */
-    fn track_queues(&mut self, snap: &mut Snapshot) {
-        if !snap.capabilities.delivery {
-            self.queues.clear();
-            return;
-        }
-        let mut runs: HashMap<String, (u64, u32)> = HashMap::new();
-        for peer in snap
-            .roster
-            .iter()
-            .chain(&snap.peers)
-            .filter(|p| p.queued > 0)
-        {
-            if runs.contains_key(&peer.peer_id) {
-                continue;
-            }
-            let (first, count) = self
-                .queues
-                .get(&peer.peer_id)
-                .copied()
-                .unwrap_or((snap.captured_at, 0));
-            runs.insert(peer.peer_id.clone(), (first, count + 1));
-        }
-        snap.stuck = runs
-            .iter()
-            .filter(|(_, (first, count))| {
-                *count >= STUCK_AFTER && snap.captured_at.saturating_sub(*first) >= STUCK_FOR
-            })
-            .map(|(id, (first, _))| (id.clone(), *first))
-            .collect();
-        self.queues = runs;
-    }
-
     /* another hub_epoch means the hub restarted and its ring started over: while any event is
     held, a divider goes after what is held, one for each restart */
-    fn mark_restart(&mut self, snap: &Snapshot) {
+    fn mark_restart(&mut self, snap: &model::Frame) {
         if snap.hub_epoch.is_empty() {
             return;
         }
@@ -555,6 +531,10 @@ impl App {
     /* the design's screen: the selected job's chain alone under its header, the flow, then
     the card; Tab moves to the next chain */
     pub fn screen(&mut self, cols: usize, rows: usize, tick: usize) -> Vec<Line<'static>> {
+        let fresh = self.fresh();
+        if let Some(frame) = self.snap.as_mut() {
+            frame.fresh = fresh;
+        }
         let mut g = Grid::default();
         let blocks = self.blocks();
         /* settling picks a job and starts its card at the top; the asks screen keeps its own
@@ -644,7 +624,7 @@ impl App {
             for (r, line) in hints.iter().enumerate() {
                 g.put(peer_rows + lines.len() + r, 0, line, Tone::Dim);
             }
-            if !hint.is_empty() && self.snap.as_ref().is_some_and(asks::held) {
+            if !hint.is_empty() && self.snap.as_ref().is_some_and(|snap| asks::held(snap)) {
                 g.put(
                     peer_rows + lines.len() + hints.len(),
                     0,
@@ -654,8 +634,7 @@ impl App {
             }
             return self.lines(&g, cols, rows);
         };
-        let mut snap = self.snap.clone().expect("blocks come from a snapshot");
-        snap.fresh = self.fresh();
+        let snap = self.snap.clone().expect("blocks come from a snapshot");
         let sel = self.sel.clone().expect("settle picked a job");
         let cur = &blocks[b];
         let mut count: HashMap<&str, usize> = HashMap::new();
@@ -738,7 +717,8 @@ impl App {
         }
         let top = peer_rows + 3;
         let avail = rows - 1 - top;
-        let view = cur.view(&snap, &sel);
+        let view = cur.view(snap, &sel);
+        let snap = &view.snap;
         let body = if self.full {
             Grid::default()
         } else if cols >= 96 {
@@ -800,9 +780,9 @@ impl App {
                 "j/k ↑↓ scroll  space/b page  g/G top/end  h/l ←→ stage  esc back".into()
             }
             Mode::Normal if self.full => "j/k scroll  space/b page  h/l stage  esc back".into(),
-            Mode::Normal if cols >= 96 && asks::held(&snap) => "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  tab chain  a asks".into(),
+            Mode::Normal if cols >= 96 && asks::held(snap) => "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  tab chain  a asks".into(),
             Mode::Normal if cols >= 96 => "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain".into(),
-            Mode::Normal if asks::held(&snap) => "j/k move  h/l stage  1-9 jump  f hint  a asks".into(),
+            Mode::Normal if asks::held(snap) => "j/k move  h/l stage  1-9 jump  f hint  a asks".into(),
             Mode::Normal => "j/k move  h/l stage  digits jump  f hint".into(),
         };
         g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
@@ -827,10 +807,13 @@ impl App {
                 let Some(job) = ids.get(&cell.node).and_then(|id| snap.job(id)) else {
                     continue;
                 };
-                if job.state == "running" && snap.spinning(job) {
+                if job.state == "running"
+                    && job.progress.as_ref().is_some_and(|p| p.busy)
+                    && !matches!(job.relation, Some(crate::wire::JobRelation::Missing { .. }))
+                {
                     cell.ch = SPINNER[if moving { tick % SPINNER.len() } else { 0 }];
                 }
-                if moving && job.state == "running" && just_sent(&snap, job) {
+                if moving && job.state == "running" && just_sent(snap, job) {
                     sent.push((*r, *c));
                 }
             }
@@ -973,8 +956,7 @@ impl App {
             }
             return self.lines(&g, cols, rows);
         }
-        let mut snap = self.snap.clone().expect("checked above");
-        snap.fresh = self.fresh();
+        let snap = self.snap.clone().expect("checked above");
         let order = asks::order(&snap);
         let at = match self
             .ask_sel
@@ -1110,7 +1092,7 @@ impl App {
         if let Some(tag) = self
             .snap
             .as_ref()
-            .and_then(asks::tag)
+            .and_then(|snap| asks::tag(snap))
             .filter(|_| self.error.is_none())
         {
             let piece = format!(" {tag} ");
@@ -1231,6 +1213,9 @@ impl App {
 
     /* the hub did not answer: say so, and how old the snapshot on screen is */
     fn stale(&self, error: &str) -> String {
+        if self.snap.is_none() {
+            return format!("! {error}");
+        }
         let age = self
             .last_ok
             .map_or("--".to_string(), |t| format!("{}s", t.elapsed().as_secs()));
@@ -1360,11 +1345,11 @@ fn rail_into(g: &Grid, r: usize, c: usize) -> Vec<(usize, usize)> {
         .collect()
 }
 
-fn just_sent(snap: &Snapshot, job: &model::Job) -> bool {
-    snap.just_now(
-        snap.ask(job.ask_id.as_deref())
-            .and_then(|ask| ask.opened_at),
-    )
+fn just_sent(snap: &model::Frame, job: &model::Job) -> bool {
+    snap.fresh
+        && snap
+            .ask(job.ask_id.as_deref())
+            .is_some_and(|ask| ask.opened_just_now == Some(true))
 }
 
 fn ascii(ch: char) -> char {
@@ -1439,7 +1424,7 @@ pub(crate) struct Want {
 
 /* what the fetch thread sends: a snapshot, or the events read after it */
 enum Got {
-    Snap(Box<std::result::Result<Snapshot, String>>),
+    Snap(Box<std::result::Result<(model::HubMode, Snapshot), String>>),
     Events(std::result::Result<Vec<model::Event>, String>),
 }
 
@@ -1462,6 +1447,16 @@ fn read_events(
     crate::cli::request("GET", &path, None)
         .map_err(|e| e.to_string())
         .and_then(|v| serde_json::from_value::<Vec<model::Event>>(v).map_err(|e| e.to_string()))
+}
+
+fn decoded(value: serde_json::Value) -> std::result::Result<(model::HubMode, Snapshot), String> {
+    match crate::wire::decode_snapshot(value)? {
+        crate::wire::Decoded::V2(snap) => Ok((model::HubMode::V2, snap)),
+        crate::wire::Decoded::V1Neutral(snap) => Ok((model::HubMode::Neutral, snap)),
+        crate::wire::Decoded::Unsupported(version) => {
+            Ok((model::HubMode::Unsupported(version), Snapshot::default()))
+        }
+    }
 }
 
 /* a request a second on a background thread, so the screen never waits for the network;
@@ -1492,7 +1487,7 @@ fn fetch(
             };
             let got = crate::cli::request("GET", &path, None)
                 .map_err(|e| e.to_string())
-                .and_then(|v| serde_json::from_value::<Snapshot>(v).map_err(|e| e.to_string()));
+                .and_then(decoded);
             if tx.send(Got::Snap(Box::new(got))).is_err() {
                 return;
             }
@@ -1530,7 +1525,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         while !stop.load(Ordering::Relaxed) {
             while let Ok(got) = rx.try_recv() {
                 match got {
-                    Got::Snap(snap) => app.apply(*snap),
+                    Got::Snap(snap) => app.receive(*snap),
                     Got::Events(events) => app.take_events(events),
                 }
             }

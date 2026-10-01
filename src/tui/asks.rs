@@ -1,7 +1,8 @@
 use super::layout::{
     self, ago, clock, field, fit, key, short, width, wrap, Fit, Grid, Row, Tone, KEY,
 };
-use super::model::{Activity, Ask, Peer, Snapshot};
+use super::model::{Ask, Frame, Snapshot};
+use crate::wire::{AskAction, AskOutcome, AskState, Liveness, Progress};
 
 /* a preview narrower than this tells nothing, so the row leaves it out */
 const PREVIEW_MIN: usize = 16;
@@ -44,13 +45,24 @@ pub(crate) fn tag(snap: &Snapshot) -> Option<String> {
         .then(|| format!("{n} ask{} open", if n == 1 { "" } else { "s" }))
 }
 
-fn failed(ask: &Ask) -> bool {
-    ask.failed || ask.closed_by.as_deref() == Some("hub")
+pub(crate) fn failed(ask: &Ask) -> bool {
+    matches!(
+        ask.state,
+        Some(AskState::Closed {
+            failed_effective: true,
+            ..
+        })
+    )
 }
 
 pub(crate) fn header(order: &[&Ask], all: bool) -> String {
     let open = order.iter().filter(|ask| ask.open).count();
-    let failed = order.iter().filter(|ask| !ask.open && failed(ask)).count();
+    /* v1 carries no AskState, so a closed ask is not an answer and not a failure */
+    if order.iter().all(|ask| ask.state.is_none()) {
+        let scope = if all { " · all circles" } else { "" };
+        return format!("asks{scope} · {open} open · {} closed", order.len() - open);
+    }
+    let failed = order.iter().filter(|ask| failed(ask)).count();
     let scope = if all { " · all circles" } else { "" };
     let mut head = format!(
         "asks{scope} · {open} open · {} answered",
@@ -63,64 +75,65 @@ pub(crate) fn header(order: &[&Ask], all: bool) -> String {
 }
 
 fn glyph(ask: &Ask) -> (char, Tone) {
-    match (ask.open, failed(ask)) {
-        (true, _) => ('◆', Tone::Run),
-        (false, true) => ('×', Tone::Fail),
-        (false, false) => ('●', Tone::Done),
+    match ask.state {
+        Some(AskState::Open { .. }) => ('◆', Tone::Run),
+        Some(AskState::Closed {
+            failed_effective: true,
+            ..
+        }) => ('×', Tone::Fail),
+        Some(AskState::Closed { .. }) => ('●', Tone::Done),
+        _ if ask.open => ('◆', Tone::Run),
+        _ => ('●', Tone::Plain),
     }
 }
 
-/* the recipient by id: a name may have passed to another peer since */
-fn recipient<'a>(snap: &'a Snapshot, ask: &Ask) -> Option<&'a Peer> {
-    snap.peer_by_id(&ask.to_peer_id)
+fn waiting(now: u64, opened: Option<u64>) -> (String, Tone) {
+    (format!("waiting {}", ago(now, opened)), Tone::Run)
 }
 
-/* what the recipient of an open ask is doing, from hubs that report it */
-fn doing<'a>(snap: &'a Snapshot, ask: &Ask) -> Option<&'a Activity> {
-    recipient(snap, ask)
-        .filter(|p| ask.open && p.status == "online" && snap.capabilities.peer_activity)
-        .and_then(|p| p.activity.as_ref())
+fn open_line(now: u64, opened: Option<u64>, progress: &Progress) -> (String, Tone) {
+    match progress {
+        Progress::Gone => ("left the hub".into(), Tone::Fail),
+        Progress::Offline => ("offline".into(), Tone::Fail),
+        Progress::Wait { since, .. } => (format!("WAIT! {}", ago(now, Some(*since))), Tone::Wait),
+        Progress::Idle { since, .. } => (format!("IDLE! {}", ago(now, Some(*since))), Tone::Fail),
+        Progress::Work { .. } | Progress::Pending { .. } | Progress::Unknown => {
+            waiting(now, opened)
+        }
+    }
 }
 
-fn stalled(snap: &Snapshot, ask: &Ask) -> Option<(u64, &'static str)> {
-    doing(snap, ask).and_then(|a| snap.stalled(ask, a))
+fn closed_line(outcome: &AskOutcome) -> (String, Tone) {
+    match outcome {
+        AskOutcome::AckedOk => ("acked ok".into(), Tone::Done),
+        AskOutcome::AckedFailed => ("acked failed".into(), Tone::Fail),
+        AskOutcome::HandOk => ("closed by hand".into(), Tone::Done),
+        AskOutcome::HandFailed => ("closed by hand".into(), Tone::Fail),
+        AskOutcome::Hub => ("closed by hub".into(), Tone::Fail),
+        AskOutcome::ClosedOk => ("closed ok".into(), Tone::Done),
+        AskOutcome::ClosedFailed => ("closed failed".into(), Tone::Fail),
+        AskOutcome::Unknown => ("closed".into(), Tone::Plain),
+    }
 }
 
 /* the job card's words for an ask */
 pub(crate) fn state(snap: &Snapshot, ask: &Ask) -> (String, Tone) {
     let now = snap.captured_at;
-    if ask.open {
-        return match (recipient(snap, ask), doing(snap, ask)) {
-            (None, _) => ("left the hub".into(), Tone::Fail),
-            (Some(p), _) if p.status != "online" => ("offline".into(), Tone::Fail),
-            (_, Some(a)) if a.state == "wait" => {
-                (format!("WAIT! {}", ago(now, Some(a.since))), Tone::Wait)
-            }
-            _ => match stalled(snap, ask) {
-                Some((at, _)) => (format!("IDLE! {}", ago(now, Some(at))), Tone::Fail),
-                None => (format!("waiting {}", ago(now, ask.opened_at)), Tone::Run),
-            },
-        };
-    }
-    let outcome = |ok: &str, bad: &str| match ask.failed {
-        true => (bad.to_string(), Tone::Fail),
-        false => (ok.to_string(), Tone::Done),
-    };
-    match ask.closed_by.as_deref() {
-        Some("recipient") => outcome("acked ok", "acked failed"),
-        Some("hand") => outcome("closed by hand", "closed by hand"),
-        Some("hub") => ("closed by hub".into(), Tone::Fail),
-        _ => outcome("closed ok", "closed failed"),
+    match ask.state.as_ref() {
+        Some(AskState::Open { progress }) => open_line(now, ask.opened_at, progress),
+        Some(AskState::Closed { outcome, .. }) => closed_line(outcome),
+        _ if ask.open => waiting(now, ask.opened_at),
+        _ => ("closed".into(), Tone::Plain),
     }
 }
 
-/* a peer of the view's own circle, by id or name; anonymous stands for no sender */
-fn own(snap: &Snapshot, name: &str) -> bool {
-    name != "anonymous"
-        && snap
-            .roster
-            .iter()
-            .any(|peer| peer.peer_id == name || peer.name == name)
+/* a roster id; anonymous is no sender. Display names are not identities */
+fn own(snap: &Snapshot, id: &str) -> bool {
+    !id.is_empty() && id != "anonymous" && snap.roster.iter().any(|peer| peer.peer_id == id)
+}
+
+fn identity<'a>(displayed: &'a str, resolved: Option<&'a str>) -> &'a str {
+    resolved.filter(|id| !id.is_empty()).unwrap_or(displayed)
 }
 
 /* the prefix the view's own peers share up to a '-': the {folder}- of {folder}-{backend} ids,
@@ -128,8 +141,13 @@ which tells nothing apart inside a circle */
 fn prefix(snap: &Snapshot, order: &[&Ask]) -> String {
     let mut names: Vec<&str> = order
         .iter()
-        .flat_map(|ask| [ask.from_peer.as_str(), ask.to_peer_id.as_str()])
-        .filter(|name| own(snap, name))
+        .flat_map(|ask| {
+            [
+                identity(ask.from_peer.as_str(), ask.from_peer_id.as_deref()),
+                ask.to_peer_id.as_str(),
+            ]
+        })
+        .filter(|id| own(snap, id))
         .collect();
     names.sort_unstable();
     names.dedup();
@@ -186,17 +204,37 @@ fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+fn ask_arrow(snap: &Frame, ask: &Ask) -> (String, Tone) {
+    let working = matches!(
+        ask.state,
+        Some(AskState::Open {
+            progress: Progress::Work { .. },
+        })
+    );
+    if matches!(ask.state, Some(AskState::Open { .. })) || (ask.state.is_none() && ask.open) {
+        return ("─▸─".into(), if working { Tone::Flow } else { Tone::Dim });
+    }
+    let just = snap.fresh && ask.closed_just_now == Some(true);
+    if !just {
+        return (">".into(), Tone::Plain);
+    }
+    if failed(ask) {
+        ("─×─".into(), Tone::Fail)
+    } else {
+        ("─◂─".into(), Tone::Back)
+    }
+}
+
 /* one row per ask: number, glyph, id, sender>recipient, state and, where it fits, the text or
 the reply; the route gives way to the state */
-pub(crate) fn rows(snap: &Snapshot, order: &[&Ask], cols: usize) -> Vec<Row> {
+pub(crate) fn rows(snap: &Frame, order: &[&Ask], cols: usize) -> Vec<Row> {
     let prefix = prefix(snap, order);
     let routes: Vec<(String, (String, Tone), String)> = order
         .iter()
         .map(|ask| {
-            let working = doing(snap, ask).is_some_and(|a| a.state == "work");
             (
                 shown(snap, &ask.from_peer, &prefix),
-                layout::arrow(snap, ask, working),
+                ask_arrow(snap, ask),
                 shown(snap, &ask.to_peer_id, &prefix),
             )
         })
@@ -279,17 +317,27 @@ fn party(k: &str, name: &str, status: Row, room: usize) -> Vec<Row> {
     lines
 }
 
-fn now_doing(snap: &Snapshot, peer: Option<&Peer>) -> Row {
-    match peer {
-        None => vec![("· left the hub".into(), Tone::Fail)],
-        Some(p) if p.status != "online" => vec![("· offline".into(), Tone::Fail)],
-        Some(p) => p
-            .activity
+fn liveness_word(kind: &Liveness) -> Row {
+    let word = match kind {
+        Liveness::Offline => return vec![("· offline".into(), Tone::Fail)],
+        Liveness::Online | Liveness::Unknown => return Vec::new(),
+        Liveness::Wait { .. } => "WAIT",
+        Liveness::Work { .. } => "WORK",
+        Liveness::Idle { .. } => "IDLE",
+    };
+    vec![(format!("· now {word}"), Tone::Soft)]
+}
+
+/* an unresolved party has left; a v1 snapshot claims nothing */
+fn party_now(snap: &Snapshot, id: Option<&str>, neutral: bool) -> Row {
+    match id.and_then(|id| snap.peer_by_id(id)) {
+        Some(peer) => peer
+            .liveness
             .as_ref()
-            .filter(|_| snap.capabilities.peer_activity)
-            .map_or(Vec::new(), |a| {
-                vec![(format!("· now {}", a.state.to_uppercase()), Tone::Soft)]
-            }),
+            .map(liveness_word)
+            .unwrap_or_default(),
+        None if neutral => Vec::new(),
+        None => vec![("· left the hub".into(), Tone::Fail)],
     }
 }
 
@@ -297,7 +345,7 @@ fn now_doing(snap: &Snapshot, peer: Option<&Peer>) -> Row {
 asked whom and what each does now, the times, the question, and the command a stalled answer
 calls for */
 pub(crate) fn card(
-    snap: &Snapshot,
+    snap: &Frame,
     ask: &Ask,
     num: usize,
     cols: usize,
@@ -314,22 +362,29 @@ pub(crate) fn card(
     left.extend(party(
         "from",
         &ask.from_peer,
-        now_doing(snap, snap.peer(&ask.from_peer)),
+        party_now(snap, ask.from_peer_id.as_deref(), ask.state.is_none()),
         room,
     ));
-    let to = recipient(snap, ask);
-    let status = match (doing(snap, ask), stalled(snap, ask)) {
-        (Some(a), _) if a.state == "wait" => {
-            vec![(format!("WAIT! {}", ago(now, Some(a.since))), Tone::Wait)]
-        }
-        (_, Some((at, why))) => vec![
-            (format!("IDLE! {}", ago(now, Some(at))), Tone::Fail),
-            (format!(" · {why}"), Tone::Dim),
+    let status = match ask.state.as_ref() {
+        Some(AskState::Open {
+            progress: Progress::Wait { since, .. },
+        }) => vec![(format!("WAIT! {}", ago(now, Some(*since))), Tone::Wait)],
+        Some(AskState::Open {
+            progress: Progress::Idle { since, why },
+        }) => vec![
+            (format!("IDLE! {}", ago(now, Some(*since))), Tone::Fail),
+            (format!(" · {}", layout::idle_why(why)), Tone::Dim),
         ],
-        _ => now_doing(snap, to),
+        Some(AskState::Open {
+            progress: Progress::Gone,
+        }) => vec![("· left the hub".into(), Tone::Fail)],
+        Some(AskState::Open {
+            progress: Progress::Offline,
+        }) => vec![("· offline".into(), Tone::Fail)],
+        _ => party_now(snap, Some(&ask.to_peer_id), ask.state.is_none()),
     };
     left.extend(party("to", &ask.to_peer_id, status, room));
-    if let (Some(p), true) = (to, ask.open) {
+    if let Some(p) = snap.peer_by_id(&ask.to_peer_id).filter(|_| ask.open) {
         let words = layout::delivery(snap, p);
         if !words.is_empty() {
             left.push([vec![key("", false)], words].concat());
@@ -346,32 +401,30 @@ pub(crate) fn card(
         ),
     };
     layout::wrapped(&mut left, "times", &times, Tone::Dim, colw, usize::MAX);
-    if ask.open && to.is_none() {
-        let command = format!(
-            "amesh peer ack {} --failed true --message {}",
-            layout::quote(&ask.correlation_id),
-            layout::quote("recipient left")
-        );
+    for action in ask.actions.iter().flatten() {
+        let command = match action {
+            AskAction::CloseLeft => format!(
+                "amesh peer ack {} --failed true --message {}",
+                layout::quote(&ask.correlation_id),
+                layout::quote("recipient left")
+            ),
+            AskAction::Nudge { to } => format!(
+                "amesh peer notify {} {}",
+                layout::quote(to),
+                layout::quote(&format!(
+                    "ask {} waits for your ack",
+                    short(&ask.correlation_id)
+                ))
+            ),
+            AskAction::Unknown => continue,
+        };
+        let key_name = match action {
+            AskAction::CloseLeft => "close",
+            _ => "nudge",
+        };
         layout::wrapped(
             &mut commands,
-            "close",
-            &command,
-            Tone::Dim,
-            colw,
-            usize::MAX,
-        );
-    } else if stalled(snap, ask).is_some() {
-        let command = format!(
-            "amesh peer notify {} {}",
-            layout::quote(&ask.to_peer_id),
-            layout::quote(&format!(
-                "ask {} waits for your ack",
-                short(&ask.correlation_id)
-            ))
-        );
-        layout::wrapped(
-            &mut commands,
-            "nudge",
+            key_name,
             &command,
             Tone::Dim,
             colw,

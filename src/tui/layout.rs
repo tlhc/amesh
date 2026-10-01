@@ -1,4 +1,8 @@
-use super::model::{Ask, Chain, Job, Peer, Snapshot};
+use super::model::{Ask, Chain, Frame, Job, Peer, Snapshot};
+use crate::wire::{
+    BlockReason, DeliveryCondition, DispatchState, IdleWhy, JobAction, JobRelation, Liveness,
+    Progress,
+};
 use std::collections::{BTreeMap, HashMap};
 use unicode_width::UnicodeWidthChar;
 
@@ -171,7 +175,7 @@ impl Grid {
 they do not all fit, those waiting for a person or at work are placed first, a name that
 does not fit is counted and the next one tried; names are never cut. `spin` is the
 spinner's frame, `lit` whether the WAIT mark shows in this frame */
-pub(crate) fn presence(snap: &Snapshot, cols: usize, spin: char, lit: bool) -> Vec<(String, Tone)> {
+pub(crate) fn presence(snap: &Frame, cols: usize, spin: char, lit: bool) -> Vec<(String, Tone)> {
     if !snap.capabilities.roster {
         let hint = "peers: restart the hub on the current amesh to list them";
         return vec![(fit(hint, cols), Tone::Dim)];
@@ -181,11 +185,11 @@ pub(crate) fn presence(snap: &Snapshot, cols: usize, spin: char, lit: bool) -> V
         return vec![(fit("no peers online", cols), Tone::Dim)];
     }
     let label = label(online.len());
-    let need = |kept: &[&Peer]| line_width(snap, &label, kept, online.len() - kept.len());
+    let need = |kept: &[&Peer]| line_width(&label, kept, online.len() - kept.len());
     let mut kept = online.clone();
     if need(&kept) > cols {
         let mut ranked = online.clone();
-        ranked.sort_by_key(|p| urgency(snap, p));
+        ranked.sort_by_key(|p| urgency(p));
         kept.clear();
         for peer in ranked {
             kept.push(peer);
@@ -203,8 +207,8 @@ pub(crate) fn presence(snap: &Snapshot, cols: usize, spin: char, lit: bool) -> V
         if i > 0 {
             out.push(("  ".into(), Tone::Plain));
         }
-        out.push(mark(snap, peer, spin, lit));
-        out.extend(named(snap, peer));
+        out.push(mark(peer, spin, lit));
+        out.extend(named(peer));
     }
     let hidden = online.len() - kept.len();
     if hidden > 0 {
@@ -218,7 +222,7 @@ a grid, each name padded to the widest and every further line indented under the
 so the names stand in columns. A grid taller than `rows` keeps those waiting or at work and
 counts the rest in its last cell; a name wider than any column leaves the one top line */
 pub(crate) fn presence_lines(
-    snap: &Snapshot,
+    snap: &Frame,
     cols: usize,
     rows: usize,
     spin: char,
@@ -227,10 +231,10 @@ pub(crate) fn presence_lines(
     let line = presence(snap, cols, spin, lit);
     let online = online_peers(snap);
     let label = label(online.len());
-    let single = line_width(snap, &label, &online, 0);
+    let single = line_width(&label, &online, 0);
     let cell = online
         .iter()
-        .map(|p| 2 + width(shown(p)) + width(&tail(snap, p)))
+        .map(|p| 2 + width(shown(p)) + width(&tail(p)))
         .chain([width(&format!("+{}", online.len()))])
         .max()
         .unwrap_or(0);
@@ -240,14 +244,14 @@ pub(crate) fn presence_lines(
     }
     let mut kept = online.clone();
     if kept.len() > rows * per {
-        kept.sort_by_key(|p| urgency(snap, p));
+        kept.sort_by_key(|p| urgency(p));
         kept.truncate(rows * per - 1);
         kept.sort_by(|a, b| shown(a).cmp(shown(b)));
     }
     let hidden = online.len() - kept.len();
     let mut cells: Vec<Vec<(String, Tone)>> = kept
         .iter()
-        .map(|peer| [vec![mark(snap, peer, spin, lit)], named(snap, peer)].concat())
+        .map(|peer| [vec![mark(peer, spin, lit)], named(peer)].concat())
         .collect();
     if hidden > 0 {
         cells.push(vec![(format!("+{hidden}"), Tone::Dim)]);
@@ -290,11 +294,11 @@ fn label(online: usize) -> String {
 }
 
 /* the top line's width with `kept` shown after `label` and `hidden` counted */
-fn line_width(snap: &Snapshot, label: &str, kept: &[&Peer], hidden: usize) -> usize {
+fn line_width(label: &str, kept: &[&Peer], hidden: usize) -> usize {
     width(label)
         + kept
             .iter()
-            .map(|p| 2 + width(shown(p)) + width(&tail(snap, p)))
+            .map(|p| 2 + width(shown(p)) + width(&tail(p)))
             .sum::<usize>()
         + 2 * kept.len().saturating_sub(1)
         + if hidden > 0 {
@@ -312,69 +316,67 @@ fn shown(peer: &Peer) -> &str {
     }
 }
 
-/* a name on the top line, dimmed while its peer has no push channel, and after it ✉ with the
-count of a stuck queue */
-fn named(snap: &Snapshot, peer: &Peer) -> Vec<(String, Tone)> {
-    let tone = match snap.capabilities.delivery && !peer.push {
-        true => Tone::Dim,
-        false => Tone::Soft,
+/* a name on the top line. NoPush dims it. A stuck queue under Push or NoPush adds the count */
+fn named(peer: &Peer) -> Vec<(String, Tone)> {
+    let tone = match peer.delivery.as_ref().map(|row| row.condition) {
+        Some(DeliveryCondition::NoPush) => Tone::Dim,
+        _ => Tone::Soft,
     };
     let mut out = vec![(format!(" {}", shown(peer)), tone)];
-    let tail = tail(snap, peer);
-    if !tail.is_empty() {
-        out.push((tail, Tone::Warn));
+    let mark = tail(peer);
+    if !mark.is_empty() {
+        out.push((mark, Tone::Warn));
     }
     out
 }
 
-fn tail(snap: &Snapshot, peer: &Peer) -> String {
-    match snap.capabilities.delivery && snap.stuck.contains_key(&peer.peer_id) {
-        true => format!(" ✉{}", peer.queued),
-        false => String::new(),
+fn tail(peer: &Peer) -> String {
+    let Some(delivery) = peer.delivery.as_ref() else {
+        return String::new();
+    };
+    let Some(stuck) = delivery.stuck.as_ref() else {
+        return String::new();
+    };
+    match delivery.condition {
+        DeliveryCondition::Push | DeliveryCondition::NoPush => format!(" ✉{}", stuck.count),
+        _ => String::new(),
     }
 }
 
-/* why an open ask to an online peer may go unseen, from hubs that report delivery: no push
-channel, a queue stuck over several snapshots */
-pub(crate) fn delivery(snap: &Snapshot, peer: &Peer) -> Row {
+pub(crate) fn delivery(snap: &Frame, peer: &Peer) -> Row {
+    let Some(delivery) = peer.delivery.as_ref() else {
+        return Vec::new();
+    };
     let mut out: Row = Vec::new();
-    if !snap.capabilities.delivery || peer.status != "online" {
-        return out;
+    match delivery.condition {
+        DeliveryCondition::NoPush => out.push(("no push".into(), Tone::Dim)),
+        DeliveryCondition::Push => {}
+        DeliveryCondition::Offline | DeliveryCondition::Unknown => return Vec::new(),
     }
-    if !peer.push {
-        out.push(("no push".into(), Tone::Dim));
-    }
-    if let Some(first) = snap.stuck.get(&peer.peer_id) {
+    if let Some(stuck) = delivery.stuck.as_ref() {
         if !out.is_empty() {
             out.push((" · ".into(), Tone::Dim));
         }
-        let age = ago(snap.captured_at, Some(*first));
-        out.push((format!("{} queued for {age}", peer.queued), Tone::Warn));
+        let age = ago(snap.captured_at, Some(stuck.since));
+        out.push((format!("{} queued for {age}", stuck.count), Tone::Warn));
     }
     out
 }
 
-fn doing(snap: &Snapshot, peer: &Peer) -> Option<String> {
-    peer.activity
-        .as_ref()
-        .filter(|_| snap.capabilities.peer_activity)
-        .map(|a| a.state.clone())
-}
-
 /* waiting for a person first, then at work, then the rest */
-fn urgency(snap: &Snapshot, peer: &Peer) -> u8 {
-    match doing(snap, peer).as_deref() {
-        Some("wait") => 0,
-        Some("work") => 1,
+fn urgency(peer: &Peer) -> u8 {
+    match peer.liveness {
+        Some(Liveness::Wait { .. }) => 0,
+        Some(Liveness::Work { .. }) => 1,
         _ => 2,
     }
 }
 
-fn mark(snap: &Snapshot, peer: &Peer, spin: char, lit: bool) -> (String, Tone) {
-    let (mark, tone) = match doing(snap, peer).as_deref() {
-        Some("work") => (spin, Tone::Run),
-        Some("wait") => (if lit { '!' } else { ' ' }, Tone::Wait),
-        Some("idle") => ('○', Tone::Dim),
+fn mark(peer: &Peer, spin: char, lit: bool) -> (String, Tone) {
+    let (mark, tone) = match peer.liveness {
+        Some(Liveness::Work { .. }) => (spin, Tone::Run),
+        Some(Liveness::Wait { .. }) => (if lit { '!' } else { ' ' }, Tone::Wait),
+        Some(Liveness::Idle { .. }) => ('○', Tone::Dim),
         _ => ('●', Tone::Soft),
     };
     (mark.to_string(), tone)
@@ -393,11 +395,11 @@ pub(crate) fn events_tag(snap: &Snapshot) -> Option<String> {
 while it works and rests while it does not; one the hub closed within the second before a
 fresh snapshot steps back to the sender, or crosses out when it closed failed, and an older
 one reads > */
-pub(crate) fn arrow(snap: &Snapshot, ask: &Ask, working: bool) -> (String, Tone) {
+pub(crate) fn arrow(snap: &Frame, ask: &Ask, working: bool) -> (String, Tone) {
     match ask.open {
         true => ("─▸─".into(), if working { Tone::Flow } else { Tone::Dim }),
-        false if !snap.just_now(ask.closed_at) => (">".into(), Tone::Plain),
-        false if ask.failed => ("─×─".into(), Tone::Fail),
+        false if !(snap.fresh && ask.closed_just_now == Some(true)) => (">".into(), Tone::Plain),
+        false if super::asks::failed(ask) => ("─×─".into(), Tone::Fail),
         false => ("─◂─".into(), Tone::Back),
     }
 }
@@ -409,33 +411,6 @@ pub(crate) fn glyph(state: &str) -> (char, Tone) {
         "failed" => ('×', Tone::Fail),
         "cancelled" => ('–', Tone::Queued),
         _ => ('○', Tone::Queued),
-    }
-}
-
-/* a running job whose worker needs a person: at a permission prompt (WAIT!, with what
-it asks), or idle with the ask still open (IDLE!, since when and why) */
-pub(crate) enum Alarm {
-    Wait(String),
-    Idle(u64, &'static str),
-}
-
-pub(crate) fn alarm(snap: &Snapshot, job: &Job) -> Option<Alarm> {
-    if !snap.capabilities.peer_activity || job.state != "running" {
-        return None;
-    }
-    let activity = snap.worker(job)?.activity.as_ref()?;
-    match activity.state.as_str() {
-        "wait" => Some(Alarm::Wait(
-            activity
-                .reason
-                .clone()
-                .unwrap_or_else(|| "needs your permission".into()),
-        )),
-        "idle" => snap
-            .ask(job.ask_id.as_deref())
-            .and_then(|ask| snap.stalled(ask, activity))
-            .map(|(at, why)| Alarm::Idle(at, why)),
-        _ => None,
     }
 }
 
@@ -502,7 +477,7 @@ pub(crate) fn ago(now: u64, then: Option<u64>) -> String {
 /* numbers restart in every block, so cells carry base + number: every job on the screen
 has its own node for hints and highlights */
 pub(crate) struct View<'a> {
-    pub snap: &'a Snapshot,
+    pub snap: Frame,
     pub chain: &'a Chain,
     pub num: &'a HashMap<String, usize>,
     pub base: usize,
@@ -570,9 +545,12 @@ impl View<'_> {
 
     /* a flow row marks a worker waiting for a permission; an idle one shows in the card */
     fn waiting(&self, id: &str) -> bool {
-        self.snap
-            .job(id)
-            .is_some_and(|job| matches!(alarm(self.snap, job), Some(Alarm::Wait(_))))
+        self.snap.job(id).is_some_and(|job| {
+            matches!(
+                job.progress.as_ref().and_then(|p| p.state.as_ref()),
+                Some(Progress::Wait { .. })
+            )
+        })
     }
 
     /* worker, age and any partial-dependency note after a one-job row */
@@ -1174,6 +1152,48 @@ pub(crate) fn columns(cols: usize) -> (bool, usize) {
 
 /* the design's card: fields on the left and, in a wide pane, the prompt and any command
 on the right */
+pub(super) fn idle_why(why: &IdleWhy) -> &'static str {
+    match why {
+        IdleWhy::NotPickedUp => "not picked up",
+        IdleWhy::AskStillOpen => "ask still open",
+        IdleWhy::TurnEnded => "turn ended",
+        IdleWhy::Unknown => "",
+    }
+}
+
+fn gone_label<'a>(ask: Option<&'a Ask>, job: &'a Job) -> &'a str {
+    ask.and_then(|ask| {
+        [ask.to_peer_id.as_str(), ask.to_peer.as_str()]
+            .into_iter()
+            .find(|part| !part.is_empty())
+    })
+    .or(job.assigned_peer.as_deref())
+    .filter(|part| !part.is_empty())
+    .unwrap_or("-")
+}
+
+fn worker_name<'a>(snap: &'a Snapshot, job: &'a Job) -> &'a str {
+    job.worker
+        .as_deref()
+        .map(|id| {
+            snap.peer_by_id(id)
+                .map(|peer| peer.name.as_str())
+                .unwrap_or(id)
+        })
+        .unwrap_or_else(|| job.assigned_peer.as_deref().unwrap_or("-"))
+}
+
+fn now_word(snap: &Snapshot, job: &Job) -> Option<&'static str> {
+    let id = job.worker.as_deref()?;
+    match snap.peer_by_id(id)?.liveness.as_ref()? {
+        Liveness::Work { .. } => Some(" · now WORK"),
+        Liveness::Idle { .. } => Some(" · now IDLE"),
+        Liveness::Wait { .. } => Some(" · now WAIT"),
+        Liveness::Offline => Some(" · offline"),
+        _ => None,
+    }
+}
+
 pub(crate) fn card(
     v: &View,
     id: &str,
@@ -1185,7 +1205,7 @@ pub(crate) fn card(
     if matches!(size, Fit::Whole) {
         WHOLE_CARDS.with(|n| n.set(n.get() + 1));
     }
-    let snap = v.snap;
+    let snap = &v.snap;
     let job = snap.job(id).expect("selected job is in the snapshot");
     let ask = snap.ask(job.ask_id.as_deref());
     let now = snap.captured_at;
@@ -1196,8 +1216,11 @@ pub(crate) fn card(
     let result = full_text.map_or(job.result.as_deref(), |(_, r)| r);
     let worker = job.assigned_peer.as_deref().unwrap_or("-");
     let state = job.state.as_str();
-    let alarm = alarm(snap, job);
-    let idle = matches!(alarm, Some(Alarm::Idle(..)));
+    let progress = job.progress.as_ref();
+    let idle = matches!(
+        progress.and_then(|p| p.state.as_ref()),
+        Some(Progress::Idle { .. })
+    );
     let sent = ask.and_then(|a| a.opened_at).filter(|_| state != "queued");
     /* up to three items share a line, so each name gets its share of the card's width */
     let share = |count: usize| {
@@ -1214,7 +1237,10 @@ pub(crate) fn card(
                     (ch.to_string(), tone),
                 ]
             }
-            _ => vec![(format!("{} deleted", fit(d, 14)), Tone::Fail)],
+            _ if snap.missing.jobs.contains(d) => {
+                vec![(format!("{} deleted", fit(d, 14)), Tone::Fail)]
+            }
+            _ => vec![(fit(d, 14), Tone::Dim)],
         }
     };
     let items = |ids: &[String]| -> Vec<Row> {
@@ -1236,101 +1262,100 @@ pub(crate) fn card(
         )),
         _ => None,
     };
-    /* the worker in the design's words: WORK in a turn on this job, IDLE! with the ask
-    open, WAIT! at a permission prompt, else what it does now. The card holds still; the
-    flow above it carries the spinner */
-    let doing = |p: &Peer| -> String {
-        if p.status != "online" {
-            return format!("{} · offline", p.name);
-        }
-        match p
-            .activity
-            .as_ref()
-            .filter(|_| snap.capabilities.peer_activity)
-        {
-            Some(a) => format!("{} · now {}", p.name, a.state.to_uppercase()),
-            None => p.name.clone(),
-        }
-    };
+    /* Job.worker is a peer id. Null with no derived fields is the v1 assignee line */
+    let name = worker_name(snap, job);
     let worker_block = left.len();
-    match (state, snap.worker(job)) {
-        ("queued", _) => left.push(vec![
+    let bare = job.worker.is_none() && job.relation.is_none() && job.progress.is_none();
+    if matches!(job.relation, Some(JobRelation::Missing { .. })) || bare {
+        left.push(vec![key("worker", true), (worker.to_string(), Tone::Soft)]);
+    } else if state == "queued" {
+        left.push(vec![
             key("worker", true),
             (format!("{worker} (when ready)"), Tone::Dim),
-        ]),
-        ("running", None) if ask.is_some() => wrapped(
-            &mut left,
-            "worker",
-            &format!(
-                "{} left the hub",
-                ask.map_or(worker, |a| a.to_peer_id.as_str())
+        ]);
+    } else if state == "running" {
+        match progress.and_then(|p| p.state.as_ref()) {
+            Some(Progress::Gone) if ask.is_some() => wrapped(
+                &mut left,
+                "worker",
+                &format!("{} left the hub", gone_label(ask, job)),
+                Tone::Warn,
+                colw,
+                usize::MAX,
             ),
-            Tone::Warn,
-            colw,
-            usize::MAX,
-        ),
-        ("running", Some(p)) => {
-            let since = p
-                .activity
-                .as_ref()
-                .map_or(String::new(), |a| ago(now, Some(a.since)));
-            let name = (format!("{} ", p.name), Tone::Plain);
-            match &alarm {
-                Some(Alarm::Wait(reason)) => {
-                    left.push(vec![
-                        key("worker", true),
-                        name,
-                        (format!("WAIT! {since}"), Tone::Warn),
-                    ]);
-                    wrapped(&mut left, "", reason, Tone::Warn, colw, 2);
-                }
-                Some(Alarm::Idle(at, why)) => left.push(vec![
+            Some(Progress::Wait { since, reason }) => {
+                left.push(vec![
                     key("worker", true),
-                    name,
-                    (format!("IDLE! {}", ago(now, Some(*at))), Tone::Fail),
-                    (format!(" · {why}"), Tone::Dim),
-                ]),
-                None if snap.spinning(job) => left.push(vec![
-                    key("worker", true),
-                    name,
-                    (format!("WORK · turn {since}"), Tone::Run),
-                ]),
-                None => left.push(vec![key("worker", true), (doing(p), Tone::Soft)]),
+                    (format!("{name} "), Tone::Plain),
+                    (format!("WAIT! {}", ago(now, Some(*since))), Tone::Warn),
+                ]);
+                wrapped(
+                    &mut left,
+                    "",
+                    reason.as_deref().unwrap_or("needs your permission"),
+                    Tone::Warn,
+                    colw,
+                    2,
+                );
+            }
+            Some(Progress::Idle { since, why }) => left.push(vec![
+                key("worker", true),
+                (format!("{name} "), Tone::Plain),
+                (format!("IDLE! {}", ago(now, Some(*since))), Tone::Fail),
+                (format!(" · {}", idle_why(why)), Tone::Dim),
+            ]),
+            Some(Progress::Work { since }) if progress.is_some_and(|p| p.busy) => left.push(vec![
+                key("worker", true),
+                (format!("{name} "), Tone::Plain),
+                (format!("WORK · turn {}", ago(now, Some(*since))), Tone::Run),
+            ]),
+            Some(Progress::Work { .. }) => left.push(vec![
+                key("worker", true),
+                (format!("{name} · now WORK"), Tone::Soft),
+            ]),
+            Some(Progress::Offline) => left.push(vec![
+                key("worker", true),
+                (format!("{name} · offline"), Tone::Soft),
+            ]),
+            _ => {
+                let line = now_word(snap, job)
+                    .map(|word| format!("{name}{word}"))
+                    .unwrap_or_else(|| name.to_string());
+                left.push(vec![key("worker", true), (line, Tone::Soft)]);
             }
         }
-        (_, Some(p)) => left.push(vec![key("worker", true), (doing(p), Tone::Soft)]),
-        (_, None) => left.push(vec![key("worker", true), (worker.to_string(), Tone::Soft)]),
+    } else {
+        let line = now_word(snap, job)
+            .map(|word| format!("{name}{word}"))
+            .unwrap_or_else(|| name.to_string());
+        left.push(vec![key("worker", true), (line, Tone::Soft)]);
     }
     /* why the open ask may go unseen, on a row of its own so a halved card keeps it whole */
-    if let (Some(p), true) = (snap.worker(job), ask.is_some_and(|a| a.open)) {
-        let words = delivery(snap, p);
-        if !words.is_empty() && left.len() > worker_block {
-            left.push([vec![key("", false)], words].concat());
+    if let (Some(id), true) = (
+        job.worker.as_deref(),
+        matches!(job.relation, Some(JobRelation::Open)),
+    ) {
+        if let Some(p) = snap.peer_by_id(id) {
+            let words = delivery(snap, p);
+            if !words.is_empty() && left.len() > worker_block {
+                left.push([vec![key("", false)], words].concat());
+            }
         }
     }
     if let Some(ask) = ask {
-        /* the hub records how an ask closed; "acked" is the recipient's own answer, and an
-        ask closed before the hub kept this says only whether it went well */
-        let outcome = |ok: &'static str, failed: &'static str| {
-            if ask.failed {
-                (failed, Tone::Fail)
-            } else {
-                (ok, Tone::Done)
-            }
-        };
-        let (word, tone) = match (state, ask.open, ask.closed_by.as_deref()) {
-            ("queued", _, _) => ("previous attempt", Tone::Dim),
-            (_, true, _) => ("unacked", if idle { Tone::Fail } else { Tone::Plain }),
-            (_, false, Some("recipient")) => outcome("acked ok", "acked failed"),
-            (_, false, Some("hand")) => outcome("closed by hand", "closed by hand"),
-            (_, false, Some("hub")) => ("closed by hub", Tone::Fail),
-            (_, false, _) => outcome("closed ok", "closed failed"),
-        };
-        /* a closed ask on a job still running settles on the hub's next pass */
-        let (tail, tone) = if state == "running" && !ask.open {
-            (format!("{word}, settling"), Tone::Warn)
-        } else {
-            (word.to_string(), tone)
+        let (word, tone) = super::asks::state(snap, ask);
+        let (tail, tone) = match job.relation {
+            Some(JobRelation::Settling) => (format!("{word}, settling"), Tone::Warn),
+            Some(JobRelation::Closed) if state == "running" => (
+                format!("{word}; automatic settlement is disabled"),
+                Tone::Warn,
+            ),
+            _ if state == "queued" => ("previous attempt".into(), Tone::Dim),
+            _ if state == "running" && matches!(job.relation, Some(JobRelation::Open)) => (
+                "unacked".into(),
+                if idle { Tone::Fail } else { Tone::Plain },
+            ),
+            _ => (word, tone),
         };
         let to = if ask.to_peer.is_empty() {
             &ask.to_peer_id
@@ -1339,7 +1364,9 @@ pub(crate) fn card(
         };
         let mut route = vec![(format!("{} ", short(&ask.correlation_id)), Tone::Plain)];
         if !ask.from_peer.is_empty() {
-            let mark = arrow(snap, ask, snap.spinning(job));
+            let working =
+                progress.is_some_and(|p| p.busy && !matches!(p.state, Some(Progress::Offline)));
+            let mark = arrow(snap, ask, working);
             /* the sender gives way first, so the recipient stays whole */
             let room = colw.saturating_sub(KEY + width(&route[0].0) + width(&mark.0) + width(to));
             if room > 0 {
@@ -1366,60 +1393,109 @@ pub(crate) fn card(
             ]);
         }
     } else if let Some(cid) = job.ask_id.as_deref() {
-        /* settle_job fails a running job whose ask is gone */
-        let text = if state == "running" {
-            format!("{cid} is missing: the hub fails this job at its next check")
-        } else {
-            format!("{cid} was cleaned up")
+        let text = match job.relation {
+            Some(JobRelation::Missing { will_fail: true }) => {
+                format!("{cid} is missing: the hub fails this job at its next check")
+            }
+            Some(JobRelation::Missing { will_fail: false }) => {
+                format!("{cid} is missing; automatic settlement is disabled")
+            }
+            Some(JobRelation::CleanedUp) => format!("{cid} was cleaned up"),
+            _ => String::new(),
         };
-        wrapped(&mut left, "ask", &text, Tone::Warn, colw, usize::MAX);
+        if !text.is_empty() {
+            wrapped(&mut left, "ask", &text, Tone::Warn, colw, usize::MAX);
+        }
     }
     if state == "queued" {
-        /* the hub's rule: every dependency done, and a failed, cancelled or deleted one blocks */
-        let waits = by_number(
-            job.depends_on
-                .iter()
-                .filter(|d| snap.job(d).is_none_or(|dep| dep.state != "done"))
-                .cloned()
-                .collect(),
-        );
-        let blocked = waits.iter().find(|d| {
-            snap.job(d)
-                .is_none_or(|dep| matches!(dep.state.as_str(), "failed" | "cancelled"))
-        });
-        if waits.is_empty() {
-            let (note, tone) = match snap.peer(worker) {
-                /* only an update that names the assignee turns dispatch on */
-                _ if !job.dispatch && job.assigned_peer.is_some() => (
-                    "held: set its assignee again to send it".to_string(),
-                    Tone::Dim,
-                ),
-                _ if !job.dispatch => (
-                    "not dispatched: name an assignee to send it".to_string(),
-                    Tone::Dim,
-                ),
-                None => (format!("no peer named {worker}: not sent"), Tone::Dim),
-                Some(p) if !job.circle.is_empty() && p.circle != job.circle => (
-                    format!("{worker} is in another circle: not sent"),
-                    Tone::Dim,
-                ),
-                Some(_) => ("nothing: will be sent next tick".to_string(), Tone::Done),
-            };
-            wrapped(&mut left, "waits", &note, tone, colw, usize::MAX);
-        } else {
-            listed(&mut left, "waits", items(&waits), colw, "  ");
-        }
-        if let Some(bad) = blocked {
-            let text = match snap.job(bad) {
-                Some(dep) => format!(
-                    "{} {} {}: retry it first",
-                    v.num.get(bad).copied().unwrap_or(0),
-                    fit(&dep.title, share(1)),
-                    dep.state
-                ),
-                None => format!("{} was deleted: this job cannot start", fit(bad, 14)),
-            };
-            wrapped(&mut left, "blocked", &text, Tone::Fail, colw, usize::MAX);
+        match job.dispatch_state.clone() {
+            Some(DispatchState::Waiting { dependencies }) => {
+                listed(
+                    &mut left,
+                    "waits",
+                    items(&by_number(dependencies)),
+                    colw,
+                    "  ",
+                );
+            }
+            Some(DispatchState::Blocked {
+                dependencies,
+                dependency,
+                reason,
+            }) => {
+                listed(
+                    &mut left,
+                    "waits",
+                    items(&by_number(dependencies)),
+                    colw,
+                    "  ",
+                );
+                /* the reason is the hub's; one this build does not know claims nothing */
+                let label = match snap.job(&dependency) {
+                    Some(dep) => format!(
+                        "{} {}",
+                        v.num.get(&dependency).copied().unwrap_or(0),
+                        fit(&dep.title, share(1))
+                    ),
+                    None => fit(&dependency, 14),
+                };
+                let (text, tone) = match reason {
+                    BlockReason::Deleted => (
+                        format!(
+                            "{} was deleted: this job cannot start",
+                            fit(&dependency, 14)
+                        ),
+                        Tone::Fail,
+                    ),
+                    BlockReason::Failed => (format!("{label} failed: retry it first"), Tone::Fail),
+                    BlockReason::Cancelled => {
+                        (format!("{label} cancelled: retry it first"), Tone::Fail)
+                    }
+                    BlockReason::Unknown => (label, Tone::Dim),
+                };
+                wrapped(&mut left, "blocked", &text, tone, colw, usize::MAX);
+            }
+            Some(DispatchState::Held) => wrapped(
+                &mut left,
+                "waits",
+                "held: set its assignee again to send it",
+                Tone::Dim,
+                colw,
+                usize::MAX,
+            ),
+            Some(DispatchState::Unassigned) => wrapped(
+                &mut left,
+                "waits",
+                "not dispatched: name an assignee to send it",
+                Tone::Dim,
+                colw,
+                usize::MAX,
+            ),
+            Some(DispatchState::NoPeer { name }) => wrapped(
+                &mut left,
+                "waits",
+                &format!("no peer named {name}: not sent"),
+                Tone::Dim,
+                colw,
+                usize::MAX,
+            ),
+            Some(DispatchState::OtherCircle { .. }) => wrapped(
+                &mut left,
+                "waits",
+                &format!("{worker} is in another circle: not sent"),
+                Tone::Dim,
+                colw,
+                usize::MAX,
+            ),
+            Some(DispatchState::Ready { .. }) => wrapped(
+                &mut left,
+                "waits",
+                "nothing: will be sent next tick",
+                Tone::Done,
+                colw,
+                usize::MAX,
+            ),
+            _ => {}
         }
     } else {
         let needs = by_number(v.chain.deps.get(id).cloned().unwrap_or_default());
@@ -1456,70 +1532,48 @@ pub(crate) fn card(
         }
     };
     wrapped(&mut left, "times", &times, Tone::Dim, colw, usize::MAX);
-    match state {
-        "failed" => {
-            let mut command = format!("amesh jobs update {} --state queued", quote(id));
-            if !job.dispatch {
-                command.push_str(&format!(
-                    " --assigned-peer {}",
-                    quote(job.assigned_peer.as_deref().unwrap_or("PEER"))
-                ));
+    for action in job.actions.iter().flatten() {
+        let peer = job.assigned_peer.as_deref().unwrap_or("PEER");
+        let command = match action {
+            JobAction::Retry {
+                needs_assignee: false,
+            } => {
+                format!("amesh jobs update {} --state queued", quote(id))
             }
-            wrapped(
-                &mut commands,
-                "retry",
-                &command,
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            );
-        }
-        "queued" if !job.dispatch => {
-            let command = format!(
+            JobAction::Retry {
+                needs_assignee: true,
+            }
+            | JobAction::Send => format!(
                 "amesh jobs update {} --state queued --assigned-peer {}",
                 quote(id),
-                quote(job.assigned_peer.as_deref().unwrap_or("PEER"))
-            );
-            wrapped(&mut commands, "send", &command, Tone::Dim, colw, usize::MAX);
-        }
-        "running" if idle => {
-            /* the ask's recipient by peer id: a name may have passed to another peer */
-            let to = ask
-                .map(|a| a.to_peer_id.as_str())
-                .filter(|to| !to.is_empty())
-                .unwrap_or(worker);
-            let command = format!(
+                quote(peer)
+            ),
+            JobAction::Nudge { to } => format!(
                 "amesh peer notify {} {}",
                 quote(to),
                 quote(&format!("{}?", job.title))
-            );
-            wrapped(
-                &mut commands,
-                "nudge",
-                &command,
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            );
-        }
-        /* a worker that left the hub without answering will not answer; sending the job
-        again, to a peer that is here, is the way on. An answer already given only waits
-        for the hub to settle it */
-        "running" if ask.is_some_and(|a| a.open) && snap.worker(job).is_none() => {
-            let command = format!(
+            ),
+            JobAction::Resend => format!(
                 "amesh jobs update {} --state queued --assigned-peer PEER",
                 quote(id)
-            );
-            wrapped(
-                &mut commands,
-                "resend",
-                &command,
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            );
-        }
-        _ => {}
+            ),
+            JobAction::Unknown => continue,
+        };
+        let key_name = match action {
+            JobAction::Retry { .. } => "retry",
+            JobAction::Send => "send",
+            JobAction::Nudge { .. } => "nudge",
+            JobAction::Resend => "resend",
+            JobAction::Unknown => continue,
+        };
+        wrapped(
+            &mut commands,
+            key_name,
+            &command,
+            Tone::Dim,
+            colw,
+            usize::MAX,
+        );
     }
     /* result or reason and the prompt take the rows the pane has left, result first, and
     the frame stretches to the rows it was given; a field cut short ends in … */

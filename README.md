@@ -124,7 +124,7 @@ amesh peer ack ask-5e6f7a8b --message "no fixture" --failed true --from-peer ame
 
 ### Watching jobs
 
-`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`, and `GET /events` while the events screen is up.
+`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`, and `GET /events` while the events screen is up. What it shows is decided by the hub (snapshot schema 2); against an older hub it shows jobs and asks without alarms, queue marks or dispatch notes until that hub restarts on the current amesh; against a newer one it says `unsupported hub` in place of jobs, asks and peers.
 
 ```bash
 amesh tui                    # this directory's circle
@@ -149,10 +149,11 @@ amesh tui --all --ascii      # every circle, ASCII only
   - spinner: the worker is busy with this job (`--no-anim` freezes it)
   - `sender─▸─recipient` on an open ask: the arrowhead steps toward a recipient that is working and holds still otherwise; for a second after the ack it steps back (`─◂─`)
   - a dot on the rail into a job the hub has just sent, then its glyph lights
-  - `✉N` after a name (`+N` in ASCII): N records have waited in that peer's inbox over three snapshots in a row, two seconds or more; a card whose ask to it is open says `N queued for 38s` under the worker or `to` line
+  - `✉N` after a name (`+N` in ASCII): N records wait in that peer's inbox and the oldest has waited two seconds or more; the hub keeps each record's queue time, so a hub restart does not reset it; a card whose ask to it is open says `N queued for 38s` under the worker or `to` line
   - a dimmed name: the peer is online without a push channel (its `amesh hook ws` or pi extension is not connected); such a card says `no push`
   - `IDLE!`: the worker stopped with the ask open; the card gives a nudge command
   - blinking `WAIT!`: Claude Code waits on a permission
+  - `offline`: the hub marks the worker offline, as when its connection drops; it replaces `WAIT!` and `IDLE!`, and a job sent by hand (no dispatch) whose ask closed or went missing says automatic settlement is disabled
   - hooks installed before this reporting send none; rerun `amesh setup`
 - Colours:
   - `tui-theme.json` next to the state file (default `~/.amesh`) overrides the roles `text title dim line done run fail wait worker near select select_bg`
@@ -192,7 +193,7 @@ Set `AMESH_TOKEN` before exposing the port and restart the hub after changing it
 - The hub reclaims unused database space and trims its runtime logs.
 - On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.
-- An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) how an ask closed (`closed_by`) or a job's last handoff notice (`handoff`). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
+- An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) how an ask closed (`closed_by`), a job's last handoff notice (`handoff`) or when each inbox record was queued (`queued_at`; the next start counts such records from that moment). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
 - `gc` and `uninstall` are dry-run until `--apply true`. Attachments are left alone unless `--attachments-days N`.
 
 ## Troubleshooting
