@@ -21,6 +21,7 @@ fn hub() -> Hub {
         sweep_at: 0,
         config: Config::default(),
         epoch: String::new(),
+        commits: tokio::sync::watch::channel(0).0,
         activity: HashMap::new(),
     }
 }

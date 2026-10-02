@@ -97,16 +97,60 @@ fn lease_port(port: u16) -> Option<PortLease> {
     }
 }
 
+/* roots a suite killed before its sandboxes dropped left in /tmp: real directories this user
+owns, named exactly amesh-cli-p<port>-<8 hex>, whose port lease is free. Each is dropped as the
+sandbox it was, which stops what still runs for it and removes it */
+fn sweep_dead_sandboxes() {
+    use std::os::unix::fs::MetadataExt;
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| {
+        let uid = unsafe { libc::geteuid() };
+        for entry in fs::read_dir("/tmp").into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some((port, tag)) = name
+                .strip_prefix("amesh-cli-p")
+                .and_then(|rest| rest.split_once('-'))
+            else {
+                continue;
+            };
+            let Ok(port) = port.parse::<u16>() else {
+                continue;
+            };
+            let hex = tag.len() == 8 && tag.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            let ours = entry
+                .metadata()
+                .is_ok_and(|meta| meta.is_dir() && meta.uid() == uid);
+            if !(hex && ours && name == format!("amesh-cli-p{port}-{tag}")) {
+                continue;
+            }
+            if let Some(lease) = lease_port(port) {
+                let (root, bind, tag) =
+                    (entry.path(), format!("127.0.0.1:{port}"), tag.to_string());
+                drop(Sandbox {
+                    root,
+                    bind,
+                    tag,
+                    daemon: None,
+                    _port: lease,
+                });
+            }
+        }
+    });
+}
+
 impl Sandbox {
+    /* in /tmp so a unix socket path inside fits SUN_LEN, and named after the port it leases,
+    which is how a sweep tells a dead one */
     fn new() -> Self {
-        let uuid = uuid::Uuid::new_v4();
-        let root = std::env::temp_dir().join(format!("amesh-cli-{uuid}"));
-        fs::create_dir_all(&root).unwrap();
+        sweep_dead_sandboxes();
+        let tag = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
         let (port, lease) = sandbox_port();
+        let root = PathBuf::from(format!("/tmp/amesh-cli-p{port}-{tag}"));
+        fs::create_dir(&root).unwrap();
         Self {
             root,
             bind: format!("127.0.0.1:{port}"),
-            tag: uuid.simple().to_string()[..8].to_string(),
+            tag,
             daemon: None,
             _port: lease,
         }
@@ -1248,17 +1292,6 @@ fn live_inbox(path: &Path) -> std::os::unix::net::UnixListener {
     fs::rename(&fresh, path).unwrap();
     listener.set_nonblocking(true).unwrap();
     listener
-}
-
-/* what a test made outside its sandbox, removed even when the test ends in a panic */
-struct Remove(Vec<PathBuf>);
-
-impl Drop for Remove {
-    fn drop(&mut self) {
-        for path in &self.0 {
-            let _ = fs::remove_dir_all(path).or_else(|_| fs::remove_file(path));
-        }
-    }
 }
 
 impl Drop for KillChild {
@@ -3000,7 +3033,7 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
     );
     /* the subject is surviving a hub kill, so the drainer needs a messaging socket to be a
     valid claude-code drainer at all */
-    let sock = claude_socket_path();
+    let sock = claude_socket_path(&sandbox);
     let _ = fs::remove_file(&sock);
     let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let mut child = sandbox
@@ -3046,10 +3079,7 @@ fn hook_ws_injects_notify_into_claude_socket() {
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
-    let sock = PathBuf::from(format!(
-        "/tmp/ai{}.s",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let sock = sandbox.root.join("ai.s");
     let _ = fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -3145,10 +3175,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
         ],
         None,
     );
-    let sock = PathBuf::from(format!(
-        "/tmp/ai{}.s",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let sock = sandbox.root.join("ai.s");
     let _ = fs::remove_file(&sock);
     dead_inbox(&sock);
     let mut child = sandbox
@@ -3300,10 +3327,7 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
         sandbox.json(&["peer", "ack", &cid, "--message", "done"], None)["ok"],
         true
     );
-    let sock = PathBuf::from(format!(
-        "/tmp/ai{}.s",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let sock = sandbox.root.join("ai.s");
     let _ = fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -3370,10 +3394,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
     let worker = sandbox.id("worker");
     sandbox.start();
     let cwd = sandbox.root.clone();
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ac{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("ac");
     let sock = codex_home
         .join("app-server-control")
         .join("app-server-control.sock");
@@ -3589,7 +3610,7 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
     };
     let sandbox = Sandbox::new();
     let worker = sandbox.id("worker");
-    let socket_path = PathBuf::from(format!("/tmp/ar-{}.sock", uuid::Uuid::new_v4().simple()));
+    let socket_path = sandbox.root.join("ar.sock");
     if inbox == "refused" {
         dead_inbox(&socket_path);
     }
@@ -3599,8 +3620,7 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
         json!({"type":kind,"id":"delivery-1","text":"payload","correlation_id":"closed"})
             .to_string()
     };
-    let app_home = PathBuf::from(format!("/tmp/ap-{}", uuid::Uuid::new_v4().simple()));
-    let _made = Remove(vec![socket_path.clone(), app_home.clone()]);
+    let app_home = sandbox.root.join("ap");
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
         let app_task = if inbox.starts_with("app-") {
@@ -3830,7 +3850,7 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
     use tokio::io::AsyncBufReadExt;
     let sandbox = Sandbox::new();
     let worker = sandbox.id("worker");
-    let path = PathBuf::from(format!("/tmp/ad-{}.sock", uuid::Uuid::new_v4().simple()));
+    let path = sandbox.root.join("ad.sock");
     let rt = tokio::runtime::Runtime::new().unwrap();
     let result = rt.block_on(async {
         let delivered = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -4287,10 +4307,7 @@ fn codex_drainer_follows_the_rows_session_over_its_thread_env() {
     let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "B");
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ab{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("ab");
     let injected = app_server_capture_threads(&codex_home, &["A", "B"], &[]);
     let _drainer = stale_drainer(&sandbox, &codex_home);
     sandbox.json(&["peer", "notify", pinned, "for the owner"], None);
@@ -4308,10 +4325,7 @@ fn codex_drainer_drops_the_old_sessions_queue_when_the_name_is_replaced() {
     let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "A");
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ar{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("ar");
     /* A is mid-turn, so what reaches A waits in the drainer */
     let injected = app_server_capture_threads(&codex_home, &["A", "B"], &["A"]);
     let _drainer = KillChild(Some(
@@ -4357,10 +4371,7 @@ fn codex_drainer_keeps_the_old_sessions_queue_from_the_new_owner_across_a_reconn
     let pinned = sandbox.id("pinned");
     sandbox.start();
     pin_session(&sandbox, "A");
-    let codex_home = PathBuf::from(format!(
-        "/tmp/aq{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("aq");
     /* A is mid-turn, so what reaches A waits in the drainer */
     let injected = app_server_capture_threads(&codex_home, &["A", "B"], &["A"]);
     let drainer = KillChild(Some(
@@ -4426,10 +4437,7 @@ fn codex_drainer_follows_a_first_bind_over_its_thread_env() {
         ],
         None,
     );
-    let codex_home = PathBuf::from(format!(
-        "/tmp/af{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("af");
     /* the drainer's thread env names A, which is idle, so only the hold on an unbound name
     keeps what it gets from A */
     let injected = app_server_capture_threads(&codex_home, &["A", "C"], &[]);
@@ -4480,10 +4488,7 @@ fn pruned_while_away(
     let pinprune = sandbox.id("pinprune");
     sandbox.start();
     bind_pinprune(&sandbox, "A");
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ap{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("ap");
     let injected = app_server_capture_with(&codex_home, &["A", "B"], busy);
     let drainer = KillChild(Some(
         sandbox
@@ -4706,10 +4711,7 @@ fn claude_across_a_reconnect(
 ) -> (Vec<String>, Vec<String>) {
     let sandbox = Sandbox::new();
     let claude_x = sandbox.id("claude-x");
-    let inbox = PathBuf::from(format!(
-        "/tmp/ai{}.sock",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let inbox = sandbox.root.join("ai.sock");
     /* the messaging socket is there but nobody listens, so what reaches A stays queued */
     dead_inbox(&inbox);
     let (_hub, release, progress) = fake_hub(&sandbox, claude_x, json!([]), first, before, after);
@@ -4801,10 +4803,7 @@ fn drainer_alive_when_the_pin_moves(
     let sandbox = Sandbox::new();
     let pin = format!("pinhand{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
     let inbox = |tag: &str| {
-        let path = PathBuf::from(format!(
-            "/tmp/a{tag}{}.s",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
+        let path = sandbox.root.join(format!("a{tag}.s"));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         (path, listener)
     };
@@ -4938,10 +4937,7 @@ fn claude_session_retires_only_the_drainer_of_its_own_dotted_pin() {
     let tag = &uuid::Uuid::new_v4().simple().to_string()[..6];
     let (pin, neighbour) = (format!("ap{tag}.pin"), format!("ap{tag}xpin"));
     let inbox = |tag: &str| {
-        let path = PathBuf::from(format!(
-            "/tmp/a{tag}{}.s",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
+        let path = sandbox.root.join(format!("a{tag}.s"));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         (path, listener)
     };
@@ -5000,10 +4996,7 @@ fn claude_session_never_takes_a_pin_while_pgrep_cannot_confirm_the_old_drainer_g
 fn claude_hook_spawns_no_drainer_while_pgrep_cannot_answer() {
     let mut sandbox = Sandbox::new();
     sandbox.start();
-    let socket = PathBuf::from(format!(
-        "/tmp/aq{}.s",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let socket = sandbox.root.join("aq.s");
     let _inbox = std::os::unix::net::UnixListener::bind(&socket).unwrap();
     let path = blind_pgrep_path(&sandbox.root);
     let output = sandbox.run_text(
@@ -5038,10 +5031,7 @@ fn claude_session_never_retires_drainers_for_a_pin_the_hub_would_refuse() {
     sandbox.start();
     let bystander = format!("xby{}", &uuid::Uuid::new_v4().simple().to_string()[..6]);
     let inbox = |tag: &str| {
-        let path = PathBuf::from(format!(
-            "/tmp/a{tag}{}.s",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
+        let path = sandbox.root.join(format!("a{tag}.s"));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         (path, listener)
     };
@@ -5201,10 +5191,7 @@ fn claude_drainer_flushes_nothing_from_an_earlier_connection_before_the_hub_gree
 fn codex_drainer_flushes_nothing_from_an_earlier_connection_before_the_hub_greets_it() {
     let sandbox = Sandbox::new();
     let codex_g = sandbox.id("codex-g");
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ag{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("ag");
     let injected = app_server_capture_threads(&codex_home, &["X", "Y"], &[]);
     /* the row still names X; only the second connection's greeting says Y owns the name */
     let (_hub, _release, reconnected) = fake_hub(
@@ -5261,10 +5248,7 @@ fn claude_drainer_holds_an_earlier_sessions_queue_from_a_hub_too_old_to_name_the
 fn codex_drainer_holds_another_sessions_queue_from_a_hub_too_old_to_name_the_owner() {
     let sandbox = Sandbox::new();
     let codex_x = sandbox.id("codex-x");
-    let codex_home = PathBuf::from(format!(
-        "/tmp/al{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("al");
     /* A is mid-turn, so A's frame stays queued; the row the old hub reports names B */
     let injected = app_server_capture_threads(&codex_home, &["A", "B"], &["A"]);
     let (_hub, _release, reconnected) = fake_hub(
@@ -5315,10 +5299,7 @@ fn codex_drainer_keeps_a_first_owners_queue_from_the_session_that_replaces_it() 
         ],
         None,
     );
-    let codex_home = PathBuf::from(format!(
-        "/tmp/aw{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("aw");
     /* A is mid-turn, so what the name gets before and after A binds it waits in the drainer */
     let injected = app_server_capture_threads(&codex_home, &["A", "B"], &["A"]);
     let drainer = KillChild(Some(
@@ -5811,20 +5792,13 @@ impl Drop for AcceptCounter {
     }
 }
 
-fn claude_socket_path() -> PathBuf {
-    PathBuf::from(format!(
-        "/tmp/ab{}.s",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ))
+fn claude_socket_path(sandbox: &Sandbox) -> PathBuf {
+    sandbox.root.join("ab.s")
 }
 
-/* the sandbox root lives under a long temp path and a unix socket address is capped at
-SUN_LEN, so the fake App Server gets its own short CODEX_HOME that the test passes through */
-fn fake_app_server() -> (AcceptCounter, PathBuf) {
-    let home = PathBuf::from(format!(
-        "/tmp/ac{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+/* a fake App Server in its own CODEX_HOME, which the test passes through */
+fn fake_app_server(sandbox: &Sandbox) -> (AcceptCounter, PathBuf) {
+    let home = sandbox.root.join("ac");
     let counter = AcceptCounter::bind(home.join("app-server-control/app-server-control.sock"));
     (counter, home)
 }
@@ -5954,8 +5928,8 @@ fn claude_drainer_without_socket_exits_and_reaches_nothing() {
     sandbox.start();
     /* deliberately unregistered: hook_ws_once announces the peer itself, so the roster
     staying empty is what proves the guard returned before any hub contact */
-    let claude = AcceptCounter::bind(claude_socket_path());
-    let (app, codex_home) = fake_app_server();
+    let claude = AcceptCounter::bind(claude_socket_path(&sandbox));
+    let (app, codex_home) = fake_app_server(&sandbox);
     /* no CLAUDE_CODE_MESSAGING_SOCKET: sandbox.command() removes it */
     let mut child = sandbox
         .command()
@@ -6020,8 +5994,8 @@ fn claude_drainer_with_socket_never_reaches_the_app_server() {
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
-    let claude = AcceptCounter::bind(claude_socket_path());
-    let (app, codex_home) = fake_app_server();
+    let claude = AcceptCounter::bind(claude_socket_path(&sandbox));
+    let (app, codex_home) = fake_app_server(&sandbox);
     let mut child = sandbox
         .command()
         .args([
@@ -6063,11 +6037,8 @@ fn codex_drainer_ignores_an_inherited_claude_socket() {
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "codex");
-    let claude = AcceptCounter::bind(claude_socket_path());
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ac{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let claude = AcceptCounter::bind(claude_socket_path(&sandbox));
+    let codex_home = sandbox.root.join("ac");
     let injected = app_server_capture(&codex_home);
     /* the reverse leak: a codex drainer started under a live Claude session */
     let mut child = sandbox
@@ -6155,8 +6126,8 @@ fn drainer_with_an_unsupported_backend_never_acknowledges() {
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "pi");
-    let claude = AcceptCounter::bind(claude_socket_path());
-    let (app, codex_home) = fake_app_server();
+    let claude = AcceptCounter::bind(claude_socket_path(&sandbox));
+    let (app, codex_home) = fake_app_server(&sandbox);
     for backend in ["pi", "grok"] {
         let mut child = sandbox
             .command()
@@ -6278,7 +6249,7 @@ fn beat_counting_hub(
 fn codex_heartbeat_never_flushes_into_an_inherited_claude_socket() {
     let sandbox = Sandbox::new();
     let worker = sandbox.id("worker");
-    let claude = AcceptCounter::bind(claude_socket_path());
+    let claude = AcceptCounter::bind(claude_socket_path(&sandbox));
     let (_hub, beats) = beat_counting_hub(
         &sandbox,
         worker,
@@ -6330,7 +6301,7 @@ fn hook_ws_pid(peer_id: &str) -> Option<String> {
 fn codex_mcp_keeps_its_drainer_despite_an_inherited_claude_socket() {
     let mut sandbox = Sandbox::new();
     sandbox.start();
-    let claude = AcceptCounter::bind(claude_socket_path());
+    let claude = AcceptCounter::bind(claude_socket_path(&sandbox));
     let expected = "shared-codex".to_string();
     /* both MCPs claim the same peer id on the same thread, so the second one's bind sees
     the first drainer */
@@ -6696,10 +6667,7 @@ fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
     sandbox.start();
     pin_session(&sandbox, "A");
     sandbox.json(&["jobs", "create", "watch", "--from-peer", pinned], None);
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ai{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("ai");
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
     let injected = app_server_capture_with(&codex_home, &["A"], busy.clone());
     let prompt = sandbox.run(
@@ -6813,10 +6781,7 @@ fn a_codex_drainer_that_dies_inside_the_inject_leaves_the_frame_with_the_hub() {
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "codex");
-    let codex_home = PathBuf::from(format!(
-        "/tmp/ac{}",
-        &uuid::Uuid::new_v4().simple().to_string()[..8]
-    ));
+    let codex_home = sandbox.root.join("ac");
     let injected = app_server_capture_threads(&codex_home, &["thread-1"], &["~thread-1"]);
     let mut child = sandbox
         .command()

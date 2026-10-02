@@ -23,7 +23,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -60,6 +60,9 @@ struct Hub {
     config: Config,
     /* names this hub process in snapshots, so a reader can tell a restart from a gap */
     epoch: String,
+    /* counts commits to disk. A waiter subscribes while it holds the lock and wakes on the
+    next commit, one that lands before it starts waiting included */
+    commits: watch::Sender<u64>,
     /* what each runtime last said it is doing, by peer_id. Memory only: after a restart
     nobody knows until the runtime reports again, and unknown is the honest answer */
     activity: HashMap<String, Activity>,
@@ -895,6 +898,7 @@ impl Hub {
             sweep_at: 0,
             config: load_config(path),
             epoch: Uuid::new_v4().simple().to_string(),
+            commits: watch::channel(0).0,
             activity: HashMap::new(),
             mcp_servers: disk.mcp_servers,
         })
@@ -916,7 +920,9 @@ fn persist(hub: &mut Hub) -> Result<(), String> {
         recv_peers: hub.recv_known.clone(),
         owed: hub.owed.clone(),
     };
-    write_snapshot(&mut hub.db, &disk)
+    write_snapshot(&mut hub.db, &disk)?;
+    hub.commits.send_modify(|count| *count += 1);
+    Ok(())
 }
 
 fn persist_ok(hub: &mut Hub) -> Result<(), (StatusCode, Json<Value>)> {
@@ -1922,6 +1928,11 @@ async fn register_peer(
     let mut replies = queue_replies(&mut hub, replies, now);
     replies.extend(to_push.into_iter().map(|record| (peer_id.clone(), record)));
     persist_ok(&mut hub)?;
+    /* seen when its registration is on disk: a write that stalls must not age the peer
+    toward the PEER_ONLINE_SECS prune */
+    if let Some(row) = hub.peers.get_mut(&peer_id) {
+        row.last_seen = now_unix();
+    }
     /* only once the registration is on disk: a failed one rolls the peer back to its old
     session, and activity kept in memory would outlive the rollback */
     if let Some(report) = &req.activity {
@@ -2657,7 +2668,7 @@ async fn wait_capture(
 ) -> Result<CapturedWait, (StatusCode, Json<Value>)> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
     loop {
-        {
+        let mut commits = {
             let hub = app.inner.lock().await;
             let ask = hub
                 .asks
@@ -2667,8 +2678,9 @@ async fn wait_capture(
                 let now = now_unix();
                 return Ok(capture_wait(&hub, ask, caller, now));
             }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+            hub.commits.subscribe()
+        };
+        let _ = tokio::time::timeout_at(deadline, commits.changed()).await;
     }
 }
 

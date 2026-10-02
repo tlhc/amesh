@@ -21,11 +21,8 @@ async fn next<T>(rx: &mut UnboundedReceiver<T>) -> T {
 
 #[test]
 fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() {
-    let mut sandbox = Sandbox::new();
+    let sandbox = Sandbox::new();
     let worker = sandbox.id("worker");
-    let root = PathBuf::from(format!("/tmp/amesh-cli-{}", uuid::Uuid::new_v4().simple()));
-    fs::rename(&sandbox.root, &root).unwrap();
-    sandbox.root = root;
     let home = sandbox.root.join("cx");
     fs::create_dir_all(home.join("app-server-control")).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();

@@ -22,7 +22,7 @@ fn identity_probe_case(case: &str, target: Option<&str>) {
         ],
         None,
     );
-    let home = PathBuf::from(format!("/tmp/ai-{}", uuid::Uuid::new_v4().simple()));
+    let home = sandbox.root.join("ai");
     fs::create_dir_all(home.join("app-server-control")).unwrap();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
@@ -310,7 +310,7 @@ impl Resume {
             "{}-codex",
             sandbox.root.file_name().unwrap().to_string_lossy()
         );
-        let home = PathBuf::from(format!("/tmp/ai-{}", uuid::Uuid::new_v4().simple()));
+        let home = sandbox.root.join("ai");
         fs::create_dir_all(home.join("app-server-control")).unwrap();
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let socket = home.join("app-server-control/app-server-control.sock");
@@ -629,7 +629,7 @@ fn pinned_after_a_previous_run() -> (Sandbox, PathBuf) {
     sandbox.start();
     pin_session(&sandbox, "A");
     sandbox.json(&["peer", "ask", pinned, "for A only"], None);
-    let home = PathBuf::from(format!("/tmp/ap-{}", uuid::Uuid::new_v4().simple()));
+    let home = sandbox.root.join("ap");
     fs::create_dir_all(&home).unwrap();
     (sandbox, home)
 }

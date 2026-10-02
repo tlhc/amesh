@@ -42,6 +42,27 @@ fn temp_state(name: &str) -> TempState {
     TempState::new(name)
 }
 
+/* wakes on each commit until the check holds; the bound only fails a test whose commit
+never comes */
+async fn until(state: &App, check: impl Fn(&Hub) -> bool, failure: &str) {
+    let bound = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        let mut commits = {
+            let hub = state.inner.lock().await;
+            if check(&hub) {
+                return;
+            }
+            hub.commits.subscribe()
+        };
+        assert!(
+            tokio::time::timeout_at(bound, commits.changed())
+                .await
+                .is_ok(),
+            "{failure}"
+        );
+    }
+}
+
 /* the router and the directory its state lives in, which goes when the test drops it */
 fn test_app() -> (Router, TempState) {
     let path = temp_state("test");
@@ -175,6 +196,37 @@ async fn a_second_answer_is_refused_instead_of_dropped() {
     assert_eq!(
         stored["reply"], "first",
         "the refused answer must not have overwritten"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_wakes_on_the_commit_that_closes_its_ask() {
+    let path = temp_state("wake");
+    let app = App {
+        inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    let worker =
+        json!({"name": "worker", "peer_id": "worker", "backend": "pi", "circle": "default"});
+    let _ = json_req(router(app.clone()), "POST", "/peers", worker).await;
+    let ping = json!({"from_peer": "boss", "to_peer": "worker", "text": "ping"});
+    let (_, ask) = json_req(router(app.clone()), "POST", "/ask", ping).await;
+    let cid = ask["correlation_id"].as_str().unwrap().to_string();
+    let started = tokio::time::Instant::now();
+    let waiter = tokio::spawn({
+        let (app, cid) = (app.clone(), cid.clone());
+        async move { wait_capture(&app, &cid, WAIT_MAX_SECS, None).await.is_ok() }
+    });
+    tokio::task::yield_now().await;
+    let subscribed = app.inner.lock().await.commits.receiver_count();
+    assert_eq!(subscribed, 1, "the wait subscribed before the ack");
+    let pong = json!({"correlation_id": cid, "message": "pong"});
+    let _ = json_req(router(app.clone()), "POST", "/ack", pong).await;
+    assert!(waiter.await.unwrap());
+    assert!(
+        started.elapsed() < Duration::from_secs(WAIT_MAX_SECS),
+        "the commit woke the wait before its deadline"
     );
 }
 
@@ -3853,14 +3905,12 @@ async fn the_owner_session_comes_back_to_its_backlog() {
         .await
         .unwrap();
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.inbox.count("tmp-pi") > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "recv never drained the replayed backlog"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(
+        &state,
+        |hub| hub.inbox.count("tmp-pi") == 0,
+        "recv never drained the replayed backlog",
+    )
+    .await;
     let _ = fs::remove_file(&path);
 }
 
@@ -3994,14 +4044,12 @@ async fn unproven_connection_waits_for_its_session(recv: bool) {
             .unwrap();
         }
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.inbox.count("tmp-pi") > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "recv never drained the adopted backlog"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(
+        &state,
+        |hub| hub.inbox.count("tmp-pi") == 0,
+        "recv never drained the adopted backlog",
+    )
+    .await;
     let _ = fs::remove_file(&path);
 }
 
@@ -4421,14 +4469,12 @@ async fn a_first_time_acknowledger_gets_ids_on_its_backlog() {
     ))
     .await
     .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.inbox.count("p-worker") > 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "recv of a backlog record never drained it"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(
+        &state,
+        |hub| hub.inbox.count("p-worker") == 0,
+        "recv of a backlog record never drained it",
+    )
+    .await;
     let _ = fs::remove_file(&path);
 }
 
@@ -4636,11 +4682,12 @@ async fn a_reconnecting_acknowledging_client_gets_copies_not_duplicates() {
     );
     drop(r1);
     drop(w1);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.sockets.contains_key("p-worker") {
-        assert!(std::time::Instant::now() < deadline, "socket never closed");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(
+        &state,
+        |hub| !hub.sockets.contains_key("p-worker"),
+        "socket never closed",
+    )
+    .await;
     assert_eq!(
         owed(&state).await,
         2,
@@ -4661,25 +4708,24 @@ async fn a_reconnecting_acknowledging_client_gets_copies_not_duplicates() {
         .await
         .unwrap();
     }
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while owed(&state).await != 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "recv never drained the inbox"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(
+        &state,
+        |hub| hub.inbox.count("p-worker") == 0,
+        "recv never drained the inbox",
+    )
+    .await;
     assert!(
         Hub::open(&path).unwrap().inbox.count("p-worker") == 0,
         "acknowledged records leave the disk too"
     );
     drop(r2);
     drop(w2);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while state.inner.lock().await.sockets.contains_key("p-worker") {
-        assert!(std::time::Instant::now() < deadline, "socket never closed");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    until(
+        &state,
+        |hub| !hub.sockets.contains_key("p-worker"),
+        "socket never closed",
+    )
+    .await;
     let (_w3, mut r3) = connect().await;
     let nothing = tokio::time::timeout(Duration::from_millis(500), r3.next()).await;
     assert!(
