@@ -60,9 +60,10 @@ struct Hub {
     config: Config,
     /* names this hub process in snapshots, so a reader can tell a restart from a gap */
     epoch: String,
-    /* counts commits to disk. A waiter subscribes while it holds the lock and wakes on the
-    next commit, one that lands before it starts waiting included */
-    commits: watch::Sender<u64>,
+    /* counts what a waiter can see change: commits to disk and activity state changes. A
+    waiter subscribes while it holds the lock and wakes on the next one, one that lands
+    before it starts waiting included */
+    changes: watch::Sender<u64>,
     /* what each runtime last said it is doing, by peer_id. Memory only: after a restart
     nobody knows until the runtime reports again, and unknown is the honest answer */
     activity: HashMap<String, Activity>,
@@ -898,7 +899,7 @@ impl Hub {
             sweep_at: 0,
             config: load_config(path),
             epoch: Uuid::new_v4().simple().to_string(),
-            commits: watch::channel(0).0,
+            changes: watch::channel(0).0,
             activity: HashMap::new(),
             mcp_servers: disk.mcp_servers,
         })
@@ -921,7 +922,7 @@ fn persist(hub: &mut Hub) -> Result<(), String> {
         owed: hub.owed.clone(),
     };
     write_snapshot(&mut hub.db, &disk)?;
-    hub.commits.send_modify(|count| *count += 1);
+    hub.changes.send_modify(|count| *count += 1);
     Ok(())
 }
 
@@ -1596,7 +1597,14 @@ fn set_activity(hub: &mut Hub, peer_id: &str, report: &ActivityReport, now: u64)
         source: clean(report.source.as_deref(), 32).unwrap_or_default(),
         reason: clean(report.reason.as_deref(), 120),
     };
+    let changed = hub
+        .activity
+        .get(peer_id)
+        .is_none_or(|old| old.state != report.state);
     hub.activity.insert(peer_id.to_string(), activity);
+    if changed {
+        hub.changes.send_modify(|count| *count += 1);
+    }
 }
 
 /* a report from a session that is not the peer's current one, or from no session for a
@@ -2666,21 +2674,36 @@ async fn wait_capture(
     wait: u64,
     caller: Option<&str>,
 ) -> Result<CapturedWait, (StatusCode, Json<Value>)> {
+    use crate::wire::{AskState, Progress};
     let deadline = tokio::time::Instant::now() + Duration::from_secs(wait);
+    /* a stop the wait has not seen ends it: the recipient waits at a prompt or ended its
+    turn, by a report made after the wait began */
+    let mut began = None;
     loop {
-        let mut commits = {
+        let mut changes = {
             let hub = app.inner.lock().await;
             let ask = hub
                 .asks
                 .get(id)
                 .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": "unknown ask"}))))?;
-            if !ask.open || tokio::time::Instant::now() >= deadline {
-                let now = now_unix();
+            let now = now_unix();
+            let reported = hub
+                .activity
+                .get(&ask.to_peer_id)
+                .map(|activity| (activity.state.clone(), activity.since));
+            let stop = matches!(
+                derive::ReadModel::new(&hub, now).wait(ask).state,
+                AskState::Open {
+                    progress: Progress::Wait { .. } | Progress::Idle { .. }
+                }
+            ) && began.as_ref().is_some_and(|first| *first != reported);
+            if !ask.open || stop || tokio::time::Instant::now() >= deadline {
                 return Ok(capture_wait(&hub, ask, caller, now));
             }
-            hub.commits.subscribe()
+            began.get_or_insert(reported);
+            hub.changes.subscribe()
         };
-        let _ = tokio::time::timeout_at(deadline, commits.changed()).await;
+        let _ = tokio::time::timeout_at(deadline, changes.changed()).await;
     }
 }
 

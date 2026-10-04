@@ -47,15 +47,15 @@ never comes */
 async fn until(state: &App, check: impl Fn(&Hub) -> bool, failure: &str) {
     let bound = tokio::time::Instant::now() + Duration::from_secs(120);
     loop {
-        let mut commits = {
+        let mut changes = {
             let hub = state.inner.lock().await;
             if check(&hub) {
                 return;
             }
-            hub.commits.subscribe()
+            hub.changes.subscribe()
         };
         assert!(
-            tokio::time::timeout_at(bound, commits.changed())
+            tokio::time::timeout_at(bound, changes.changed())
                 .await
                 .is_ok(),
             "{failure}"
@@ -219,7 +219,7 @@ async fn a_wait_wakes_on_the_commit_that_closes_its_ask() {
         async move { wait_capture(&app, &cid, WAIT_MAX_SECS, None).await.is_ok() }
     });
     tokio::task::yield_now().await;
-    let subscribed = app.inner.lock().await.commits.receiver_count();
+    let subscribed = app.inner.lock().await.changes.receiver_count();
     assert_eq!(subscribed, 1, "the wait subscribed before the ack");
     let pong = json!({"correlation_id": cid, "message": "pong"});
     let _ = json_req(router(app.clone()), "POST", "/ack", pong).await;
@@ -227,6 +227,80 @@ async fn a_wait_wakes_on_the_commit_that_closes_its_ask() {
     assert!(
         started.elapsed() < Duration::from_secs(WAIT_MAX_SECS),
         "the commit woke the wait before its deadline"
+    );
+}
+
+#[tokio::test]
+async fn a_wait_ends_when_its_recipient_stops_during_it() {
+    let path = temp_state("stall");
+    let app = App {
+        inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    let report = |peer: &str, state: &str| {
+        let body = json!({"peer_id": peer, "state": state});
+        json_req(router(app.clone()), "POST", "/activity", body)
+    };
+    for peer in ["worker", "other"] {
+        let row = json!({"name": peer, "peer_id": peer, "backend": "pi", "circle": "default"});
+        let _ = json_req(router(app.clone()), "POST", "/peers", row).await;
+    }
+    report("worker", "idle").await;
+    let ping = json!({"from_peer": "boss", "to_peer": "worker", "text": "ping"});
+    let (_, ask) = json_req(router(app.clone()), "POST", "/ask", ping).await;
+    let cid = ask["correlation_id"].as_str().unwrap().to_string();
+    /* the recipient went idle before the ask, which is nine seconds old: still inside the
+    pickup grace when the wait begins */
+    {
+        let mut hub = app.inner.lock().await;
+        hub.activity.get_mut("worker").unwrap().since = now_unix() - 20;
+        hub.asks.get_mut(&cid).unwrap().opened_at = Some(now_unix() - 9);
+    }
+    let spawn_wait = || {
+        let (app, cid) = (app.clone(), cid.clone());
+        tokio::spawn(async move { wait_capture(&app, &cid, WAIT_MAX_SECS, None).await.unwrap() })
+    };
+    let started = tokio::time::Instant::now();
+    let waiter = spawn_wait();
+    tokio::task::yield_now().await;
+    /* the grace runs out with no word from the recipient */
+    app.inner.lock().await.asks.get_mut(&cid).unwrap().opened_at = Some(now_unix() - 15);
+    for (peer, state) in [("other", "work"), ("other", "idle"), ("worker", "work")] {
+        tokio::task::yield_now().await;
+        report(peer, state).await;
+    }
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "elapsed time woken by another peer, or a resumed recipient, leaves it running"
+    );
+    report("worker", "wait").await;
+    assert!(waiter.await.unwrap().ask.open);
+    assert!(
+        started.elapsed() < Duration::from_secs(WAIT_MAX_SECS),
+        "the recipient's prompt ended the wait before its deadline"
+    );
+    let started = tokio::time::Instant::now();
+    let waiter = spawn_wait();
+    tokio::task::yield_now().await;
+    report("other", "work").await;
+    tokio::task::yield_now().await;
+    assert!(
+        !waiter.is_finished(),
+        "a stop from before the wait leaves it running"
+    );
+    {
+        let mut hub = app.inner.lock().await;
+        for state in ["work", "idle"] {
+            let report: ActivityReport = serde_json::from_value(json!({"state": state})).unwrap();
+            set_activity(&mut hub, "worker", &report, now_unix());
+        }
+    }
+    assert!(waiter.await.unwrap().ask.open);
+    assert!(
+        started.elapsed() < Duration::from_secs(WAIT_MAX_SECS),
+        "a turn that resumed and ended between two looks ended the wait"
     );
 }
 
