@@ -114,7 +114,6 @@ fn identity_probe_case(case: &str, target: Option<&str>) {
         if let Some(mut child) = hook.0.take() { child.kill().unwrap(); child.wait().unwrap(); }
         server.abort();
     });
-    fs::remove_dir_all(home).unwrap();
 }
 
 #[test]
@@ -371,7 +370,6 @@ impl Drop for Resume {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .close();
-        let _ = fs::remove_dir_all(&self.home);
     }
 }
 
@@ -662,7 +660,6 @@ fn codex_pinned_mcp_names_its_thread_before_it_registers_or_drains() {
         "A's ask is closed, not handed to B: {asks}"
     );
     mcp.close();
-    let _ = fs::remove_dir_all(&home);
 }
 
 #[test]
@@ -695,5 +692,4 @@ fn codex_pinned_mcp_without_a_thread_speaks_for_its_pin_unregistered() {
     let asks = sandbox.json(&["peer", "asks", "--peer-id", pinned], None);
     assert_eq!(asks["asks"][0]["text"], "for A only", "{asks}");
     mcp.close();
-    let _ = fs::remove_dir_all(&home);
 }

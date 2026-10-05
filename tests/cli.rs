@@ -3034,7 +3034,6 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
     /* the subject is surviving a hub kill, so the drainer needs a messaging socket to be a
     valid claude-code drainer at all */
     let sock = claude_socket_path(&sandbox);
-    let _ = fs::remove_file(&sock);
     let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
     let mut child = sandbox
         .command()
@@ -3064,7 +3063,6 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
     let still = child.try_wait().unwrap();
     let _ = child.kill();
     let _ = child.wait();
-    let _ = fs::remove_file(&sock);
     assert!(
         still.is_none(),
         "hook ws exited after hub SIGKILL past retry window: {still:?}"
@@ -3080,7 +3078,6 @@ fn hook_ws_injects_notify_into_claude_socket() {
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
     let sock = sandbox.root.join("ai.s");
-    let _ = fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut child = sandbox
@@ -3145,7 +3142,6 @@ fn hook_ws_injects_notify_into_claude_socket() {
     }
     let _ = child.kill();
     let _ = child.wait();
-    let _ = fs::remove_file(&sock);
     let frame: Value = serde_json::from_str(&line).unwrap();
     assert_eq!(frame["type"], "user");
     assert_eq!(frame["message"]["role"], "user");
@@ -3176,7 +3172,6 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
         None,
     );
     let sock = sandbox.root.join("ai.s");
-    let _ = fs::remove_file(&sock);
     dead_inbox(&sock);
     let mut child = sandbox
         .command()
@@ -3253,7 +3248,6 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     }
     let _ = child.kill();
     let _ = child.wait();
-    let _ = fs::remove_file(&sock);
     assert_eq!(contents.len(), 3, "{contents:?}");
     assert!(contents[0].contains("c-fail-n"), "{contents:?}");
     assert!(contents[1].contains("c-fail-a"), "{contents:?}");
@@ -3328,7 +3322,6 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
         true
     );
     let sock = sandbox.root.join("ai.s");
-    let _ = fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
     let mut child = sandbox
@@ -3380,7 +3373,6 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
     }
     let _ = child.kill();
     let _ = child.wait();
-    let _ = fs::remove_file(&sock);
     assert!(!saw_closed, "closed ask must not be injected");
     assert!(saw_notify, "later notify must still inject");
 }
@@ -3555,13 +3547,11 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
             assert!(got[0].contains("q0"), "{got:?}");
             assert!(got[1].contains("q1"), "{got:?}");
             assert!(got[2].contains("q2"), "{got:?}");
-            let _ = fs::remove_dir_all(&codex_home);
             return;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            let _ = fs::remove_dir_all(&codex_home);
             panic!("inject side got {got:?}; queue must survive hub reconnect and flush once");
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -3992,7 +3982,6 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
         let messages = delivered.lock().unwrap().clone();
         (messages, receipts)
     });
-    let _ = fs::remove_file(path);
     result
 }
 
@@ -4314,7 +4303,6 @@ fn codex_drainer_follows_the_rows_session_over_its_thread_env() {
     let raw = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the notify must be injected");
-    let _ = fs::remove_dir_all(&codex_home);
     let request: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(request["params"]["threadId"], "B", "{request}");
 }
@@ -4346,7 +4334,6 @@ fn codex_drainer_drops_the_old_sessions_queue_when_the_name_is_replaced() {
         .recv_timeout(Duration::from_secs(10))
         .expect("the B-era notify must reach B");
     let later = injected.recv_timeout(Duration::from_secs(2));
-    let _ = fs::remove_dir_all(&codex_home);
     let request: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(request["params"]["threadId"], "B", "{request}");
     assert!(raw.contains("B-era") && !raw.contains("A-era"), "{raw}");
@@ -4411,7 +4398,6 @@ fn codex_drainer_keeps_the_old_sessions_queue_from_the_new_owner_across_a_reconn
         .recv_timeout(Duration::from_secs(10))
         .expect("the B-era notify must reach B");
     let later = injected.recv_timeout(Duration::from_secs(2));
-    let _ = fs::remove_dir_all(&codex_home);
     assert!(raw.contains("B-era") && !raw.contains("A-era"), "{raw}");
     assert!(later.is_err(), "nothing of A's reaches B: {later:?}");
 }
@@ -4452,7 +4438,6 @@ fn codex_drainer_follows_a_first_bind_over_its_thread_env() {
     let second = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("and what follows");
-    let _ = fs::remove_dir_all(&codex_home);
     let thread =
         |raw: &str| serde_json::from_str::<Value>(raw).unwrap()["params"]["threadId"].clone();
     assert!(first.contains("before the bind"), "{first}");
@@ -4478,12 +4463,7 @@ for the hub to prune A's row, which owes nothing, and comes back to a name nobod
 thread env names B, an idle thread, so it has somewhere to flush that nobody confirmed */
 fn pruned_while_away(
     busy: Arc<std::sync::Mutex<Vec<String>>>,
-) -> (
-    Sandbox,
-    KillChild,
-    std::sync::mpsc::Receiver<String>,
-    PathBuf,
-) {
+) -> (Sandbox, KillChild, std::sync::mpsc::Receiver<String>) {
     let mut sandbox = Sandbox::new();
     let pinprune = sandbox.id("pinprune");
     sandbox.start();
@@ -4517,13 +4497,13 @@ fn pruned_while_away(
     }
     signal(&pid, "-CONT");
     std::thread::sleep(Duration::from_millis(2500));
-    (sandbox, drainer, injected, codex_home)
+    (sandbox, drainer, injected)
 }
 
 #[test]
 fn codex_drainer_gives_another_owner_only_what_the_unowned_name_queued() {
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
-    let (sandbox, drainer, injected, codex_home) = pruned_while_away(busy);
+    let (sandbox, drainer, injected) = pruned_while_away(busy);
     let pinprune = sandbox.id("pinprune");
     /* a frame for the unowned name is waiting when B binds it; nothing flushes to the
     thread env's B before the stream says B owns the name */
@@ -4540,7 +4520,6 @@ fn codex_drainer_gives_another_owner_only_what_the_unowned_name_queued() {
         .recv_timeout(Duration::from_secs(10))
         .expect("and what follows");
     let later = injected.recv_timeout(Duration::from_secs(2));
-    let _ = fs::remove_dir_all(&codex_home);
     for raw in [&first, &second] {
         assert!(!raw.contains("A-era"), "nothing of A's reaches B: {raw}");
         assert!(raw.contains("\"threadId\":\"B\""), "{raw}");
@@ -4553,7 +4532,7 @@ fn codex_drainer_gives_another_owner_only_what_the_unowned_name_queued() {
 #[test]
 fn codex_drainer_keeps_a_pruned_owners_queue_for_its_return() {
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
-    let (sandbox, _drainer, injected, codex_home) = pruned_while_away(busy.clone());
+    let (sandbox, _drainer, injected) = pruned_while_away(busy.clone());
     let pinprune = sandbox.id("pinprune");
     busy.lock().unwrap().clear();
     bind_pinprune(&sandbox, "A");
@@ -4564,7 +4543,6 @@ fn codex_drainer_keeps_a_pruned_owners_queue_for_its_return() {
     let second = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("and what follows");
-    let _ = fs::remove_dir_all(&codex_home);
     assert!(
         first.contains("A-era") && first.contains("\"threadId\":\"A\""),
         "{first}"
@@ -4750,7 +4728,6 @@ fn claude_across_a_reconnect(
     let early = collect();
     release.notify_one();
     let late = collect();
-    let _ = fs::remove_file(&inbox);
     (early, late)
 }
 
@@ -4892,8 +4869,6 @@ fn drainer_alive_when_the_pin_moves(
     let _ = Command::new("pkill")
         .args(["-f", &format!("hook ws --peer-id {pin}($| )")])
         .status();
-    let _ = fs::remove_file(&socket_a);
-    let _ = fs::remove_file(&socket_b);
     let alive = alive_at_post.lock().unwrap().first().copied();
     alive
 }
@@ -4975,8 +4950,6 @@ fn claude_session_retires_only_the_drainer_of_its_own_dotted_pin() {
     let _ = Command::new("pkill")
         .args(["-f", &format!("hook ws --peer-id ap{tag}\\.pin($| )")])
         .status();
-    let _ = fs::remove_file(&socket);
-    let _ = fs::remove_file(&other);
     assert!(
         alive,
         "{pin} must not be matched against {neighbour}'s drainer"
@@ -5017,7 +4990,6 @@ fn claude_hook_spawns_no_drainer_while_pgrep_cannot_answer() {
     let _ = Command::new("pkill")
         .args(["-f", &format!("hook ws --peer-id {peer}($| )")])
         .status();
-    let _ = fs::remove_file(&socket);
     assert!(output.status.success(), "{output:?}");
     assert!(
         !spawned,
@@ -5067,8 +5039,6 @@ fn claude_session_never_retires_drainers_for_a_pin_the_hub_would_refuse() {
         &[("CLAUDE_CODE_MESSAGING_SOCKET", other.to_str().unwrap())],
     );
     let alive = hook_ws_alive(&bystander);
-    let _ = fs::remove_file(&socket);
-    let _ = fs::remove_file(&other);
     assert!(alive, "a pin the hub refuses must never reach pkill");
 }
 
@@ -5220,7 +5190,6 @@ fn codex_drainer_flushes_nothing_from_an_earlier_connection_before_the_hub_greet
         .recv_timeout(Duration::from_secs(10))
         .expect("the first owner gets what the unbound name queued");
     let later = injected.recv_timeout(Duration::from_secs(2));
-    let _ = fs::remove_dir_all(&codex_home);
     assert!(
         raw.contains("unbound-era") && raw.contains("\"threadId\":\"Y\""),
         "nothing goes to the row's X before the greeting names Y: {raw}"
@@ -5274,7 +5243,6 @@ fn codex_drainer_holds_another_sessions_queue_from_a_hub_too_old_to_name_the_own
         .recv_timeout(Duration::from_secs(10))
         .expect("the drainer reconnects");
     let leaked = injected.recv_timeout(Duration::from_secs(6));
-    let _ = fs::remove_dir_all(&codex_home);
     assert!(leaked.is_err(), "A's frame must wait for A: {leaked:?}");
 }
 
@@ -5332,7 +5300,6 @@ fn codex_drainer_keeps_a_first_owners_queue_from_the_session_that_replaces_it() 
         .recv_timeout(Duration::from_secs(10))
         .expect("the B-era notify must reach B");
     let later = injected.recv_timeout(Duration::from_secs(2));
-    let _ = fs::remove_dir_all(&codex_home);
     assert!(
         raw.contains("B-era") && !raw.contains("unowned-era"),
         "what A owned since its first bind never reaches B: {raw}"
