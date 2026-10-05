@@ -179,6 +179,7 @@ amesh tui --all --ascii      # every circle, ASCII only
 | `sweep_secs` | 60 | 1 | how often the hub looks for what to delete |
 | `job_nudge_secs` | 3600 | 60 | how often a stalled job reminds its creator |
 | `job_upstream_chars` | 2000 | 0 | characters of each upstream result quoted into a dependent job's ask |
+| `attachment_keep_secs` | 604800 | 60 | an attachment is deleted this long after its upload (by file time) at the hub's next 60-second file pass; reading it or an ask that names it does not keep it |
 
 ## Security
 
@@ -195,7 +196,7 @@ Set `AMESH_TOKEN` before exposing the port and restart the hub after changing it
 - On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
 - `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.
 - An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) how an ask closed (`closed_by`), a job's last handoff notice (`handoff`) or when each inbox record was queued (`queued_at`; the next start counts such records from that moment). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
-- `gc` and `uninstall` are dry-run until `--apply true`. Attachments are left alone unless `--attachments-days N`.
+- `gc` and `uninstall` are dry-run until `--apply true`. `gc` leaves attachments alone unless `--attachments-days N`; the hub deletes them `attachment_keep_secs` after upload.
 
 ## Troubleshooting
 

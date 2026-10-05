@@ -3760,15 +3760,20 @@ async fn delete_schedule(
 
 /* Every peer the hub still knows keeps its stamp and log. What is left over belongs to
 drainers that are gone, and the gc command's own tests decide whether a pid is really
-dead, so the daemon never reaches a different verdict than a hand-run gc would. The
-attachments and the state files are never touched from here. */
+dead, so the daemon never reaches a different verdict than a hand-run gc would. An
+attachment goes attachment_keep_secs after its upload; the state files are never touched
+from here. */
 async fn sweep_runtime_files(app: &App) {
     let Some(dir) = app.state_path.parent().map(Path::to_path_buf) else {
         return;
     };
-    let keep: HashSet<String> = app.inner.lock().await.peers.keys().cloned().collect();
+    let (keep, attachments) = {
+        let hub = app.inner.lock().await;
+        let keep: HashSet<String> = hub.peers.keys().cloned().collect();
+        (keep, hub.config.attachment_keep_secs)
+    };
     let targets = tokio::task::spawn_blocking(move || {
-        let targets = crate::cli::gc_candidates(&dir, &keep, true, None);
+        let targets = crate::cli::gc_candidates(&dir, &keep, true, Some(attachments));
         crate::cli::cap_runtime_logs(&dir);
         targets
     })
@@ -3786,6 +3791,7 @@ const JOB_UPSTREAM_CHARS: u64 = 2000;
 const JOB_KEEP_SECS: u64 = 3600;
 const ASK_KEEP_SECS: u64 = 3600;
 const SWEEP_SECS: u64 = 60;
+const ATTACHMENT_KEEP_SECS: u64 = 7 * 86400;
 
 /* config.toml next to the state file, read once at start; a missing file or key keeps the
 default */
@@ -3796,6 +3802,7 @@ struct Config {
     sweep_secs: u64,
     job_nudge_secs: u64,
     job_upstream_chars: u64,
+    attachment_keep_secs: u64,
 }
 
 impl Default for Config {
@@ -3806,16 +3813,18 @@ impl Default for Config {
             sweep_secs: SWEEP_SECS,
             job_nudge_secs: JOB_NUDGE_SECS,
             job_upstream_chars: JOB_UPSTREAM_CHARS,
+            attachment_keep_secs: ATTACHMENT_KEEP_SECS,
         }
     }
 }
 
-const CONFIG_KEYS: [&str; 5] = [
+const CONFIG_KEYS: [&str; 6] = [
     "job_keep_secs",
     "ask_keep_secs",
     "sweep_secs",
     "job_nudge_secs",
     "job_upstream_chars",
+    "attachment_keep_secs",
 ];
 
 fn load_config(state: &Path) -> Config {
@@ -3857,6 +3866,7 @@ fn load_config(state: &Path) -> Config {
         ("sweep_secs", &mut config.sweep_secs, 1),
         ("job_nudge_secs", &mut config.job_nudge_secs, 60),
         ("job_upstream_chars", &mut config.job_upstream_chars, 0),
+        ("attachment_keep_secs", &mut config.attachment_keep_secs, 60),
     ] {
         let Some(item) = doc.get(key) else {
             continue;
@@ -3893,8 +3903,16 @@ fn config_template() -> String {
          # job_nudge_secs = {}\n\
          \n\
          # characters of each upstream result quoted into a dependent job's ask\n\
-         # job_upstream_chars = {}\n",
-        d.job_keep_secs, d.ask_keep_secs, d.sweep_secs, d.job_nudge_secs, d.job_upstream_chars
+         # job_upstream_chars = {}\n\
+         \n\
+         # delete an attachment this long after its upload, even if an ask still names it (seconds, min 60)\n\
+         # attachment_keep_secs = {}\n",
+        d.job_keep_secs,
+        d.ask_keep_secs,
+        d.sweep_secs,
+        d.job_nudge_secs,
+        d.job_upstream_chars,
+        d.attachment_keep_secs
     )
 }
 

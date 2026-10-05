@@ -1499,7 +1499,7 @@ pub(crate) fn gc_candidates(
     dir: &Path,
     keep: &HashSet<String>,
     daemon: bool,
-    days: Option<u64>,
+    attachment_secs: Option<u64>,
 ) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(dir) else {
@@ -1513,15 +1513,13 @@ pub(crate) fn gc_candidates(
             continue;
         }
         if name == "attachments" {
-            let Some(days) = days else {
+            let Some(secs) = attachment_secs else {
                 continue;
             };
             if !path.is_dir() {
                 continue;
             }
-            let Some(cutoff) =
-                SystemTime::now().checked_sub(Duration::from_secs(days.saturating_mul(86400)))
-            else {
+            let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(secs)) else {
                 continue;
             };
             if let Ok(files) = fs::read_dir(&path) {
@@ -1613,7 +1611,12 @@ fn gc(args: &Args) -> Result<Value> {
             Err(_) => false,
         }
     };
-    let targets = gc_candidates(&dir, &keep, daemon, days);
+    let targets = gc_candidates(
+        &dir,
+        &keep,
+        daemon,
+        days.map(|days| days.saturating_mul(86400)),
+    );
     let mut removed = Vec::new();
     for path in targets {
         let display = path.display().to_string();

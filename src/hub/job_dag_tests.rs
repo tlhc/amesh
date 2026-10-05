@@ -1617,11 +1617,12 @@ async fn config_file_overrides_defaults() {
         d.sweep_secs,
         d.job_nudge_secs,
         d.job_upstream_chars,
+        d.attachment_keep_secs,
     ];
     assert_eq!(values, defaults.map(|value| value as i64));
     fs::write(
         root.join("config.toml"),
-        "job_keep_secs = 60\nask_keep_secs = 61\nsweep_secs = 1\njob_nudge_secs = 62\njob_upstream_chars = 0\n",
+        "job_keep_secs = 60\nask_keep_secs = 61\nsweep_secs = 1\njob_nudge_secs = 62\njob_upstream_chars = 0\nattachment_keep_secs = 63\n",
     )
     .unwrap();
     let set = Config {
@@ -1630,6 +1631,7 @@ async fn config_file_overrides_defaults() {
         sweep_secs: 1,
         job_nudge_secs: 62,
         job_upstream_chars: 0,
+        attachment_keep_secs: 63,
     };
     assert_eq!(load_config(&state), set);
     fs::write(root.join("config.toml"), b"\xff").unwrap();

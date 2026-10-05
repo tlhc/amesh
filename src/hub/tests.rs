@@ -2846,6 +2846,35 @@ async fn the_sweep_keeps_every_known_peer_and_clears_the_rest() {
 }
 
 #[tokio::test]
+async fn the_sweep_deletes_attachments_past_their_keep_time() {
+    let dir = std::env::temp_dir().join(format!("amesh-sweep-attach-{}", Uuid::new_v4()));
+    let attachments = dir.join("attachments");
+    fs::create_dir_all(&attachments).unwrap();
+    let path = dir.join("state.db");
+    let state = App {
+        inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
+        token: None,
+        state_path: path.clone(),
+    };
+    /* a keep time of a minute, which the sweep can only have from the config */
+    state.inner.lock().await.config.attachment_keep_secs = 60;
+    let (old, young) = (attachments.join("att-old"), attachments.join("att-young"));
+    fs::write(&old, "x").unwrap();
+    fs::write(&young, "x").unwrap();
+    let past = std::time::SystemTime::now() - Duration::from_secs(120);
+    fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    sweep_runtime_files(&state).await;
+    assert!(!old.exists(), "an attachment past its keep time is deleted");
+    assert!(young.exists(), "a younger one stays");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn the_sweep_caps_oversized_logs_in_place() {
     let dir = std::env::temp_dir().join(format!("amesh-sweep-cap-{}", Uuid::new_v4()));
     fs::create_dir_all(&dir).unwrap();

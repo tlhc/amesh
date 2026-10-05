@@ -327,3 +327,37 @@ fn derived_folder_names_leave_room_for_suffixes() {
     )));
     assert_eq!(folder_name(Path::new("/tmp/short")), "short");
 }
+
+#[test]
+fn gc_deletes_attachments_older_than_the_days_given() {
+    let root = std::env::temp_dir().join(format!("amesh-gc-attach-{}", std::process::id()));
+    let attachments = root.join(".amesh").join("attachments");
+    fs::create_dir_all(&attachments).unwrap();
+    let aged = |name: &str, secs: u64| {
+        let path = attachments.join(name);
+        fs::write(&path, "x").unwrap();
+        let at = std::time::SystemTime::now() - Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        path
+    };
+    let (old, recent) = (aged("att-old", 2 * 86400), aged("att-recent", 2 * 3600));
+    let args: Vec<String> = [
+        "--home",
+        &root.display().to_string(),
+        "--attachments-days",
+        "1",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .chain(["--apply".into(), "true".into()])
+    .collect();
+    gc(&Args::parse(&args, &["home", "apply", "attachments-days"]).unwrap()).unwrap();
+    assert!(!old.exists(), "two days old is past one day");
+    assert!(recent.exists(), "two hours old is within one day");
+    let _ = fs::remove_dir_all(&root);
+}
