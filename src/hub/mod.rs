@@ -4720,7 +4720,7 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives.",
+                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives.",
                 json!({
                     "correlation_id": {"type": "string"},
                     "timeout_seconds": {"type": "integer"}

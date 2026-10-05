@@ -497,7 +497,7 @@ export default function AmeshHooks(pi) {
         text: { type: "string" },
         cross_circle: { type: "boolean" },
       }, ["to_peers", "text"]],
-      ["wait", "Wait for an ask ack. timeout_seconds is capped at 50. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives. The recipient acks once.", {
+      ["wait", "Wait for an ask ack. timeout_seconds is capped at 50. It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives. The recipient acks once.", {
         correlation_id: { type: "string" },
         timeout_seconds: { type: "integer" },
       }, ["correlation_id"]],

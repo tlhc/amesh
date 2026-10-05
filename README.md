@@ -95,7 +95,7 @@ A **circle** is one git repo: `project-` plus a short hash of the git common dir
 
 The CLI mirrors this under `amesh peer`, `amesh jobs`, and `amesh schedule`; `amesh --help` lists the flags.
 
-`amesh_wait` returns status and reply, including `failed`; it waits 45 seconds by default (Codex: 8), at most 50. Acks normally arrive as peer-messages; wait again only if one is missing. `amesh_events` returns 20 entries by default, up to 50, with text trimmed to 200 characters.
+`amesh_wait` returns status and reply, including `failed`; it waits 45 seconds by default (Codex: 8), at most 50, and returns early when the recipient stops at a prompt or ends its turn. Acks normally arrive as peer-messages; wait again only if one is missing. `amesh_events` returns 20 entries by default, up to 50, with text trimmed to 200 characters.
 
 MCP list tools and `amesh_events` are circle-scoped; CLI `peer list` shows all peers unless `--cwd` or `--circle` is given. HTTP `GET /peers`, `/jobs`, `/schedules`, and `/events` return every circle and untrimmed records; `GET /events?circle=NAME` filters.
 
