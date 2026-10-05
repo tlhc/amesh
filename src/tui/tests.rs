@@ -499,7 +499,7 @@ fn one_chain_per_screen_and_tab_crosses_them() {
     let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
     assert_eq!(lines[1], "independent jobs · 1/2 done · 1 run", "{text}");
     assert!(
-        lines[2].starts_with("───") && lines[2].trim_end().ends_with("─ +2 run · 1/2 ─"),
+        lines[2].starts_with("───") && lines[2].trim_end().ends_with("─ +2 run · 1/2 · ● ─"),
         "the rule says which of two blocks this is, and what runs in the other:\n{text}"
     );
     assert!(
@@ -528,7 +528,11 @@ fn one_chain_per_screen_and_tab_crosses_them() {
     let text = screen_text(&mut app, 46, 60).join("\n");
     assert!(
         text.lines().nth(1) == Some("chain deploy · 3/9 done · 1 fail · 2 run")
-            && text.lines().nth(2).unwrap().ends_with("─ +1 run · 2/2 ─")
+            && text
+                .lines()
+                .nth(2)
+                .unwrap()
+                .ends_with("─ +1 run · 2/2 · ● ─")
             && !text.contains("lint"),
         "{text}"
     );
@@ -671,10 +675,7 @@ fn errors_say_what_went_wrong() {
     app.apply(Ok(s1()));
     app.apply(Err(crate::cli::DAEMON_UNREACHABLE.to_string()));
     let text = screen_text(&mut app, 46, 40).join("\n");
-    assert!(
-        text.contains("! hub unreachable · showing the snapshot from"),
-        "{text}"
-    );
+    assert!(text.contains("! hub unreachable · × sec failed"), "{text}");
 }
 
 /* the rows a terminal shows: a wide character hides the cell after it */
@@ -2357,8 +2358,8 @@ const FRAMES: &str = r#"
 ===== S1 narrow scope
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention × sec failed
                     ● 1 scope cc 1m
     ┌───────┬───────┼───────┬───────┐
     ●       ◆       ●       ×       ⠋
@@ -2384,8 +2385,8 @@ j/k move  h/l stage  digits jump  f hint
 ===== S1 narrow perf
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention × sec failed
                     ● 1 scope cc 1m
     ┌───────┬───────┼───────┬───────┐
     ●       ◆       ●       ×       ⠋
@@ -2412,8 +2413,8 @@ j/k move  h/l stage  digits jump  f hint
 ===== S4 narrow audit
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention WAIT cc 40s needs your Bash permiss…
         ● 1 audit codex 4m ─────┐
     ┌───┴───┐                   │
     ●       ●                   │
@@ -2438,8 +2439,8 @@ j/k move  h/l stage  digits jump  f hint
 ===== S4 narrow deploy
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention WAIT cc 40s needs your Bash permiss…
         ● 1 audit codex 4m ─────┐
     ┌───┴───┐                   │
     ●       ●                   │
@@ -2466,8 +2467,8 @@ j/k move  h/l stage  digits jump  f hint
 7 online · ⠋ cc     ○ codex  ○ pi     ○ pi-2
            ○ pi-3   ⠋ u1     ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention × sec failed
                     ● 1 scope cc 1m
 ┌───────────────────┴────────────────────────┐
 │ 2-11 · 10 jobs · 5● 3◆ 1× 1○               │
@@ -2496,8 +2497,8 @@ j/k move  h/l stage  digits jump  f hint
 7 online · ⠋ cc     ○ codex  ○ pi     ○ pi-2
            ○ pi-3   ⠋ u1     ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention × sec failed
                     ● 1 scope cc 1m
 ┌───────────────────┴────────────────────────┐
 │ 2-11 · 10 jobs · 5● 3◆ 1× 1○               │
@@ -2529,8 +2530,8 @@ j/k move  h/l stage  digits jump  f hint
 ===== S1 wide upg
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
-────────────────────────────────────────────────────────────────────────────────────────────────────
-
+──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
+attention × sec failed
 ● 1 scope ─┬─ ● 2 func ──┬── ○ 7 synth ── ○ 8 fix ── ○ 9 deploy
            ├─ ◆ 3 perf ──┤
            ├─ ● 4 deliv ─┤
@@ -2548,8 +2549,8 @@ j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc
 ===== S5 wide scope
 7 online · ⠋ cc  ○ codex  ○ pi  ○ pi-2  ○ pi-3  ⠋ u1  ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
-────────────────────────────────────────────────────────────────────────────────────────────────────
-
+──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
+attention × sec failed
 ● 1 scope ─┬─ ● 2 func ───┬── ○ 12 synth ── ○ 13 fix ── ○ 14 deploy
            ├─ ◆ 3 perf ───┤
            ├─ ● 4 deliv ──┤
@@ -2572,8 +2573,8 @@ j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc
 ===== S1 narrow synth
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention × sec failed
                     ● 1 scope cc 1m
     ┌───────┬───────┼───────┬───────┐
     ●       ◆       ●       ×       ⠋
@@ -2598,8 +2599,8 @@ j/k move  h/l stage  digits jump  f hint
 ===== S1 wide synth
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
 chain deploy · 3/9 done · 1 fail · 2 run
-────────────────────────────────────────────────────────────────────────────────────────────────────
-
+──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
+attention × sec failed
 ● 1 scope ─┬─ ● 2 func ──┬── ○ 7 synth ── ○ 8 fix ── ○ 9 deploy
            ├─ ◆ 3 perf ──┤
            ├─ ● 4 deliv ─┤
@@ -2617,8 +2618,8 @@ j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc
 ===== S4 narrow review
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
-──────────────────────────────────────────────
-
+────────────────────────────────────────── ● ─
+attention WAIT cc 40s needs your Bash permiss…
         ● 1 audit codex 4m ─────┐
     ┌───┴───┐                   │
     ●       ●                   │
@@ -2643,8 +2644,8 @@ j/k move  h/l stage  digits jump  f hint
 ===== S4 wide deploy
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
 chain verify · 4/6 done · 1 run
-────────────────────────────────────────────────────────────────────────────────────────────────────
-
+──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
+attention WAIT cc 40s needs your Bash permission
 ● 1 audit ─┬─ ● 2 fix-a ─┬── ● 4 review ── ◆ 5 deploy ── ○ 6 verify
            └─ ● 3 fix-b ─┘                               ↑ also needs 1 audit
 
@@ -2660,8 +2661,8 @@ j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc
 ===== S5 wide sec
 7 online · ⠋ cc  ○ codex  ○ pi  ○ pi-2  ○ pi-3  ⠋ u1  ⠋ u2
 chain deploy · 6/14 done · 1 fail · 3 run
-────────────────────────────────────────────────────────────────────────────────────────────────────
-
+──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
+attention × sec failed
 ● 1 scope ─┬─ ● 2 func ───┬── ○ 12 synth ── ○ 13 fix ── ○ 14 deploy
            ├─ ◆ 3 perf ───┤
            ├─ ● 4 deliv ──┤
@@ -3638,7 +3639,7 @@ fn the_screen_puts_the_online_peers_above_the_chain() {
         lines[0], "2 online · ⠋ cc  ○ pi",
         "the line shows before any job exists"
     );
-    assert_eq!(lines[1], "no jobs here yet");
+    assert_eq!(lines[1], format!("{:<45}●", "no jobs here yet"));
 }
 
 #[test]
@@ -3835,7 +3836,12 @@ fn the_screen_moves_the_chain_below_a_wrapped_top_line() {
     assert!(lines[3].starts_with("───"), "{}", lines.join("\n"));
     let mut empty = app_with(with_roster(Snapshot::default(), roster.clone()));
     let lines = screen_text(&mut empty, 80, 20);
-    assert_eq!(lines[2], "no jobs here yet", "{}", lines.join("\n"));
+    assert_eq!(
+        lines[2],
+        format!("{:<79}●", "no jobs here yet"),
+        "{}",
+        lines.join("\n")
+    );
     let mut small = app_with(with_roster(s1(), roster));
     let lines = screen_text(&mut small, 80, 8);
     assert_eq!(lines.len(), 8, "{}", lines.join("\n"));
@@ -3911,7 +3917,7 @@ fn the_rule_shows_how_many_events_the_hub_keeps() {
     for cols in [46usize, 100] {
         let lines = screen_text(&mut app, cols, 40);
         assert!(
-            lines[2].starts_with("───") && lines[2].ends_with(" 42 events ─"),
+            lines[2].starts_with("───") && lines[2].ends_with(" 42 events · ● ─"),
             "{cols}: {}",
             lines[2]
         );
@@ -3929,20 +3935,20 @@ fn the_events_tag_joins_the_block_tag_and_gives_way_first_when_narrow() {
     let mut app = app_with(with_events(mixed(), 42));
     let wide = screen_text(&mut app, 46, 60);
     assert!(
-        wide[2].ends_with(" 42 events · +2 run · 1/2 ─"),
+        wide[2].ends_with(" 42 events · +2 run · 1/2 · ● ─"),
         "{}",
         wide[2]
     );
     let narrow = screen_text(&mut app, 30, 60);
     assert!(
-        narrow[2].ends_with("─ +2 run · 1/2 ─") && !narrow[2].contains("events"),
+        narrow[2].ends_with("─ +2 run · 1/2 · ● ─") && !narrow[2].contains("events"),
         "{}",
         narrow[2]
     );
     app.opts.ascii = true;
     let ascii = screen_text(&mut app, 46, 60);
     assert!(
-        ascii[2].ends_with(" 42 events | +2 run | 1/2 -"),
+        ascii[2].ends_with(" 42 events | +2 run | 1/2 | * -"),
         "{}",
         ascii[2]
     );
@@ -3953,7 +3959,7 @@ fn the_view_without_jobs_shows_the_count_on_its_message_row() {
     let mut app = app_with(with_events(Snapshot::default(), 42));
     let lines = screen_text(&mut app, 46, 20);
     assert!(
-        lines[1].starts_with("no jobs here yet") && lines[1].ends_with("42 events"),
+        lines[1].starts_with("no jobs here yet") && lines[1].ends_with("42 events · ●"),
         "{}",
         lines[1]
     );
@@ -3961,7 +3967,7 @@ fn the_view_without_jobs_shows_the_count_on_its_message_row() {
     /* wide enough that the error line leaves room for the count, so only the rule for an
     error keeps it off */
     let fresh = screen_text(&mut app, 100, 20);
-    assert!(fresh[1].ends_with("42 events"), "{}", fresh[1]);
+    assert!(fresh[1].ends_with("42 events · ●"), "{}", fresh[1]);
     app.apply(Err("connection refused".into()));
     let lines = screen_text(&mut app, 100, 20);
     assert!(
@@ -3979,7 +3985,7 @@ fn the_view_without_jobs_shows_the_count_on_its_message_row() {
 fn a_stale_count_stays_off_the_rule_while_the_hub_is_unreachable() {
     let mut app = app_with(with_events(s1(), 42));
     let fresh = screen_text(&mut app, 100, 40);
-    assert!(fresh[2].ends_with(" 42 events ─"), "{}", fresh[2]);
+    assert!(fresh[2].ends_with(" 42 events · ● ─"), "{}", fresh[2]);
     app.apply(Err("connection refused".into()));
     let lines = screen_text(&mut app, 100, 40);
     assert!(
@@ -4712,11 +4718,14 @@ fn the_rule_counts_the_open_asks_and_gives_way_after_the_events() {
             .unwrap()
     };
     let wide = rule(&mut app, 100);
-    assert!(wide.ends_with(" 2 asks open · 1234567 events ─"), "{wide}");
-    let both = " 2 asks open ·".width() + " 1234567 events ".width() + 1 + 4;
+    assert!(
+        wide.ends_with(" 2 asks open · 1234567 events · ● ─"),
+        "{wide}"
+    );
+    let both = " 2 asks open ·".width() + " 1234567 events ".width() + "· ● ".width() + 1 + 4;
     let narrow = rule(&mut app, both - 1);
     assert!(
-        narrow.ends_with(" 2 asks open ─"),
+        narrow.ends_with(" 2 asks open · ● ─"),
         "the events go first: {narrow}"
     );
     app.apply(Err("connection refused".into()));
@@ -4735,7 +4744,7 @@ fn the_no_jobs_row_counts_the_asks_and_points_to_their_screen() {
         .iter()
         .find(|l| l.starts_with("no jobs here yet"))
         .unwrap();
-    assert!(row.ends_with("2 asks open · 3 events"), "{row}");
+    assert!(row.ends_with("2 asks open · 3 events · ●"), "{row}");
     assert!(
         lines
             .iter()
@@ -4747,7 +4756,10 @@ fn the_no_jobs_row_counts_the_asks_and_points_to_their_screen() {
         .iter()
         .find(|l| l.starts_with("no jobs here yet"))
         .unwrap();
-    assert!(row.ends_with("2 asks open"), "the events go first: {row}");
+    assert!(
+        row.ends_with("2 asks open · ●"),
+        "the events go first: {row}"
+    );
     let mut quiet = with_events(fan_out(), 3);
     quiet.asks.clear();
     let mut app = app_with(quiet);
@@ -4757,7 +4769,7 @@ fn the_no_jobs_row_counts_the_asks_and_points_to_their_screen() {
         .find(|l| l.starts_with("no jobs here yet"))
         .unwrap();
     assert!(
-        row.ends_with("  3 events") && !lines.iter().any(|l| l.contains("press a")),
+        row.ends_with("  3 events · ●") && !lines.iter().any(|l| l.contains("press a")),
         "no asks, no count and no pointer: {lines:?}"
     );
 }
@@ -5275,7 +5287,8 @@ fn the_job_card_says_why_its_open_ask_may_go_unseen() {
     assert!(
         !lines
             .iter()
-            .any(|l| l.contains("no push") || l.contains("queued for")),
+            .any(|l| !l.starts_with("attention ")
+                && (l.contains("no push") || l.contains("queued for"))),
         "a worker with a push channel and an empty queue gets no row:\n{}",
         lines.join("\n")
     );
@@ -5311,7 +5324,9 @@ fn the_ask_card_says_why_an_open_ask_may_go_unseen() {
     app.key(KeyCode::Char('3'));
     let lines = screen_at(&mut app, 100, 0);
     assert!(
-        !lines.iter().any(|l| l.contains("no push")),
+        !lines
+            .iter()
+            .any(|l| !l.starts_with("attention ") && l.contains("no push")),
         "a closed ask has nothing left to explain:\n{}",
         lines.join("\n")
     );
@@ -6012,10 +6027,10 @@ fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
             live.windows(2).any(|w| w[0] != w[1]),
             "{what}: a snapshot 1.5s old still moves"
         );
+        app.last_ok = aged(2100);
         app.opts.anim = false;
         let still = screen_at(app, 100, 0);
         app.opts.anim = true;
-        app.last_ok = aged(2100);
         for (tick, frame) in frames(app).iter().enumerate().skip(1) {
             assert_eq!(
                 frame, &still,
@@ -7431,4 +7446,426 @@ fn a_malformed_v2_snapshot_keeps_the_last_frame_end_to_end() {
         "{:?}",
         app.error
     );
+}
+
+/* one view with each thing the attention line lists: w3 at a prompt, w4 idle on two asks
+and listed once from the one that stalled first, w5's queue stuck without push, w9's queue
+stuck under push, and s1's failed job sec. w6 has no push and works on the ask it holds,
+w7's ask is still in its pickup grace, w8 has no push and no ask, and w10 is offline, so
+none of those four is listed. Each state is one the hub derives from the peer's activity */
+fn attention_view() -> Snapshot {
+    use crate::wire::{AskState, DeliveryCondition, IdleWhy, Liveness, Progress};
+    let mut w3 = peer("w3", "online", Some("wait"));
+    w3.liveness = Some(Liveness::Wait {
+        since: 880,
+        reason: Some("Claude needs your permission to use Bash".into()),
+    });
+    let mut w4 = peer("w4", "online", Some("idle"));
+    w4.liveness = Some(Liveness::Idle { since: 940 });
+    let mut w6 = marked("w6", DeliveryCondition::NoPush, None);
+    w6.liveness = Some(Liveness::Work { since: 990 });
+    let mut w10 = marked("w10", DeliveryCondition::Offline, Some((3, 900)));
+    w10.status = "offline".into();
+    w10.liveness = Some(Liveness::Offline);
+    let mut snap = delivering(
+        s1(),
+        vec![
+            w3,
+            w4,
+            marked("w5", DeliveryCondition::NoPush, Some((2, 970))),
+            w6,
+            peer("w7", "online", Some("idle")),
+            marked("w8", DeliveryCondition::NoPush, None),
+            marked("w9", DeliveryCondition::Push, Some((1, 990))),
+            w10,
+        ],
+        1000,
+    );
+    snap.capabilities.ask_list = true;
+    for (i, (to, opened, progress)) in [
+        (
+            "w4",
+            950,
+            Progress::Idle {
+                since: 950,
+                why: IdleWhy::NotPickedUp,
+            },
+        ),
+        (
+            "w4",
+            930,
+            Progress::Idle {
+                since: 940,
+                why: IdleWhy::TurnEnded,
+            },
+        ),
+        ("w6", 930, Progress::Work { since: 990 }),
+        ("w7", 995, Progress::Pending { since: Some(995) }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        snap.asks.push(Ask {
+            correlation_id: format!("ask-{i}-{to}"),
+            to_peer: to.into(),
+            to_peer_id: to.into(),
+            open: true,
+            opened_at: Some(opened),
+            state: Some(AskState::Open { progress }),
+            ..Default::default()
+        });
+    }
+    snap
+}
+
+/* what attention_view's row under the rule reads */
+const ATTENTION: &str = "attention WAIT w3 2m Claude needs your permission to use Bash · IDLE w4 1m turn ended · ✉2 w5 no push · ✉1 w9 · × sec failed";
+
+/* the first row drawn in rule characters */
+fn rule_row(lines: &[String]) -> usize {
+    lines
+        .iter()
+        .position(|l| l.starts_with("────") || l.starts_with("----"))
+        .unwrap_or_else(|| panic!("no rule:\n{}", lines.join("\n")))
+}
+
+/* the first row that starts with `prefix` */
+fn first_row(lines: &[String], prefix: &str) -> usize {
+    lines
+        .iter()
+        .position(|l| l.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no row starting {prefix:?}:\n{}", lines.join("\n")))
+}
+
+/* an age of about 120 s reads 121s, or 122s on a slow run */
+fn aged(row: &str, head: &str, tail: &str) -> bool {
+    ["121s", "122s"]
+        .iter()
+        .any(|age| row.ends_with(&format!("{head}{age}{tail}")))
+}
+
+fn two_minutes_ago() -> Option<std::time::Instant> {
+    std::time::Instant::now().checked_sub(std::time::Duration::from_secs(120))
+}
+
+#[test]
+fn the_attention_line_lists_what_needs_a_person() {
+    let mut app = app_with(attention_view());
+    let lines = screen_text(&mut app, 160, 40);
+    assert_eq!(
+        lines[rule_row(&lines) + 1],
+        ATTENTION,
+        "{}",
+        lines.join("\n")
+    );
+    let heads: Vec<layout::Tone> = layout::attention(&attention_view())
+        .iter()
+        .map(|item| item[0].1)
+        .collect();
+    assert_eq!(
+        heads,
+        [
+            layout::Tone::Warn,
+            layout::Tone::Fail,
+            layout::Tone::Warn,
+            layout::Tone::Warn,
+            layout::Tone::Fail
+        ]
+    );
+    app.opts.ascii = true;
+    let lines = screen_text(&mut app, 160, 40);
+    assert_eq!(
+        lines[rule_row(&lines) + 1],
+        "attention WAIT w3 2m Claude needs your permission to use Bash | IDLE w4 1m turn ended | +2 w5 no push | +1 w9 | x sec failed"
+    );
+    let mut app = app_with(s4());
+    let lines = screen_text(&mut app, 100, 40);
+    assert_eq!(
+        lines[rule_row(&lines) + 1],
+        "",
+        "nothing needs a person:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn a_stale_snapshot_leads_the_attention_line_and_the_edge_cuts_it() {
+    let mut app = app_with(attention_view());
+    let lines = screen_text(&mut app, 46, 40);
+    assert_eq!(
+        lines[rule_row(&lines) + 1],
+        "attention WAIT w3 2m Claude needs your permis…"
+    );
+    app.apply(Err("connection refused".into()));
+    /* the error leads in a few words, leaving the items room; the rule shows the age */
+    let lines = screen_text(&mut app, 46, 40);
+    assert_eq!(
+        lines[rule_row(&lines) + 1],
+        "! connection refused · WAIT w3 2m Claude need…"
+    );
+    let lines = screen_text(&mut app, 200, 40);
+    let row = &lines[rule_row(&lines) + 1];
+    assert!(row.ends_with(" · × sec failed"), "{row}");
+}
+
+#[test]
+fn the_rule_ends_in_how_old_the_snapshot_is() {
+    let mut snap = attention_view();
+    snap.capabilities.event_count = true;
+    snap.event_count = 14;
+    let mut app = app_with(snap);
+    let rule = |app: &mut App, cols: usize| {
+        let lines = screen_text(app, cols, 40);
+        lines[rule_row(&lines)].clone()
+    };
+    let fresh = rule(&mut app, 100);
+    assert!(
+        fresh.ends_with("─ 4 asks open · 14 events · ● ─"),
+        "{fresh}"
+    );
+    assert_eq!(app.freshness().1, layout::Tone::Done);
+    /* past the fresh two seconds the age rounds up */
+    app.last_ok = std::time::Instant::now().checked_sub(std::time::Duration::from_millis(2100));
+    let just = rule(&mut app, 100);
+    assert!(
+        just.ends_with("─ 4 asks open · 14 events · ○ 3s ─"),
+        "{just}"
+    );
+    assert_eq!(app.freshness().1, layout::Tone::Warn);
+    app.last_ok = two_minutes_ago();
+    let old = rule(&mut app, 100);
+    assert!(aged(&old, "─ 4 asks open · 14 events · ○ ", " ─"), "{old}");
+    /* a narrow pane drops the tags before the mark */
+    let narrow = rule(&mut app, 30);
+    assert!(aged(&narrow, "─ 4 asks open · ○ ", " ─"), "{narrow}");
+    app.opts.ascii = true;
+    let ascii = rule(&mut app, 100);
+    assert!(
+        aged(&ascii, "- 4 asks open | 14 events | o ", " -"),
+        "{ascii}"
+    );
+    app.last_ok = Some(std::time::Instant::now());
+    let ascii = rule(&mut app, 100);
+    assert!(
+        ascii.ends_with("- 4 asks open | 14 events | * -"),
+        "{ascii}"
+    );
+}
+
+#[test]
+fn the_asks_and_events_screens_carry_the_attention_line_and_the_mark() {
+    let mut app = app_with(attention_view());
+    app.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut app, 160, 40);
+    let at = rule_row(&lines);
+    assert!(lines[at].ends_with("──── ● ─"), "{}", lines.join("\n"));
+    assert_eq!(lines[at + 1], ATTENTION, "{}", lines.join("\n"));
+    app.key(KeyCode::Char('e'));
+    let lines = screen_text(&mut app, 160, 40);
+    let at = rule_row(&lines);
+    assert!(
+        lines[at].ends_with("─ 4 asks open · ● ─"),
+        "{}",
+        lines.join("\n")
+    );
+    assert_eq!(lines[at + 1], ATTENTION, "{}", lines.join("\n"));
+    /* on the asks screen a long tag gives way to the mark, and an error leads the row */
+    let mut snap = attention_view();
+    snap.capabilities.event_count = true;
+    snap.event_count = 123_456_789_012;
+    let mut app = app_with(snap);
+    app.key(KeyCode::Char('a'));
+    app.last_ok = two_minutes_ago();
+    let lines = screen_text(&mut app, 30, 40);
+    let rule = &lines[rule_row(&lines)];
+    assert!(aged(rule, "──── ○ ", " ─"), "{}", lines.join("\n"));
+    app.apply(Err("connection refused".into()));
+    let lines = screen_text(&mut app, 160, 40);
+    let row = &lines[rule_row(&lines) + 1];
+    assert!(
+        row.starts_with("! connection refused · WAIT w3 2m"),
+        "{row}"
+    );
+    app.key(KeyCode::Char('e'));
+    let lines = screen_text(&mut app, 160, 40);
+    let row = &lines[rule_row(&lines) + 1];
+    assert!(
+        row.starts_with("! connection refused · WAIT w3 2m"),
+        "{row}"
+    );
+}
+
+#[test]
+fn screens_with_nothing_listed_name_what_needs_a_person() {
+    let mut snap = attention_view();
+    snap.jobs.clear();
+    let mut app = app_with(snap);
+    let items = ATTENTION.strip_suffix(" · × sec failed").unwrap();
+    let lines = screen_text(&mut app, 200, 40);
+    let at = first_row(&lines, "no jobs here yet");
+    assert!(lines[at].ends_with(" 4 asks open · ●"), "{}", lines[at]);
+    assert_eq!(lines[at + 1], items, "{}", lines.join("\n"));
+    app.last_ok = two_minutes_ago();
+    let lines = screen_text(&mut app, 200, 40);
+    assert!(aged(&lines[at], " 4 asks open · ○ ", ""), "{}", lines[at]);
+    app.apply(Err("connection refused".into()));
+    let lines = screen_text(&mut app, 200, 40);
+    assert_eq!(lines[at + 1], items, "{}", lines.join("\n"));
+    /* a wrapped error keeps its first line whole and takes the mark on its last */
+    let lines = screen_text(&mut app, 46, 40);
+    let at = first_row(&lines, "! connection refused");
+    assert_eq!(lines[at], "! connection refused · showing the snapshot");
+    assert!(aged(&lines[at + 1], "  ○ ", ""), "{}", lines[at + 1]);
+    /* with nothing to list, the hint follows the message */
+    let mut app = app_with(Snapshot {
+        captured_at: 1000,
+        ..Default::default()
+    });
+    let lines = screen_text(&mut app, 100, 20);
+    let at = first_row(&lines, "no jobs here yet");
+    assert!(
+        lines[at + 1].starts_with("jobs appear once created"),
+        "{}",
+        lines.join("\n")
+    );
+    let mut quiet = attention_view();
+    quiet.asks.clear();
+    quiet.capabilities.event_count = true;
+    quiet.event_count = 14;
+    let mut app = app_with(quiet);
+    app.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut app, 200, 40);
+    let at = first_row(&lines, "no asks here yet");
+    assert!(lines[at].ends_with("  14 events · ●"), "{}", lines[at]);
+    assert_eq!(
+        lines[at + 1],
+        "attention WAIT w3 2m Claude needs your permission to use Bash · ✉2 w5 no push · ✉1 w9 · × sec failed",
+        "{}",
+        lines.join("\n")
+    );
+    app.last_ok = two_minutes_ago();
+    let lines = screen_text(&mut app, 200, 40);
+    assert!(aged(&lines[at], "  14 events · ○ ", ""), "{}", lines[at]);
+}
+
+#[test]
+fn the_events_rule_has_no_mark_without_a_snapshot() {
+    let mut app = App::new(Opts {
+        circle: None,
+        ascii: false,
+        color: false,
+        anim: true,
+        theme: Default::default(),
+    });
+    app.key(KeyCode::Char('e'));
+    let lines = screen_text(&mut app, 80, 20);
+    assert_eq!(lines[rule_row(&lines)], "─".repeat(80));
+    let mut app = app_with(attention_view());
+    app.apply(Ok(Snapshot {
+        schema_version: crate::wire::SNAPSHOT_VERSION + 1,
+        ..Default::default()
+    }));
+    app.key(KeyCode::Char('e'));
+    let lines = screen_text(&mut app, 80, 20);
+    assert_eq!(lines[rule_row(&lines)], "─".repeat(80));
+}
+
+/* an ask sent out of the circle: its recipient comes in peers, not the roster, under the
+name it goes by now; a peer in both is listed once, and a peer the view only refers to is
+not listed */
+#[test]
+fn a_recipient_outside_the_circle_is_listed_once() {
+    use crate::wire::{AskState, DeliveryCondition, IdleWhy, Liveness, Progress};
+    let mut w3 = peer("w3", "online", Some("wait"));
+    w3.liveness = Some(Liveness::Wait {
+        since: 940,
+        reason: None,
+    });
+    let mut x1 = marked("x1", DeliveryCondition::NoPush, Some((2, 970)));
+    x1.liveness = Some(Liveness::Wait {
+        since: 970,
+        reason: None,
+    });
+    let mut x2 = peer("x2", "online", Some("idle"));
+    x2.name = "x2-now".into();
+    let mut y = peer("y", "online", Some("wait"));
+    y.liveness = Some(Liveness::Wait {
+        since: 900,
+        reason: None,
+    });
+    let mut snap = delivering(Snapshot::default(), vec![w3.clone()], 1000);
+    snap.peers = vec![w3, x1, x2, y];
+    for (to, called, progress) in [
+        (
+            "x1",
+            "x1",
+            Progress::Wait {
+                since: 970,
+                reason: None,
+            },
+        ),
+        (
+            "x2",
+            "x2-then",
+            Progress::Idle {
+                since: 990,
+                why: IdleWhy::Unknown,
+            },
+        ),
+    ] {
+        snap.asks.push(Ask {
+            correlation_id: format!("ask-{to}"),
+            to_peer: called.into(),
+            to_peer_id: to.into(),
+            open: true,
+            state: Some(AskState::Open { progress }),
+            ..Default::default()
+        });
+    }
+    let items: Vec<String> = layout::attention(&snap)
+        .iter()
+        .map(|item| joined(item))
+        .collect();
+    assert_eq!(
+        items,
+        [
+            "WAIT w3 1m",
+            "WAIT x1 30s",
+            "IDLE x2-now 10s",
+            "✉2 x1 no push"
+        ]
+    );
+}
+
+#[test]
+fn a_row_cut_where_a_piece_ends_still_ends_in_an_ellipsis() {
+    let row = |reason: &str| {
+        let mut snap = attention_view();
+        snap.roster[0].liveness = Some(crate::wire::Liveness::Wait {
+            since: 880,
+            reason: Some(reason.into()),
+        });
+        let mut app = app_with(snap);
+        let lines = screen_text(&mut app, 30, 40);
+        lines[rule_row(&lines) + 1].clone()
+    };
+    /* the WAIT item ends in the last column and more items follow */
+    assert_eq!(row("123456789"), "attention WAIT w3 2m 12345678…");
+    /* the same, ending in a wide character */
+    assert_eq!(row("1需要权限"), "attention WAIT w3 2m 1需要权…");
+    /* a row that fills the pane exactly is not cut */
+    let mut app = app_with(attention_view());
+    let lines = screen_text(&mut app, layout::width(ATTENTION), 40);
+    assert_eq!(lines[rule_row(&lines) + 1], ATTENTION);
+}
+
+/* a piece too long for the row is cut in one pass, so a long title or reason cannot stall
+a frame */
+#[test]
+fn a_long_piece_is_cut_in_one_pass() {
+    let long = "a".repeat(40_000);
+    let started = std::time::Instant::now();
+    let cut = layout::ellipsis(&long, 80);
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(cut, format!("{}…", "a".repeat(79)));
 }

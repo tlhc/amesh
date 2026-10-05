@@ -1,9 +1,9 @@
 use super::model::{Ask, Chain, Frame, Job, Peer, Snapshot};
 use crate::wire::{
-    BlockReason, DeliveryCondition, DispatchState, IdleWhy, JobAction, JobRelation, Liveness,
-    Progress,
+    AskState, BlockReason, DeliveryCondition, DispatchState, IdleWhy, JobAction, JobRelation,
+    Liveness, Progress,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use unicode_width::UnicodeWidthChar;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,18 +61,7 @@ pub(crate) fn fit(text: &str, max: usize) -> String {
     if width(text) <= max {
         return text.to_string();
     }
-    let mut out = String::new();
-    let mut used = 0;
-    for ch in text.chars() {
-        let w = ch.width().unwrap_or(0);
-        if used + w + 1 > max {
-            break;
-        }
-        out.push(ch);
-        used += w;
-    }
-    out.push('…');
-    out
+    ellipsis(text, max)
 }
 
 impl Grid {
@@ -361,6 +350,99 @@ pub(crate) fn delivery(snap: &Frame, peer: &Peer) -> Row {
         out.push((format!("{} queued for {age}", stuck.count), Tone::Warn));
     }
     out
+}
+
+/* what needs a person, from the hub's facts: a peer at a prompt, the recipient of an open
+ask the hub calls idle, a stuck queue, and a failed job, one item for each. The peers are
+the circle's and the recipients of its open asks, in another circle too */
+pub(crate) fn attention(snap: &Snapshot) -> Vec<Row> {
+    let now = snap.captured_at;
+    let mut items: Vec<Row> = Vec::new();
+    let recipients = snap
+        .asks
+        .iter()
+        .filter(|ask| ask.open)
+        .filter_map(|ask| snap.peer_by_id(&ask.to_peer_id));
+    let mut seen = HashSet::new();
+    let peers: Vec<&Peer> = snap
+        .roster
+        .iter()
+        .chain(recipients)
+        .filter(|peer| seen.insert(peer.peer_id.as_str()))
+        .collect();
+    for peer in &peers {
+        if let Some(Liveness::Wait { since, reason }) = &peer.liveness {
+            let mut item = vec![
+                ("WAIT ".to_string(), Tone::Warn),
+                (
+                    format!("{} {}", shown(peer), ago(now, Some(*since))),
+                    Tone::Plain,
+                ),
+            ];
+            item.extend(reason.as_ref().map(|r| (format!(" {r}"), Tone::Dim)));
+            items.push(item);
+        }
+    }
+    /* one item per recipient, from the ask that stalled first */
+    let mut idle: Vec<(&Ask, u64, &IdleWhy)> = Vec::new();
+    for ask in &snap.asks {
+        let Some(AskState::Open {
+            progress: Progress::Idle { since, why },
+        }) = &ask.state
+        else {
+            continue;
+        };
+        match idle
+            .iter_mut()
+            .find(|(kept, ..)| kept.to_peer_id == ask.to_peer_id)
+        {
+            Some(kept) if *since < kept.1 => *kept = (ask, *since, why),
+            Some(_) => {}
+            None => idle.push((ask, *since, why)),
+        }
+    }
+    for (ask, since, why) in idle {
+        let name = snap
+            .peer_by_id(&ask.to_peer_id)
+            .map_or(ask.to_peer.as_str(), shown);
+        let mut item = vec![
+            ("IDLE ".to_string(), Tone::Fail),
+            (format!("{name} {}", ago(now, Some(since))), Tone::Plain),
+        ];
+        let why = idle_why(why);
+        if !why.is_empty() {
+            item.push((format!(" {why}"), Tone::Dim));
+        }
+        items.push(item);
+    }
+    for peer in &peers {
+        let Some(delivery) = &peer.delivery else {
+            continue;
+        };
+        let no_push = delivery.condition == DeliveryCondition::NoPush;
+        let Some(stuck) = delivery
+            .stuck
+            .as_ref()
+            .filter(|_| no_push || delivery.condition == DeliveryCondition::Push)
+        else {
+            continue;
+        };
+        let mut item = vec![
+            (format!("✉{} ", stuck.count), Tone::Warn),
+            (shown(peer).to_string(), Tone::Plain),
+        ];
+        if no_push {
+            item.push((" no push".into(), Tone::Dim));
+        }
+        items.push(item);
+    }
+    for job in snap.jobs.iter().filter(|job| job.state == "failed") {
+        items.push(vec![
+            ("× ".into(), Tone::Fail),
+            (format!("{} failed", job.title), Tone::Plain),
+        ]);
+    }
+    items
 }
 
 /* waiting for a person first, then at work, then the rest */
@@ -1024,10 +1106,16 @@ fn wrap_now(text: &str, max: usize) -> Vec<String> {
 }
 
 /* cut to `max` columns ending in …, which always shows */
-fn ellipsis(text: &str, max: usize) -> String {
-    let mut out = text.to_string();
-    while !out.is_empty() && width(&out) + 1 > max {
-        out.pop();
+pub(crate) fn ellipsis(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(ch);
+        used += w;
     }
     out.push('…');
     out

@@ -124,7 +124,7 @@ amesh peer ack ask-5e6f7a8b --message "no fixture" --failed true --from-peer ame
 
 ### Watching jobs
 
-`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`, and `GET /events` while the events screen is up. What it shows is decided by the hub (snapshot schema 2); against an older hub it shows jobs and asks without alarms, queue marks or dispatch notes until that hub restarts on the current amesh; against a newer one it says `unsupported hub` in place of jobs, asks and peers.
+`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`, and `GET /events` while the events screen is up. What it shows is decided by the hub (snapshot schema 2); against an older hub it shows jobs and asks without alarms, queue marks or dispatch notes (failed jobs still show) until that hub restarts on the current amesh; against a newer one it says `unsupported hub` in place of jobs, asks and peers.
 
 ```bash
 amesh tui                    # this directory's circle
@@ -132,7 +132,8 @@ amesh tui --all --ascii      # every circle, ASCII only
 ```
 
 - The top of the screen lists the peers online in this view and what each is doing.
-- The rule under the header shows how many events the hub keeps for this view.
+- The rule under the header shows how many events the hub keeps for this view, and ends in `●` while the snapshot is at most two seconds old, or `○ Ns` with its age once it is older (`*` and `o` in ASCII); with no jobs or asks yet, both go at the end of the message line.
+- The row under the rule, or under that message line, names what needs a person: a peer at a permission prompt (`WAIT`), the recipient of an open ask that stopped (`IDLE`), a stuck queue (`✉N`, `no push` when the peer has no push channel), and a failed job (`×`). On a screen with a rule, a hub error (`! error`) or the events screen's notice comes first on that row; with nothing listed, the error is the message line.
 - `a` shows the asks no job points at, open ones first: who waits on whom and for how long, the question and the reply, and a nudge or close command when an answer stalls. The rule counts the open ones.
 - `e` lists the hub's events, the newest at the bottom: asks, acks, notifies, broadcasts (one row each) and chat, with the whole text in the card; a divider marks a hub restart.
 - Each chain gets its own screen, with numbered jobs under a `chain <name> · done/total` header; jobs without dependencies share one block. The selected job's card shows its result or failure reason, worker, ask and dependencies, plus the command to retry it, nudge its worker, or hand it to another peer.

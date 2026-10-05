@@ -592,41 +592,32 @@ impl App {
             for (r, line) in lines.iter().enumerate() {
                 g.put(peer_rows + r, 0, line, Tone::Warn);
             }
-            /* the open asks and what the hub keeps at the right end, the events the first to go */
-            if let Some(snap) = self.snap.as_ref().filter(|_| self.error.is_none()) {
-                let taken = lines.first().map_or(0, |line| layout::width(line));
-                let tags: Vec<(String, Tone)> = [
+            /* the open asks and what the hub keeps, the events the first to go */
+            if let Some(snap) = &self.snap {
+                let tags = [
                     asks::tag(snap).map(|t| (t, Tone::Near)),
                     layout::events_tag(snap).map(|t| (t, Tone::Dim)),
-                ]
-                .into_iter()
-                .flatten()
-                .collect();
-                for keep in (1..=tags.len()).rev() {
-                    let w = tags[..keep]
-                        .iter()
-                        .map(|(t, _)| layout::width(t))
-                        .sum::<usize>()
-                        + 3 * (keep - 1);
-                    if taken + 2 + w <= cols {
-                        let mut c = cols - w;
-                        for (i, (t, tone)) in tags[..keep].iter().enumerate() {
-                            if i > 0 {
-                                c = g.put(peer_rows, c, " · ", Tone::Dim);
-                            }
-                            c = g.put(peer_rows, c, t, *tone);
-                        }
-                        break;
-                    }
-                }
+                ];
+                let last = lines.len().saturating_sub(1);
+                let taken = lines.last().map_or(0, |line| layout::width(line));
+                self.message_end(
+                    &mut g,
+                    peer_rows + last,
+                    taken,
+                    cols,
+                    tags.into_iter().flatten(),
+                );
             }
+            let below = peer_rows
+                + lines.len()
+                + usize::from(self.under_rule(&mut g, peer_rows + lines.len(), cols, None));
             let hints = layout::wrap(hint, cols);
             for (r, line) in hints.iter().enumerate() {
-                g.put(peer_rows + lines.len() + r, 0, line, Tone::Dim);
+                g.put(below + r, 0, line, Tone::Dim);
             }
             if !hint.is_empty() && self.snap.as_ref().is_some_and(|snap| asks::held(snap)) {
                 g.put(
-                    peer_rows + lines.len() + hints.len(),
+                    below + hints.len(),
                     0,
                     &layout::fit("asks have a screen of their own: press a", cols),
                     Tone::Near,
@@ -686,7 +677,11 @@ impl App {
         .flatten()
         .filter(|_| self.error.is_none())
         .collect();
-        let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
+        let used = right
+            .iter()
+            .map(|(text, _)| layout::width(text))
+            .sum::<usize>()
+            + self.mark_room();
         for keep in (1..=tags.len()).rev() {
             let pieces: Vec<(String, Tone)> = tags[..keep]
                 .iter()
@@ -702,19 +697,8 @@ impl App {
                 break;
             }
         }
-        let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
-        let mut at = cols - used - 1;
-        for (text, tone) in right {
-            at = g.put(peer_rows + 1, at, &text, tone);
-        }
-        if let Some(error) = &self.error {
-            g.put(
-                peer_rows + 2,
-                0,
-                &layout::fit(&self.stale(error), cols),
-                Tone::Warn,
-            );
-        }
+        self.rule_end(&mut g, peer_rows + 1, cols, right);
+        self.under_rule(&mut g, peer_rows + 2, cols, self.error_lead());
         let top = peer_rows + 3;
         let avail = rows - 1 - top;
         let view = cur.view(snap, &sel);
@@ -951,8 +935,17 @@ impl App {
             for (r, line) in lines.iter().enumerate() {
                 g.put(peer_rows + r, 0, line, Tone::Warn);
             }
+            if let Some(snap) = &self.snap {
+                let last = lines.len().saturating_sub(1);
+                let taken = lines.last().map_or(0, |line| layout::width(line));
+                let events = layout::events_tag(snap).map(|t| (t, Tone::Dim));
+                self.message_end(&mut g, peer_rows + last, taken, cols, events);
+            }
+            let below = peer_rows
+                + lines.len()
+                + usize::from(self.under_rule(&mut g, peer_rows + lines.len(), cols, None));
             for (r, line) in layout::wrap(hint, cols).iter().enumerate() {
-                g.put(peer_rows + lines.len() + r, 0, line, Tone::Dim);
+                g.put(below + r, 0, line, Tone::Dim);
             }
             return self.lines(&g, cols, rows);
         }
@@ -978,25 +971,15 @@ impl App {
         let head = asks::header(&order, self.opts.circle.is_none());
         g.put(peer_rows, 0, &layout::fit(&head, cols), Tone::Plain);
         g.put(peer_rows + 1, 0, &"─".repeat(cols), Tone::Line);
+        let mut right = Vec::new();
         if let Some(events) = layout::events_tag(&snap).filter(|_| self.error.is_none()) {
             let piece = format!(" {events} ");
-            if layout::width(&piece) + 1 + RULE_MIN <= cols {
-                g.put(
-                    peer_rows + 1,
-                    cols - layout::width(&piece) - 1,
-                    &piece,
-                    Tone::Dim,
-                );
+            if layout::width(&piece) + self.mark_room() + 1 + RULE_MIN <= cols {
+                right.push((piece, Tone::Dim));
             }
         }
-        if let Some(error) = &self.error {
-            g.put(
-                peer_rows + 2,
-                0,
-                &layout::fit(&self.stale(error), cols),
-                Tone::Warn,
-            );
-        }
+        self.rule_end(&mut g, peer_rows + 1, cols, right);
+        self.under_rule(&mut g, peer_rows + 2, cols, self.error_lead());
         let top = peer_rows + 3;
         let avail = rows - 1 - top;
         let list = asks::rows(&snap, &order, cols);
@@ -1089,6 +1072,7 @@ impl App {
         let head = feed::header(&self.feed, self.opts.circle.is_none());
         g.put(peer_rows, 0, &layout::fit(&head, cols), Tone::Plain);
         g.put(peer_rows + 1, 0, &"─".repeat(cols), Tone::Line);
+        let mut right = Vec::new();
         if let Some(tag) = self
             .snap
             .as_ref()
@@ -1096,19 +1080,15 @@ impl App {
             .filter(|_| self.error.is_none())
         {
             let piece = format!(" {tag} ");
-            if layout::width(&piece) + 1 + RULE_MIN <= cols {
-                g.put(
-                    peer_rows + 1,
-                    cols - layout::width(&piece) - 1,
-                    &piece,
-                    Tone::Near,
-                );
+            if layout::width(&piece) + self.mark_room() + 1 + RULE_MIN <= cols {
+                right.push((piece, Tone::Near));
             }
         }
+        self.rule_end(&mut g, peer_rows + 1, cols, right);
         /* a hub that numbers no events cannot tell one from the next, so the selection stays
         on the newest; the screen says why */
         let problem = match (&self.error, &self.ev_error) {
-            (Some(error), _) => Some((self.stale(error), Tone::Warn)),
+            (Some(_), _) => self.error_lead(),
             (None, Some(error)) => Some((format!("! events: {error}"), Tone::Warn)),
             (None, None) if feed::unnumbered(&self.feed) => Some((
                 "this hub numbers no events, so only the newest opens; restart it on the current amesh"
@@ -1117,9 +1097,7 @@ impl App {
             )),
             (None, None) => None,
         };
-        if let Some((problem, tone)) = &problem {
-            g.put(peer_rows + 2, 0, &layout::fit(problem, cols), *tone);
-        }
+        self.under_rule(&mut g, peer_rows + 2, cols, problem);
         let footer = match self.full {
             true if cols >= 96 => "j/k ↑↓ scroll  space/b page  g/G top/end  esc back",
             true => "j/k scroll  space/b page  esc back",
@@ -1211,15 +1189,134 @@ impl App {
         self.opts.anim && self.fresh()
     }
 
+    /* whole seconds rounded up, so a snapshot past the fresh two seconds reads at least 3s */
+    fn age(&self) -> String {
+        self.last_ok.map_or("--".to_string(), |t| {
+            let elapsed = t.elapsed();
+            format!(
+                "{}s",
+                elapsed.as_secs() + u64::from(elapsed.subsec_nanos() > 0)
+            )
+        })
+    }
+
+    /* the hub's error in a few words, leading the row under the rule; the rule's mark gives
+    the snapshot's age */
+    fn error_lead(&self) -> Option<(String, Tone)> {
+        self.error
+            .as_ref()
+            .map(|error| (format!("! {error}"), Tone::Warn))
+    }
+
     /* the hub did not answer: say so, and how old the snapshot on screen is */
     fn stale(&self, error: &str) -> String {
         if self.snap.is_none() {
             return format!("! {error}");
         }
-        let age = self
-            .last_ok
-            .map_or("--".to_string(), |t| format!("{}s", t.elapsed().as_secs()));
-        format!("! {error} · showing the snapshot from {age} ago")
+        format!("! {error} · showing the snapshot from {} ago", self.age())
+    }
+
+    /* the rule's last word: ● while the snapshot is fresh, ○ and its age once it is older */
+    fn freshness(&self) -> (String, Tone) {
+        match self.fresh() {
+            true => ("●".into(), Tone::Done),
+            false => (format!("○ {}", self.age()), Tone::Warn),
+        }
+    }
+
+    /* what the freshness takes of the rule, with the separator before it and the space after */
+    fn mark_room(&self) -> usize {
+        layout::width(&self.freshness().0) + 3
+    }
+
+    /* the rule's right end: the screen's tags, then the freshness while a snapshot shows, one
+    rule character after */
+    fn rule_end(&self, g: &mut Grid, row: usize, cols: usize, mut right: Vec<(String, Tone)>) {
+        if self.snap.is_some() {
+            let sep = if right.is_empty() { " " } else { "· " };
+            right.push((sep.into(), Tone::Dim));
+            right.push(self.freshness());
+            right.push((" ".into(), Tone::Dim));
+        }
+        let used: usize = right.iter().map(|(text, _)| layout::width(text)).sum();
+        let mut at = cols.saturating_sub(used + 1);
+        for (text, tone) in right {
+            at = g.put(row, at, &text, tone);
+        }
+    }
+
+    /* the right end of a message's last line on a screen with nothing listed: the screen's
+    tags while the hub answers, then the freshness; the tags give way first, the last one first */
+    fn message_end(
+        &self,
+        g: &mut Grid,
+        row: usize,
+        taken: usize,
+        cols: usize,
+        tags: impl IntoIterator<Item = (String, Tone)>,
+    ) {
+        let tags: Vec<(String, Tone)> = tags
+            .into_iter()
+            .filter(|_| self.error.is_none())
+            .chain([self.freshness()])
+            .collect();
+        let last = tags.len() - 1;
+        for keep in (0..=last).rev() {
+            let shown: Vec<&(String, Tone)> = tags[..keep].iter().chain(&tags[last..]).collect();
+            let w =
+                shown.iter().map(|(t, _)| layout::width(t)).sum::<usize>() + 3 * (shown.len() - 1);
+            if taken + 2 + w <= cols {
+                let mut c = cols - w;
+                for (i, (t, tone)) in shown.into_iter().enumerate() {
+                    if i > 0 {
+                        c = g.put(row, c, " · ", Tone::Dim);
+                    }
+                    c = g.put(row, c, t, *tone);
+                }
+                break;
+            }
+        }
+    }
+
+    /* the row under the rule: what went wrong with the data, then what needs a person; a row
+    longer than the pane is cut and ends in …. Says whether it drew anything */
+    fn under_rule(
+        &self,
+        g: &mut Grid,
+        row: usize,
+        cols: usize,
+        lead: Option<(String, Tone)>,
+    ) -> bool {
+        let mut pieces: Vec<(String, Tone)> = lead.into_iter().collect();
+        for item in self
+            .snap
+            .as_ref()
+            .map(|snap| layout::attention(snap))
+            .unwrap_or_default()
+        {
+            let sep = if pieces.is_empty() {
+                "attention "
+            } else {
+                " · "
+            };
+            pieces.push((sep.into(), Tone::Dim));
+            pieces.extend(item);
+        }
+        let fits = pieces
+            .iter()
+            .map(|(text, _)| layout::width(text))
+            .sum::<usize>()
+            <= cols;
+        let mut c = 0;
+        for (text, tone) in &pieces {
+            if fits || c + layout::width(text) < cols {
+                c = g.put(row, c, text, *tone);
+            } else {
+                g.put(row, c, &layout::ellipsis(text, cols - c), *tone);
+                break;
+            }
+        }
+        !pieces.is_empty()
     }
 
     fn lines(&self, g: &Grid, cols: usize, rows: usize) -> Vec<Line<'static>> {
