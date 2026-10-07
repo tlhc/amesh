@@ -84,7 +84,7 @@ pub(crate) fn header(order: &[&Ask], all: bool) -> String {
     head
 }
 
-fn glyph(ask: &Ask) -> (char, Tone) {
+pub(crate) fn glyph(ask: &Ask) -> (char, Tone) {
     match ask.state {
         Some(AskState::Open { .. }) => ('◆', Tone::Run),
         Some(AskState::Closed {
@@ -233,13 +233,13 @@ pub(crate) fn rows(snap: &Frame, order: &[&Ask], cols: usize) -> Vec<Row> {
                 let (from, (mark, flow), to) = route;
                 let rest = rw - width(&from) - width(&mark);
                 row.extend([
-                    (from, Tone::Plain),
+                    (from, Tone::Soft),
                     (mark, flow),
-                    (pad(&to, rest), Tone::Plain),
+                    (pad(&to, rest), Tone::Soft),
                 ]);
             } else {
                 let (from, _, to) = route;
-                row.push((pad(&fit_end(&format!("{from}>{to}"), rw), rw), Tone::Plain));
+                row.push((pad(&fit_end(&format!("{from}>{to}"), rw), rw), Tone::Soft));
             }
             /* a pill or badge ends with its word, so the column pads in plain */
             let gap = " ".repeat(sw - width(&st));
@@ -264,7 +264,7 @@ fn party(k: &str, name: &str, status: Row, room: usize) -> Vec<Row> {
     let mut lines: Vec<Row> = wrap(name, room)
         .into_iter()
         .enumerate()
-        .map(|(i, part)| vec![key(k, i == 0), (part, Tone::Plain)])
+        .map(|(i, part)| vec![key(k, i == 0), (part, Tone::Soft)])
         .collect();
     if status.is_empty() {
         return lines;
@@ -305,6 +305,36 @@ fn party_now(snap: &Snapshot, id: Option<&str>, neutral: bool) -> Row {
     }
 }
 
+/* the commands a stalled answer calls for, as the full card lists them and y and Y copy them */
+pub(crate) fn commands(ask: &Ask) -> Vec<(&'static str, String)> {
+    let mut commands = Vec::new();
+    for action in ask.actions.iter().flatten() {
+        let mut command = match action {
+            AskAction::CloseLeft => format!(
+                "amesh peer ack {} --failed true --message {}",
+                layout::quote(&ask.correlation_id),
+                layout::quote("recipient left")
+            ),
+            AskAction::Nudge { to } => format!(
+                "amesh peer notify {} {}",
+                layout::quote(to),
+                layout::quote(&format!(
+                    "ask {} waits for your ack",
+                    short(&ask.correlation_id)
+                ))
+            ),
+            AskAction::Unknown => continue,
+        };
+        let key_name = match action {
+            AskAction::CloseLeft => "close",
+            _ => "nudge",
+        };
+        command.retain(|c| !c.is_control());
+        commands.push((key_name, command));
+    }
+    commands
+}
+
 /* the selected ask's card in the job card's frame, with a badge while the ask needs a person:
 the reply once there is one, or why it needs one, then the route and the question. The full
 card names both parties whole and what each does now, the times, and the command a stalled
@@ -336,6 +366,7 @@ pub(crate) fn card(
         Some(Progress::Offline) => Some((" OFFLINE ", Tone::PillFail)),
         _ => None,
     };
+    let actions = commands(ask);
     let (mut left, mut right, mut commands): (Vec<Row>, Vec<Row>, Vec<Row>) =
         (Vec::new(), Vec::new(), Vec::new());
     let lead = if ask.open {
@@ -393,51 +424,33 @@ pub(crate) fn card(
             ),
         };
         layout::wrapped(&mut left, "times", &times, Tone::Dim, colw, usize::MAX);
-        for action in ask.actions.iter().flatten() {
-            let command = match action {
-                AskAction::CloseLeft => format!(
-                    "amesh peer ack {} --failed true --message {}",
-                    layout::quote(&ask.correlation_id),
-                    layout::quote("recipient left")
-                ),
-                AskAction::Nudge { to } => format!(
-                    "amesh peer notify {} {}",
-                    layout::quote(to),
-                    layout::quote(&format!(
-                        "ask {} waits for your ack",
-                        short(&ask.correlation_id)
-                    ))
-                ),
-                AskAction::Unknown => continue,
-            };
-            let key_name = match action {
-                AskAction::CloseLeft => "close",
-                _ => "nudge",
-            };
-            layout::wrapped(
-                &mut commands,
-                key_name,
-                &command,
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            );
+        for (k, command) in &actions {
+            layout::wrapped(&mut commands, k, command, Tone::Dim, colw, usize::MAX);
         }
     }
+    let keys = wrap(&layout::key_row(&actions, &[], size, colw), colw);
+    let height = match size {
+        Fit::Rows(h) => h.saturating_sub(2 + keys.len()),
+        Fit::Whole => 0,
+    };
     let lines = wrap(text, room);
     let n = match size {
         Fit::Whole => lines.len(),
-        Fit::Rows(h) if two => lines.len().min(h.saturating_sub(2)).max(1),
-        Fit::Rows(h) => lines.len().min(h.saturating_sub(2 + left.len())).max(1),
+        Fit::Rows(_) if two => lines.len().min(height).max(1),
+        Fit::Rows(_) => lines.len().min(height.saturating_sub(left.len())).max(1),
     };
     let side = if two { &mut right } else { &mut left };
     side.extend(field("text", &lines, n, Tone::Plain, room));
     side.extend(commands);
-    if let Fit::Rows(h) = size {
-        while 2 + left.len().max(right.len()) < h {
-            left.push(Vec::new());
-        }
-    }
+    /* a compact card keeps to the rows it is given, its keys last, so a short pane cuts the
+    question and never the keys */
+    let rows = match size {
+        Fit::Rows(h) if h > 0 => height,
+        _ => left.len().max(right.len()),
+    };
+    right.truncate(rows);
+    left.resize(rows, Vec::new());
+    left.extend(keys.into_iter().map(|line| layout::card_keys(&line)));
     let (word, _) = state(snap, ask);
     let head_state = match (ask.open, ask.opened_at, ask.closed_at) {
         (true, None, _) => "open, age unknown".to_string(),

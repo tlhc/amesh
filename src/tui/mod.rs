@@ -66,14 +66,15 @@ pub(crate) struct App {
     asks: bool,
     ask_sel: Option<String>,
     ask_order: Vec<String>,
-    /* the events screen is up instead of the jobs or the asks; the events it holds, the seq
-    of the one selected (None follows the newest), the last read's error, and the hub process
-    the snapshots came from */
+    /* the events screen is up instead of the jobs or the asks; the events it holds, the hub run
+    they are read in, the one selected by its run and seq (None follows the newest), the last
+    read's error, and the hub process the snapshots came from */
     events: bool,
     /* the jobs-screen body is the selected chain's timeline instead of the flow */
     timeline: bool,
     feed: Vec<feed::Held>,
-    ev_sel: Option<u64>,
+    ring: u64,
+    ev_sel: Option<(u64, u64)>,
     ev_error: Option<String>,
     epoch: String,
 }
@@ -100,13 +101,19 @@ impl Block {
 
 impl App {
     fn copy_command(&mut self, index: usize, tmux: bool, out: &mut impl std::io::Write) {
-        if self.events || self.asks {
+        if self.events {
             return;
         }
-        let Some(job) = self.snap.as_ref().and_then(|s| s.job(self.sel.as_deref()?)) else {
-            return;
+        let snap = self.snap.as_ref();
+        let commands = match self.asks {
+            true => snap
+                .and_then(|s| s.ask(self.ask_sel.as_deref()))
+                .map(asks::commands),
+            false => snap
+                .and_then(|s| s.job(self.sel.as_deref()?))
+                .map(layout::job_commands),
         };
-        let Some((_, command)) = layout::job_commands(job).into_iter().nth(index) else {
+        let Some((_, command)) = commands.into_iter().flatten().nth(index) else {
             return;
         };
         let notice = match send_clipboard(&command, tmux, out) {
@@ -153,6 +160,7 @@ impl App {
             events: false,
             timeline: false,
             feed: Vec::new(),
+            ring: 0,
             ev_sel: None,
             ev_error: None,
             epoch: String::new(),
@@ -209,11 +217,11 @@ impl App {
             return;
         }
         let before = std::mem::replace(&mut self.epoch, snap.hub_epoch.clone());
-        if !before.is_empty()
-            && before != snap.hub_epoch
-            && self.feed.iter().any(|h| matches!(h, feed::Held::Event(_)))
-        {
-            self.feed.push(feed::Held::Restart(snap.captured_at));
+        if !before.is_empty() && before != snap.hub_epoch {
+            self.ring += 1;
+            if self.feed.iter().any(|h| matches!(h, feed::Held::Event(..))) {
+                self.feed.push(feed::Held::Restart(snap.captured_at));
+            }
         }
     }
 
@@ -240,7 +248,7 @@ impl App {
             self.feed.extend(
                 list.into_iter()
                     .filter(|e| e.seq > newest)
-                    .map(|e| feed::Held::Event(Box::new(e))),
+                    .map(|e| feed::Held::Event(self.ring, Box::new(e))),
             );
         } else {
             /* the ring read whole stands for what came after the last restart only */
@@ -250,11 +258,13 @@ impl App {
                 .rposition(|h| matches!(h, feed::Held::Restart(_)))
                 .map_or(0, |at| at + 1);
             self.feed.truncate(kept);
-            self.feed
-                .extend(list.into_iter().map(|e| feed::Held::Event(Box::new(e))));
+            self.feed.extend(
+                list.into_iter()
+                    .map(|e| feed::Held::Event(self.ring, Box::new(e))),
+            );
         }
         feed::trim(&mut self.feed, feed::KEEP);
-        if self.ev_sel.is_some_and(|seq| !feed::holds(&self.feed, seq)) {
+        if self.ev_sel.is_some_and(|key| !feed::holds(&self.feed, key)) {
             self.ev_sel = None;
         }
     }
@@ -475,9 +485,15 @@ impl App {
                 let hit = |id: &String| {
                     snap.and_then(|s| s.asks.iter().find(|a| &a.correlation_id == id))
                         .is_some_and(|a| {
-                            [&a.from_peer, &a.to_peer_id, &a.text]
-                                .iter()
-                                .any(|t| t.to_lowercase().contains(&query))
+                            let id = a.correlation_id.strip_prefix("ask-");
+                            [
+                                id.unwrap_or(&a.correlation_id),
+                                &a.from_peer,
+                                &a.to_peer_id,
+                                &a.text,
+                            ]
+                            .iter()
+                            .any(|t| t.to_lowercase().contains(&query))
                         })
                 };
                 let n = order.len() as i32;
@@ -510,19 +526,17 @@ impl App {
     }
 
     /* the events screen's keys: j/k move toward newer and older, the newest row following the
-    newest again; e goes to the jobs, a to the asks */
+    newest again; e goes to the jobs, a to the asks, on the selected ask where they list it */
     fn event_key(&mut self, code: KeyCode) -> Act {
-        let seqs: Vec<u64> = feed::items(&self.feed)
-            .iter()
-            .filter_map(|item| item.seq())
-            .collect();
+        let items = feed::items(&self.feed);
+        let keys: Vec<(u64, u64)> = items.iter().filter_map(feed::Item::key).collect();
         let act = self.input.key(code, 0);
         /* the events carry no numbers, letters or search */
         self.input.mode = Mode::Normal;
         let at = self
             .ev_sel
-            .and_then(|seq| seqs.iter().position(|s| *s == seq))
-            .unwrap_or(seqs.len().saturating_sub(1));
+            .and_then(|key| keys.iter().position(|k| *k == key))
+            .unwrap_or(keys.len().saturating_sub(1));
         let before = self.ev_sel;
         match act {
             Act::Events => {
@@ -532,6 +546,16 @@ impl App {
                 self.scroll = 0;
             }
             Act::Asks => {
+                let item = self
+                    .ev_sel
+                    .and_then(|key| items.iter().find(|item| item.key() == Some(key)))
+                    .or(items.last());
+                if let Some(ask) = item
+                    .zip(self.snap.as_deref())
+                    .and_then(|(item, snap)| feed::opens(item, snap))
+                {
+                    self.ask_sel = Some(ask.correlation_id.clone());
+                }
                 self.events = false;
                 self.full = false;
                 self.scroll = 0;
@@ -552,10 +576,10 @@ impl App {
                 self.full = open;
                 self.scroll = 0;
             }
-            _ if seqs.is_empty() => {}
+            _ if keys.is_empty() => {}
             Act::Move(d) => {
-                let next = (at as i32 + d).clamp(0, seqs.len() as i32 - 1) as usize;
-                self.ev_sel = (next + 1 < seqs.len()).then(|| seqs[next]);
+                let next = (at as i32 + d).clamp(0, keys.len() as i32 - 1) as usize;
+                self.ev_sel = (next + 1 < keys.len()).then(|| keys[next]);
             }
             _ => {}
         }
@@ -1050,6 +1074,11 @@ impl App {
             }
             _ => "j/k move  1-9 jump  enter card  a jobs".into(),
         };
+        let footer = if self.input.mode == Mode::Normal {
+            self.copy_notice().unwrap_or(footer)
+        } else {
+            footer
+        };
         g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
         walk(&mut g, tick, self.moving());
         let mut lines = self.lines(&g, cols, rows);
@@ -1124,11 +1153,11 @@ impl App {
         }
         let at = self
             .ev_sel
-            .and_then(|seq| items.iter().position(|item| item.seq() == Some(seq)))
+            .and_then(|key| items.iter().position(|item| item.key() == Some(key)))
             .unwrap_or(items.len() - 1);
         let prefix = self.snap.as_ref().map_or("", |snap| layout::prefix(snap));
         let list = feed::rows(&items, cols, prefix);
-        let card = |fit| feed::card(&items[at], cols, fit, prefix);
+        let card = |fit| feed::card(&items[at], cols, fit, self.snap.as_deref());
         let list_h = if self.full { 0 } else { list.len() + 1 };
         let least = if self.full {
             0

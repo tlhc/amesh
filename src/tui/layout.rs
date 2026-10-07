@@ -1657,12 +1657,38 @@ fn compact_route(name: &str, ask: &Ask, room: usize) -> String {
     .unwrap_or_else(|| fit(name, room))
 }
 
-fn card_keys(text: &str) -> Row {
+/* a card's key row: y and Y copy its first two commands, then what else it offers, then how
+to open or leave the full card; a compact card short of room keeps only the keys */
+pub(super) fn key_row(actions: &[(&str, String)], more: &[&str], size: Fit, colw: usize) -> String {
+    let line = |copy: &str, last: &str| {
+        ["y", "Y"]
+            .iter()
+            .zip(actions)
+            .map(|(k, (action, _))| format!("{k} {copy}{action}"))
+            .chain(more.iter().map(|m| m.to_string()))
+            .chain([last.to_string()])
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    match size {
+        Fit::Whole => line("copy ", "esc back"),
+        Fit::Rows(_) => {
+            let keys = line("copy ", "⏎ full card");
+            if width(&keys) <= colw {
+                keys
+            } else {
+                fit(&line("", "⏎"), colw)
+            }
+        }
+    }
+}
+
+pub(super) fn card_keys(text: &str) -> Row {
     text.split_inclusive(' ')
         .map(|part| {
             (
                 part.to_string(),
-                if matches!(part.trim(), "y" | "Y" | "⏎" | "esc") {
+                if matches!(part.trim(), "y" | "Y" | "a" | "⏎" | "esc") {
                     Tone::Near
                 } else {
                     Tone::Dim
@@ -2088,22 +2114,7 @@ pub(crate) fn card(
         );
     }
     let room = colw.saturating_sub(KEY);
-    let keys_for = |copy: &str, last: &str| {
-        let mut parts: Vec<String> = ["y", "Y"]
-            .iter()
-            .zip(&actions)
-            .map(|(k, (action, _))| format!("{k} {copy}{action}"))
-            .collect();
-        parts.push(last.into());
-        parts.join(" · ")
-    };
-    let mut keys = match size {
-        Fit::Whole => keys_for("copy ", "esc back"),
-        Fit::Rows(_) => keys_for("copy ", "⏎ full card"),
-    };
-    if matches!(size, Fit::Rows(_)) && width(&keys) > colw {
-        keys = fit(&keys_for("", "⏎"), colw);
-    }
+    let keys = key_row(&actions, &[], size, colw);
     if matches!(size, Fit::Rows(1 | 2)) {
         let mut grid = Grid::default();
         let mut col = 0;

@@ -5302,7 +5302,7 @@ fn the_compact_ask_card_leads_with_why_and_names_the_route() {
             "badge, lead and route tones:\n{text}"
         );
         assert!(
-            ["nudge", "close", "times", "│ to "]
+            ["│ nudge ", "│ close ", "times", "│ to "]
                 .iter()
                 .all(|word| !text.contains(word)),
             "no parties, times or commands:\n{text}"
@@ -5335,10 +5335,11 @@ fn the_compact_ask_card_leads_with_why_and_names_the_route() {
     assert_eq!(lines[1], "│ from    claude-code▸pi-2                   │");
     assert!(
         lines[2].starts_with("│ text    word")
-            && lines[8].starts_with("│         word")
-            && lines[8].ends_with("… │")
+            && lines[7].starts_with("│         word")
+            && lines[7].ends_with("… │")
+            && lines[8].starts_with("│ ⏎ full card ")
             && lines[9].starts_with('└'),
-        "the question takes every row left:\n{}",
+        "the question takes every row left above the key row:\n{}",
         lines.join("\n")
     );
     let wide = card(&odd, "ask-f00d0001", 46).text();
@@ -5381,7 +5382,7 @@ fn the_busy_asks_screen_lists_the_wait_first_as_designed() {
             "│         arm64 box and post the table       │",
             "│                                            │",
             "│                                            │",
-            "│                                            │",
+            "│ ⏎ full card                                │",
             "└────────────────────────────────────────────┘",
             "j/k move  1-9 jump  enter card  a jobs",
         ]
@@ -6043,6 +6044,233 @@ fn the_smallest_pane_still_lists_the_selected_ask() {
     );
 }
 
+/* y and Y copy the selected ask's first and second command over the jobs screen's OSC 52 path
+and footer notice, controls stripped; an ask without one copies nothing, and neither does the
+events screen over the asks */
+#[test]
+fn y_and_shift_y_copy_the_selected_asks_commands() {
+    let mut snap = fan_out();
+    snap.asks[1]
+        .actions
+        .as_mut()
+        .unwrap()
+        .push(crate::wire::AskAction::CloseLeft);
+    let mut app = app_with(snap);
+    app.key(KeyCode::Char('a'));
+    screen_text(&mut app, 100, 30);
+    let mut bytes = Vec::new();
+    assert_eq!(app.key(KeyCode::Char('y')), Act::Copy(0));
+    app.copy_command(0, false, &mut bytes);
+    assert_eq!(
+        bytes,
+        b"\x1b]52;c;YW1lc2ggcGVlciBub3RpZnkgb3BlbmhpdGxzLXNtMi1vcHQtcGkgJ2FzayBhM2EwIHdhaXRzIGZvciB5b3VyIGFjayc=\x07"
+    );
+    assert_eq!(
+        screen_text(&mut app, 100, 30).last().unwrap(),
+        "sent to clipboard (OSC 52): amesh peer notify openhitls-sm2-opt-pi 'ask a3a0 waits for your ack'"
+    );
+    bytes.clear();
+    assert_eq!(app.key(KeyCode::Char('Y')), Act::Copy(1));
+    app.copy_command(1, false, &mut bytes);
+    assert_eq!(
+        bytes,
+        b"\x1b]52;c;YW1lc2ggcGVlciBhY2sgYXNrLWEzYTA3YjUxIC0tZmFpbGVkIHRydWUgLS1tZXNzYWdlICdyZWNpcGllbnQgbGVmdCc=\x07"
+    );
+    bytes.clear();
+    app.key(KeyCode::Char('e'));
+    app.copy_command(0, false, &mut bytes);
+    assert!(bytes.is_empty(), "the events screen copies nothing");
+    app.key(KeyCode::Char('a'));
+    app.key(KeyCode::Char('j'));
+    app.copy_command(0, false, &mut bytes);
+    assert!(bytes.is_empty(), "a recipient at work needs no command");
+    let mut prompt = app_with(fan_out());
+    prompt.key(KeyCode::Char('a'));
+    prompt.copy_command(0, true, &mut Vec::new());
+    prompt.key(KeyCode::Char('/'));
+    assert_eq!(
+        screen_text(&mut prompt, 100, 30).last().map(String::as_str),
+        Some("/_"),
+        "a search prompt keeps the footer from the copy notice"
+    );
+    let mut odd = fan_out();
+    odd.asks[1].actions = Some(vec![crate::wire::AskAction::Nudge {
+        to: "p\u{1}i\n".into(),
+    }]);
+    let mut app = app_with(odd);
+    app.key(KeyCode::Char('a'));
+    app.copy_command(0, false, &mut bytes);
+    assert_eq!(
+        bytes,
+        b"\x1b]52;c;YW1lc2ggcGVlciBub3RpZnkgJ3BpJyAnYXNrIGEzYTAgd2FpdHMgZm9yIHlvdXIgYWNrJw==\x07"
+    );
+}
+
+/* the ask card ends in its key row: y names the command it copies, then enter opens the full
+card or esc leaves it; a compact card short of room keeps only the keys, and the row sits
+below both columns and within the rows the list leaves the card */
+#[test]
+fn the_ask_card_ends_in_its_key_row() {
+    let mut short = app_with(fan_out());
+    short.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut short, 46, 15);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("│ y copy nudge · ⏎ full card")),
+        "a short pane keeps the keys:\n{}",
+        lines.join("\n")
+    );
+    let mut snap = fan_out();
+    snap.asks[1].text = "word ".repeat(40);
+    let card = |snap: &Snapshot, cid: &str, cols: usize, size: Fit| {
+        let ask = snap.asks.iter().find(|a| a.correlation_id == cid).unwrap();
+        super::asks::card(&as_frame(snap), ask, 1, cols, None, size)
+    };
+    let keys = |g: &Grid| g.text().lines().rev().nth(1).unwrap().to_string();
+    for (cid, cols, size, row) in [
+        (
+            "ask-a3a07b51",
+            46,
+            Fit::Rows(10),
+            "│ y copy nudge · ⏎ full card                 │",
+        ),
+        (
+            "ask-a3a07b51",
+            46,
+            Fit::Whole,
+            "│ y copy nudge · esc back                    │",
+        ),
+        (
+            "ask-1223c9e0",
+            46,
+            Fit::Rows(10),
+            "│ ⏎ full card                                │",
+        ),
+        (
+            "ask-1223c9e0",
+            46,
+            Fit::Whole,
+            "│ esc back                                   │",
+        ),
+        (
+            "ask-a3a07b51",
+            100,
+            Fit::Rows(10),
+            "│ y copy nudge · ⏎ full card                      │                                                │",
+        ),
+        (
+            "ask-a3a07b51",
+            100,
+            Fit::Whole,
+            "│ y copy nudge · esc back                         │                                                │",
+        ),
+    ] {
+        let g = card(&snap, cid, cols, size);
+        assert_eq!(keys(&g), row, "{cols} {size:?}:\n{}", g.text());
+    }
+    snap.asks[1]
+        .actions
+        .as_mut()
+        .unwrap()
+        .push(crate::wire::AskAction::CloseLeft);
+    let g = card(&snap, "ask-a3a07b51", 46, Fit::Rows(10));
+    assert_eq!(keys(&g), "│ y copy nudge · Y copy close · ⏎ full card  │");
+    let g = card(&snap, "ask-a3a07b51", 44, Fit::Rows(10));
+    assert_eq!(keys(&g), "│ y nudge · Y close · ⏎                    │");
+    let (r, c) = find(&g, "y nudge · Y close · ⏎");
+    assert_eq!(
+        [0, 2, 10, 12, 20].map(|i| tone_at(&g, r, c + i)),
+        [Tone::Near, Tone::Dim, Tone::Near, Tone::Dim, Tone::Near]
+    );
+    let mut app = app_with(busy_asks());
+    app.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut app, 46, 19);
+    assert_eq!(
+        lines[lines.len() - 3],
+        "│ ⏎ full card                                │",
+        "the list gives way first:\n{}",
+        lines.join("\n")
+    );
+    let busy = busy_asks();
+    for ask in &busy.asks {
+        for cols in [30, 46, 60, 100] {
+            for h in 1..=12 {
+                let g = super::asks::card(&as_frame(&busy), ask, 1, cols, None, Fit::Rows(h));
+                assert!(
+                    g.height() <= h.max(3) && keys(&g).contains('⏎'),
+                    "{} at {cols}x{h}:\n{}",
+                    ask.correlation_id,
+                    g.text()
+                );
+            }
+        }
+    }
+}
+
+/* / finds an ask by its whole correlation id, from another row */
+#[test]
+fn find_matches_the_ask_id() {
+    let mut app = app_with(busy_asks());
+    app.key(KeyCode::Char('a'));
+    screen_text(&mut app, 46, 24);
+    for query in ["5d0c", "11e2"] {
+        app.key(KeyCode::Char('j'));
+        app.key(KeyCode::Char('/'));
+        for c in query.chars() {
+            app.key(KeyCode::Char(c));
+        }
+        app.key(KeyCode::Enter);
+        assert_eq!(app.ask_sel.as_deref(), Some("ask-5d0c11e2"), "/{query}");
+    }
+    let mut quiet = busy_asks();
+    for ask in quiet.asks.iter_mut() {
+        ask.text = "no match here".into();
+    }
+    let mut app = app_with(quiet);
+    app.key(KeyCode::Char('a'));
+    screen_text(&mut app, 46, 24);
+    let first = app.ask_sel.clone();
+    app.key(KeyCode::Char('/'));
+    for c in "ask".chars() {
+        app.key(KeyCode::Char(c));
+    }
+    app.key(KeyCode::Enter);
+    app.key(KeyCode::Char('n'));
+    assert_eq!(app.ask_sel, first, "the ids' ask- prefix is no match");
+}
+
+/* the asks rows' sender and recipient, whole or cut to fit, and the full card's parties read
+in the worker role; the arrows keep their tones */
+#[test]
+fn ask_names_read_in_the_worker_role() {
+    let snap = fan_out();
+    let rows = super::asks::rows(&as_frame(&snap), &super::asks::order(&snap), 100);
+    let route = |row: &Vec<(String, Tone)>| (row[3].1, row[4].clone(), row[5].1);
+    assert_eq!(
+        route(&rows[0]),
+        (Tone::Soft, ("─▸─".to_string(), Tone::Dim), Tone::Soft)
+    );
+    assert_eq!(
+        route(&rows[2]),
+        (Tone::Soft, (">".to_string(), Tone::Plain), Tone::Soft)
+    );
+    let mut all = fan_out();
+    all.roster.clear();
+    let rows = super::asks::rows(&as_frame(&all), &super::asks::order(&all), 46);
+    assert_eq!(
+        (rows[0][3].0.starts_with('…'), rows[0][3].1),
+        (true, Tone::Soft),
+        "{:?}",
+        rows[0]
+    );
+    let g = super::asks::card(&as_frame(&snap), &snap.asks[1], 1, 46, None, Fit::Whole);
+    for k in ["│ from ", "│ to "] {
+        let (r, _) = find(&g, k);
+        assert_eq!(tone_at(&g, r, 10), Tone::Soft, "{k}:\n{}", g.text());
+    }
+}
+
 /* the screen at `tick`, one string a line */
 fn screen_at(app: &mut App, cols: usize, tick: usize) -> Vec<String> {
     app.screen(cols, 40, tick)
@@ -6621,11 +6849,32 @@ fn events_app(events: Vec<model::Event>) -> App {
     app
 }
 
+/* fan_out()'s asks as the hub records them: an event for each recipient, all from one sender
+with one text in one second, numbered from `seq` */
+fn fan_events(seq: u64) -> Vec<model::Event> {
+    fan_out()
+        .asks
+        .iter()
+        .zip(seq..)
+        .map(|(ask, n)| model::Event {
+            at: Some(1000 + seq),
+            correlation_id: ask.correlation_id.clone(),
+            ..ev(
+                n,
+                "ask",
+                &ask.from_peer,
+                &ask.to_peer,
+                "review the SM2 sign path",
+            )
+        })
+        .collect()
+}
+
 fn held_seqs(app: &App) -> Vec<Option<u64>> {
     app.feed
         .iter()
         .map(|h| match h {
-            super::feed::Held::Event(e) => e.seq,
+            super::feed::Held::Event(_, e) => e.seq,
             super::feed::Held::Restart(_) => None,
         })
         .collect()
@@ -6706,7 +6955,7 @@ fn a_hub_that_numbers_no_events_is_read_whole() {
         .feed
         .iter()
         .filter_map(|h| match h {
-            super::feed::Held::Event(e) => Some(e.message.clone()),
+            super::feed::Held::Event(_, e) => Some(e.message.clone()),
             super::feed::Held::Restart(_) => None,
         })
         .collect();
@@ -6748,7 +6997,7 @@ fn the_rows_read_time_kind_route_and_text() {
         [
             "00:16:41 ask    claude-code▸pi  list the modules",
             "00:16:42 ack ●  pi▸claude-code  seven modules",
-            "00:16:43 notify amesh▸claude-code  job j1 is stalled",
+            "00:16:43 hub    ▸claude-code  job j1 is stalled",
             "00:16:44 bcast  claude-code▸3 peers  deploying at ten",
             "00:16:47 chat   claude-code (user)  hello there",
         ]
@@ -6758,7 +7007,7 @@ fn the_rows_read_time_kind_route_and_text() {
         [
             "00:16 ask    claude-code▸pi  list the modules",
             "00:16 ack ●  pi▸claude-code  seven modules",
-            "00:16 notify amesh▸claude-code  job j1 is sta…",
+            "00:16 hub    ▸claude-code  job j1 is stalled",
             "00:16 bcast  claude-code▸3 peers  deploying a…",
             "00:16 chat   claude-code (user)  hello there",
         ],
@@ -6798,13 +7047,13 @@ fn an_ack_says_how_it_ended_without_the_hubs_marker() {
     );
     let items = super::feed::items(&app.feed);
     let rows = super::feed::rows(&items, 46, "");
-    assert_eq!(cell(&rows[0], "ack ●"), Tone::Done);
-    assert_eq!(cell(&rows[1], "ack ×"), Tone::Fail);
-    let card = |i: usize| super::feed::card(&items[i], 46, Fit::Whole, "");
+    assert_eq!(cell(&rows[0], "●"), Tone::Done);
+    assert_eq!(cell(&rows[1], "×"), Tone::Fail);
+    let card = |i: usize| super::feed::card(&items[i], 46, Fit::Whole, None);
     for (i, mark) in [
         (0, ('●', Tone::Done)),
         (1, ('×', Tone::Fail)),
-        (2, ('•', Tone::Plain)),
+        (2, ('•', Tone::Dim)),
     ] {
         let corner = card(i).rows[&0][&1];
         assert_eq!(
@@ -6910,7 +7159,7 @@ fn a_hub_restart_leaves_a_divider_and_takes_the_new_ring() {
             .position(|l| l.contains(needle))
             .unwrap_or_else(|| panic!("no {needle}:\n{}", lines.join("\n")))
     };
-    let divider = "─── hub restarted 00:20:00 ───";
+    let divider = "─── hub restarted 00:20:00 · ";
     assert!(at("before") < at(divider));
     assert!(
         at(divider) < at("after"),
@@ -6922,8 +7171,10 @@ fn a_hub_restart_leaves_a_divider_and_takes_the_new_ring() {
         "one divider per restart"
     );
     assert!(
-        screen_text(&mut app, 46, 40).iter().any(|l| l == divider),
-        "a narrow pane keeps the divider's seconds"
+        screen_text(&mut app, 46, 40)
+            .iter()
+            .any(|l| l.starts_with("─── hub restarted 00:20 ─")),
+        "a narrow pane gives the divider's minutes"
     );
 }
 
@@ -7097,6 +7348,460 @@ fn a_hub_upgraded_to_number_its_events_is_read_by_seq_again() {
     assert!(
         !lines.iter().any(|l| l.contains("numbers no events")),
         "the unnumbered events of an earlier ring say nothing about this one: {lines:?}"
+    );
+}
+
+#[test]
+fn asks_from_one_sender_with_one_text_in_one_second_are_one_row() {
+    let mut app = events_app(fan_events(1));
+    let rows: Vec<String> = screen_text(&mut app, 46, 24)
+        .into_iter()
+        .filter(|l| l.starts_with("00:16"))
+        .collect();
+    assert_eq!(rows, ["00:16 ask    claude-code▸3 peers  review the …"]);
+    let ask = |seq, at, from: &str, text: &str| model::Event {
+        at,
+        ..ev(seq, "ask", from, PI, text)
+    };
+    let sizes = |events: Vec<model::Event>| -> Vec<usize> {
+        let held: Vec<super::feed::Held> = events
+            .into_iter()
+            .map(|e| super::feed::Held::Event(0, Box::new(e)))
+            .collect();
+        super::feed::items(&held)
+            .iter()
+            .map(|item| match item {
+                super::feed::Item::Event(_, group) => group.len(),
+                super::feed::Item::Restart(_) => 0,
+            })
+            .collect()
+    };
+    let one = || ask(1, Some(5), CC, "q");
+    assert_eq!(
+        sizes(vec![one(), ask(2, Some(6), CC, "q")]),
+        [1, 1],
+        "another second"
+    );
+    assert_eq!(
+        sizes(vec![one(), ask(2, Some(5), CODEX, "q")]),
+        [1, 1],
+        "another sender"
+    );
+    assert_eq!(
+        sizes(vec![one(), ask(2, Some(5), CC, "r")]),
+        [1, 1],
+        "another text"
+    );
+    assert_eq!(
+        sizes(vec![
+            one(),
+            ev(2, "notify", CC, PI, "n"),
+            ask(3, Some(5), CC, "q")
+        ]),
+        [1, 1, 1],
+        "an event between"
+    );
+    assert_eq!(
+        sizes(vec![ask(1, None, CC, "q"), ask(2, None, CC, "q")]),
+        [1, 1],
+        "no second to share"
+    );
+}
+
+#[test]
+fn an_asks_card_lists_each_recipient_as_the_asks_screen_orders_them() {
+    let gone = model::Event {
+        seq: Some(1),
+        to_peer: "openhitls-sm2-opt-gemini".into(),
+        correlation_id: "ask-0000beef".into(),
+        ..fan_events(2).remove(0)
+    };
+    let mut events = vec![gone];
+    events.extend(fan_events(2));
+    let mut app = events_app(events);
+    let snap = fan_out();
+    app.apply(Ok(snap.clone()));
+    let to = |app: &mut App, rows| -> Vec<String> {
+        let lines = screen_text(app, 46, rows);
+        let from = lines.iter().position(|l| l.starts_with("│ from")).unwrap();
+        let text = lines.iter().position(|l| l.starts_with("│ text")).unwrap();
+        lines[from + 1..text].to_vec()
+    };
+    assert_eq!(
+        to(&mut app, 24),
+        [
+            "│ to      pi     ◆ IDLE 1m     a3a0          │",
+            "│         pi-2   ◆ working 3m  1223          │",
+            "│         codex  ● acked ok    a904          │",
+            "│         gemini                             │",
+        ],
+        "the asks screen's order, and a name alone for an ask the snapshot lost"
+    );
+    let items = super::feed::items(&app.feed);
+    let card = super::feed::card(&items[0], 46, Fit::Rows(0), Some(&snap));
+    let tone = |needle: &str, offset: usize| {
+        let (r, c) = find(&card, needle);
+        tone_at(&card, r, c + offset)
+    };
+    assert_eq!(tone("◆ IDLE", 0), Tone::Run);
+    assert_eq!(tone("◆ IDLE", 2), Tone::PillWait);
+    assert_eq!(
+        tone("IDLE 1m", 7),
+        Tone::Plain,
+        "the pill ends with its word"
+    );
+    assert!(
+        card.text().lines().next().unwrap().contains(" · 4 peers "),
+        "{}",
+        card.text()
+    );
+    assert_eq!(tone("a3a0", 0), Tone::Dim);
+    assert_eq!(tone("gemini", 0), Tone::Soft);
+    assert_eq!(
+        tone("a open in asks", 0),
+        Tone::Near,
+        "the a key reads as a key"
+    );
+    app.key(KeyCode::Enter);
+    assert_eq!(
+        to(&mut app, 40),
+        [
+            "│ to      openhitls-sm2-opt-pi               │",
+            "│         ◆ IDLE 1m     a3a0                 │",
+            "│         openhitls-sm2-opt-pi-2             │",
+            "│         ◆ working 3m  1223                 │",
+            "│         openhitls-sm2-opt-codex            │",
+            "│         ● acked ok    a904                 │",
+            "│         openhitls-sm2-opt-gemini           │",
+        ],
+        "whole names too wide for the state beside them put it under them"
+    );
+    let far = model::Event {
+        to_peer: "a-very-long-recipient-name-with-a-distinctive-ending".into(),
+        correlation_id: "ask-0000feed".into(),
+        ..fan_events(2).remove(0)
+    };
+    let held = vec![super::feed::Held::Event(0, Box::new(far))];
+    let card = super::feed::card(&super::feed::items(&held)[0], 30, Fit::Whole, Some(&snap));
+    assert!(
+        card.text()
+            .replace(['│', ' ', '\n'], "")
+            .contains("a-very-long-recipient-name-with-a-distinctive-ending"),
+        "a name wider than the card wraps whole:\n{}",
+        card.text()
+    );
+    let mut hand = fan_out();
+    hand.asks[2].state = Some(crate::wire::AskState::Closed {
+        outcome: crate::wire::AskOutcome::HandOk,
+        failed_effective: false,
+    });
+    let held: Vec<super::feed::Held> = fan_events(2)
+        .into_iter()
+        .map(|e| super::feed::Held::Event(0, Box::new(e)))
+        .collect();
+    let card = super::feed::card(&super::feed::items(&held)[0], 30, Fit::Whole, Some(&hand)).text();
+    assert!(
+        ["a3a0", "1223", "a904"].iter().all(|id| card.contains(id)),
+        "a long state is cut before an id is lost:\n{card}"
+    );
+}
+
+#[test]
+fn a_opens_the_asks_screen_on_the_selected_ask_where_it_lists_it() {
+    let mut events = fan_events(1);
+    events.extend([
+        model::Event {
+            correlation_id: "ask-a904f2d6".into(),
+            ..ev(4, "ack", CODEX, CC, "2 findings, both fixed")
+        },
+        model::Event {
+            correlation_id: "ask-0000beef".into(),
+            ..ev(5, "ask", CC, PI, "an ask the hub no longer holds")
+        },
+    ]);
+    let mut app = events_app(events);
+    app.apply(Ok(busy_asks()));
+    let keys = |app: &mut App| {
+        screen_text(app, 46, 24)
+            .into_iter()
+            .find(|l| l.contains("full card"))
+            .unwrap()
+    };
+    app.key(KeyCode::Char('k'));
+    app.key(KeyCode::Char('k'));
+    assert!(
+        keys(&mut app).starts_with("│ a open in asks · ⏎ full card "),
+        "{}",
+        keys(&mut app)
+    );
+    app.key(KeyCode::Char('a'));
+    assert!(app.asks && !app.events);
+    assert_eq!(
+        app.ask_sel.as_deref(),
+        Some("ask-a3a07b51"),
+        "the fan-out's ask the asks screen lists first, not that screen's first row"
+    );
+    app.key(KeyCode::Char('e'));
+    assert!(
+        keys(&mut app).starts_with("│ ⏎ full card "),
+        "an ask the asks screen does not list offers no a: {}",
+        keys(&mut app)
+    );
+    app.key(KeyCode::Char('a'));
+    assert_eq!(
+        app.ask_sel.as_deref(),
+        Some("ask-a3a07b51"),
+        "the asks screen keeps its own selection"
+    );
+    app.key(KeyCode::Char('e'));
+    app.key(KeyCode::Char('k'));
+    assert!(
+        keys(&mut app).starts_with("│ ⏎ full card "),
+        "an ack is not an ask: {}",
+        keys(&mut app)
+    );
+    app.key(KeyCode::Char('a'));
+    assert_eq!(app.ask_sel.as_deref(), Some("ask-a3a07b51"));
+}
+
+#[test]
+fn a_notice_from_the_hub_reads_hub_and_names_only_its_recipient() {
+    let mut app = events_app(vec![
+        ev(1, "notify", "amesh", CC, "job j1 is stalled"),
+        ev(2, "notify", "amesh-pi", CC, "a peer named like the hub"),
+        ev(3, "broadcast", "amesh", CC, "not a notice"),
+    ]);
+    let rows: Vec<String> = screen_text(&mut app, 100, 40)
+        .into_iter()
+        .filter(|l| l.starts_with("00:16"))
+        .collect();
+    assert_eq!(
+        rows,
+        [
+            "00:16:41 hub    ▸claude-code  job j1 is stalled",
+            "00:16:42 notify amesh-pi▸claude-code  a peer named like the hub",
+            "00:16:43 bcast  amesh▸claude-code  not a notice",
+        ]
+    );
+    let items = super::feed::items(&app.feed);
+    let head = super::feed::card(&items[0], 46, Fit::Rows(0), None).text();
+    assert!(head.starts_with("┌• hub · "), "{head}");
+}
+
+#[test]
+fn event_rows_name_peers_soft_and_colour_only_asks_hub_notices_and_ack_glyphs() {
+    use layout::Tone::{Dim, Done, Fail, Near, Plain, Soft, Wait};
+    let app = events_app(vec![
+        ev(1, "ask", CC, PI, "q"),
+        ev(2, "ack", PI, CC, "a"),
+        model::Event {
+            failed: Some(true),
+            ..ev(3, "ack", PI, CC, "broke")
+        },
+        ev(4, "notify", "amesh", CC, "job j1 is stalled"),
+        ev(5, "notify", CC, PI, "n"),
+        ev(6, "broadcast", CC, PI, "b"),
+    ]);
+    let items = super::feed::items(&app.feed);
+    let rows = super::feed::rows(&items, 46, "openhitls-sm2-opt-");
+    let tones = |i: usize| -> Vec<layout::Tone> { rows[i].iter().map(|(_, t)| *t).collect() };
+    assert_eq!(tones(0), [Dim, Near, Soft, Plain], "{:?}", rows[0]);
+    assert_eq!(tones(1), [Dim, Dim, Done, Soft, Plain], "{:?}", rows[1]);
+    assert_eq!(
+        (rows[1][1].0.as_str(), rows[1][2].0.as_str()),
+        ("ack ", "●  "),
+        "an ack keeps its six columns"
+    );
+    assert_eq!(tones(2), [Dim, Dim, Fail, Soft, Plain], "{:?}", rows[2]);
+    assert_eq!(tones(3), [Dim, Wait, Soft, Plain], "{:?}", rows[3]);
+    assert_eq!(tones(4), [Dim, Dim, Soft, Plain], "{:?}", rows[4]);
+    assert_eq!(tones(5), [Dim, Dim, Soft, Plain], "{:?}", rows[5]);
+}
+
+#[test]
+fn the_restart_row_is_a_rule_across_the_pane() {
+    let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
+    let mut snap = app.snap.clone().unwrap().view;
+    snap.hub_epoch = "e2".into();
+    snap.captured_at = 1200;
+    app.apply(Ok(snap));
+    app.take_events(Ok(vec![ev(1, "ask", "cc", "pi", "after")]));
+    let row = |app: &mut App, cols| {
+        screen_text(app, cols, 24)
+            .into_iter()
+            .find(|l| l.contains("hub restarted"))
+            .unwrap()
+    };
+    let narrow = format!("─── hub restarted 00:20 {}", "─".repeat(22));
+    assert_eq!(row(&mut app, 46), narrow);
+    assert_eq!(
+        row(&mut app, 100),
+        format!(
+            "─── hub restarted 00:20:00 · the rows above came from the previous hub process {}",
+            "─".repeat(21)
+        )
+    );
+    let items = super::feed::items(&app.feed);
+    assert_eq!(
+        super::feed::rows(&items, 46, "")[1],
+        [(narrow, Tone::Line)],
+        "the whole row is the rule's colour"
+    );
+    assert_eq!(
+        super::feed::rows(&items, 20, "")[1],
+        [("─── hub restarted 0…".to_string(), Tone::Line)],
+        "a pane too narrow for even the minutes cuts the row"
+    );
+}
+
+#[test]
+fn the_selection_keeps_to_its_ring_when_the_new_ring_repeats_its_seqs() {
+    let mut app = events_app(vec![
+        ev(5, "notify", "cc", "pi", "old five"),
+        ev(6, "notify", "cc", "pi", "old six"),
+    ]);
+    let mut snap = app.snap.clone().unwrap().view;
+    snap.hub_epoch = "e2".into();
+    snap.captured_at = 1200;
+    app.apply(Ok(snap));
+    app.take_events(Ok(vec![
+        ev(5, "notify", "cc", "pi", "new five"),
+        ev(6, "notify", "cc", "pi", "new six"),
+    ]));
+    let text = |app: &mut App| {
+        screen_text(app, 100, 40)
+            .into_iter()
+            .find(|l| l.starts_with("│ from"))
+            .unwrap()
+    };
+    app.key(KeyCode::Char('k'));
+    assert_eq!(app.ev_sel, Some((1, 5)));
+    assert!(text(&mut app).contains("new five"), "{}", text(&mut app));
+    app.key(KeyCode::Char('k'));
+    assert!(text(&mut app).contains("old six"), "{}", text(&mut app));
+    app.key(KeyCode::Char('j'));
+    assert!(text(&mut app).contains("new five"), "{}", text(&mut app));
+    /* the old ring goes, and its restart with it */
+    app.take_events(Ok((10..508)
+        .map(|s| ev(s, "notify", "cc", "pi", "n"))
+        .collect()));
+    assert!(!app
+        .feed
+        .iter()
+        .any(|h| matches!(h, super::feed::Held::Restart(_))));
+    assert!(
+        text(&mut app).contains("new five"),
+        "the selection stays on its event, now in the first ring: {}",
+        text(&mut app)
+    );
+}
+
+#[test]
+fn the_selection_never_lands_on_another_hub_run() {
+    let restart = |app: &mut App, epoch: &str| {
+        let mut snap = app.snap.clone().unwrap().view;
+        snap.hub_epoch = epoch.into();
+        snap.captured_at = 1200;
+        app.apply(Ok(snap));
+    };
+    let shown = |app: &mut App| {
+        screen_text(app, 100, 40)
+            .into_iter()
+            .find(|l| l.starts_with("│ from"))
+            .unwrap()
+    };
+    let mut app = events_app(vec![
+        ev(5, "notify", "cc", "pi", "old five"),
+        ev(6, "notify", "cc", "pi", "old six"),
+    ]);
+    app.key(KeyCode::Char('k'));
+    assert_eq!(app.ev_sel, Some((0, 5)));
+    restart(&mut app, "e2");
+    app.take_events(Ok((5..505)
+        .map(|s| ev(s, "notify", "cc", "pi", "new"))
+        .collect()));
+    assert_eq!(
+        app.ev_sel, None,
+        "its ring went with the oldest rows, so the newest is followed again"
+    );
+    let mut app = events_app(vec![ev(1, "notify", "cc", "pi", "e1 one")]);
+    for epoch in ["e2", "e3"] {
+        restart(&mut app, epoch);
+        app.take_events(Ok(vec![
+            ev(5, "notify", "cc", "pi", &format!("{epoch} five")),
+            ev(6, "notify", "cc", "pi", &format!("{epoch} six")),
+        ]));
+    }
+    app.key(KeyCode::Char('k'));
+    assert!(
+        shown(&mut app).contains("e3 five"),
+        "two restarts in one second keep their rows apart: {}",
+        shown(&mut app)
+    );
+}
+
+#[test]
+fn the_events_card_keeps_its_keys_however_short_the_pane() {
+    let mut events: Vec<model::Event> = (1..=20).map(|s| ev(s, "notify", CC, PI, "n")).collect();
+    let fan = fan_events(21);
+    let lost = |seq, to: &str| model::Event {
+        seq: Some(seq),
+        to_peer: to.into(),
+        correlation_id: format!("ask-{seq:08}"),
+        ..fan[0].clone()
+    };
+    events.extend(fan.iter().cloned());
+    events.extend([lost(24, "x"), lost(25, "y")]);
+    let mut app = events_app(events);
+    app.apply(Ok(fan_out()));
+    let lines = screen_text(&mut app, 46, 24).join("\n");
+    assert!(
+        lines.contains("\n│ from    claude-code "),
+        "the list gives way to the card down to all it needs:\n{lines}"
+    );
+    for (rows, why) in [
+        (24, "the card the list leaves is shorter than all it holds"),
+        (14, "a short pane"),
+        (8, "a pane with no room for the card's frame"),
+    ] {
+        let lines = screen_text(&mut app, 46, rows);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("a open in asks · ⏎ full card")),
+            "{why}:\n{}",
+            lines.join("\n")
+        );
+    }
+}
+
+#[test]
+fn the_events_card_ends_in_its_keys_under_a_text_it_marks_as_cut() {
+    let long = (1..=30)
+        .map(|n| format!("line {n}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut app = events_app(vec![ev(1, "notify", CC, PI, &long)]);
+    let card = |app: &mut App, cols| -> Vec<String> {
+        let lines = screen_text(app, cols, 40);
+        let top = lines.iter().position(|l| l.starts_with('┌')).unwrap();
+        let end = lines.iter().position(|l| l.starts_with('└')).unwrap();
+        lines[top..end].to_vec()
+    };
+    let compact = card(&mut app, 46);
+    assert_eq!(
+        compact[compact.len() - 2..],
+        [
+            format!("│         line 28…{}│", " ".repeat(27)),
+            format!("│ ⏎ full card{}│", " ".repeat(32)),
+        ]
+    );
+    app.key(KeyCode::Enter);
+    let full = card(&mut app, 100);
+    assert!(
+        full.last().unwrap().starts_with("│ esc back "),
+        "the full card's keys come under its text:\n{}",
+        full.join("\n")
     );
 }
 
