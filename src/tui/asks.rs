@@ -5,7 +5,7 @@ use super::model::{Ask, Frame, Snapshot};
 use crate::wire::{AskAction, AskOutcome, AskState, Liveness, Progress};
 
 /* a preview narrower than this tells nothing, so the row leaves it out */
-const PREVIEW_MIN: usize = 16;
+pub(crate) const PREVIEW_MIN: usize = 16;
 /* reply or why lines the card shows under the list; the full card shows them all */
 const REPLY_ROWS: usize = 4;
 
@@ -24,9 +24,7 @@ pub(crate) fn order(snap: &Snapshot) -> Vec<&Ask> {
             Some(AskState::Open {
                 progress: Progress::Idle { since, .. },
             }) => (1, Some(*since)),
-            Some(AskState::Open {
-                progress: Progress::Gone | Progress::Offline,
-            }) => (2, ask.opened_at),
+            _ if needs(ask) => (2, ask.opened_at),
             _ => (3, ask.opened_at),
         };
         (class, at.is_none(), at)
@@ -37,6 +35,20 @@ pub(crate) fn order(snap: &Snapshot) -> Vec<&Ask> {
             .then_with(|| a.correlation_id.cmp(&b.correlation_id))
     });
     asks
+}
+
+/* an open ask a person must act on: its recipient at a prompt, idle, gone or offline, the
+classes asks::order lists first */
+pub(crate) fn needs(ask: &Ask) -> bool {
+    matches!(
+        ask.state,
+        Some(AskState::Open {
+            progress: Progress::Wait { .. }
+                | Progress::Idle { .. }
+                | Progress::Gone
+                | Progress::Offline,
+        })
+    )
 }
 
 /* whether the view holds asks no job points at, which the job screen then points to */
@@ -131,6 +143,17 @@ fn closed_line(outcome: &AskOutcome) -> (String, Tone) {
 pub(crate) fn state(snap: &Snapshot, ask: &Ask) -> (String, Tone) {
     let now = snap.captured_at;
     match ask.state.as_ref() {
+        Some(AskState::Open {
+            progress: Progress::Pending { .. },
+        }) if snap
+            .peer_by_id(&ask.to_peer_id)
+            .is_some_and(|peer| matches!(peer.liveness, Some(Liveness::Online))) =>
+        {
+            (
+                format!("no activity {}", ago(now, ask.opened_at)),
+                Tone::Run,
+            )
+        }
         Some(AskState::Open { progress }) => open_line(now, ask.opened_at, progress),
         Some(AskState::Closed { outcome, .. }) => closed_line(outcome),
         _ if ask.open => waiting(now, ask.opened_at),
@@ -157,7 +180,7 @@ fn fit_end(text: &str, max: usize) -> String {
     format!("…{}", tail.into_iter().collect::<String>())
 }
 
-fn pad(text: &str, to: usize) -> String {
+pub(crate) fn pad(text: &str, to: usize) -> String {
     format!("{text}{}", " ".repeat(to.saturating_sub(width(text))))
 }
 
@@ -347,6 +370,18 @@ pub(crate) fn card(
     full_text: Option<(&str, Option<&str>)>,
     size: Fit,
 ) -> Grid {
+    card_in(snap, ask, num, cols, full_text, size, layout::framed)
+}
+
+pub(crate) fn card_in(
+    snap: &Frame,
+    ask: &Ask,
+    num: usize,
+    cols: usize,
+    full_text: Option<(&str, Option<&str>)>,
+    size: Fit,
+    frame: layout::Framing,
+) -> Grid {
     let now = snap.captured_at;
     let (two, colw) = layout::columns(cols);
     let room = colw.saturating_sub(KEY);
@@ -459,5 +494,5 @@ pub(crate) fn card(
         (false, ..) => word,
     };
     let head = format!(" {num} ask {} · {head_state} ", short(&ask.correlation_id));
-    layout::framed(glyph(ask), &head, badge, &left, &right, cols)
+    frame(glyph(ask), &head, badge, &left, &right, cols)
 }

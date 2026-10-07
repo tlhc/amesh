@@ -1705,6 +1705,17 @@ pub(crate) fn card(
     full_text: Option<(&str, Option<&str>)>,
     size: Fit,
 ) -> Grid {
+    card_in(v, id, cols, full_text, size, framed)
+}
+
+pub(crate) fn card_in(
+    v: &View,
+    id: &str,
+    cols: usize,
+    full_text: Option<(&str, Option<&str>)>,
+    size: Fit,
+    frame: Framing,
+) -> Grid {
     #[cfg(test)]
     if matches!(size, Fit::Whole) {
         WHOLE_CARDS.with(|n| n.set(n.get() + 1));
@@ -2224,8 +2235,12 @@ pub(crate) fn card(
     if keep_stage {
         head.push_str(&stage);
     }
-    framed(glyph(state), &head, badge, &left, &right, cols)
+    frame(glyph(state), &head, badge, &left, &right, cols)
 }
+
+/* how a card's parts are framed: `framed` on the screens, `boxed` on HOME */
+pub(crate) type Framing =
+    fn((char, Tone), &str, Option<(&str, Tone)>, &[Row], &[Row], usize) -> Grid;
 
 /* a card's frame: the glyph, the head and a badge at its right end in the top border, the
 left rows and, in a wide pane, the right rows beside them */
@@ -2283,5 +2298,75 @@ pub(crate) fn framed(
         r += 1;
     }
     g.put(r, 0, &format!("└{}┘", "─".repeat(cols - 2)), Tone::Line);
+    g
+}
+
+/* a box's top edge on HOME: the corner and one stroke, the head from column 3 cut to the room
+the tail leaves, then the line and the tail */
+pub(crate) fn edge(w: usize, head: Row, tail: Row) -> Row {
+    let mut room = w.saturating_sub(3 + tail.iter().map(|(text, _)| width(text)).sum::<usize>());
+    let mut out: Row = vec![("┌─ ".into(), Tone::Line)];
+    for (text, tone) in head {
+        if room == 0 {
+            break;
+        }
+        let text = fit(&text, room);
+        room -= width(&text);
+        out.push((text, tone));
+    }
+    if room > 0 {
+        out.push((format!(" {}", "─".repeat(room - 1)), Tone::Line));
+    }
+    out.extend(tail);
+    out
+}
+
+/* HOME's box around a card laid out for `cols`: a column wider for the gutter, the glyph and head
+on the edge from column 3, the badge a stroke from the corner, the rows from column 3 */
+pub(crate) fn boxed(
+    mark: (char, Tone),
+    head: &str,
+    badge: Option<(&str, Tone)>,
+    left: &[Row],
+    right: &[Row],
+    cols: usize,
+) -> Grid {
+    debug_assert!(right.is_empty(), "a card on HOME has one column");
+    if cols < 2 {
+        return Grid::default();
+    }
+    let (w, colw) = (cols + 1, columns(cols).1);
+    let mut tail: Row = badge
+        .map(|(text, tone)| (text.to_string(), tone))
+        .into_iter()
+        .collect();
+    tail.push(("─┐".into(), Tone::Line));
+    let head = vec![
+        (mark.0.to_string(), mark.1),
+        (head.trim_end().to_string(), Tone::Title),
+    ];
+    let mut g = Grid::default();
+    let mut col = 0;
+    for (text, tone) in edge(w, head, tail) {
+        col = g.put(0, col, &text, tone);
+    }
+    for (i, row) in left.iter().enumerate() {
+        g.put(i + 1, 0, "│", Tone::Line);
+        let mut col = 3;
+        for (text, tone) in row {
+            let room = (3 + colw).saturating_sub(col);
+            if room == 0 {
+                break;
+            }
+            col = g.put(i + 1, col, &fit(text, room), *tone);
+        }
+        g.put(i + 1, w - 1, "│", Tone::Line);
+    }
+    g.put(
+        left.len() + 1,
+        0,
+        &format!("└{}┘", "─".repeat(w - 2)),
+        Tone::Line,
+    );
     g
 }

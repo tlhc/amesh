@@ -77,6 +77,21 @@ pub(crate) struct App {
     ev_sel: Option<(u64, u64)>,
     ev_error: Option<String>,
     epoch: String,
+    /* HOME is up instead of the screens; its one selection, the rows of the last HOME frame it
+    can move to, top to bottom, and the job the card of a selected chain showed there */
+    home: bool,
+    home_sel: Option<Pick>,
+    home_rows: Vec<Pick>,
+    home_job: Option<String>,
+}
+
+/* what HOME's selection is on: an ask, a chain by its block's first job, or an event by its hub
+run and seq */
+#[derive(Clone, Debug, PartialEq)]
+enum Pick {
+    Ask(String),
+    Chain(String),
+    Event((u64, u64)),
 }
 
 /* a chain or the loose block, numbered 1..n; base counts the jobs in the blocks above */
@@ -105,13 +120,17 @@ impl App {
             return;
         }
         let snap = self.snap.as_ref();
-        let commands = match self.asks {
-            true => snap
-                .and_then(|s| s.ask(self.ask_sel.as_deref()))
-                .map(asks::commands),
-            false => snap
-                .and_then(|s| s.job(self.sel.as_deref()?))
-                .map(layout::job_commands),
+        /* HOME copies from the card it shows */
+        let (ask, job) = match (self.home, &self.home_sel) {
+            (true, Some(Pick::Ask(cid))) => (Some(cid.as_str()), None),
+            (true, Some(Pick::Chain(_))) => (None, self.home_job.as_deref()),
+            (true, _) => (None, None),
+            (false, _) if self.asks => (self.ask_sel.as_deref(), None),
+            (false, _) => (None, self.sel.as_deref()),
+        };
+        let commands = match ask {
+            Some(_) => snap.and_then(|s| s.ask(ask)).map(asks::commands),
+            None => snap.and_then(|s| s.job(job?)).map(layout::job_commands),
         };
         let Some((_, command)) = commands.into_iter().flatten().nth(index) else {
             return;
@@ -164,6 +183,10 @@ impl App {
             ev_sel: None,
             ev_error: None,
             epoch: String::new(),
+            home: true,
+            home_sel: None,
+            home_rows: Vec::new(),
+            home_job: None,
         }
     }
 
@@ -323,6 +346,9 @@ impl App {
     }
 
     pub fn key(&mut self, code: KeyCode) -> Act {
+        if self.home {
+            return self.home_key(code);
+        }
         if self.events {
             return self.event_key(code);
         }
@@ -340,6 +366,7 @@ impl App {
         let Some((b, p)) = self.settle(&blocks) else {
             let act = self.input.key(code, 0);
             match act {
+                Act::Jobs | Act::Card(false) => self.go_home(),
                 Act::Asks => self.flip(),
                 Act::Events => self.open_events(),
                 _ => {}
@@ -380,10 +407,12 @@ impl App {
                 let next = (b as i32 + d).rem_euclid(blocks.len() as i32) as usize;
                 self.sel = blocks[next].order.first().cloned();
             }
+            Act::Card(false) if !self.full => self.go_home(),
             Act::Card(open) => {
                 self.full = open;
                 self.scroll = 0;
             }
+            Act::Jobs => self.go_home(),
             Act::Asks => self.flip(),
             Act::Events => self.open_events(),
             Act::Timeline => self.timeline = !self.timeline,
@@ -458,7 +487,8 @@ impl App {
             .unwrap_or(0);
         let before = self.ask_sel.clone();
         match act {
-            Act::Asks => self.flip(),
+            Act::Asks => self.go_home(),
+            Act::Jobs => self.flip(),
             Act::Events => self.open_events(),
             Act::Move(d) if self.full => {
                 self.scroll = self.scroll.saturating_add_signed(d as isize);
@@ -469,6 +499,7 @@ impl App {
                     .saturating_add_signed(d as isize * self.page as isize);
             }
             Act::Edge(d) if self.full => self.scroll = if d < 0 { 0 } else { usize::MAX },
+            Act::Card(false) if !self.full => self.go_home(),
             Act::Card(open) => {
                 self.full = open;
                 self.scroll = 0;
@@ -517,6 +548,94 @@ impl App {
         act
     }
 
+    /* HOME from any screen: a full card closes and no screen stays up under it */
+    fn go_home(&mut self) {
+        self.home = true;
+        self.asks = false;
+        self.events = false;
+        self.full = false;
+        self.scroll = 0;
+    }
+
+    /* HOME's keys: j/k move through the rows it shows, tab and backtab through its chains; c, a
+    and e open their screen on the selection where it belongs there, enter the selection's own
+    screen with its full card. Nothing else acts and no mode starts */
+    fn home_key(&mut self, code: KeyCode) -> Act {
+        let act = self.input.key(code, 0);
+        self.input.mode = Mode::Normal;
+        let rows = &self.home_rows;
+        let at = rows.iter().position(|p| Some(p) == self.home_sel.as_ref());
+        let go = match (act, &self.home_sel) {
+            (Act::Card(true), Some(Pick::Ask(_))) => Act::Asks,
+            (Act::Card(true), Some(Pick::Chain(_))) => Act::Jobs,
+            (Act::Card(true), Some(Pick::Event(_))) => Act::Events,
+            _ => act,
+        };
+        match go {
+            Act::Move(d) => {
+                if let Some(at) = at {
+                    let next = (at as i32 + d).clamp(0, rows.len() as i32 - 1) as usize;
+                    self.home_sel = Some(rows[next].clone());
+                }
+            }
+            /* tab from a row that is no chain takes the first chain, backtab the last */
+            Act::Chain(d) => {
+                let chains: Vec<&Pick> = rows
+                    .iter()
+                    .filter(|p| matches!(p, Pick::Chain(_)))
+                    .collect();
+                let next = match chains
+                    .iter()
+                    .position(|p| Some(*p) == self.home_sel.as_ref())
+                {
+                    Some(i) => i as i32 + d,
+                    None if d > 0 => 0,
+                    None => -1,
+                };
+                if !chains.is_empty() {
+                    let next = next.rem_euclid(chains.len() as i32) as usize;
+                    self.home_sel = Some(chains[next].clone());
+                }
+            }
+            Act::Jobs => {
+                if let Some(Pick::Chain(_)) = self.home_sel {
+                    self.sel = self.home_job.clone();
+                }
+                self.home = false;
+            }
+            Act::Asks => {
+                let ask = match &self.home_sel {
+                    Some(Pick::Ask(cid)) => Some(cid.clone()),
+                    Some(Pick::Event(key)) => {
+                        let items = feed::items(&self.feed);
+                        let item = items.iter().find(|item| item.key() == Some(*key));
+                        item.zip(self.snap.as_deref())
+                            .and_then(|(item, snap)| feed::opens(item, snap))
+                            .map(|ask| ask.correlation_id.clone())
+                    }
+                    _ => None,
+                };
+                if ask.is_some() {
+                    self.ask_sel = ask;
+                }
+                self.home = false;
+                self.flip();
+            }
+            Act::Events => {
+                self.home = false;
+                self.open_events();
+                if let Some(Pick::Event(key)) = self.home_sel {
+                    self.ev_sel = Some(key);
+                }
+            }
+            _ => {}
+        }
+        if act == Act::Card(true) && !self.home {
+            self.full = true;
+        }
+        act
+    }
+
     /* the events screen over the jobs or the asks, following the newest */
     fn open_events(&mut self) {
         self.events = true;
@@ -526,7 +645,7 @@ impl App {
     }
 
     /* the events screen's keys: j/k move toward newer and older, the newest row following the
-    newest again; e goes to the jobs, a to the asks, on the selected ask where they list it */
+    newest again; c goes to the jobs, a to the asks, on the selected ask where they list it */
     fn event_key(&mut self, code: KeyCode) -> Act {
         let items = feed::items(&self.feed);
         let keys: Vec<(u64, u64)> = items.iter().filter_map(feed::Item::key).collect();
@@ -539,7 +658,8 @@ impl App {
             .unwrap_or(keys.len().saturating_sub(1));
         let before = self.ev_sel;
         match act {
-            Act::Events => {
+            Act::Events => self.go_home(),
+            Act::Jobs => {
                 self.events = false;
                 self.asks = false;
                 self.full = false;
@@ -572,6 +692,7 @@ impl App {
                     .saturating_add_signed(d as isize * self.page as isize);
             }
             Act::Edge(d) if self.full => self.scroll = if d < 0 { 0 } else { usize::MAX },
+            Act::Card(false) if !self.full => self.go_home(),
             Act::Card(open) => {
                 self.full = open;
                 self.scroll = 0;
@@ -600,7 +721,7 @@ impl App {
         let blocks = self.blocks();
         /* settling picks a job and starts its card at the top; the asks screen keeps its own
         place in the card it shows */
-        let settled = if self.asks || self.events {
+        let settled = if self.asks || self.events || self.home {
             None
         } else {
             self.settle(&blocks)
@@ -628,6 +749,9 @@ impl App {
                 self.held = (lines.len(), self.snaps);
             }
             peer_rows = self.held.0.min(cap);
+        }
+        if self.home {
+            return self.home_screen(g, &blocks, peer_rows, cols, rows, tick);
         }
         if self.events {
             return self.events_screen(g, peer_rows, cols, rows);
@@ -691,7 +815,7 @@ impl App {
         let cur = &blocks[b];
         /* one row per block above the rule, leaving the view at least three rows */
         let rows_free = rows.saturating_sub(peer_rows + 6).clamp(1, 4);
-        let chains = strip(&blocks, b, &snap, cols, rows_free);
+        let chains = strip(&blocks, Some(b), &snap, cols, rows_free, false);
         for (r, row) in chains.iter().enumerate() {
             let mut c = 0;
             for (text, tone) in row {
@@ -962,12 +1086,12 @@ impl App {
             (None, None) => Some(("waiting for the hub".to_string(), "")),
             (_, Some(snap)) if !snap.capabilities.ask_list => Some((
                 "this hub lists only the asks of jobs; restart it on the current amesh".to_string(),
-                "a: back to the jobs",
+                "a: back",
             )),
             (Some(error), Some(snap)) if empty(snap) => Some((self.stale(error), "")),
             (None, Some(snap)) if empty(snap) => Some((
                 "no asks here yet".to_string(),
-                "asks appear when a peer calls amesh_ask; a: back to the jobs",
+                "asks appear when a peer calls amesh_ask; a: back",
             )),
             _ => None,
         };
@@ -1070,9 +1194,9 @@ impl App {
             (_, true) if cols >= 96 => "j/k ↑↓ scroll  space/b page  g/G top/end  esc back".into(),
             (_, true) => "j/k scroll  space/b page  esc back".into(),
             _ if cols >= 96 => {
-                "j/k ↑↓ move  digits jump  / find  enter card  esc back  a jobs".into()
+                "j/k ↑↓ move  digits jump  / find  enter card  esc back  c jobs".into()
             }
-            _ => "j/k move  1-9 jump  enter card  a jobs".into(),
+            _ => "j/k move  1-9 jump  enter card  c jobs".into(),
         };
         let footer = if self.input.mode == Mode::Normal {
             self.copy_notice().unwrap_or(footer)
@@ -1136,8 +1260,8 @@ impl App {
         let footer = match self.full {
             true if cols >= 96 => "j/k ↑↓ scroll  space/b page  g/G top/end  esc back",
             true => "j/k scroll  space/b page  esc back",
-            false if cols >= 96 => "j/k ↑↓ move  enter card  esc back  e jobs  a asks",
-            false => "j/k move  enter card  e jobs  a asks",
+            false if cols >= 96 => "j/k ↑↓ move  enter card  esc back  c jobs  a asks",
+            false => "j/k move  enter card  c jobs  a asks",
         };
         g.put(rows - 1, 0, &layout::fit(footer, cols), Tone::Dim);
         let top = peer_rows + 3;
@@ -1145,7 +1269,7 @@ impl App {
         let items = feed::items(&self.feed);
         if items.is_empty() {
             g.put(top, 0, &layout::fit("no events yet", cols), Tone::Warn);
-            let hint = "events appear as peers ask, ack, notify and broadcast; e: back to the jobs";
+            let hint = "events appear as peers ask, ack, notify and broadcast; e: back";
             for (r, line) in layout::wrap(hint, cols).iter().enumerate() {
                 g.put(top + 1 + r, 0, line, Tone::Dim);
             }
@@ -1156,7 +1280,7 @@ impl App {
             .and_then(|key| items.iter().position(|item| item.key() == Some(key)))
             .unwrap_or(items.len() - 1);
         let prefix = self.snap.as_ref().map_or("", |snap| layout::prefix(snap));
-        let list = feed::rows(&items, cols, prefix);
+        let list = feed::rows(&items, cols, prefix, false);
         let card = |fit| feed::card(&items[at], cols, fit, self.snap.as_deref());
         let list_h = if self.full { 0 } else { list.len() + 1 };
         let least = if self.full {
@@ -1198,17 +1322,329 @@ impl App {
         lines
     }
 
+    /* HOME: the asks, the chains and the newest events, each in a box of its own, and the card of
+    the one selection; the boxes stack above the card in a narrow pane and stand left of it in a
+    wide one, the first carrying the freshness. The default selection's card sets the rows the
+    boxes get, so moving the selection never moves them */
+    fn home_screen(
+        &mut self,
+        mut g: Grid,
+        blocks: &[Block],
+        peer_rows: usize,
+        cols: usize,
+        rows: usize,
+        tick: usize,
+    ) -> Vec<Line<'static>> {
+        let Some(snap) = self.snap.clone() else {
+            let text = self.error.as_deref().unwrap_or("waiting for the hub");
+            let lines = layout::wrap(text, cols);
+            for (r, line) in lines.iter().take(rows - 1 - peer_rows).enumerate() {
+                g.put(peer_rows + r, 0, line, Tone::Warn);
+            }
+            self.home_rows.clear();
+            self.home_sel = None;
+            self.home_footer(&mut g, cols, rows, false);
+            return self.lines(&g, cols, rows);
+        };
+        let put = |g: &mut Grid, r: usize, c: usize, row: &[(String, Tone)]| {
+            row.iter()
+                .fold(c, |c, (text, tone)| g.put(r, c, text, *tone))
+        };
+        /* what went wrong with the data on a row of its own: the snapshot read, else the events */
+        let trouble = self.error_lead().map(|(text, _)| text).or_else(|| {
+            let error = self.ev_error.as_deref()?;
+            Some(match error.contains(crate::cli::DAEMON_UNREACHABLE) {
+                true => "! events: hub unreachable".to_string(),
+                false => format!("! events: {error}"),
+            })
+        });
+        if let Some(text) = &trouble {
+            g.put(peer_rows, 0, &layout::fit(text, cols), Tone::Dim);
+        }
+        let top = peer_rows + usize::from(trouble.is_some());
+        let items = feed::items(&self.feed);
+        let order = asks::order(&snap);
+        let open: Vec<&model::Ask> = order.iter().copied().filter(|ask| ask.open).collect();
+        /* asks::order lists those that need a person first */
+        let needs = open.iter().filter(|ask| asks::needs(ask)).count();
+        /* the blocks in the order the chains box lists them */
+        let mut ranked: Vec<usize> = (0..blocks.len()).collect();
+        ranked.sort_by_key(|&b| !urgent(&blocks[b], &snap));
+        let first = |b: usize| Pick::Chain(blocks[b].order[0].clone());
+        let default = open
+            .first()
+            .map(|ask| Pick::Ask(ask.correlation_id.clone()))
+            .or_else(|| ranked.first().map(|&b| first(b)))
+            .or_else(|| {
+                items
+                    .iter()
+                    .rev()
+                    .find_map(feed::Item::key)
+                    .map(Pick::Event)
+            });
+        let wide = cols >= 96;
+        let (left_w, card_cols) = if wide {
+            (cols - 47, 45)
+        } else {
+            (cols, cols - 1)
+        };
+        /* a chain's card is its most urgent job's, the first in the block's order on a tie */
+        let chain_job = |first: &str| {
+            let block = blocks.iter().find(|block| block.order[0] == first)?;
+            let job = block
+                .order
+                .iter()
+                .min_by_key(|id| snap.job(id).map_or(u8::MAX, |job| station(job).0))?;
+            Some((block, job.clone()))
+        };
+        let card = |pick: &Pick, size: Fit| match pick {
+            Pick::Ask(cid) => {
+                let at = order.iter().position(|ask| ask.correlation_id == *cid)?;
+                let detail = snap
+                    .ask_detail
+                    .as_ref()
+                    .filter(|d| d.correlation_id == *cid)
+                    .map(|d| (d.text.as_str(), d.reply.as_deref()));
+                Some(asks::card_in(
+                    &snap,
+                    order[at],
+                    at + 1,
+                    card_cols,
+                    detail,
+                    size,
+                    layout::boxed,
+                ))
+            }
+            Pick::Chain(first) => {
+                let (block, job) = chain_job(first)?;
+                let detail = snap
+                    .detail
+                    .as_ref()
+                    .filter(|d| d.job_id == job)
+                    .map(|d| (d.prompt.as_str(), d.result.as_deref()));
+                let view = block.view(snap.clone(), &job);
+                Some(layout::card_in(
+                    &view,
+                    &job,
+                    card_cols,
+                    detail,
+                    size,
+                    layout::boxed,
+                ))
+            }
+            Pick::Event(key) => {
+                let item = items.iter().find(|item| item.key() == Some(*key))?;
+                Some(feed::card_in(
+                    item,
+                    card_cols,
+                    size,
+                    Some(&*snap),
+                    layout::boxed,
+                ))
+            }
+        };
+        /* the rows above the footer: a stacked card takes what the default's needs, then each box
+        in turn takes its two edges and its rows from what is left, the asks after the room
+        the chains need */
+        let avail = rows - 1 - top;
+        let room = match wide {
+            true => avail,
+            false => {
+                let card_h = default.as_ref().and_then(|pick| card(pick, Fit::Rows(0)));
+                avail - card_h.map_or(0, |c| c.height().min(avail))
+            }
+        };
+        let (chain_cap, other_cap, event_cap) = match wide {
+            true => (3, usize::MAX, usize::MAX),
+            false => (2, 3, 5),
+        };
+        let chains_need = match blocks.len() {
+            0 => 0,
+            n => 2 + n.min(chain_cap),
+        };
+        let allowance = room.saturating_sub(2 + chains_need);
+        let need_rows = needs.min(allowance);
+        let others = open.len() - needs;
+        let other_rows = others.min(other_cap.min(allowance).saturating_sub(need_rows));
+        let cost = |n: usize| if n > 0 { n + 2 } else { 0 };
+        let left = room - cost(need_rows + other_rows);
+        let chain_rows = chain_cap.min(blocks.len()).min(left.saturating_sub(2));
+        let left = left - cost(chain_rows);
+        let event_rows = event_cap.min(items.len()).min(left.saturating_sub(2));
+        let shown_asks: Vec<usize> = (0..need_rows).chain(needs..needs + other_rows).collect();
+        let shown_items = &items[items.len() - event_rows..];
+        let picks: Vec<Pick> = shown_asks
+            .iter()
+            .map(|&i| Pick::Ask(open[i].correlation_id.clone()))
+            .chain(ranked[..chain_rows].iter().map(|&b| first(b)))
+            .chain(
+                shown_items
+                    .iter()
+                    .filter_map(feed::Item::key)
+                    .map(Pick::Event),
+            )
+            .collect();
+        /* a selection this frame does not show becomes the default where that shows, else the
+        first row; with no row to show the card is the default's */
+        let sel = [self.home_sel.take(), default.clone()]
+            .into_iter()
+            .flatten()
+            .find(|pick| picks.contains(pick))
+            .or_else(|| picks.first().cloned())
+            .or(default);
+        let mark = |pick: Option<Pick>| {
+            let on = pick.is_some() && pick == sel;
+            ((if on { "▸ " } else { "  " }).to_string(), Tone::Near)
+        };
+        let listed = asks::rows(&snap, &open, left_w - 3);
+        let ask_band: Vec<layout::Row> = shown_asks
+            .iter()
+            .map(|&i| {
+                let mut row = listed[i].clone();
+                row[0] = mark(Some(Pick::Ask(open[i].correlation_id.clone())));
+                row
+            })
+            .collect();
+        let sel_block = match &sel {
+            Some(Pick::Chain(id)) => blocks.iter().position(|block| block.order[0] == *id),
+            _ => None,
+        };
+        let more_blocks = usize::from(blocks.len() > chain_rows);
+        let mut chain_band = strip(
+            blocks,
+            sel_block,
+            &snap,
+            left_w - 3,
+            chain_rows + more_blocks,
+            true,
+        );
+        chain_band.truncate(chain_rows);
+        let prefix = layout::prefix(&snap);
+        let event_band: Vec<layout::Row> = feed::rows(shown_items, left_w - 5, prefix, true)
+            .into_iter()
+            .zip(shown_items)
+            .map(|(row, item)| [vec![mark(item.key().map(Pick::Event))], row].concat())
+            .collect();
+        let more = |all: usize, shown: usize, what: &str| {
+            (all > shown).then(|| format!("+{}{what}", all - shown))
+        };
+        let mut ask_counts = vec![match needs {
+            0 => format!("{} open", open.len()),
+            n => format!("{n} need you"),
+        }];
+        ask_counts.extend(more(needs, need_rows, " need you"));
+        ask_counts.extend(more(others, other_rows, ""));
+        let mut chain_counts = vec![blocks.len().to_string()];
+        chain_counts.extend(more(blocks.len(), chain_rows, ""));
+        let (kept, newest) = feed::kept(&self.feed);
+        let mut event_counts = vec![format!("{kept} kept")];
+        event_counts.extend(newest.map(|at| format!("newest {}", layout::clock(Some(at)))));
+        let bands = [
+            ("asks", ask_counts, ask_band),
+            ("chains", chain_counts, chain_band),
+            ("events", event_counts, event_band),
+        ];
+        let bands: Vec<_> = bands
+            .into_iter()
+            .filter(|(.., body)| !body.is_empty())
+            .collect();
+        let mut r = top;
+        for (i, (name, counts, body)) in bands.iter().enumerate() {
+            let head = vec![
+                (name.to_string(), Tone::Title),
+                (format!(" · {}", counts.join(" · ")), Tone::Dim),
+            ];
+            let tail = match i {
+                0 => vec![
+                    (" ".into(), Tone::Line),
+                    self.freshness(),
+                    (" ─┐".into(), Tone::Line),
+                ],
+                _ => vec![("─┐".into(), Tone::Line)],
+            };
+            put(&mut g, r, 0, &layout::edge(left_w, head, tail));
+            for (k, row) in body.iter().enumerate() {
+                put(&mut g, r + 1 + k, 1, row);
+            }
+            /* the last box of a wide pane's left column ends where the card does */
+            let bottom = match wide && i + 1 == bands.len() {
+                true => rows - 2,
+                false => r + 1 + body.len(),
+            };
+            for row in r + 1..bottom {
+                g.put(row, 0, "│", Tone::Line);
+                g.put(row, left_w - 1, "│", Tone::Line);
+            }
+            g.put(
+                bottom,
+                0,
+                &format!("└{}┘", "─".repeat(left_w - 2)),
+                Tone::Line,
+            );
+            r = bottom + 1;
+        }
+        let (card_top, card_x, card_h) = match wide {
+            true => (top, cols - 46, avail),
+            false => (r, 0, rows - 1 - r),
+        };
+        let card = sel
+            .as_ref()
+            .filter(|_| card_h >= 3)
+            .and_then(|pick| card(pick, Fit::Rows(card_h)));
+        if let Some(card) = card {
+            for (cr, row) in &card.rows {
+                for (cc, cell) in row.iter().filter(|(_, cell)| cell.ch != SPACER) {
+                    g.put(card_top + cr, card_x + cc, &cell.ch.to_string(), cell.tone);
+                }
+            }
+        }
+        self.home_job = match &sel {
+            Some(Pick::Chain(id)) => chain_job(id).map(|(_, job)| job),
+            _ => None,
+        };
+        self.home_sel = sel;
+        self.home_rows = picks;
+        let nothing = open.is_empty() && blocks.is_empty() && items.is_empty();
+        if nothing {
+            let text = layout::fit("no open asks, jobs or events yet", cols);
+            let taken = g.put(top, 0, &text, Tone::Dim);
+            self.message_end(&mut g, top, taken, cols, None);
+        }
+        self.home_footer(&mut g, cols, rows, bands.is_empty() && !nothing);
+        walk(&mut g, tick, self.moving());
+        self.lines(&g, cols, rows)
+    }
+
+    /* HOME's keys on the last row, or the copy notice; `fresh` ends the row in the freshness
+    when no box carries it */
+    fn home_footer(&self, g: &mut Grid, cols: usize, rows: usize, fresh: bool) {
+        let keys = match cols >= 96 {
+            true => "j/k ↑↓ move  tab chain  enter card  c jobs  a asks  e events",
+            false => "j/k move  c jobs  a asks  e events  enter card",
+        };
+        let footer = self.copy_notice().unwrap_or(keys.into());
+        let room = cols.saturating_sub(if fresh { self.mark_room() } else { 0 });
+        let taken = g.put(rows - 1, 0, &layout::fit(&footer, room), Tone::Dim);
+        if fresh {
+            self.message_end(g, rows - 1, taken, cols, None);
+        }
+    }
+
     /* the full texts the card wants: the selected job's, or on the asks screen the ask's; the
-    events screen wants the events instead */
+    events screen wants the events instead, and HOME both, for the card it shows */
     fn wanted(&self) -> Want {
-        let detail = match (self.events, self.asks) {
-            (true, _) => None,
-            (false, true) => self.ask_sel.as_ref().map(|cid| format!("ask={cid}")),
-            (false, false) => self.sel.as_ref().map(|id| format!("detail={id}")),
+        let detail = match (self.home, &self.home_sel, self.events, self.asks) {
+            (true, Some(Pick::Ask(cid)), ..) => Some(format!("ask={cid}")),
+            (true, Some(Pick::Chain(_)), ..) => {
+                self.home_job.as_ref().map(|id| format!("detail={id}"))
+            }
+            (true, ..) | (false, _, true, _) => None,
+            (false, _, false, true) => self.ask_sel.as_ref().map(|cid| format!("ask={cid}")),
+            (false, _, false, false) => self.sel.as_ref().map(|id| format!("detail={id}")),
         };
         Want {
             detail,
-            events: self.events,
+            events: self.events || self.home,
         }
     }
 
@@ -1847,22 +2283,17 @@ fn stop_on_signals(stop: &Arc<AtomicBool>) {
 
 /* one row per block, the selected one marked: a station per stage (its most urgent job),
 done/total, then what needs a person. Blocks with a failure or a person to answer come
-first; at most three rows and a count of the rest, and the selected block always shows */
+first; at most three rows and a count of the rest, and the selected block always shows.
+HOME's rows keep the selected name and the done count plain */
 fn strip(
     blocks: &[Block],
-    b: usize,
+    b: Option<usize>,
     snap: &Snapshot,
     cols: usize,
     rows: usize,
+    home: bool,
 ) -> Vec<layout::Row> {
-    let urgent = |i: usize| {
-        blocks[i]
-            .order
-            .iter()
-            .filter_map(|id| snap.job(id))
-            .any(|job| station(job).0 < 2)
-    };
-    let key = |i: &usize| (!urgent(*i), *i);
+    let key = |i: &usize| (!urgent(&blocks[*i], snap), *i);
     let mut order: Vec<usize> = (0..blocks.len()).collect();
     order.sort_by_key(key);
     let shown = match blocks.len() <= rows.min(3) {
@@ -1870,16 +2301,20 @@ fn strip(
         false => rows.saturating_sub(1).clamp(1, 3),
     };
     let mut pick: Vec<usize> = order[..shown].to_vec();
-    if !pick.contains(&b) {
+    if let Some(b) = b.filter(|b| !pick.contains(b)) {
         pick[shown - 1] = b;
         pick.sort_by_key(key);
     }
-    let name_w = pick
-        .iter()
-        .map(|&i| layout::width(block_name(&blocks[i])))
-        .max()
-        .unwrap_or(0)
-        .min(16);
+    let widest = |w: &dyn Fn(usize) -> usize| pick.iter().map(|&i| w(i)).max().unwrap_or(0);
+    let name_w = widest(&|i| layout::width(block_name(&blocks[i]))).min(16);
+    let count_w = widest(&|i| {
+        let (done, total) = count(&blocks[i], snap);
+        layout::width(&done) + layout::width(&total)
+    });
+    /* whole stations pad to the widest run that still leaves every row its count, so the
+    counts and the pills line up */
+    let stations_w = widest(&|i| (2 * stations(&blocks[i], snap).len()).saturating_sub(1))
+        .min(cols.saturating_sub(2 + name_w + 2 + 2 + count_w));
     let rest = blocks.len() - pick.len();
     let more = (rest > 0).then(|| (format!("  +{rest} more"), Tone::Dim));
     let fold = more.is_some() && pick.len() >= rows;
@@ -1896,7 +2331,8 @@ fn strip(
             } else {
                 cols
             };
-            strip_row(&blocks[i], i == b, snap, name_w, row_cols)
+            let widths = (name_w, stations_w, count_w);
+            strip_row(&blocks[i], Some(i) == b, snap, widths, row_cols, home)
         })
         .collect();
     if let Some(more) = more {
@@ -1907,6 +2343,15 @@ fn strip(
         }
     }
     out
+}
+
+/* a block with a failure or a person to answer, which the strip lists first */
+fn urgent(block: &Block, snap: &Snapshot) -> bool {
+    block
+        .order
+        .iter()
+        .filter_map(|id| snap.job(id))
+        .any(|job| station(job).0 < 2)
 }
 
 fn block_name(block: &Block) -> &str {
@@ -1942,11 +2387,9 @@ fn station(job: &model::Job) -> (u8, char, Tone) {
     }
 }
 
-/* the pills give way first, then the stations from the right; done/total stays whole
-and the name shrinks; what still does not fit is cut */
-fn strip_row(block: &Block, sel: bool, snap: &Snapshot, name_w: usize, cols: usize) -> layout::Row {
-    let jobs: Vec<&model::Job> = block.order.iter().filter_map(|id| snap.job(id)).collect();
-    let stations: Vec<(char, Tone)> = block
+/* a station per stage: its most urgent job */
+fn stations(block: &Block, snap: &Snapshot) -> Vec<(char, Tone)> {
+    block
         .chain
         .stages
         .iter()
@@ -1958,7 +2401,31 @@ fn strip_row(block: &Block, sel: bool, snap: &Snapshot, name_w: usize, cols: usi
                 .min_by_key(|s| s.0)
         })
         .map(|(_, ch, tone)| (ch, tone))
-        .collect();
+        .collect()
+}
+
+/* done/total, as the done count and the rest */
+fn count(block: &Block, snap: &Snapshot) -> (String, String) {
+    let jobs: Vec<&model::Job> = block.order.iter().filter_map(|id| snap.job(id)).collect();
+    let done = jobs.iter().filter(|job| job.state == "done").count();
+    (done.to_string(), format!("/{}", jobs.len()))
+}
+
+/* the pills give way first, then the stations from the right; done/total stays whole
+and the name shrinks; what still does not fit is cut. `widths` are the name, stations and
+count columns the strip's rows share */
+fn strip_row(
+    block: &Block,
+    sel: bool,
+    snap: &Snapshot,
+    widths: (usize, usize, usize),
+    cols: usize,
+    home: bool,
+) -> layout::Row {
+    let (name_w, stations_w, counts_w) = widths;
+    let done_tone = if home { Tone::Plain } else { Tone::Done };
+    let jobs: Vec<&model::Job> = block.order.iter().filter_map(|id| snap.job(id)).collect();
+    let stations = stations(block, snap);
     let title = |job: &model::Job| layout::fit(&job.title, 12);
     let mut pills: Vec<(String, Tone)> = jobs
         .iter()
@@ -1976,9 +2443,7 @@ fn strip_row(block: &Block, sel: bool, snap: &Snapshot, name_w: usize, cols: usi
     if pills.is_empty() && running > 0 {
         pills.push((format!("{running} run"), Tone::PillRun));
     }
-    let done = jobs.iter().filter(|job| job.state == "done").count();
-    let count_done = done.to_string();
-    let count_tot = format!("/{}", jobs.len());
+    let (count_done, count_tot) = count(block, snap);
     let count_w = 2 + layout::width(&count_done) + layout::width(&count_tot);
     let body_cols = cols.saturating_sub(count_w);
     let front = |name_max: usize, keep_stations: usize| {
@@ -1988,7 +2453,11 @@ fn strip_row(block: &Block, sel: bool, snap: &Snapshot, name_w: usize, cols: usi
             ((if sel { "▸ " } else { "  " }).into(), Tone::Near),
             (
                 format!("{name}{pad}"),
-                if sel { Tone::Title } else { Tone::Plain },
+                if sel && !home {
+                    Tone::Title
+                } else {
+                    Tone::Plain
+                },
             ),
         ];
         for (i, (ch, tone)) in stations.iter().take(keep_stations).enumerate() {
@@ -2004,9 +2473,14 @@ fn strip_row(block: &Block, sel: bool, snap: &Snapshot, name_w: usize, cols: usi
     };
     let build = |name_max: usize, keep_stations: usize, keep_pills: usize| {
         let mut row = front(name_max, keep_stations);
-        row.push(("  ".into(), Tone::Plain));
-        row.push((count_done.clone(), Tone::Done));
-        row.push((count_tot.clone(), Tone::Dim));
+        let fill = match keep_stations == stations.len() {
+            true => stations_w.saturating_sub((2 * keep_stations).saturating_sub(1)),
+            false => 0,
+        };
+        let total_w = counts_w.saturating_sub(layout::width(&count_done));
+        row.push((" ".repeat(fill + 2), Tone::Plain));
+        row.push((count_done.clone(), done_tone));
+        row.push((asks::pad(&count_tot, total_w), Tone::Dim));
         for (text, tone) in pills.iter().take(keep_pills) {
             row.push((" ".into(), Tone::Plain));
             row.push((format!(" {text} "), *tone));
@@ -2047,7 +2521,7 @@ fn strip_row(block: &Block, sel: bool, snap: &Snapshot, name_w: usize, cols: usi
         }
     }
     out.push(("  ".into(), Tone::Plain));
-    out.push((count_done, Tone::Done));
+    out.push((count_done, done_tone));
     out.push((count_tot, Tone::Dim));
     out
 }

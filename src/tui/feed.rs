@@ -110,17 +110,19 @@ pub(crate) fn items(held: &[Held]) -> Vec<Item<'_>> {
     out
 }
 
+/* how many events are held, and when the newest happened */
+pub(crate) fn kept(held: &[Held]) -> (usize, Option<u64>) {
+    held.iter().fold((0, None), |(n, newest), h| match h {
+        Held::Event(_, e) => (n + 1, newest.max(e.at)),
+        Held::Restart(_) => (n, newest),
+    })
+}
+
 pub(crate) fn header(held: &[Held], all: bool) -> String {
-    let events: Vec<&Event> = held
-        .iter()
-        .filter_map(|h| match h {
-            Held::Event(_, e) => Some(&**e),
-            Held::Restart(_) => None,
-        })
-        .collect();
+    let (n, newest) = kept(held);
     let scope = if all { " · all circles" } else { "" };
-    let head = format!("events{scope} · {} kept", events.len());
-    match events.iter().filter_map(|e| e.at).max() {
+    let head = format!("events{scope} · {n} kept");
+    match newest {
         Some(at) => format!("{head} · newest {}", stamp(Some(at))),
         None => head,
     }
@@ -164,7 +166,7 @@ fn label(kind: &str, (glyph, tone): (char, Tone)) -> Row {
         "broadcast" => "bcast",
         _ => kind,
     };
-    vec![(format!("{:<6} ", fit(word, 6)), tone)]
+    vec![(format!("{} ", asks::pad(&fit(word, 6), 6)), tone)]
 }
 
 fn route(group: &[&Event], prefix: &str) -> String {
@@ -180,10 +182,22 @@ fn route(group: &[&Event], prefix: &str) -> String {
     }
 }
 
-/* one row per item: the time, to the second in a wide pane, the kind, who to whom and the
-text's first line, cut to fit; a restart is a rule across the pane */
-pub(crate) fn rows(items: &[Item], cols: usize, prefix: &str) -> Vec<Row> {
+/* one row per item: the time, to the second in a wide pane, the kind, who to whom in a column
+as wide as the widest route, and the text's first line where asks::PREVIEW_MIN columns are left
+for it; a restart is a rule across the pane. HOME's calm rows give the kind words no colour of
+their own */
+pub(crate) fn rows(items: &[Item], cols: usize, prefix: &str, calm: bool) -> Vec<Row> {
     let wide = layout::columns(cols).0;
+    let time = |at| if wide { stamp(at) } else { clock(at) };
+    let rw = items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Event(_, group) => Some(width(&route(group, prefix))),
+            Item::Restart(_) => None,
+        })
+        .max()
+        .unwrap_or(0)
+        .min(cols.saturating_sub(width(&time(None)) + 1 + 7));
     items
         .iter()
         .map(|item| match item {
@@ -197,19 +211,19 @@ pub(crate) fn rows(items: &[Item], cols: usize, prefix: &str) -> Vec<Row> {
             }
             Item::Event(_, group) => {
                 let e = group[0];
-                let (text, mark) = body(e);
-                let mut row: Row = vec![(
-                    format!("{} ", if wide { stamp(e.at) } else { clock(e.at) }),
-                    Tone::Dim,
-                )];
-                row.extend(label(kind(e), mark));
-                let room = cols.saturating_sub(row.iter().map(|(t, _)| width(t)).sum());
-                let way = fit(&format!("{}  ", route(group, prefix)), room);
-                let rest = room.saturating_sub(width(&way));
+                let (text, (glyph, tone)) = body(e);
+                let tone = match calm && kind(e) != "ack" {
+                    true => Tone::Dim,
+                    false => tone,
+                };
+                let mut row: Row = vec![(format!("{} ", time(e.at)), Tone::Dim)];
+                row.extend(label(kind(e), (glyph, tone)));
+                row.push((asks::pad(&fit(&route(group, prefix), rw), rw), Tone::Soft));
+                let used: usize = row.iter().map(|(t, _)| width(t)).sum();
+                let rest = cols.saturating_sub(used + 2);
                 let first = text.lines().next().unwrap_or("");
-                row.push((way, Tone::Soft));
-                if rest > 0 && !first.is_empty() {
-                    row.push((fit(first, rest), Tone::Plain));
+                if rest >= asks::PREVIEW_MIN && !first.is_empty() {
+                    row.push((format!("  {}", fit(first, rest)), Tone::Plain));
                 }
                 row
             }
@@ -306,6 +320,16 @@ fn recipients(group: &[&Event], snap: Option<&Snapshot>, prefix: &str, room: usi
 topic when it says more than the id, the whole text and the keys; a restart says what it means
 for the rows above it. A card the pane gives no room for its frame is its keys alone */
 pub(crate) fn card(item: &Item, cols: usize, size: Fit, snap: Option<&Snapshot>) -> Grid {
+    card_in(item, cols, size, snap, layout::framed)
+}
+
+pub(crate) fn card_in(
+    item: &Item,
+    cols: usize,
+    size: Fit,
+    snap: Option<&Snapshot>,
+    frame: layout::Framing,
+) -> Grid {
     let prefix = match (size, snap) {
         (Fit::Rows(_), Some(snap)) => layout::prefix(snap),
         _ => "",
@@ -399,5 +423,5 @@ pub(crate) fn card(item: &Item, cols: usize, size: Fit, snap: Option<&Snapshot>)
         Fit::Rows(h) => left.resize(h.saturating_sub(2 + keys.len()), Vec::new()),
     }
     left.extend(keys);
-    layout::framed(mark, &head, None, &left, &right, cols)
+    frame(mark, &head, None, &left, &right, cols)
 }

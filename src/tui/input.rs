@@ -23,6 +23,8 @@ pub(crate) enum Act {
     Chain(i32),
     Card(bool),
     Find(i32),
+    /* the jobs screen, or HOME from it */
+    Jobs,
     /* the asks screen and back */
     Asks,
     /* the events screen and back */
@@ -145,6 +147,7 @@ impl Input {
                 KeyCode::Char('G') | KeyCode::End => Act::Edge(1),
                 KeyCode::Char('n') => Act::Find(1),
                 KeyCode::Char('N') => Act::Find(-1),
+                KeyCode::Char('c') => Act::Jobs,
                 KeyCode::Char('a') => Act::Asks,
                 KeyCode::Char('e') => Act::Events,
                 KeyCode::Char('t') => Act::Timeline,
