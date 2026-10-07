@@ -29,6 +29,9 @@ pub(crate) struct Event {
     pub text: String,
     #[serde(default)]
     pub message: String,
+    /* how an ack's ask ended; an older hub's events carry none */
+    #[serde(default)]
+    pub failed: Option<bool>,
 }
 
 #[cfg(test)]

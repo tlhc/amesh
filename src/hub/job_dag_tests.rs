@@ -253,6 +253,7 @@ async fn job_ack_completes_and_unblocks() {
     let acks = acks_for(&boss, &cid);
     assert_eq!(acks.len(), 1, "{boss:?}");
     assert_eq!(acks[0]["message"], "found 3 stale pages");
+    assert_eq!(acks[0]["failed"], false);
 }
 
 #[tokio::test]
@@ -475,6 +476,7 @@ async fn job_ack_failed_marks_failed() {
     let acks = acks_for(&f.inbox("boss").await, &cid);
     assert_eq!(acks.len(), 1);
     assert_eq!(acks[0]["message"], "[failed] missing fixture");
+    assert_eq!(acks[0]["failed"], true);
 }
 
 #[tokio::test]
@@ -552,7 +554,9 @@ async fn job_update_closes_open_ask() {
         ask.reply.as_deref(),
         Some(format!("amesh: job {a} set to cancelled").as_str())
     );
-    assert_eq!(acks_for(&f.inbox("boss").await, &cid).len(), 1);
+    let acks = acks_for(&f.inbox("boss").await, &cid);
+    assert_eq!(acks.len(), 1);
+    assert_eq!(acks[0]["failed"], true, "the text says it in words only");
 
     f.advance().await;
     assert_eq!(f.row(&a).await.state, "cancelled");
@@ -3116,6 +3120,7 @@ async fn a_hub_close_says_failed_in_the_reply_text() {
             .starts_with("[failed] amesh: recipient's session did not come back"),
         "the text carries the outcome, as a failed ack's does: {ack}"
     );
+    assert_eq!(ack["failed"], true, "{ack}");
 }
 
 #[tokio::test]

@@ -1,4 +1,4 @@
-use super::layout::{self, fit, stamp, width, wrap, Fit, Grid, Row, Tone, KEY};
+use super::layout::{self, brief, clock, fit, stamp, width, wrap, Fit, Grid, Row, Tone, KEY};
 use super::model::Event;
 
 /* events the screen holds at most, as many as the hub keeps */
@@ -109,40 +109,53 @@ pub(crate) fn header(held: &[Held], all: bool) -> String {
     }
 }
 
-fn body(e: &Event) -> &str {
-    if e.text.is_empty() {
+/* an event's text and the glyph and tone of its kind. An ack is × when its ask failed, which
+the hub says in `failed`; an older hub says it only by starting the text with "[failed]", the
+form runtimes read because they render the text alone. A failed ack loses that marker and the
+space after it; any other ack is ● */
+fn body(e: &Event) -> (&str, (char, Tone)) {
+    let text = if e.text.is_empty() {
         &e.message
     } else {
         &e.text
+    };
+    let marked = text.strip_prefix("[failed]");
+    match e.kind.as_str() {
+        "ack" if e.failed.unwrap_or(marked.is_some()) => (
+            marked.map_or(text, |rest| rest.strip_prefix(' ').unwrap_or(rest)),
+            ('×', Tone::Fail),
+        ),
+        "ack" => (text, ('●', Tone::Done)),
+        "ask" => (text, ('•', Tone::Near)),
+        "notify" | "broadcast" => (text, ('•', Tone::Plain)),
+        _ => (text, ('•', Tone::Dim)),
     }
 }
 
-fn tone(kind: &str) -> Tone {
-    match kind {
-        "ask" => Tone::Near,
-        "ack" => Tone::Done,
-        "notify" | "broadcast" => Tone::Plain,
-        _ => Tone::Dim,
-    }
+/* a kind in the list's column, six wide; an ack's glyph says how it ended */
+fn label(kind: &str, glyph: char) -> String {
+    let short = match kind {
+        "broadcast" => "bcast".into(),
+        "ack" => format!("ack {glyph}"),
+        _ => kind.into(),
+    };
+    format!("{:<6}", fit(&short, 6))
 }
 
-/* a kind in the list's column, six wide */
-fn label(kind: &str) -> String {
-    let short = if kind == "broadcast" { "bcast" } else { kind };
-    format!("{:<6}", fit(short, 6))
-}
-
-fn route(group: &[&Event]) -> String {
+fn route(group: &[&Event], prefix: &str) -> String {
     let e = group[0];
+    let from = brief(&e.from_peer, prefix);
     match (e.kind.as_str(), group.len()) {
-        ("chat", _) => format!("{} ({})", e.peer, e.role),
-        (_, 1) => format!("{} → {}", e.from_peer, e.to_peer),
-        (_, n) => format!("{} → {n} peers", e.from_peer),
+        ("chat", _) => format!("{} ({})", brief(&e.peer, prefix), e.role),
+        (_, 1) => format!("{from}▸{}", brief(&e.to_peer, prefix)),
+        (_, n) => format!("{from}▸{n} peers"),
     }
 }
 
-/* one row per item: the time, the kind, who to whom and the text's first line, cut to fit */
-pub(crate) fn rows(items: &[Item], cols: usize) -> Vec<Row> {
+/* one row per item: the time, to the second in a wide pane, the kind, who to whom and the
+text's first line, cut to fit */
+pub(crate) fn rows(items: &[Item], cols: usize, prefix: &str) -> Vec<Row> {
+    let wide = layout::columns(cols).0;
     items
         .iter()
         .map(|item| match item {
@@ -152,14 +165,14 @@ pub(crate) fn rows(items: &[Item], cols: usize) -> Vec<Row> {
             )],
             Item::Event(group) => {
                 let e = group[0];
-                let time = format!("{} ", stamp(e.at));
-                let kind = format!("{} ", label(&e.kind));
+                let (text, (glyph, tone)) = body(e);
+                let time = format!("{} ", if wide { stamp(e.at) } else { clock(e.at) });
+                let kind = format!("{} ", label(&e.kind, glyph));
                 let room = cols.saturating_sub(width(&time) + width(&kind));
-                let way = fit(&format!("{}  ", route(group)), room);
+                let way = fit(&format!("{}  ", route(group, prefix)), room);
                 let rest = room.saturating_sub(width(&way));
-                let first = body(e).lines().next().unwrap_or("");
-                let mut row: Row =
-                    vec![(time, Tone::Dim), (kind, tone(&e.kind)), (way, Tone::Plain)];
+                let first = text.lines().next().unwrap_or("");
+                let mut row: Row = vec![(time, Tone::Dim), (kind, tone), (way, Tone::Plain)];
                 if rest > 0 && !first.is_empty() {
                     row.push((fit(first, rest), Tone::Plain));
                 }
@@ -171,7 +184,12 @@ pub(crate) fn rows(items: &[Item], cols: usize) -> Vec<Row> {
 
 /* the selected row's card: who to whom, the topic when it says more than the id, and the whole
 text; a restart says what it means for the rows above it */
-pub(crate) fn card(item: &Item, cols: usize, size: Fit) -> Grid {
+pub(crate) fn card(item: &Item, cols: usize, size: Fit, prefix: &str) -> Grid {
+    let prefix = if matches!(size, Fit::Whole) {
+        ""
+    } else {
+        prefix
+    };
     let (two, colw) = layout::columns(cols);
     let room = colw.saturating_sub(KEY);
     let (mut left, mut right): (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
@@ -186,18 +204,19 @@ pub(crate) fn card(item: &Item, cols: usize, size: Fit) -> Grid {
         }
         Item::Event(group) => {
             let e = group[0];
+            let (text, mark) = body(e);
             let id = if e.correlation_id.is_empty() {
                 e.id.as_str()
             } else {
                 e.correlation_id.as_str()
             };
             let from = match e.kind.as_str() {
-                "chat" => format!("{} ({})", e.peer, e.role),
-                _ => e.from_peer.clone(),
+                "chat" => route(group, prefix),
+                _ => brief(&e.from_peer, prefix).to_string(),
             };
             layout::wrapped(&mut left, "from", &from, Tone::Soft, colw, usize::MAX);
             if e.kind != "chat" {
-                let to: Vec<&str> = group.iter().map(|r| r.to_peer.as_str()).collect();
+                let to: Vec<&str> = group.iter().map(|r| brief(&r.to_peer, prefix)).collect();
                 layout::wrapped(
                     &mut left,
                     "to",
@@ -210,10 +229,7 @@ pub(crate) fn card(item: &Item, cols: usize, size: Fit) -> Grid {
             if !e.topic.is_empty() && e.topic != id {
                 layout::wrapped(&mut left, "topic", &e.topic, Tone::Dim, colw, usize::MAX);
             }
-            let lines: Vec<String> = body(e)
-                .split('\n')
-                .flat_map(|part| wrap(part, room))
-                .collect();
+            let lines: Vec<String> = text.split('\n').flat_map(|part| wrap(part, room)).collect();
             let n = match size {
                 Fit::Whole => lines.len(),
                 Fit::Rows(h) if two => lines.len().min(h.saturating_sub(2)).max(1),
@@ -225,7 +241,7 @@ pub(crate) fn card(item: &Item, cols: usize, size: Fit) -> Grid {
                 "" => format!(" {} · {} ", e.kind, stamp(e.at)),
                 _ => format!(" {} · {} · {id} ", e.kind, stamp(e.at)),
             };
-            (('•', tone(&e.kind)), head)
+            (mark, head)
         }
     };
     if let Fit::Rows(h) = size {
@@ -233,5 +249,5 @@ pub(crate) fn card(item: &Item, cols: usize, size: Fit) -> Grid {
             left.push(Vec::new());
         }
     }
-    layout::framed(mark, &head, &left, &right, cols)
+    layout::framed(mark, &head, None, &left, &right, cols)
 }

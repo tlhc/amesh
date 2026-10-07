@@ -27,6 +27,9 @@ pub(crate) enum Act {
     Asks,
     /* the events screen and back */
     Events,
+    /* the jobs-screen body: flow or the selected chain's timeline */
+    Timeline,
+    Copy(usize),
     Refresh,
     Quit,
 }
@@ -144,6 +147,9 @@ impl Input {
                 KeyCode::Char('N') => Act::Find(-1),
                 KeyCode::Char('a') => Act::Asks,
                 KeyCode::Char('e') => Act::Events,
+                KeyCode::Char('t') => Act::Timeline,
+                KeyCode::Char('y') => Act::Copy(0),
+                KeyCode::Char('Y') => Act::Copy(1),
                 KeyCode::Char('r') => Act::Refresh,
                 KeyCode::Char('q') => Act::Quit,
                 _ => Act::None,

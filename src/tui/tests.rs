@@ -1,9 +1,13 @@
 use super::input::{Act, Input, Mode};
-use super::layout::{self, width, Fit, View};
+use super::layout::{self, width, Fit, Grid, Tone, View};
 use super::model::{self, Activity, Ask, Job, Numbers, Peer, Snapshot};
 use super::{App, Opts, PEER_HOLD};
+use crate::wire::{
+    BlockReason, DispatchState, IdleWhy, JobAction, JobProgress, JobRelation, Liveness, Progress,
+};
 use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::KeyCode;
+use ratatui::style::Modifier;
 use ratatui::Terminal;
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
@@ -497,10 +501,17 @@ fn one_chain_per_screen_and_tab_crosses_them() {
     let text = screen_text(&mut app, 46, 60).join("\n");
     assert_eq!(app.sel.as_deref(), Some("lint"), "the first running job");
     let lines: Vec<&str> = text.lines().map(str::trim_end).collect();
-    assert_eq!(lines[1], "independent jobs · 1/2 done · 1 run", "{text}");
+    assert_eq!(
+        lines[1..3],
+        [
+            "  deploy            ●─×─○─○─○  3/9  × sec",
+            "▸ independent jobs  ◆  1/2  1 run"
+        ],
+        "a row per block, the selected one marked and the one with a failure first:\n{text}"
+    );
     assert!(
-        lines[2].starts_with("───") && lines[2].trim_end().ends_with("─ +2 run · 1/2 · ● ─"),
-        "the rule says which of two blocks this is, and what runs in the other:\n{text}"
+        lines[3].starts_with("───") && lines[3].trim_end().ends_with("─ ● ─"),
+        "the strip says what runs elsewhere, so the rule does not:\n{text}"
     );
     assert!(
         text.contains("1-2 · 2 jobs · 1● 1◆ 0× 0○")
@@ -510,8 +521,8 @@ fn one_chain_per_screen_and_tab_crosses_them() {
         "independent jobs share the box:\n{text}"
     );
     assert!(
-        !text.contains("chain deploy"),
-        "one block at a time:\n{text}"
+        !text.contains("7 synth"),
+        "one block's flow at a time:\n{text}"
     );
     app.key(KeyCode::Char('j'));
     assert_eq!(app.sel.as_deref(), Some("docs"));
@@ -527,12 +538,9 @@ fn one_chain_per_screen_and_tab_crosses_them() {
     );
     let text = screen_text(&mut app, 46, 60).join("\n");
     assert!(
-        text.lines().nth(1) == Some("chain deploy · 3/9 done · 1 fail · 2 run")
-            && text
-                .lines()
-                .nth(2)
-                .unwrap()
-                .ends_with("─ +1 run · 2/2 · ● ─")
+        text.lines().nth(1) == Some("▸ deploy            ●─×─○─○─○  3/9  × sec")
+            && text.lines().nth(2) == Some("  independent jobs  ◆  1/2  1 run")
+            && text.lines().nth(3).unwrap().ends_with("─ ● ─")
             && !text.contains("lint"),
         "{text}"
     );
@@ -565,6 +573,216 @@ fn one_chain_per_screen_and_tab_crosses_them() {
     assert_eq!(app.sel.as_deref(), Some("docs"), "two jobs: 2 is unique");
 }
 
+/* the design's S1 chain, perf's worker idle on it and upg's at a prompt, beside two loose jobs */
+fn two_blocks() -> Snapshot {
+    let mut snap = mixed();
+    set_progress(
+        &mut snap,
+        "perf",
+        Progress::Idle {
+            since: 900,
+            why: IdleWhy::TurnEnded,
+        },
+        false,
+    );
+    set_progress(
+        &mut snap,
+        "upg",
+        Progress::Wait {
+            since: 900,
+            reason: None,
+        },
+        false,
+    );
+    snap
+}
+
+#[test]
+fn the_strip_gives_each_block_its_stations_count_and_what_needs_a_person() {
+    let mut app = app_with(two_blocks());
+    let lines = screen_text(&mut app, 100, 40);
+    assert_eq!(
+        lines[1],
+        "  deploy            ●─×─○─○─○  3/9  × sec   WAIT upg   IDLE perf",
+        "the block with a failure first, then its pills in order:\n{}",
+        lines.join("\n")
+    );
+}
+
+#[test]
+fn the_strip_draws_from_the_theme_roles() {
+    let mut app = app_with(two_blocks());
+    app.opts.color = true;
+    let theme = super::theme::Theme::default();
+    let lines = app.screen(100, 40, 0);
+    let span = |row: usize, piece: &str| {
+        lines[row]
+            .spans
+            .iter()
+            .find(|s| s.content.contains(piece))
+            .unwrap_or_else(|| panic!("no {piece:?} on row {row}"))
+            .style
+    };
+    assert_eq!(
+        (span(1, "× sec").fg, span(1, "× sec").bg),
+        (Some(theme.fail), Some(theme.select_bg)),
+        "a failure is a fail pill"
+    );
+    let wait = span(1, "WAIT upg");
+    assert!(
+        wait.fg == Some(theme.wait) && wait.add_modifier.contains(Modifier::REVERSED),
+        "a prompt is the wait badge: {wait:?}"
+    );
+    assert_eq!(
+        (span(1, "IDLE perf").fg, span(1, "IDLE perf").bg),
+        (Some(theme.wait), Some(theme.select_bg)),
+        "an idle holder is a wait pill"
+    );
+    assert_eq!(
+        span(2, "1 run").fg,
+        Some(theme.run),
+        "nothing to answer: the run count"
+    );
+    assert_eq!(
+        span(1, "×").fg,
+        Some(theme.fail),
+        "the station of the stage that failed"
+    );
+    assert_eq!(
+        span(2, "▸").fg,
+        Some(theme.near),
+        "the selected block's mark"
+    );
+    assert_eq!(span(2, "independent jobs").fg, Some(theme.title));
+    assert_eq!(span(1, "deploy").fg, Some(theme.text));
+    assert_eq!(span(1, "3").fg, Some(theme.done), "the done count");
+}
+
+/* five chains of two jobs; c and e failed */
+fn five_chains() -> Snapshot {
+    let mut jobs = Vec::new();
+    for (i, name) in ["a", "b", "c", "d", "e"].iter().enumerate() {
+        let last = if matches!(*name, "c" | "e") {
+            "failed"
+        } else {
+            "queued"
+        };
+        jobs.push(job(&format!("{name}1"), "done", &[], 10 * i as u64));
+        jobs.push(job(
+            &format!("{name}2"),
+            last,
+            &[&format!("{name}1")],
+            10 * i as u64 + 1,
+        ));
+    }
+    Snapshot {
+        captured_at: 1000,
+        jobs,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn blocks_that_need_a_person_come_first_and_the_selected_one_always_shows() {
+    let mut app = app_with(five_chains());
+    app.sel = Some("d1".into());
+    let lines = screen_text(&mut app, 60, 40);
+    let names: Vec<&str> = lines[1..5]
+        .iter()
+        .map(|l| l.split_whitespace().find(|w| *w != "▸").unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["c2", "e2", "d2", "+2"],
+        "the failed blocks first, then the selected one, then a count of the rest:\n{}",
+        lines.join("\n")
+    );
+    assert!(lines[3].starts_with("▸ d2"), "{}", lines.join("\n"));
+    assert_eq!(lines[4], "  +2 more");
+    assert_eq!(rule_row(&lines), 5, "{}", lines.join("\n"));
+}
+
+#[test]
+fn a_short_pane_folds_the_rest_into_the_selected_row() {
+    let mut snap = five_chains();
+    for job in &mut snap.jobs {
+        job.title = format!("{}-long-chain-name", job.job_id);
+    }
+    let mut app = app_with(snap);
+    app.sel = Some("a1".into());
+    for cols in [30, 46, 60, 80, 100] {
+        let lines = screen_text(&mut app, cols, 8);
+        assert_eq!(
+            rule_row(&lines),
+            2,
+            "one strip row in a pane of 8:\n{}",
+            lines.join("\n")
+        );
+        assert!(
+            lines[1].starts_with("▸ a2") && lines[1].ends_with("+4 more"),
+            "{cols}: {}",
+            lines[1]
+        );
+    }
+}
+
+#[test]
+fn strip_rows_never_pass_the_pane_and_pills_give_way_first() {
+    let mut snap = two_blocks();
+    for job in &mut snap.jobs {
+        job.title = format!("{} with a long title", job.job_id);
+    }
+    let mut app = app_with(snap);
+    /* the screen clips a row at the pane, so the strip's own rows are measured */
+    let blocks = app.blocks();
+    let (b, _) = app.settle(&blocks).expect("a job is selected");
+    let frame = app.snap.clone().expect("a snapshot");
+    for cols in 30..=140 {
+        for row in super::strip(&blocks, b, &frame, cols, 4) {
+            assert!(super::row_width(&row) <= cols, "{cols}: {row:?}");
+        }
+    }
+    for cols in 30..=140 {
+        let lines = screen_text(&mut app, cols, 40);
+        let rule = rule_row(&lines);
+        for row in &lines[1..rule] {
+            assert!(width(row) <= cols, "{cols}: {row}");
+        }
+        let deploy = lines[1..rule]
+            .iter()
+            .find(|l| l.contains("deploy with"))
+            .expect("the chain's row");
+        if deploy.contains("WAIT") {
+            assert!(
+                deploy.contains("●─×─○─○─○"),
+                "stations before pills go: {deploy}"
+            );
+        }
+    }
+    let narrow = screen_text(&mut app, 34, 40);
+    assert!(
+        narrow[1].contains('…') && !narrow[1].contains("WAIT"),
+        "at 34 columns the pills are gone and the name or stations are cut: {}",
+        narrow[1]
+    );
+}
+
+#[test]
+fn a_narrow_strip_keeps_the_whole_done_count() {
+    let snap = Snapshot {
+        jobs: (0..1000)
+            .map(|i| job(&format!("j{i}"), "done", &[], i))
+            .collect(),
+        ..Default::default()
+    };
+    let mut a = app_with(snap);
+    let blocks = a.blocks();
+    let frame = a.snap.clone().unwrap();
+    let rows = super::strip(&blocks, 0, &frame, 30, 4);
+    let row: String = rows[0].iter().map(|(s, _)| s.as_str()).collect();
+    assert!(row.contains("1000/1000"), "{row}");
+}
+
 #[test]
 fn a_tall_flow_scrolls_to_the_selection_and_keeps_the_footer() {
     let mut app = app_with(s5());
@@ -578,8 +796,8 @@ fn a_tall_flow_scrolls_to_the_selection_and_keeps_the_footer() {
     );
     assert_eq!(
         lines[23],
-        "j/k move  h/l stage  digits jump  f hint",
-        "the design's footer on the last row:\n{}",
+        "j/k move  h/l stage  tab chain  t timeline",
+        "the keys that fit, none cut, on the last row:\n{}",
         lines.join("\n")
     );
     assert!(
@@ -612,8 +830,8 @@ fn a_tall_flow_scrolls_to_the_selection_and_keeps_the_footer() {
     );
     let tiny = screen_text(&mut app, 46, 12);
     assert!(
-        tiny.iter().any(|l| l.contains("more lines · enter")),
-        "a card that cannot fit at all is cut and says so:\n{}",
+        tiny.iter().any(|l| l.contains("⏎ full card")),
+        "a short card keeps its full-card key:\n{}",
         tiny.join("\n")
     );
     app.key(KeyCode::Enter);
@@ -675,7 +893,7 @@ fn errors_say_what_went_wrong() {
     app.apply(Ok(s1()));
     app.apply(Err(crate::cli::DAEMON_UNREACHABLE.to_string()));
     let text = screen_text(&mut app, 46, 40).join("\n");
-    assert!(text.contains("! hub unreachable · × sec failed"), "{text}");
+    assert!(flat(&text).contains("! hub unreachable · × sec"), "{text}");
 }
 
 /* the rows a terminal shows: a wide character hides the cell after it */
@@ -710,7 +928,14 @@ fn the_terminal_shows_the_same_screen() {
         let mut app = app_with(snap.clone());
         let rows = rendered(&mut app, cols, 50);
         let text = rows.join("\n");
-        assert_eq!(rows[1], "independent jobs · 1/2 done · 1 run", "{text}");
+        assert_eq!(
+            rows[1..3],
+            [
+                "  deploy            ●─×─○─○─○  3/9  × sec",
+                "▸ independent jobs  ◆  1/2  1 run"
+            ],
+            "{text}"
+        );
         assert!(
             text.contains("2 审查 hub 数据"),
             "wide characters keep their order:\n{text}"
@@ -820,7 +1045,7 @@ fn cards_lead_with_what_matters() {
     };
     let sec = card("sec");
     assert!(
-        sec.lines().nth(1).unwrap().contains("reason") && sec.contains("no fixture"),
+        sec.lines().nth(1).unwrap().contains("why") && sec.contains("no fixture"),
         "{sec}"
     );
     assert!(
@@ -1223,7 +1448,7 @@ fn real_titles_fit_the_pane() {
     };
     let head = card(46).lines().next().unwrap().to_string();
     assert!(
-        head.contains("failed 1m ago") && !head.contains('…') && !head.contains("stage"),
+        head.contains("failed 1m ago") && head.contains(" FAILED ") && !head.contains("stage"),
         "the stage gives way first:\n{head}"
     );
     assert!(
@@ -1559,12 +1784,12 @@ fn a_worker_busy_with_one_job_spins_it() {
     );
     assert_eq!(glyph_of(&mut app, "8 fix", 4), '◆', "so does a waiting one");
     assert!(
-        row_of(&mut app, "8 fix", 0).contains("8 fix w3 1m WAIT!"),
-        "WAIT! follows the worker on the even half second"
+        row_of(&mut app, "8 fix", 0).contains("8 fix w3 1m WAIT"),
+        "WAIT follows the worker"
     );
     assert!(
-        !row_of(&mut app, "8 fix", 4).contains("WAIT!"),
-        "and blinks off on the odd one"
+        row_of(&mut app, "8 fix", 4).contains("8 fix w3 1m WAIT"),
+        "and holds steady on the odd half second"
     );
     let mut still = App::new(Opts {
         circle: None,
@@ -1576,8 +1801,8 @@ fn a_worker_busy_with_one_job_spins_it() {
     still.apply(Ok(busy()));
     assert_eq!(glyph_of(&mut still, "3 perf", 1), '⠋', "--no-anim");
     assert!(
-        row_of(&mut still, "8 fix", 4).contains("WAIT!"),
-        "--no-anim keeps the WAIT! mark"
+        row_of(&mut still, "8 fix", 4).contains("WAIT"),
+        "--no-anim keeps the WAIT mark"
     );
     let mut elsewhere = busy();
     elsewhere
@@ -1610,8 +1835,8 @@ fn a_worker_busy_with_one_job_spins_it() {
         "no spinner from a hub without activity"
     );
     assert!(
-        !row_of(&mut app, "8 fix", 0).contains("WAIT!"),
-        "nor a WAIT! mark"
+        !row_of(&mut app, "8 fix", 0).contains("WAIT"),
+        "nor a WAIT mark"
     );
     let mut ascii = App::new(Opts {
         circle: None,
@@ -1661,9 +1886,8 @@ fn cards_say_what_the_worker_is_doing() {
     );
     let synth = card("synth");
     assert!(
-        synth.contains(
-            "worker w4 IDLE! 1m · not picked up ask synt w4 · 00:15 · unacked ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ waiting 1m"
-        ) && synth.contains("nudge amesh peer notify w4 'synth?'"),
+        synth.contains("why w4: not picked up · 1m worker w4 IDLE ask synt w4 · 00:15 unacked 1m")
+            && synth.contains("nudge amesh peer notify w4 'synth?'"),
         "{synth}"
     );
     assert!(
@@ -1686,7 +1910,7 @@ fn cards_say_what_the_worker_is_doing() {
     )
     .text();
     assert!(
-        text.contains("7 synth w4 1m\n") && text.contains("8 fix w3 1m WAIT!"),
+        text.contains("7 synth w4 1m\n") && text.contains("8 fix w3 1m WAIT"),
         "{text}"
     );
     let mut old = snap.clone();
@@ -2343,23 +2567,15 @@ fn proto_s5() -> Snapshot {
     s
 }
 
-/* frames of the approved mock-up, exported from its generator: every card state at both
-widths, S4's skip-level note and S5's box. Five changes are agreed: three the data forces, an
-open ask reading "unacked" (the hub keeps no read receipts), the nudge text single-quoted
-for the shell, and the 14-job chain named after its last job, as the design's rule says,
-instead of the mock-up's "ship"; and two the user chose, a card that holds still (its glyph
-and lists show ◆, its worker reads WORK) while the flow carries the spinner, and a top line
-that names every online peer, in columns aligned under the first name, where the mock-up
-counted the ones that did not fit. The mock-up's
-other frames differ from these fixtures only where its sample data contradicts itself: ages
-that disagree with its own times, one worker both working and idle, two spinners under one
-worker, a queued job with an ask, and retry commands naming the mock-up's random job ids */
+/* frames of the jobs screen, rendered at the approved design's sizes: every card state at both
+widths, S4's skip-level note and S5's box, under the chain strip, the attention line and the
+footer the screen draws today */
 const FRAMES: &str = r#"
 ===== S1 narrow scope
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
-chain deploy · 3/9 done · 1 fail · 2 run
+▸ deploy  ●─×─○─○─○  3/9  × sec   IDLE perf
 ────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
                     ● 1 scope cc 1m
     ┌───────┬───────┼───────┬───────┐
     ●       ◆       ●       ×       ⠋
@@ -2374,19 +2590,19 @@ attention × sec failed
 ┌● 1 scope · done · took 1m · stage 1 of 5 ──┐
 │ result  5 review dimensions and a shared   │
 │         brief                              │
-│ worker  cc · now WORK                      │
-│ ask     1f0 cc>cc · 13:19 · acked ok       │
-│ blocks  2 func ● · 3 perf ◆ · 4 deliv ●    │
-│ times   sent 13:19 · ended 13:20 · took 1m │
+│ worker  cc · ask 1f0 cc▸cc · 13:19         │
 │ prompt  split the cleanup review into      │
 │         dimensions                         │
+│                                            │
+│                                            │
+│ ⏎ full card                                │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S1 narrow perf
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
-chain deploy · 3/9 done · 1 fail · 2 run
+▸ deploy  ●─×─○─○─○  3/9  × sec   IDLE perf
 ────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
                     ● 1 scope cc 1m
     ┌───────┬───────┼───────┬───────┐
     ●       ◆       ●       ×       ⠋
@@ -2398,23 +2614,23 @@ attention × sec failed
                     │
                     ○ 9 deploy cc
 
-┌◆ 3 perf · running 12m · stage 2 of 5 ──────┐
-│ worker  codex IDLE! 5m · turn ended        │
-│ ask     9a1 cc─▸─codex · 13:30 · unacked   │
-│         ⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿ waiting 12m           │
-│ needs   1 scope ●                          │
-│ blocks  7 synth ○                          │
-│ times   sent 13:30 · running 12m           │
+┌◆ 3 perf · running 12m ─────────────── IDLE ┐
+│ why     codex ended its turn 5m ago        │
+│ worker  codex · ask 9a1 cc▸codex · 13:30   │
+│         unacked 12m · chain median 4m      │
 │ prompt  review perf: sweep lock time and   │
 │         inbox filter cost at 100k rows     │
-│ nudge   amesh peer notify codex 'perf?'    │
+│                                            │
+│                                            │
+│                                            │
+│ y copy nudge · ⏎ full card                 │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S4 narrow audit
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
-chain verify · 4/6 done · 1 run
+▸ verify  ●─●─●─◆─○  4/6  WAIT deploy
 ────────────────────────────────────────── ● ─
-attention WAIT cc 40s needs your Bash permiss…
+attention  WAIT cc 40s
         ● 1 audit codex 4m ─────┐
     ┌───┴───┐                   │
     ●       ●                   │
@@ -2422,25 +2638,25 @@ attention WAIT cc 40s needs your Bash permiss…
     └───┬───┘                   │
         ● 4 review codex 3m     │
         │                       │
-        ◆ 5 deploy cc 1m WAIT!  │
+        ◆ 5 deploy cc 1m WAIT   │
         │                       │
         ○ 6 verify pi-3 ◀───────┘
 
 ┌● 1 audit · done · took 4m · stage 1 of 5 ──┐
 │ result  12 stale docs found, split in two  │
 │         halves                             │
-│ worker  codex · now IDLE                   │
-│ ask     a11 cc>codex · 13:30 · acked ok    │
-│ blocks  2 fix-a ● · 3 fix-b ● · 6 verify ○ │
-│ times   sent 13:30 · ended 13:34 · took 4m │
+│ worker  codex · ask a11 cc▸codex · 13:30   │
 │ prompt  list stale docs in the repo        │
+│                                            │
+│                                            │
+│ ⏎ full card                                │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S4 narrow deploy
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
-chain verify · 4/6 done · 1 run
+▸ verify  ●─●─●─◆─○  4/6  WAIT deploy
 ────────────────────────────────────────── ● ─
-attention WAIT cc 40s needs your Bash permiss…
+attention  WAIT cc 40s
         ● 1 audit codex 4m ─────┐
     ┌───┴───┐                   │
     ●       ●                   │
@@ -2448,27 +2664,27 @@ attention WAIT cc 40s needs your Bash permiss…
     └───┬───┘                   │
         ● 4 review codex 3m     │
         │                       │
-        ◆ 5 deploy cc 1m WAIT!  │
+        ◆ 5 deploy cc 1m WAIT   │
         │                       │
         ○ 6 verify pi-3 ◀───────┘
 
-┌◆ 5 deploy · running 1m · stage 4 of 5 ─────┐
-│ worker  cc WAIT! 40s                       │
-│         needs your Bash permission         │
-│ ask     d3a9 codex─▸─cc · 13:41 · unacked  │
-│ needs   4 review ●                         │
-│ blocks  6 verify ○                         │
-│ times   sent 13:41 · running 1m            │
+┌◆ 5 deploy · running 1m ────────────── WAIT ┐
+│ why     needs your Bash permission         │
+│ worker  cc · ask d3a9 codex▸cc · 13:41     │
+│         unacked 1m · chain median 2m       │
 │ prompt  install the build and restart the  │
 │         hub                                │
+│                                            │
+│                                            │
+│ ⏎ full card                                │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S5 narrow scope
 7 online · ⠋ cc     ○ codex  ○ pi     ○ pi-2
            ○ pi-3   ⠋ u1     ⠋ u2
-chain deploy · 6/14 done · 1 fail · 3 run
+▸ deploy  ●─×─○─○─○  6/14  × sec   IDLE perf
 ────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
                     ● 1 scope cc 1m
 ┌───────────────────┴────────────────────────┐
 │ 2-11 · 10 jobs · 5● 3◆ 1× 1○               │
@@ -2486,19 +2702,19 @@ attention × sec failed
 
 ┌● 1 scope · done · took 1m · stage 1 of 5 ──┐
 │ result  10 review dimensions               │
-│ worker  cc · now WORK                      │
-│ ask     1f0 cc>cc · 13:10 · acked ok       │
-│ blocks  2 func ● · 3 perf ◆ · 4 deliv ●    │
-│ times   sent 13:10 · ended 13:11 · took 1m │
+│ worker  cc · ask 1f0 cc▸cc · 13:10         │
 │ prompt  split the release review           │
+│                                            │
+│                                            │
+│ ⏎ full card                                │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S5 narrow sec
 7 online · ⠋ cc     ○ codex  ○ pi     ○ pi-2
            ○ pi-3   ⠋ u1     ⠋ u2
-chain deploy · 6/14 done · 1 fail · 3 run
+▸ deploy  ●─×─○─○─○  6/14  × sec   IDLE perf
 ────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
                     ● 1 scope cc 1m
 ┌───────────────────┴────────────────────────┐
 │ 2-11 · 10 jobs · 5● 3◆ 1× 1○               │
@@ -2514,24 +2730,24 @@ attention × sec failed
                     │
                     ○ 14 deploy cc
 
-┌× 5 sec · failed 6m ago · stage 2 of 5 ─────┐
-│ reason  sec review could not run its       │
+┌× 5 sec · failed 6m ago ──────────── FAILED ┐
+│ why     sec review could not run its       │
 │         fixture                            │
-│ worker  pi-2 · now IDLE                    │
-│ ask     3a3 cc>pi-2 · 13:12 · acked failed │
-│ needs   1 scope ●                          │
-│ blocks  12 synth ○                         │
-│ times   sent 13:12 · failed 13:20          │
+│ worker  pi-2 · ask 3a3 cc▸pi-2 · 13:12     │
 │ prompt  review the release for sec         │
-│ retry   amesh jobs update job-58851116     │
-│         --state queued                     │
+│                                            │
+│                                            │
+│                                            │
+│                                            │
+│                                            │
+│ y copy retry · ⏎ full card                 │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S1 wide upg
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
-chain deploy · 3/9 done · 1 fail · 2 run
+▸ deploy  ●─×─○─○─○  3/9  × sec   IDLE perf
 ──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
 ● 1 scope ─┬─ ● 2 func ──┬── ○ 7 synth ── ○ 8 fix ── ○ 9 deploy
            ├─ ◆ 3 perf ──┤
            ├─ ● 4 deliv ─┤
@@ -2539,18 +2755,18 @@ attention × sec failed
            └─ ⠋ 6 upg ───┘
 
 ┌◆ 6 upg · running 6m · stage 2 of 5 ──────────────────────────────────────────────────────────────┐
-│ worker  pi-3 WORK · turn 6m                     │ prompt  review the upgrade path for old state  │
-│ ask     7c2 cc─▸─pi-3 · 13:36 · unacked         │         files and mixed versions               │
-│ needs   1 scope ●                               │                                                │
-│ blocks  7 synth ○                               │                                                │
-│ times   sent 13:36 · running 6m                 │                                                │
+│ worker  pi-3 · ask 7c2 cc▸pi-3 · 13:36          │ prompt  review the upgrade path for old state  │
+│         unacked 6m · chain median 4m            │         files and mixed versions               │
+│                                                 │                                                │
+│                                                 │                                                │
+│ ⏎ full card                                     │                                                │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
+j/k ↑↓ move  h/l ←→ stage  tab chain  t timeline  enter card  / find  f hints  digits jump  esc back
 ===== S5 wide scope
 7 online · ⠋ cc  ○ codex  ○ pi  ○ pi-2  ○ pi-3  ⠋ u1  ⠋ u2
-chain deploy · 6/14 done · 1 fail · 3 run
+▸ deploy  ●─×─○─○─○  6/14  × sec   IDLE perf
 ──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
 ● 1 scope ─┬─ ● 2 func ───┬── ○ 12 synth ── ○ 13 fix ── ○ 14 deploy
            ├─ ◆ 3 perf ───┤
            ├─ ● 4 deliv ──┤
@@ -2564,17 +2780,17 @@ attention × sec failed
 
 ┌● 1 scope · done · took 1m · stage 1 of 5 ────────────────────────────────────────────────────────┐
 │ result  10 review dimensions                    │ prompt  split the release review               │
-│ worker  cc · now WORK                           │                                                │
-│ ask     1f0 cc>cc · 13:10 · acked ok            │                                                │
-│ blocks  2 func ● · 3 perf ◆ · 4 deliv ●         │                                                │
-│ times   sent 13:10 · ended 13:11 · took 1m      │                                                │
+│ worker  cc · ask 1f0 cc▸cc · 13:10              │                                                │
+│                                                 │                                                │
+│                                                 │                                                │
+│ ⏎ full card                                     │                                                │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
+j/k ↑↓ move  h/l ←→ stage  tab chain  t timeline  enter card  / find  f hints  digits jump  esc back
 ===== S1 narrow synth
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
-chain deploy · 3/9 done · 1 fail · 2 run
+▸ deploy  ●─×─○─○─○  3/9  × sec   IDLE perf
 ────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
                     ● 1 scope cc 1m
     ┌───────┬───────┼───────┬───────┐
     ●       ◆       ●       ×       ⠋
@@ -2586,40 +2802,40 @@ attention × sec failed
                     │
                     ○ 9 deploy cc
 
-┌○ 7 synth · queued · stage 3 of 5 ──────────┐
-│ worker  cc (when ready)                    │
-│ waits   3 perf ◆  5 sec ×  6 upg ◆         │
-│ blocked 5 sec failed: retry it first       │
-│ blocks  8 fix ○                            │
-│ times   not sent yet                       │
+┌○ 7 synth · queued · stage 3 of 5 ─ BLOCKED ┐
+│ why     5 sec failed: retry it first       │
+│ worker  cc                                 │
 │ prompt  merge the five reviews into one    │
 │         decision list                      │
+│                                            │
+│                                            │
+│ ⏎ full card                                │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S1 wide synth
 4 online · ⠋ cc  ○ codex  ⠋ pi  ⠋ pi-3
-chain deploy · 3/9 done · 1 fail · 2 run
+▸ deploy  ●─×─○─○─○  3/9  × sec   IDLE perf
 ──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
 ● 1 scope ─┬─ ● 2 func ──┬── ○ 7 synth ── ○ 8 fix ── ○ 9 deploy
            ├─ ◆ 3 perf ──┤
            ├─ ● 4 deliv ─┤
            ├─ × 5 sec ───┤
            └─ ⠋ 6 upg ───┘
 
-┌○ 7 synth · queued · stage 3 of 5 ────────────────────────────────────────────────────────────────┐
-│ worker  cc (when ready)                         │ prompt  merge the five reviews into one        │
-│ waits   3 perf ◆  5 sec ×  6 upg ◆              │         decision list                          │
-│ blocked 5 sec failed: retry it first            │                                                │
-│ blocks  8 fix ○                                 │                                                │
-│ times   not sent yet                            │                                                │
+┌○ 7 synth · queued · stage 3 of 5 ─────────────────────────────────────────────────────── BLOCKED ┐
+│ why     5 sec failed: retry it first            │ prompt  merge the five reviews into one        │
+│ worker  cc                                      │         decision list                          │
+│                                                 │                                                │
+│                                                 │                                                │
+│ ⏎ full card                                     │                                                │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
+j/k ↑↓ move  h/l ←→ stage  tab chain  t timeline  enter card  / find  f hints  digits jump  esc back
 ===== S4 narrow review
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
-chain verify · 4/6 done · 1 run
+▸ verify  ●─●─●─◆─○  4/6  WAIT deploy
 ────────────────────────────────────────── ● ─
-attention WAIT cc 40s needs your Bash permiss…
+attention  WAIT cc 40s
         ● 1 audit codex 4m ─────┐
     ┌───┴───┐                   │
     ●       ●                   │
@@ -2627,42 +2843,42 @@ attention WAIT cc 40s needs your Bash permiss…
     └───┬───┘                   │
         ● 4 review codex 3m     │
         │                       │
-        ◆ 5 deploy cc 1m WAIT!  │
+        ◆ 5 deploy cc 1m WAIT   │
         │                       │
         ○ 6 verify pi-3 ◀───────┘
 
 ┌● 4 review · done · took 3m · stage 3 of 5 ─┐
 │ result  approved with 1 nit                │
-│ worker  codex · now IDLE                   │
-│ ask     d44 cc>codex · 13:36 · acked ok    │
-│ needs   2 fix-a ●  3 fix-b ●               │
-│ blocks  5 deploy ◆                         │
-│ times   sent 13:36 · ended 13:39 · took 3m │
+│ worker  codex · ask d44 cc▸codex · 13:36   │
 │ prompt  review both halves together        │
+│                                            │
+│                                            │
+│                                            │
+│ ⏎ full card                                │
 └────────────────────────────────────────────┘
-j/k move  h/l stage  digits jump  f hint
+j/k move  h/l stage  tab chain  t timeline
 ===== S4 wide deploy
 4 online · ! cc  ○ codex  ⠋ pi  ○ pi-3
-chain verify · 4/6 done · 1 run
+▸ verify  ●─●─●─◆─○  4/6  WAIT deploy
 ──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
-attention WAIT cc 40s needs your Bash permission
+attention  WAIT cc 40s  needs your Bash permission
 ● 1 audit ─┬─ ● 2 fix-a ─┬── ● 4 review ── ◆ 5 deploy ── ○ 6 verify
            └─ ● 3 fix-b ─┘                               ↑ also needs 1 audit
 
-┌◆ 5 deploy · running 1m · stage 4 of 5 ───────────────────────────────────────────────────────────┐
-│ worker  cc WAIT! 40s                            │ prompt  install the build and restart the hub  │
-│         needs your Bash permission              │                                                │
-│ ask     d3a9 codex─▸─cc · 13:41 · unacked       │                                                │
-│ needs   4 review ●                              │                                                │
-│ blocks  6 verify ○                              │                                                │
-│ times   sent 13:41 · running 1m                 │                                                │
+┌◆ 5 deploy · running 1m · stage 4 of 5 ───────────────────────────────────────────────────── WAIT ┐
+│ why     needs your Bash permission              │ prompt  install the build and restart the hub  │
+│ worker  cc · ask d3a9 codex▸cc · 13:41          │                                                │
+│         unacked 1m · chain median 2m            │                                                │
+│                                                 │                                                │
+│                                                 │                                                │
+│ ⏎ full card                                     │                                                │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
+j/k ↑↓ move  h/l ←→ stage  tab chain  t timeline  enter card  / find  f hints  digits jump  esc back
 ===== S5 wide sec
 7 online · ⠋ cc  ○ codex  ○ pi  ○ pi-2  ○ pi-3  ⠋ u1  ⠋ u2
-chain deploy · 6/14 done · 1 fail · 3 run
+▸ deploy  ●─×─○─○─○  6/14  × sec   IDLE perf
 ──────────────────────────────────────────────────────────────────────────────────────────────── ● ─
-attention × sec failed
+attention  × sec
 ● 1 scope ─┬─ ● 2 func ───┬── ○ 12 synth ── ○ 13 fix ── ○ 14 deploy
            ├─ ◆ 3 perf ───┤
            ├─ ● 4 deliv ──┤
@@ -2674,15 +2890,15 @@ attention × sec failed
            ├─ ⠋ 10 tests ─┤
            └─ ● 11 ux ────┘
 
-┌× 5 sec · failed 6m ago · stage 2 of 5 ───────────────────────────────────────────────────────────┐
-│ reason  sec review could not run its fixture    │ prompt  review the release for sec             │
-│ worker  pi-2 · now IDLE                         │ retry   amesh jobs update job-58851116 --state │
-│ ask     3a3 cc>pi-2 · 13:12 · acked failed      │         queued                                 │
-│ needs   1 scope ●                               │                                                │
-│ blocks  12 synth ○                              │                                                │
-│ times   sent 13:12 · failed 13:20               │                                                │
+┌× 5 sec · failed 6m ago · stage 2 of 5 ─────────────────────────────────────────────────── FAILED ┐
+│ why     sec review could not run its fixture    │ prompt  review the release for sec             │
+│ worker  pi-2 · ask 3a3 cc▸pi-2 · 13:12          │                                                │
+│                                                 │                                                │
+│                                                 │                                                │
+│                                                 │                                                │
+│ y copy retry · ⏎ full card                      │                                                │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
-j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain
+j/k ↑↓ move  h/l ←→ stage  tab chain  t timeline  enter card  y copy  / find  f hints  digits jump
 "#;
 
 #[test]
@@ -2832,8 +3048,7 @@ fn the_screen_draws_in_the_theme() {
     assert_eq!(span("7 synth").fg, Some(theme.text));
     assert_eq!(span("──────").fg, Some(theme.line));
     assert_eq!(span("5 review dimensions").fg, Some(theme.done));
-    assert_eq!(span("cc · now WORK").fg, Some(theme.worker));
-    assert_eq!(span("acked ok").fg, Some(theme.done));
+    assert_eq!(span("cc · ask").fg, Some(theme.worker));
     assert_eq!(span("j/k move").fg, Some(theme.dim));
     let mut plain = App::new(Opts {
         circle: None,
@@ -2901,7 +3116,10 @@ fn the_card_fills_the_rows_the_pane_leaves() {
         let at = lines.iter().position(|l| l.contains(key)).unwrap();
         lines[at..]
             .iter()
-            .take_while(|l| l.contains(key) || l.starts_with("│         "))
+            .take_while(|l| {
+                (l.contains(key) || l.starts_with("│         "))
+                    && !l.trim_matches('│').trim().is_empty()
+            })
             .count()
     };
     let whole = layout::card(&view, "scope", 46, None, Fit::Whole).text();
@@ -2913,17 +3131,14 @@ fn the_card_fills_the_rows_the_pane_leaves() {
     let least = layout::card(&view, "scope", 46, None, Fit::Rows(0)).text();
     assert_eq!(
         (rows(&least, "result"), rows(&least, "prompt")),
-        (1, 1),
-        "the smallest card keeps a line of each:\n{least}"
+        (2, 1),
+        "the smallest card keeps two result lines and one prompt line:\n{least}"
     );
     for h in [12, 20, 30] {
         let text = layout::card(&view, "scope", 46, None, Fit::Rows(h)).text();
         assert_eq!(text.lines().count(), h, "exactly the rows given:\n{text}");
         let (r, p) = (rows(&text, "result"), rows(&text, "prompt"));
-        assert!(
-            r >= p.min(result) && r + p == h - 6,
-            "the result takes the rows first, the prompt the rest:\n{text}"
-        );
+        assert!(r > 2 && p >= 1, "spare rows show the explanation:\n{text}");
         assert_eq!(
             text.matches('…').count(),
             usize::from(r < result) + usize::from(p < prompt),
@@ -2933,8 +3148,8 @@ fn the_card_fills_the_rows_the_pane_leaves() {
     let roomy = layout::card(&view, "scope", 46, None, Fit::Rows(60)).text();
     assert_eq!(roomy.lines().count(), 60, "the frame stretches:\n{roomy}");
     assert!(
-        !roomy.contains('…') && roomy.lines().nth(58).unwrap().starts_with("│  "),
-        "all of it shows, then blank rows down to the frame:\n{roomy}"
+        !roomy.contains('…') && roomy.lines().nth(58).unwrap().contains("⏎ full card"),
+        "the fields use the rows above the keys:\n{roomy}"
     );
     let wide = layout::card(&view, "scope", 100, None, Fit::Rows(12)).text();
     assert_eq!(wide.lines().count(), 12, "{wide}");
@@ -2942,7 +3157,7 @@ fn the_card_fills_the_rows_the_pane_leaves() {
         .lines()
         .filter(|l| l.split('│').nth(2).is_some_and(|r| !r.trim().is_empty()))
         .count();
-    assert_eq!(right, 10, "the prompt fills the right column:\n{wide}");
+    assert_eq!(right, 9, "the prompt fills the right column:\n{wide}");
 }
 
 #[test]
@@ -2970,6 +3185,7 @@ fn the_screen_fills_the_pane_and_follows_its_size() {
             lines.join("\n")
         );
     }
+    app.full = true;
     let tall = screen_text(&mut app, 46, 61)[1..].join("\n");
     assert!(
         !tall.contains('…') && flat(&tall).contains("100k rows review perf: sweep"),
@@ -3099,9 +3315,7 @@ fn widths_follow_the_pane() {
     let mut app = app_with(named);
     let top = screen_text(&mut app, 30, 20);
     assert!(
-        top[1].starts_with("chain review")
-            && top[1].ends_with(" · 2/3 done")
-            && width(&top[1]) <= 30,
+        top[1].starts_with("▸ review") && top[1].ends_with("  2/3") && width(&top[1]) <= 30,
         "a long chain name gives way to the counts:\n{}",
         top[1]
     );
@@ -3111,7 +3325,7 @@ fn widths_follow_the_pane() {
     let narrow = head(&mut app, 46);
     let broad = head(&mut app, 160);
     assert!(
-        narrow[1].ends_with(" · 2/3 done") && broad[1].ends_with(" · 2/3 done"),
+        narrow[1].ends_with("  2/3") && broad[1].ends_with("  2/3"),
         "the counts always show:\n{}\n{}",
         narrow[1],
         broad[1]
@@ -3124,6 +3338,7 @@ fn widths_follow_the_pane() {
         card_head(&broad)
     );
     app.sel = Some("a".into());
+    app.full = true;
     let blocks = |lines: Vec<String>| lines.into_iter().find(|l| l.contains("blocks")).unwrap();
     let (short, full) = (blocks(head(&mut app, 46)), blocks(head(&mut app, 160)));
     assert!(
@@ -3141,8 +3356,8 @@ fn only_a_running_job_is_marked_waiting() {
     deploy.ask_id = None;
     let mut app = app_with(snap);
     assert!(
-        row_of(&mut app, "8 fix", 0).contains("WAIT!")
-            && !row_of(&mut app, "9 deploy", 0).contains("WAIT!"),
+        row_of(&mut app, "8 fix", 0).contains("WAIT")
+            && !row_of(&mut app, "9 deploy", 0).contains("WAIT"),
         "w3 waits in fix's turn; deploy, done, is not waiting"
     );
 }
@@ -3300,44 +3515,26 @@ fn the_counts_survive_a_narrow_pane() {
     for cols in [30, 34, 46, 60] {
         let head = screen_text(&mut app, cols, 12)[1].clone();
         assert!(
-            head.ends_with("0/40 done · 20 fail · 20 run") && width(&head) <= cols,
+            head.contains("  ×  0/40") && width(&head) <= cols,
             "{cols}: {head}"
         );
     }
-    assert!(screen_text(&mut app, 60, 12)[1].starts_with("independent jobs · "));
-    assert!(screen_text(&mut app, 46, 12)[1].starts_with("independent jo… · "));
+    assert!(
+        screen_text(&mut app, 46, 12)[1].ends_with("0/40  × j00   × j02"),
+        "the pills give way before the count"
+    );
+    for cols in [46, 60] {
+        assert!(
+            screen_text(&mut app, cols, 12)[1].starts_with("▸ independent jobs  "),
+            "the name stays whole while pills give way"
+        );
+    }
     assert_eq!(
         layout::wrap("中文", 1),
         ["…", "…"],
         "a character wider than a whole line gives way to …"
     );
     assert_eq!(layout::wrap("中文", 2), ["中", "文"]);
-}
-
-#[test]
-fn counts_wider_than_the_pane_keep_their_numbers() {
-    let head = |counts, cols| super::header("independent jobs", counts, cols);
-    assert_eq!(head([0, 10000, 10000, 10000], 30), "0/10000● 10000× 10000◆");
-    assert_eq!(head([0, 10000, 10000, 10000], 36), "0/10000● 10000× 10000◆");
-    assert_eq!(
-        head([0, 10000, 10000, 10000], 37),
-        "0/10000 done · 10000 fail · 10000 run"
-    );
-    assert_eq!(
-        head([3, 9, 1, 2], 46),
-        "independent jobs · 3/9 done · 1 fail · 2 run"
-    );
-    assert_eq!(head([3, 9, 0, 0], 30), "independent jobs · 3/9 done");
-    for cols in 30..60 {
-        let text = head([12345, 99999, 54321, 33333], cols);
-        assert!(
-            width(&text) <= cols
-                && ["12345", "99999", "54321", "33333"]
-                    .iter()
-                    .all(|n| text.contains(n)),
-            "{cols}: {text}"
-        );
-    }
 }
 
 #[test]
@@ -3477,7 +3674,7 @@ fn ascii_reaches_the_headers_glyph_counts() {
         ..Default::default()
     }));
     let head = screen_text(&mut app, 30, 12)[1].clone();
-    assert_eq!(head, "0/1000* 500x 500>", "the glyph counts, in ASCII");
+    assert_eq!(head, "> independent jobs  x  0/1000", "the strip, in ASCII");
 }
 
 #[test]
@@ -3497,11 +3694,288 @@ fn the_card_holds_its_wait_still() {
     };
     let off = at(&mut app, 4);
     let row = off.iter().find(|l| l.contains("8 fix w3")).unwrap();
-    let worker = off.iter().find(|l| l.contains("worker  w3")).unwrap();
+    let worker = off
+        .iter()
+        .find(|l| l.starts_with("┌") && l.contains(" WAIT "))
+        .unwrap();
     assert!(
-        !row.contains("WAIT!") && worker.contains("w3 WAIT! 2m"),
-        "the flow row blinks, the card does not:\n{row}\n{worker}"
+        row.contains("8 fix w3 1m WAIT") && !row.contains("WAIT!") && worker.contains(" WAIT "),
+        "the flow row and the card's badge both hold WAIT steady:\n{row}\n{worker}"
     );
+}
+
+fn with(mut job: Job, progress: Progress, busy: bool) -> Job {
+    job.progress = Some(JobProgress {
+        state: Some(progress),
+        busy,
+    });
+    job
+}
+
+/* scope fans out to func, perf (its worker ended its turn), deliv, sec (failed) and upg
+(at work); synth waits on all five and sec's failure blocks it; fix, ship and zip queue behind */
+fn fanned() -> Snapshot {
+    let mut synth = job(
+        "synth",
+        "queued",
+        &["func", "perf", "deliv", "sec", "upg"],
+        107,
+    );
+    synth.dispatch_state = Some(DispatchState::Blocked {
+        dependencies: vec!["sec".into()],
+        dependency: "sec".into(),
+        reason: BlockReason::Failed,
+    });
+    let mut perf = with(
+        job("perf", "running", &["scope"], 102),
+        Progress::Idle {
+            since: 90,
+            why: IdleWhy::TurnEnded,
+        },
+        false,
+    );
+    perf.assigned_peer = Some("codex".into());
+    Snapshot {
+        captured_at: 100,
+        jobs: vec![
+            job("scope", "done", &[], 100),
+            job("func", "done", &["scope"], 101),
+            perf,
+            job("deliv", "done", &["scope"], 103),
+            job("sec", "failed", &["scope"], 104),
+            with(
+                job("upg", "running", &["scope"], 105),
+                Progress::Work { since: 90 },
+                true,
+            ),
+            synth,
+            job("fix", "queued", &["synth"], 108),
+            job("ship", "queued", &["fix"], 109),
+            job("zip", "queued", &["ship"], 110),
+        ],
+        ..Default::default()
+    }
+}
+
+/* audit is done; deploy's worker waits for a permission; verify queues behind it */
+fn waits() -> Snapshot {
+    Snapshot {
+        captured_at: 100,
+        jobs: vec![
+            job("audit", "done", &[], 100),
+            with(
+                job("deploy", "running", &["audit"], 101),
+                Progress::Wait {
+                    since: 90,
+                    reason: Some("Bash".into()),
+                },
+                false,
+            ),
+            job("verify", "queued", &["deploy"], 102),
+        ],
+        ..Default::default()
+    }
+}
+
+fn flow(snap: &Snapshot, sel: &str, cols: usize, wide: bool) -> (Grid, HashMap<String, usize>) {
+    let (chain, num) = numbered(snap);
+    let v = View {
+        snap: model::Frame {
+            view: snap.clone(),
+            ..Default::default()
+        },
+        chain: &chain,
+        num: &num,
+        base: 0,
+        sel,
+    };
+    let g = match wide {
+        true => layout::horizontal(&v, cols).expect("fits"),
+        false => layout::vertical(&v, cols),
+    };
+    (g, num)
+}
+
+fn glyph_at(g: &Grid, node: usize) -> (usize, usize) {
+    g.rows
+        .iter()
+        .flat_map(|(r, row)| row.iter().map(move |(c, cell)| (*r, *c, cell)))
+        .find(|(_, _, cell)| cell.glyph && cell.node == node)
+        .map(|(r, c, _)| (r, c))
+        .unwrap_or_else(|| panic!("no glyph for node {node}"))
+}
+
+fn tone_at(g: &Grid, r: usize, c: usize) -> Tone {
+    g.rows[&r][&c].tone
+}
+
+/* the row as text with a space for every empty cell, so a char index is its column */
+fn cells_text(g: &Grid, r: usize) -> String {
+    let row = &g.rows[&r];
+    let end = row.keys().max().copied().unwrap_or(0);
+    (0..=end)
+        .map(|c| row.get(&c).map_or(' ', |cell| cell.ch))
+        .collect()
+}
+
+fn find(g: &Grid, needle: &str) -> (usize, usize) {
+    g.rows
+        .keys()
+        .find_map(|r| {
+            cells_text(g, *r)
+                .find(needle)
+                .map(|i| (*r, cells_text(g, *r)[..i].chars().count()))
+        })
+        .unwrap_or_else(|| panic!("no {needle} in\n{}", g.text()))
+}
+
+#[test]
+fn a_fan_out_lights_only_the_branches_to_frontier_jobs() {
+    let snap = fanned();
+    let (g, num) = flow(&snap, "zip", 46, false);
+    let above = |id: &str| {
+        let (r, c) = glyph_at(&g, num[id]);
+        tone_at(&g, r - 1, c)
+    };
+    assert_eq!(
+        above("func"),
+        Tone::Dim,
+        "a branch to a done job\n{}",
+        g.text()
+    );
+    assert_eq!(above("perf"), Tone::Line, "to an idle holder");
+    assert_eq!(above("sec"), Tone::Line, "to a failed job");
+    assert_eq!(above("upg"), Tone::Line, "to a running job");
+    let (r, c) = glyph_at(&g, num["scope"]);
+    assert_eq!(
+        tone_at(&g, r + 1, c),
+        Tone::Line,
+        "the join carries every branch"
+    );
+}
+
+#[test]
+fn the_spine_lights_into_a_blocked_job_and_dims_into_a_queued_one() {
+    let snap = fanned();
+    let (g, num) = flow(&snap, "zip", 46, false);
+    let (r, c) = glyph_at(&g, num["synth"]);
+    assert_eq!(
+        tone_at(&g, r - 1, c),
+        Tone::Line,
+        "into synth, blocked\n{}",
+        g.text()
+    );
+    let (r, c) = glyph_at(&g, num["fix"]);
+    assert_eq!(tone_at(&g, r - 1, c), Tone::Dim, "into fix, only queued");
+}
+
+#[test]
+fn labels_say_who_needs_a_person() {
+    let snap = fanned();
+    let (g, num) = flow(&snap, "fix", 46, false);
+    let label = |id: &str| {
+        let (r, c) = find(&g, &format!("{} {id}", num[id]));
+        tone_at(&g, r, c)
+    };
+    assert_eq!(label("scope"), Tone::Dim, "done\n{}", g.text());
+    assert_eq!(label("func"), Tone::Dim, "done");
+    assert_eq!(label("perf"), Tone::Wait, "its worker ended its turn");
+    assert_eq!(label("sec"), Tone::Fail, "failed");
+    assert_eq!(label("upg"), Tone::Plain, "at work");
+    assert_eq!(
+        label("synth"),
+        Tone::Near,
+        "a neighbour of the selected job"
+    );
+    assert_eq!(label("zip"), Tone::Dim, "queued");
+    let (r, c) = glyph_at(&g, num["perf"]);
+    assert_eq!(tone_at(&g, r, c), Tone::Wait, "the idle holder's glyph");
+}
+
+#[test]
+fn a_waiting_worker_gets_a_steady_badge() {
+    let mut snap = waits();
+    snap.jobs.push(job("notes", "queued", &["verify"], 103));
+    let (g, num) = flow(&snap, "notes", 46, false);
+    let text = g.text();
+    assert!(!text.contains("WAIT!"), "{text}");
+    let (r, c) = find(&g, " WAIT ");
+    assert!(
+        (c..c + 6).all(|x| tone_at(&g, r, x) == Tone::Badge),
+        "the badge is one solid block\n{text}"
+    );
+    let (lr, lc) = find(&g, &format!("{} deploy", num["deploy"]));
+    assert_eq!(lr, r, "on deploy's row");
+    assert_eq!(
+        tone_at(&g, lr, lc),
+        Tone::Wait,
+        "and its label, away from the selection, in the wait colour"
+    );
+}
+
+#[test]
+fn the_worker_name_reads_in_the_worker_role() {
+    let snap = fanned();
+    let (g, num) = flow(&snap, "zip", 46, false);
+    let (r, c) = find(&g, &format!("{} scope cc", num["scope"]));
+    let at = c + format!("{} scope ", num["scope"]).len();
+    assert_eq!(tone_at(&g, r, at), Tone::Soft, "{}", g.text());
+}
+
+#[test]
+fn horizontal_branches_follow_their_jobs() {
+    let snap = fanned();
+    let (g, num) = flow(&snap, "zip", 200, true);
+    let branch = |id: &str| {
+        let (r, c) = glyph_at(&g, num[id]);
+        tone_at(&g, r, c - 2)
+    };
+    assert_eq!(branch("func"), Tone::Dim, "{}", g.text());
+    assert_eq!(branch("deliv"), Tone::Dim, "a lower branch to a done job");
+    assert_eq!(branch("perf"), Tone::Line);
+    assert_eq!(branch("sec"), Tone::Line);
+    assert_eq!(branch("upg"), Tone::Line);
+}
+
+#[test]
+fn a_failed_neighbour_of_the_selection_reads_near() {
+    let (g, num) = flow(&fanned(), "synth", 46, false);
+    let (r, c) = find(&g, &format!("{} sec", num["sec"]));
+    assert_eq!(
+        tone_at(&g, r, c),
+        Tone::Near,
+        "selected synth's failed direct dependency loses Near:\n{}",
+        g.text()
+    );
+}
+
+#[test]
+fn a_waiting_neighbour_of_the_selection_reads_near() {
+    let (g, num) = flow(&waits(), "verify", 46, false);
+    let (r, c) = find(&g, &format!("{} deploy", num["deploy"]));
+    assert_eq!(
+        tone_at(&g, r, c),
+        Tone::Near,
+        "selected verify's waiting direct dependency loses Near:\n{}",
+        g.text()
+    );
+}
+
+#[test]
+fn without_colour_the_badge_reverses_and_pills_are_bold() {
+    let a = app_with(waits());
+    assert!(a
+        .style(Tone::Badge)
+        .add_modifier
+        .contains(Modifier::REVERSED | Modifier::BOLD));
+    for tone in [
+        Tone::PillWait,
+        Tone::PillFail,
+        Tone::PillRun,
+        Tone::PillText,
+    ] {
+        assert!(a.style(tone).add_modifier.contains(Modifier::BOLD));
+    }
 }
 
 fn peer(id: &str, status: &str, state: Option<&str>) -> Peer {
@@ -3627,11 +4101,7 @@ fn the_screen_puts_the_online_peers_above_the_chain() {
     let mut app = app_with(with_roster(s1(), roster.clone()));
     let lines = screen_text(&mut app, 46, 60);
     assert_eq!(lines[0], "2 online · ⠋ cc  ○ pi", "{}", lines.join("\n"));
-    assert!(
-        lines[1].starts_with("chain deploy · "),
-        "{}",
-        lines.join("\n")
-    );
+    assert!(lines[1].starts_with("▸ deploy  "), "{}", lines.join("\n"));
     assert!(lines[2].starts_with("───"), "{}", lines.join("\n"));
     let mut empty = app_with(with_roster(Snapshot::default(), roster));
     let lines = screen_text(&mut empty, 46, 20);
@@ -3732,11 +4202,7 @@ fn the_smallest_pane_keeps_the_top_line_and_the_header() {
     let lines = screen_text(&mut app, 46, 8);
     assert_eq!(lines.len(), 8, "{}", lines.join("\n"));
     assert_eq!(lines[0], "1 online · ⠋ cc");
-    assert!(
-        lines[1].starts_with("chain deploy · "),
-        "{}",
-        lines.join("\n")
-    );
+    assert!(lines[1].starts_with("▸ deploy  "), "{}", lines.join("\n"));
 }
 
 fn grid_text(snap: &Snapshot, cols: usize, rows: usize) -> Vec<String> {
@@ -3752,7 +4218,7 @@ fn a_top_line_that_does_not_fit_wraps_into_aligned_columns() {
     let snap = with_roster(
         Snapshot::default(),
         vec![
-            peer("acme-web-frontend-pi-2", "online", Some("idle")),
+            peer("zeta-web-frontend-pi-2", "online", Some("idle")),
             peer("acme-web-frontend-claude-code", "online", Some("work")),
             peer("acme-web-frontend-codex", "online", Some("idle")),
         ],
@@ -3761,13 +4227,13 @@ fn a_top_line_that_does_not_fit_wraps_into_aligned_columns() {
         grid_text(&snap, 80, 4),
         [
             "3 online · ⠹ acme-web-frontend-claude-code  ○ acme-web-frontend-codex",
-            "           ○ acme-web-frontend-pi-2",
+            "           ○ zeta-web-frontend-pi-2",
         ],
         "every name shows, each line indented under the first name"
     );
     assert_eq!(
         grid_text(&snap, 120, 4),
-        ["3 online · ⠹ acme-web-frontend-claude-code  ○ acme-web-frontend-codex  ○ acme-web-frontend-pi-2"],
+        ["3 online · ⠹ acme-web-frontend-claude-code  ○ acme-web-frontend-codex  ○ zeta-web-frontend-pi-2"],
         "one line while they all fit"
     );
     assert_eq!(grid_text(&snap, 60, 4).len(), 3, "one name per line");
@@ -3815,7 +4281,7 @@ fn the_screen_moves_the_chain_below_a_wrapped_top_line() {
     let roster = vec![
         peer("acme-web-frontend-claude-code", "online", Some("work")),
         peer("acme-web-frontend-codex", "online", Some("idle")),
-        peer("acme-web-frontend-pi-2", "online", Some("idle")),
+        peer("zeta-web-frontend-pi-2", "online", Some("idle")),
     ];
     let mut app = app_with(with_roster(s1(), roster.clone()));
     let lines = screen_text(&mut app, 80, 30);
@@ -3823,16 +4289,12 @@ fn the_screen_moves_the_chain_below_a_wrapped_top_line() {
         lines[..2],
         [
             "3 online · ⠋ acme-web-frontend-claude-code  ○ acme-web-frontend-codex",
-            "           ○ acme-web-frontend-pi-2",
+            "           ○ zeta-web-frontend-pi-2",
         ],
         "{}",
         lines.join("\n")
     );
-    assert!(
-        lines[2].starts_with("chain deploy · "),
-        "{}",
-        lines.join("\n")
-    );
+    assert!(lines[2].starts_with("▸ deploy  "), "{}", lines.join("\n"));
     assert!(lines[3].starts_with("───"), "{}", lines.join("\n"));
     let mut empty = app_with(with_roster(Snapshot::default(), roster.clone()));
     let lines = screen_text(&mut empty, 80, 20);
@@ -3850,23 +4312,23 @@ fn the_screen_moves_the_chain_below_a_wrapped_top_line() {
         "the smallest pane keeps one line and counts the rest:\n{}",
         lines.join("\n")
     );
-    assert!(
-        lines[1].starts_with("chain deploy · "),
-        "{}",
-        lines.join("\n")
-    );
+    assert!(lines[1].starts_with("▸ deploy  "), "{}", lines.join("\n"));
 }
 
 #[test]
 fn the_view_moves_down_at_once_and_back_up_once_the_roster_held_still() {
     let long = |id: &str| peer(&format!("acme-web-frontend-{id}"), "online", Some("idle"));
     let two = vec![long("claude-code"), long("codex")];
-    let three = vec![long("claude-code"), long("codex"), long("pi-2")];
+    let three = vec![
+        long("claude-code"),
+        long("codex"),
+        peer("zeta-web-frontend-pi-2", "online", Some("idle")),
+    ];
     let header = |app: &mut App| {
         let lines = screen_text(app, 80, 30);
         lines
             .iter()
-            .position(|l| l.starts_with("chain deploy · "))
+            .position(|l| l.starts_with("▸ deploy  "))
             .unwrap_or_else(|| panic!("{}", lines.join("\n")))
     };
     let mut app = app_with(with_roster(s1(), two.clone()));
@@ -3878,8 +4340,8 @@ fn the_view_moves_down_at_once_and_back_up_once_the_roster_held_still() {
         "a third wraps it and the view moves down at once"
     );
     assert_eq!(
-        screen_text(&mut app, 80, 8)[1].get(..13),
-        Some("chain deploy "),
+        screen_text(&mut app, 80, 8)[1].get(..12),
+        Some("▸ deploy  "),
         "a small pane caps the rows kept"
     );
     for n in 1..PEER_HOLD {
@@ -3931,27 +4393,15 @@ fn the_rule_shows_how_many_events_the_hub_keeps() {
 }
 
 #[test]
-fn the_events_tag_joins_the_block_tag_and_gives_way_first_when_narrow() {
+fn the_events_tag_ends_the_rule_of_a_screen_with_two_blocks() {
     let mut app = app_with(with_events(mixed(), 42));
     let wide = screen_text(&mut app, 46, 60);
-    assert!(
-        wide[2].ends_with(" 42 events · +2 run · 1/2 · ● ─"),
-        "{}",
-        wide[2]
-    );
-    let narrow = screen_text(&mut app, 30, 60);
-    assert!(
-        narrow[2].ends_with("─ +2 run · 1/2 · ● ─") && !narrow[2].contains("events"),
-        "{}",
-        narrow[2]
-    );
+    let rule = &wide[rule_row(&wide)];
+    assert!(rule.ends_with("─ 42 events · ● ─"), "{rule}");
     app.opts.ascii = true;
     let ascii = screen_text(&mut app, 46, 60);
-    assert!(
-        ascii[2].ends_with(" 42 events | +2 run | 1/2 | * -"),
-        "{}",
-        ascii[2]
-    );
+    let rule = &ascii[rule_row(&ascii)];
+    assert!(rule.ends_with("- 42 events | * -"), "{rule}");
 }
 
 #[test]
@@ -4119,6 +4569,73 @@ fn fan_out() -> Snapshot {
     snap
 }
 
+/* the design's busy asks: the fan-out, codex at a permission prompt on a newer ask, pi-2's
+question that claude-code has not picked up, an ask to a peer that left, and a failed answer */
+fn busy_asks() -> Snapshot {
+    use crate::wire::{AskAction, AskOutcome, AskState, IdleWhy, Liveness, Progress};
+    let mut snap = fan_out();
+    let open = |cid, from, to, at, progress, actions| {
+        let ask = lone(cid, from, to, Some(at));
+        stamp(ask, AskState::Open { progress }, actions, None)
+    };
+    let reason = Some("Claude needs your permission to use Bash".to_string());
+    let mut perm = open(
+        "ask-5d0c11e2",
+        CC,
+        CODEX,
+        960,
+        Progress::Wait {
+            since: 985,
+            reason: reason.clone(),
+        },
+        vec![],
+    );
+    perm.text = "run the full sm2 bench on the arm64 box and post the table".into();
+    let failed = closed(
+        lone("ask-e81f3b07", CC, PI2, Some(600)),
+        900,
+        "recipient",
+        true,
+        "build broke: sm2_sign undefined after the rebase",
+    );
+    snap.asks.extend([
+        perm,
+        open(
+            "ask-77aa0d93",
+            PI2,
+            CC,
+            975,
+            Progress::Idle {
+                since: 975,
+                why: IdleWhy::NotPickedUp,
+            },
+            vec![AskAction::Nudge { to: CC.into() }],
+        ),
+        open(
+            "ask-0c9e4a18",
+            CC,
+            "openhitls-sm2-opt-gemini",
+            700,
+            Progress::Gone,
+            vec![AskAction::CloseLeft],
+        ),
+        stamp(
+            failed,
+            AskState::Closed {
+                outcome: AskOutcome::AckedFailed,
+                failed_effective: true,
+            },
+            vec![],
+            Some(false),
+        ),
+    ]);
+    for ask in snap.asks.iter_mut() {
+        ask.from_peer_id = Some(ask.from_peer.clone());
+    }
+    set_live(&mut snap, &[(CODEX, Liveness::Wait { since: 985, reason })]);
+    snap
+}
+
 fn row_text(row: &[(String, layout::Tone)]) -> String {
     row.iter().map(|(t, _)| t.as_str()).collect()
 }
@@ -4142,7 +4659,33 @@ fn the_asks_of_jobs_stay_on_their_cards() {
 }
 
 #[test]
-fn the_asks_are_listed_open_by_age_then_closed_latest_first() {
+fn the_asks_are_listed_by_what_they_need_then_by_age() {
+    use crate::wire::{AskOutcome, AskState, IdleWhy, Progress};
+    let open = |cid, opened, progress| {
+        stamp(
+            lone(cid, CC, PI, opened),
+            AskState::Open { progress },
+            vec![],
+            None,
+        )
+    };
+    let wait = |since| Progress::Wait {
+        since,
+        reason: None,
+    };
+    let idle = |since| Progress::Idle {
+        since,
+        why: IdleWhy::TurnEnded,
+    };
+    let shut = |cid, at| {
+        let mut ask = closed(lone(cid, CC, PI, Some(10)), 0, "recipient", false, "r");
+        ask.closed_at = at;
+        ask.state = Some(AskState::Closed {
+            outcome: AskOutcome::AckedOk,
+            failed_effective: false,
+        });
+        ask
+    };
     let snap = with_asks(
         Snapshot::default(),
         vec![
@@ -4163,6 +4706,19 @@ fn the_asks_are_listed_open_by_age_then_closed_latest_first() {
                 false,
                 "r",
             ),
+            shut("ask-c0", None),
+            shut("ask-c3", Some(970)),
+            open("ask-work", Some(850), Progress::Work { since: 990 }),
+            open("ask-pending", Some(820), Progress::Pending { since: None }),
+            open("ask-unknown", None, Progress::Unknown),
+            open("ask-left-x", None, Progress::Gone),
+            open("ask-offline", Some(500), Progress::Offline),
+            open("ask-left", Some(400), Progress::Gone),
+            open("ask-idle-new", Some(100), idle(980)),
+            open("ask-idle-old", Some(900), idle(950)),
+            open("ask-wait-y", Some(900), wait(960)),
+            open("ask-wait-new", Some(100), wait(990)),
+            open("ask-wait-x", Some(950), wait(960)),
         ],
         vec![],
     );
@@ -4170,7 +4726,29 @@ fn the_asks_are_listed_open_by_age_then_closed_latest_first() {
         .iter()
         .map(|a| a.correlation_id.as_str())
         .collect();
-    assert_eq!(ids, ["ask-a", "ask-b", "ask-legacy", "ask-c2", "ask-c1"]);
+    assert_eq!(
+        ids,
+        [
+            "ask-wait-x",
+            "ask-wait-y",
+            "ask-wait-new",
+            "ask-idle-old",
+            "ask-idle-new",
+            "ask-left",
+            "ask-offline",
+            "ask-left-x",
+            "ask-a",
+            "ask-pending",
+            "ask-work",
+            "ask-b",
+            "ask-legacy",
+            "ask-unknown",
+            "ask-c2",
+            "ask-c3",
+            "ask-c1",
+            "ask-c0",
+        ]
+    );
 }
 
 #[test]
@@ -4191,7 +4769,7 @@ fn each_ask_reads_in_the_words_of_the_job_card() {
         line(AskState::Open {
             progress: Progress::Work { since: 900 },
         }),
-        ("waiting 3m".into(), Tone::Run)
+        ("working 3m".into(), Tone::Run)
     );
     assert_eq!(
         line(AskState::Open {
@@ -4200,7 +4778,7 @@ fn each_ask_reads_in_the_words_of_the_job_card() {
                 why: IdleWhy::TurnEnded,
             },
         }),
-        ("IDLE! 1m".into(), Tone::Fail)
+        ("IDLE 1m".into(), Tone::PillWait)
     );
     assert_eq!(
         line(AskState::Open {
@@ -4209,19 +4787,30 @@ fn each_ask_reads_in_the_words_of_the_job_card() {
                 reason: None,
             },
         }),
-        ("WAIT! 40s".into(), Tone::Wait)
+        ("WAIT 40s".into(), Tone::Badge)
     );
     assert_eq!(
         line(AskState::Open {
             progress: Progress::Offline,
         }),
-        ("offline".into(), Tone::Fail)
+        ("OFFLINE".into(), Tone::PillFail)
     );
     assert_eq!(
         line(AskState::Open {
             progress: Progress::Gone,
         }),
-        ("left the hub".into(), Tone::Fail)
+        ("LEFT".into(), Tone::PillFail)
+    );
+    assert_eq!(
+        line(AskState::Open {
+            progress: Progress::Unknown,
+        }),
+        ("waiting 3m".into(), Tone::Run)
+    );
+    assert_eq!(
+        super::asks::state(&snap, &lone("ask-x", CC, PI, Some(820))),
+        ("waiting 3m".into(), Tone::Run),
+        "a v1 open ask"
     );
     let pending = stamp(
         lone("ask-x", CC, PI, Some(820)),
@@ -4293,18 +4882,18 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     };
     let wide = text(100);
     assert!(
-        wide[0].starts_with("1 ◆ 1223 …claude-code─▸─…pi-2  "),
+        wide[1].starts_with("2 ◆ 1223 claude-code─▸─pi-2  "),
         "{}",
-        wide[0]
+        wide[1]
     );
     assert!(
-        wide[0].contains("waiting 3m") && wide[0].contains("question ask-1223c9e0"),
+        wide[1].contains("working 3m") && wide[1].contains("question ask-1223c9e0"),
         "{}",
-        wide[0]
+        wide[1]
     );
-    assert!(wide[1].contains("IDLE! 1m"), "{}", wide[1]);
+    assert!(wide[0].contains("IDLE 1m"), "{}", wide[0]);
     assert!(
-        wide[2].starts_with("3 ● a904 …claude-code>…codex")
+        wide[2].starts_with("3 ● a904 claude-code>codex")
             && wide[2].contains("acked ok")
             && wide[2].contains("→ 2 findings, both fixed"),
         "{}",
@@ -4313,9 +4902,9 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     assert!(wide.iter().all(|row| width(row) <= 100));
     let narrow = text(46);
     assert!(
-        narrow[0].trim_end().ends_with("waiting 3m"),
+        narrow[1].trim_end().ends_with("working 3m"),
         "no room for a preview: {}",
-        narrow[0]
+        narrow[1]
     );
     let mut far = fan_out();
     far.asks.push(stamp(
@@ -4338,7 +4927,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
         .collect();
     let gone = rows.iter().find(|r| r.contains("0594")).unwrap();
     assert!(
-        gone.trim_end().ends_with("left the hub") && gone.contains('…') && width(gone) <= 46,
+        gone.trim_end().ends_with("LEFT") && gone.contains('…') && width(gone) <= 46,
         "the route gives way: {gone}"
     );
     let mut anon = fan_out();
@@ -4348,8 +4937,8 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
     let rows = super::asks::rows(&as_frame(&anon), &order, 100);
     assert!(
         rows.iter()
-            .any(|row| row_text(row).contains(" anonymous─▸─…pi ")),
-        "a name without a row keeps the prefix: {:?}",
+            .any(|row| row_text(row).contains(" anonymous─▸─pi ")),
+        "anonymous keeps its name: {:?}",
         rows.iter().map(|r| row_text(r)).collect::<Vec<_>>()
     );
     let mut across = fan_out();
@@ -4361,8 +4950,8 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
         .map(|row| row_text(row))
         .collect();
     assert!(
-        rows.iter().any(|r| r.contains("far─▸─…pi "))
-            && rows.iter().any(|r| r.contains("…claude-code─▸─…pi-2")),
+        rows.iter().any(|r| r.contains("far─▸─pi "))
+            && rows.iter().any(|r| r.contains("claude-code─▸─pi-2")),
         "a sender from another circle keeps its name and leaves the prefix to the circle's own: {rows:?}"
     );
     let mut all = fan_out();
@@ -4373,7 +4962,7 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
         .map(|row| row_text(row))
         .collect();
     assert!(
-        [PI2, PI, CODEX]
+        [PI, PI2, CODEX]
             .iter()
             .zip(&rows)
             .all(|(to, row)| row.contains(" …") && row.contains(&format!(">{to}  "))),
@@ -4399,18 +4988,103 @@ fn ask_rows_leave_out_the_shared_prefix_and_keep_the_state_whole() {
         .map(|row| row_text(row))
         .collect();
     assert!(
-        rows.iter().any(|r| r.contains(" anonymous─▸─…pi-2 ")),
+        rows.iter().any(|r| r.contains(" anonymous─▸─pi-2 ")),
         "anonymous keeps its name and leaves the prefix alone: {rows:?}"
     );
     assert!(
-        rows.iter()
-            .any(|r| r.contains(&format!(" {foreign}─▸─…pi "))),
-        "a name from another circle keeps its whole name: {rows:?}"
+        rows.iter().any(|r| r.contains(" external─▸─pi ")),
+        "a name from the same folder loses the prefix wherever it comes from: {rows:?}"
     );
     assert!(
-        rows.iter()
-            .any(|r| r.contains(" …claude-code─▸─openhitls-sm2-opt-pi-3 ")),
-        "a peer that left keeps its whole name: {rows:?}"
+        rows.iter().any(|r| r.contains(" claude-code─▸─pi-3 ")),
+        "a peer that left loses it too: {rows:?}"
+    );
+}
+
+#[test]
+fn the_view_prefix_comes_off_every_name_that_starts_with_it() {
+    let snap = fan_out();
+    let prefix = layout::prefix(&snap);
+    assert_eq!(prefix, "openhitls-sm2-opt-");
+    for (name, short) in [
+        (CC, "claude-code"),
+        ("openhitls-sm2-opt-pi-3", "pi-3"),
+        ("crypto-software-agile-pi-2", "crypto-software-agile-pi-2"),
+        ("anonymous", "anonymous"),
+        (prefix, prefix),
+    ] {
+        assert_eq!(layout::brief(name, prefix), short, "{name}");
+    }
+    let alone = with_roster(Snapshot::default(), vec![peer(CC, "online", None)]);
+    assert_eq!(layout::prefix(&alone), "", "one peer shares nothing");
+    let mixed = with_roster(
+        Snapshot::default(),
+        vec![
+            peer(CC, "online", None),
+            peer("crypto-software-agile-pi-2", "online", None),
+        ],
+    );
+    assert_eq!(layout::prefix(&mixed), "", "two folders share no prefix");
+    let mut anon = fan_out();
+    anon.roster.push(doing("anonymous", "work", 900, None));
+    assert_eq!(
+        layout::prefix(&anon),
+        prefix,
+        "anonymous is no folder's peer"
+    );
+    let all = with_roster(
+        Snapshot::default(),
+        vec![
+            peer("folder-", "online", None),
+            peer("folder-two", "online", None),
+        ],
+    );
+    assert_eq!(layout::prefix(&all), "", "no name gives all of itself away");
+}
+
+#[test]
+fn the_top_line_and_attention_name_peers_without_the_shared_prefix() {
+    let mut app = app_with(fan_out());
+    app.key(KeyCode::Char('a'));
+    let lines = screen_text(&mut app, 46, 24);
+    assert_eq!(
+        lines[..2],
+        [
+            "4 online · ○ claude-code  ○ codex",
+            "           ○ pi           ⠋ pi-2",
+        ],
+        "{}",
+        lines.join("\n")
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("attention  IDLE pi 1m")),
+        "{}",
+        lines.join("\n")
+    );
+    assert_eq!(
+        screen_text(&mut app, 100, 24)[0],
+        "4 online · ○ claude-code  ○ codex  ○ pi  ⠋ pi-2",
+        "one line once it fits"
+    );
+    let stuck = delivering(
+        Snapshot::default(),
+        vec![
+            marked(
+                "folder-pi",
+                crate::wire::DeliveryCondition::NoPush,
+                Some((2, 150)),
+            ),
+            marked("folder-codex", crate::wire::DeliveryCondition::Push, None),
+        ],
+        200,
+    );
+    assert_eq!(
+        layout::attention(&stuck)
+            .iter()
+            .map(|item| joined(item))
+            .collect::<Vec<_>>(),
+        ["✉2 pi no push"],
+        "a stuck queue names its peer short"
     );
 }
 
@@ -4419,7 +5093,7 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
     let snap = fan_out();
     let find = |cid: &str| snap.asks.iter().find(|a| a.correlation_id == cid).unwrap();
     let text = |cid: &str, cols: usize| {
-        super::asks::card(&as_frame(&snap), find(cid), 1, cols, None, Fit::Rows(24)).text()
+        super::asks::card(&as_frame(&snap), find(cid), 1, cols, None, Fit::Whole).text()
     };
     let mut long = fan_out();
     long.asks[2].reply = Some("word ".repeat(80));
@@ -4454,7 +5128,18 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
         pi.contains("│         · now IDLE"),
         "a status that does not fit takes its own line:\n{pi}"
     );
-    assert!(pi.contains("IDLE! 1m · turn ended"), "{pi}");
+    assert!(
+        pi.starts_with("┌◆ 1 ask a3a0 · open 3m ─")
+            && pi.lines().next().unwrap().ends_with("─ IDLE ┐")
+            && pi.contains("│ why     pi ended its turn 1m ago "),
+        "the badge, and the why naming the recipient short:\n{pi}"
+    );
+    assert!(
+        pi.contains(
+            "│ to      openhitls-sm2-opt-pi               │\n│ times   sent 00:13 · waiting 3m "
+        ),
+        "the to row leaves the stall to the badge and the why:\n{pi}"
+    );
     let joined: String = pi
         .lines()
         .map(|l| l.trim_matches(|c| c == '│' || c == ' '))
@@ -4479,10 +5164,9 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
         vec![crate::wire::AskAction::CloseLeft],
         None,
     );
-    let left =
-        super::asks::card(&as_frame(&gone), &gone.asks[1], 2, 90, None, Fit::Rows(12)).text();
+    let left = super::asks::card(&as_frame(&gone), &gone.asks[1], 2, 90, None, Fit::Whole).text();
     assert!(
-        left.contains("openhitls-sm2-opt-pi · left the hub")
+        left.contains("│ why     pi left the hub ")
             && left.contains(
                 "│ close   amesh peer ack ask-a3a07b51 --failed true --message 'recipient left'"
             ),
@@ -4490,12 +5174,261 @@ fn the_ask_card_puts_the_reply_first_and_gives_a_command_where_one_is_due() {
     );
     let mut old = fan_out();
     old.asks[0].opened_at = None;
-    let legacy =
-        super::asks::card(&as_frame(&old), &old.asks[0], 1, 46, None, Fit::Rows(20)).text();
+    let legacy = super::asks::card(&as_frame(&old), &old.asks[0], 1, 46, None, Fit::Whole).text();
     assert!(
         legacy.contains("open, age unknown")
             && legacy.contains("sent before the hub kept the time"),
         "{legacy}"
+    );
+}
+
+/* the card under the list: a badge and why while the ask needs a person, the reply once it
+is answered, one route in brief names, and the question; parties, times and commands are the
+full card's */
+#[test]
+fn the_compact_ask_card_leads_with_why_and_names_the_route() {
+    use layout::Tone;
+    let busy = busy_asks();
+    let mut off = busy_asks();
+    let gone = off
+        .asks
+        .iter_mut()
+        .find(|a| a.correlation_id == "ask-0c9e4a18");
+    gone.unwrap().state = Some(crate::wire::AskState::Open {
+        progress: crate::wire::Progress::Offline,
+    });
+    let card = |snap: &Snapshot, cid: &str, cols: usize| {
+        let ask = snap.asks.iter().find(|a| a.correlation_id == cid).unwrap();
+        super::asks::card(&as_frame(snap), ask, 1, cols, None, Fit::Rows(10))
+    };
+    for (snap, cid, top, badge, lead) in [
+        (
+            &busy,
+            "ask-5d0c11e2",
+            &[
+                "┌◆ 1 ask 5d0c · open 40s ────────────── WAIT ┐",
+                "│ why     Claude needs your permission to    │",
+                "│         use Bash                           │",
+                "│ from    claude-code▸codex · 00:16          │",
+            ][..],
+            Tone::Badge,
+            Tone::Wait,
+        ),
+        (
+            &busy,
+            "ask-a3a07b51",
+            &[
+                "┌◆ 1 ask a3a0 · open 3m ─────────────── IDLE ┐",
+                "│ why     pi ended its turn 1m ago           │",
+                "│ from    claude-code▸pi · 00:13             │",
+            ],
+            Tone::PillWait,
+            Tone::Wait,
+        ),
+        (
+            &busy,
+            "ask-77aa0d93",
+            &[
+                "┌◆ 1 ask 77aa · open 25s ────────────── IDLE ┐",
+                "│ why     claude-code: not picked up · 25s   │",
+                "│ from    pi-2▸claude-code · 00:16           │",
+            ],
+            Tone::PillWait,
+            Tone::Wait,
+        ),
+        (
+            &busy,
+            "ask-0c9e4a18",
+            &[
+                "┌◆ 1 ask 0c9e · open 5m ─────────────── LEFT ┐",
+                "│ why     gemini left the hub                │",
+                "│ from    claude-code▸gemini · 00:11         │",
+            ],
+            Tone::PillFail,
+            Tone::Warn,
+        ),
+        (
+            &off,
+            "ask-0c9e4a18",
+            &[
+                "┌◆ 1 ask 0c9e · open 5m ──────────── OFFLINE ┐",
+                "│ why     gemini is offline                  │",
+                "│ from    claude-code▸gemini · 00:11         │",
+            ],
+            Tone::PillFail,
+            Tone::Warn,
+        ),
+        (
+            &busy,
+            "ask-1223c9e0",
+            &[
+                "┌◆ 1 ask 1223 · open 3m ─────────────────────┐",
+                "│ from    claude-code▸pi-2 · 00:13           │",
+            ],
+            Tone::Line,
+            Tone::Soft,
+        ),
+        (
+            &busy,
+            "ask-a904f2d6",
+            &[
+                "┌● 1 ask a904 · acked ok · took 2m ──────────┐",
+                "│ reply   2 findings, both fixed             │",
+                "│ from    claude-code▸codex · 00:13          │",
+            ],
+            Tone::Line,
+            Tone::Done,
+        ),
+        (
+            &busy,
+            "ask-e81f3b07",
+            &[
+                "┌× 1 ask e81f · acked failed · took 5m ──────┐",
+                "│ reply   build broke: sm2_sign undefined    │",
+                "│         after the rebase                   │",
+                "│ from    claude-code▸pi-2 · 00:10           │",
+            ],
+            Tone::Line,
+            Tone::Fail,
+        ),
+    ] {
+        let g = card(snap, cid, 46);
+        let text = g.text();
+        let tone = |r: usize, c: usize| g.rows[&r][&c].tone;
+        assert_eq!(text.lines().take(top.len()).collect::<Vec<_>>(), top);
+        assert_eq!(
+            (tone(0, 44), tone(1, 10), tone(top.len() - 1, 10)),
+            (badge, lead, Tone::Soft),
+            "badge, lead and route tones:\n{text}"
+        );
+        assert!(
+            ["nudge", "close", "times", "│ to "]
+                .iter()
+                .all(|word| !text.contains(word)),
+            "no parties, times or commands:\n{text}"
+        );
+        assert_eq!(g.height(), 10, "{text}");
+    }
+    for cols in 30..=60 {
+        let g = card(&busy, "ask-5d0c11e2", cols);
+        assert_eq!(
+            g.rows[&0][&(cols - 8)].ch,
+            '─',
+            "the head leaves a rule before the badge at {cols}:\n{}",
+            g.text()
+        );
+    }
+    let mut odd = busy_asks();
+    odd.asks[0].opened_at = None;
+    odd.asks[0].text = "word ".repeat(80);
+    odd.asks.push(lone(
+        "ask-f00d0001",
+        "crypto-software-agile-pi-2",
+        "crypto-software-agile-pi-3",
+        Some(900),
+    ));
+    let lines: Vec<String> = card(&odd, "ask-1223c9e0", 46)
+        .text()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(lines[1], "│ from    claude-code▸pi-2                   │");
+    assert!(
+        lines[2].starts_with("│ text    word")
+            && lines[8].starts_with("│         word")
+            && lines[8].ends_with("… │")
+            && lines[9].starts_with('└'),
+        "the question takes every row left:\n{}",
+        lines.join("\n")
+    );
+    let wide = card(&odd, "ask-f00d0001", 46).text();
+    assert!(
+        wide.contains(
+            "│ from    crypto-software-agile-pi-2▸crypto- │\n│         software-agile-pi-3 · 00:15        │"
+        ),
+        "a route wider than the card wraps:\n{wide}"
+    );
+}
+
+/* the design's busy view at 46x24: the ask at a permission prompt is listed and selected
+first; the full card behind it says the rest */
+#[test]
+fn the_busy_asks_screen_lists_the_wait_first_as_designed() {
+    use layout::Tone;
+    let mut app = app_with(busy_asks());
+    app.key(KeyCode::Char('a'));
+    assert_eq!(
+        screen_text(&mut app, 46, 24),
+        [
+            "4 online · ○ claude-code  ! codex",
+            "           ○ pi           ⠋ pi-2",
+            "asks · all circles · 5 open · 1 answered · 1 …",
+            "────────────────────────────────────────── ● ─",
+            "attention  WAIT codex 15s   IDLE pi 1m   IDLE…",
+            "1 ◆ 5d0c claude-code─▸─codex   WAIT 15s",
+            "2 ◆ a3a0 claude-code─▸─pi      IDLE 1m",
+            "3 ◆ 77aa pi-2─▸─claude-code    IDLE 25s",
+            "4 ◆ 0c9e claude-code─▸─gemini  LEFT",
+            "5 ◆ 1223 claude-code─▸─pi-2    working 3m",
+            "6 ● a904 claude-code>codex     acked ok",
+            "7 × e81f claude-code>pi-2      acked failed",
+            "",
+            "┌◆ 1 ask 5d0c · open 40s ────────────── WAIT ┐",
+            "│ why     Claude needs your permission to    │",
+            "│         use Bash                           │",
+            "│ from    claude-code▸codex · 00:16          │",
+            "│ text    run the full sm2 bench on the      │",
+            "│         arm64 box and post the table       │",
+            "│                                            │",
+            "│                                            │",
+            "│                                            │",
+            "└────────────────────────────────────────────┘",
+            "j/k move  1-9 jump  enter card  a jobs",
+        ]
+    );
+    assert_eq!(app.ask_sel.as_deref(), Some("ask-5d0c11e2"));
+    let snap = busy_asks();
+    let rows = super::asks::rows(&as_frame(&snap), &super::asks::order(&snap), 46);
+    for (row, (word, tone)) in rows.iter().zip([
+        ("WAIT 15s", Tone::Badge),
+        ("IDLE 1m", Tone::PillWait),
+        ("IDLE 25s", Tone::PillWait),
+        ("LEFT", Tone::PillFail),
+        ("working 3m", Tone::Run),
+        ("acked ok", Tone::Done),
+        ("acked failed", Tone::Fail),
+    ]) {
+        let at = row.iter().position(|(t, _)| t == word).unwrap();
+        assert_eq!(
+            (row[at].1, &row[at + 1]),
+            (tone, &(" ".repeat(12 - word.len()), Tone::Plain)),
+            "{word} in its tone, the column padded plain"
+        );
+    }
+    assert!(
+        screen_text(&mut app, 100, 24).contains(
+            &"│ why     Claude needs your permission to use     │ text    run the full sm2 bench on the arm64 box│"
+                .to_string()
+        ),
+        "a wide card puts the question beside the why"
+    );
+    app.key(KeyCode::Enter);
+    let full = screen_text(&mut app, 46, 24);
+    assert_eq!(
+        full[5..14],
+        [
+            "┌◆ 1 ask 5d0c · open 40s ────────────── WAIT ┐",
+            "│ why     Claude needs your permission to    │",
+            "│         use Bash                           │",
+            "│ from    openhitls-sm2-opt-claude-code      │",
+            "│         · now IDLE                         │",
+            "│ to      openhitls-sm2-opt-codex            │",
+            "│ times   sent 00:16 · waiting 40s           │",
+            "│ text    run the full sm2 bench on the      │",
+            "│         arm64 box and post the table       │",
+        ],
+        "{}",
+        full.join("\n")
     );
 }
 
@@ -4517,11 +5450,11 @@ fn a_opens_the_asks_screen_even_without_jobs() {
         "the rule under it: {}",
         lines[at + 1]
     );
-    assert!(lines[at + 3].starts_with("1 ◆ 1223"), "{}", lines[at + 3]);
+    assert!(lines[at + 3].starts_with("1 ◆ a3a0"), "{}", lines[at + 3]);
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("┌◆ 1 ask 1223 · waiting 3m")),
+            .any(|l| l.starts_with("┌◆ 1 ask a3a0 · open 3m")),
         "the first ask's card"
     );
     assert!(lines.last().unwrap().ends_with("a jobs"));
@@ -4540,7 +5473,7 @@ fn the_asks_screen_moves_jumps_finds_and_opens_the_full_card() {
     app.key(KeyCode::Char('a'));
     screen_text(&mut app, 100, 30);
     app.key(KeyCode::Char('j'));
-    assert_eq!(app.ask_sel.as_deref(), Some("ask-a3a07b51"));
+    assert_eq!(app.ask_sel.as_deref(), Some("ask-1223c9e0"));
     app.key(KeyCode::Char('3'));
     assert_eq!(app.ask_sel.as_deref(), Some("ask-a904f2d6"));
     app.key(KeyCode::Char('/'));
@@ -4572,18 +5505,18 @@ fn the_ask_selection_follows_its_id_when_the_list_reorders() {
     app.key(KeyCode::Char('a'));
     screen_text(&mut app, 100, 30);
     app.key(KeyCode::Char('2'));
-    assert_eq!(app.ask_sel.as_deref(), Some("ask-a3a07b51"));
+    assert_eq!(app.ask_sel.as_deref(), Some("ask-1223c9e0"));
     let mut next = fan_out();
-    next.asks[0] = closed(next.asks[0].clone(), 990, "recipient", true, "no toolchain");
+    next.asks[1] = closed(next.asks[1].clone(), 990, "recipient", true, "no toolchain");
     app.apply(Ok(next));
     let lines = screen_text(&mut app, 100, 30);
     assert_eq!(
         app.ask_sel.as_deref(),
-        Some("ask-a3a07b51"),
+        Some("ask-1223c9e0"),
         "the same ask, now first"
     );
     assert!(
-        lines.iter().any(|l| l.starts_with("┌◆ 1 ask a3a0")),
+        lines.iter().any(|l| l.starts_with("┌◆ 1 ask 1223")),
         "{lines:?}"
     );
     let mut many = fan_out();
@@ -4619,7 +5552,7 @@ fn the_selected_ask_row_is_marked_across_the_pane() {
     };
     let row = lines
         .iter()
-        .position(|l| text(l).starts_with("1 ◆ 1223"))
+        .position(|l| text(l).starts_with("1 ◆ a3a0"))
         .unwrap();
     assert!(lines[row]
         .spans
@@ -4631,14 +5564,14 @@ fn the_selected_ask_row_is_marked_across_the_pane() {
         .all(|s| !s.style.add_modifier.contains(Modifier::REVERSED)));
     app.opts.color = true;
     let lines = app.screen(100, 30, 0);
-    let idle = lines[row + 1]
+    let working = lines[row + 1]
         .spans
         .iter()
-        .find(|s| s.content.contains("IDLE!"))
+        .find(|s| s.content.contains("working"))
         .unwrap();
     assert_eq!(
-        idle.style.fg,
-        Some(app.opts.theme.fail),
+        working.style.fg,
+        Some(app.opts.theme.run),
         "an unselected row keeps its colours"
     );
     let sel = &lines[row];
@@ -4646,14 +5579,14 @@ fn the_selected_ask_row_is_marked_across_the_pane() {
         .spans
         .iter()
         .all(|s| s.style.bg == Some(app.opts.theme.select_bg)));
-    let waiting = sel
+    let idle = sel
         .spans
         .iter()
-        .find(|s| s.content.contains("waiting"))
+        .find(|s| s.content.contains("IDLE"))
         .unwrap();
     assert_eq!(
-        waiting.style.fg,
-        Some(app.opts.theme.run),
+        idle.style.fg,
+        Some(app.opts.theme.wait),
         "the selected row keeps its colours too"
     );
 }
@@ -4692,7 +5625,7 @@ fn the_asks_screen_speaks_for_old_hubs_and_empty_views() {
     assert!(
         lines
             .iter()
-            .any(|l| l.starts_with("1 > 1223 ~claude-code->-~pi-2")),
+            .any(|l| l.starts_with("1 > a3a0 claude-code->-pi ")),
         "ASCII glyphs: {lines:?}"
     );
 }
@@ -4779,17 +5712,272 @@ fn the_footer_names_a_while_the_view_holds_asks() {
     let mut app = app_with(s1());
     assert_eq!(
         screen_text(&mut app, 100, 40).last().unwrap(),
-        "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain"
+        "j/k ↑↓ move  h/l ←→ stage  tab chain  t timeline  enter card  / find  f hints  digits jump  esc back"
+    );
+    assert!(
+        !screen_text(&mut app, 46, 40)
+            .last()
+            .unwrap()
+            .contains("a asks"),
+        "no asks, no asks key"
     );
     let mut app = app_with(with_lone_asks(s1()));
     assert_eq!(
         screen_text(&mut app, 100, 40).last().unwrap(),
-        "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  tab chain  a asks"
+        "j/k ↑↓ move  h/l ←→ stage  tab chain  t timeline  enter card  a asks  / find  f hints  digits jump"
     );
     assert_eq!(
         screen_text(&mut app, 46, 40).last().unwrap(),
-        "j/k move  h/l stage  1-9 jump  f hint  a asks"
+        "j/k move  h/l stage  t timeline  a asks",
+        "a narrow pane keeps the asks key and the view toggle"
     );
+}
+
+#[test]
+fn the_footer_offers_copy_only_when_the_card_has_a_command() {
+    let mut app = app_with(proto_s5());
+    app.sel = Some("job-58851116".into());
+    let footer = screen_text(&mut app, 100, 40).last().unwrap().clone();
+    assert!(
+        footer.contains("y copy"),
+        "a failed job can be retried: {footer}"
+    );
+    app.sel = Some("deploy".into());
+    let footer = screen_text(&mut app, 100, 40).last().unwrap().clone();
+    assert!(
+        !footer.contains("y copy"),
+        "a queued job has nothing to copy: {footer}"
+    );
+}
+
+#[test]
+fn copy_keys_leave_navigation_bindings_intact() {
+    let mut input = Input::new();
+    for (key, action) in [
+        ('y', "Copy(0)"),
+        ('Y', "Copy(1)"),
+        ('t', "Timeline"),
+        ('n', "Find(1)"),
+        ('r', "Refresh"),
+        ('g', "Edge(-1)"),
+        ('e', "Events"),
+    ] {
+        assert_eq!(
+            format!("{:?}", input.key(KeyCode::Char(key), 1)),
+            action,
+            "{key}"
+        );
+    }
+}
+
+fn copy_app() -> App {
+    let mut app = app_with(sample());
+    app.sel = Some("j".into());
+    app
+}
+
+#[test]
+fn osc52_copies_the_card_commands_and_handles_missing_actions() {
+    let mut a = copy_app();
+    let mut bytes = Vec::new();
+    a.copy_command(0, false, &mut bytes);
+    assert_eq!(
+        bytes,
+        b"\x1b]52;c;YW1lc2ggcGVlciBub3RpZnkgY29kZXggJ3Jldmlldz8n\x07"
+    );
+    bytes.clear();
+    a.copy_command(1, false, &mut bytes);
+    assert_eq!(bytes, b"\x1b]52;c;YW1lc2ggam9icyB1cGRhdGUgaiAtLXN0YXRlIHF1ZXVlZCAtLWFzc2lnbmVkLXBlZXIgUEVFUg==\x07");
+    bytes.clear();
+    a.copy_command(2, false, &mut bytes);
+    assert!(bytes.is_empty());
+    a.asks = true;
+    a.copy_command(0, false, &mut bytes);
+    assert!(bytes.is_empty());
+    a.asks = false;
+    a.events = true;
+    a.copy_command(0, false, &mut bytes);
+    assert!(bytes.is_empty());
+}
+
+#[test]
+fn copy_footer_expires_and_failed_writes_do_not_claim_success() {
+    let mut a = copy_app();
+    a.copy_command(0, false, &mut Vec::new());
+    let text = screen_text(&mut a, 100, 30).last().unwrap().clone();
+    assert!(
+        text.starts_with("sent to clipboard (OSC 52): amesh peer notify codex 'review?'"),
+        "{text}"
+    );
+    a.copied.as_mut().unwrap().0 = std::time::Instant::now() - std::time::Duration::from_secs(2);
+    let text = screen_text(&mut a, 100, 30).last().unwrap().clone();
+    assert!(!text.contains("sent to clipboard"), "{text}");
+    a.copied = None;
+    a.copy_command(0, false, &mut std::io::Cursor::new(&mut [0u8; 0][..]));
+    assert!(a.copy_notice().unwrap().starts_with("copy failed:"));
+}
+
+#[test]
+fn base64_encodes_padding_and_utf8() {
+    for (plain, encoded) in [
+        ("", ""),
+        ("f", "Zg=="),
+        ("fo", "Zm8="),
+        ("foo", "Zm9v"),
+        ("中文", "5Lit5paH"),
+    ] {
+        assert_eq!(super::base64(plain.as_bytes()), encoded, "{plain}");
+    }
+}
+
+fn retry_app() -> App {
+    let mut app = app_with(Snapshot {
+        jobs: vec![model::Job {
+            job_id: "j".into(),
+            state: "failed".into(),
+            actions: Some(vec![crate::wire::JobAction::Retry {
+                needs_assignee: false,
+            }]),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    app.sel = Some("j".into());
+    app
+}
+
+#[test]
+fn a_clipboard_flush_failure_replaces_the_success_notice() {
+    struct FailsFlush;
+    impl std::io::Write for FailsFlush {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("flush failed"))
+        }
+    }
+    let mut app = retry_app();
+    app.copy_command(0, false, &mut Vec::new());
+    app.copy_command(0, false, &mut FailsFlush);
+    assert_eq!(
+        app.copy_notice().as_deref(),
+        Some("copy failed: flush failed")
+    );
+}
+
+#[test]
+fn a_tmux_clipboard_write_sends_plain_before_passthrough() {
+    let mut app = retry_app();
+    let mut bytes = Vec::new();
+    app.copy_command(0, true, &mut bytes);
+    assert_eq!(
+        bytes,
+        b"\x1b]52;c;YW1lc2ggam9icyB1cGRhdGUgaiAtLXN0YXRlIHF1ZXVlZA==\x07\x1bPtmux;\x1b\x1b]52;c;YW1lc2ggam9icyB1cGRhdGUgaiAtLXN0YXRlIHF1ZXVlZA==\x07\x1b\\"
+    );
+}
+
+#[test]
+fn clipboard_notices_claim_the_write_and_explain_tmux() {
+    let mut app = retry_app();
+    app.copy_command(0, false, &mut Vec::new());
+    assert_eq!(
+        app.copy_notice().as_deref(),
+        Some("sent to clipboard (OSC 52): amesh jobs update j --state queued")
+    );
+    app.copy_command(0, true, &mut Vec::new());
+    assert_eq!(app.copy_notice().as_deref(), Some("tmux: set-clipboard on · sent to clipboard (OSC 52): amesh jobs update j --state queued"));
+}
+
+fn preserves_input_prompt(mode: Mode, prefix: &str) {
+    let mut app = retry_app();
+    app.copy_command(0, false, &mut Vec::new());
+    app.input.mode = mode;
+    let footer = screen_text(&mut app, 100, 30).last().unwrap().clone();
+    assert!(footer.starts_with(prefix), "{footer}");
+}
+
+#[test]
+fn a_clipboard_notice_preserves_search() {
+    preserves_input_prompt(Mode::Search("review".into()), "/review_");
+}
+
+#[test]
+fn a_clipboard_notice_preserves_jump() {
+    preserves_input_prompt(Mode::Jump("1".into()), "jump 1_");
+}
+
+#[test]
+fn a_clipboard_notice_preserves_hints() {
+    preserves_input_prompt(Mode::Hint, "hint:");
+}
+
+fn command_text_drops_controls(field: &str, action: crate::wire::JobAction) {
+    let mut job = model::Job {
+        job_id: "j".into(),
+        title: "review".into(),
+        assigned_peer: Some("peer".into()),
+        actions: Some(vec![action]),
+        ..Default::default()
+    };
+    match field {
+        "id" => job.job_id = "j\u{1}\n".into(),
+        "assignee" => job.assigned_peer = Some("pe\u{85}er\t".into()),
+        "title" => job.title = "x\u{1}echo PWNED #\n".into(),
+        _ => {}
+    }
+    let command = &layout::job_commands(&job)[0].1;
+    assert!(
+        !command.chars().any(char::is_control),
+        "{field}: {command:?}"
+    );
+}
+
+#[test]
+fn clipboard_payload_uses_the_sanitized_command() {
+    let mut app = retry_app();
+    let frame = app.snap.as_mut().unwrap();
+    frame.view.jobs[0].title = "x\u{1}echo PWNED #\n".into();
+    frame.view.jobs[0].actions = Some(vec![crate::wire::JobAction::Nudge { to: "codex".into() }]);
+    let mut bytes = Vec::new();
+    app.copy_command(0, false, &mut bytes);
+    assert_eq!(
+        bytes,
+        b"\x1b]52;c;YW1lc2ggcGVlciBub3RpZnkgY29kZXggJ3hlY2hvIFBXTkVEICM/Jw==\x07"
+    );
+}
+
+#[test]
+fn command_id_drops_controls() {
+    command_text_drops_controls(
+        "id",
+        crate::wire::JobAction::Retry {
+            needs_assignee: false,
+        },
+    );
+}
+
+#[test]
+fn command_assignee_drops_controls() {
+    command_text_drops_controls("assignee", crate::wire::JobAction::Send);
+}
+
+#[test]
+fn command_recipient_drops_controls() {
+    command_text_drops_controls(
+        "to",
+        crate::wire::JobAction::Nudge {
+            to: "pe\u{1}er\n".into(),
+        },
+    );
+}
+
+#[test]
+fn clipboard_emission_refuses_a_remaining_control() {
+    let mut bytes = Vec::new();
+    let result = super::send_clipboard("echo\u{1}danger\n", false, &mut bytes);
+    assert!(result.is_err(), "control-bearing command was accepted");
+    assert!(bytes.is_empty(), "refusal wrote {bytes:?}");
 }
 
 #[test]
@@ -4810,7 +5998,7 @@ fn the_fetch_asks_for_the_text_the_card_shows() {
 #[test]
 fn the_full_ask_card_shows_the_whole_text_once_it_arrives() {
     let mut snap = fan_out();
-    snap.asks[0].text = "x ".repeat(200);
+    snap.asks[1].text = "x ".repeat(200);
     let mut app = app_with(snap.clone());
     app.key(KeyCode::Char('a'));
     app.key(KeyCode::Enter);
@@ -4821,7 +6009,7 @@ fn the_full_ask_card_shows_the_whole_text_once_it_arrives() {
         "the preview until the detail comes"
     );
     snap.ask_detail = Some(crate::wire::AskDetail {
-        correlation_id: "ask-1223c9e0".into(),
+        correlation_id: "ask-a3a07b51".into(),
         text: format!("{}END", "x ".repeat(600)),
         reply: None,
         ..Default::default()
@@ -4843,14 +6031,14 @@ fn the_smallest_pane_still_lists_the_selected_ask() {
     for cols in [30, 46] {
         let lines = screen_text(&mut app, cols, 8);
         assert!(
-            lines.iter().any(|l| l.starts_with("1 ◆ 1223")),
+            lines.iter().any(|l| l.starts_with("1 ◆ a3a0")),
             "the blank row gives way to the list at {cols}x8: {lines:?}"
         );
     }
     app.key(KeyCode::Char('j'));
     let lines = screen_text(&mut app, 46, 8);
     assert!(
-        lines.iter().any(|l| l.starts_with("2 ◆ a3a0")),
+        lines.iter().any(|l| l.starts_with("2 ◆ 1223")),
         "the one row there is the selected ask: {lines:?}"
     );
 }
@@ -4880,6 +6068,7 @@ fn line_with(app: &mut App, cols: usize, tick: usize, needle: &str) -> String {
 #[test]
 fn an_open_asks_arrow_walks_to_a_working_recipient_and_rests_otherwise() {
     let mut app = app_with(proto_s1());
+    app.full = true;
     app.sel = Some("upg".into());
     let at = |app: &mut App, tick| line_with(app, 100, tick, "7c2 ");
     assert!(
@@ -4922,6 +6111,7 @@ fn an_ack_the_hub_just_took_walks_the_arrow_back_to_the_sender() {
         });
         ask.closed_just_now = Some(ago <= 1);
         let mut app = app_with(snap);
+        app.full = true;
         app.sel = Some("func".into());
         app
     };
@@ -4950,13 +6140,13 @@ fn an_ack_the_hub_just_took_walks_the_arrow_back_to_the_sender() {
 fn the_asks_screen_walks_the_arrow_of_an_ask_whose_recipient_works() {
     let mut app = app_with(fan_out());
     app.key(KeyCode::Char('a'));
-    assert!(line_with(&mut app, 100, 0, " 1223 ").contains("…claude-code─▸─…pi-2 "));
+    assert!(line_with(&mut app, 100, 0, " 1223 ").contains("claude-code─▸─pi-2 "));
     assert!(
-        line_with(&mut app, 100, 2, " 1223 ").contains("…claude-code──▸…pi-2 "),
+        line_with(&mut app, 100, 2, " 1223 ").contains("claude-code──▸pi-2 "),
         "the recipient works on it: the arrow steps"
     );
     assert!(
-        line_with(&mut app, 100, 2, " a3a0 ").contains("…claude-code─▸─…pi "),
+        line_with(&mut app, 100, 2, " a3a0 ").contains("claude-code─▸─pi "),
         "an idle recipient holds it still"
     );
 }
@@ -5035,6 +6225,7 @@ fn a_card_route_too_wide_for_its_column_cuts_the_sender_and_keeps_the_recipient(
     ask.from_peer = "amesh-claude-code-22".into();
     ask.to_peer = "amesh-codex-2".into();
     let mut app = app_with(snap);
+    app.full = true;
     app.sel = Some("upg".into());
     let line = line_with(&mut app, 100, 0, "7c2 ");
     assert!(
@@ -5047,6 +6238,7 @@ fn a_card_route_too_wide_for_its_column_cuts_the_sender_and_keeps_the_recipient(
     ask.from_peer = "amesh-claude-code-2".into();
     ask.to_peer = "amesh-pi-2".into();
     let mut app = app_with(snap);
+    app.full = true;
     app.sel = Some("upg".into());
     let line = line_with(&mut app, 46, 0, "7c2 ");
     assert!(
@@ -5057,6 +6249,7 @@ fn a_card_route_too_wide_for_its_column_cuts_the_sender_and_keeps_the_recipient(
     let ask = snap.asks.iter_mut().find(|a| a.correlation_id == "ask-7c2");
     ask.unwrap().to_peer = "amesh-recipient-name-123456".into();
     let mut app = app_with(snap);
+    app.full = true;
     app.sel = Some("upg".into());
     let line = line_with(&mut app, 46, 0, "7c2 ");
     assert!(
@@ -5081,10 +6274,12 @@ fn a_stale_snapshot_moves_nothing_it_reports_as_just_now() {
     let mut app = app_with(snap);
     app.last_ok = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(5));
     app.sel = Some("func".into());
+    app.full = true;
     assert!(
         line_with(&mut app, 100, 2, "5b1 ").contains("5b1 cc>codex "),
         "the hub stopped answering: no walk back"
     );
+    app.full = false;
     let lines = screen_at(&mut app, 46, 0);
     assert!(
         lines
@@ -5113,10 +6308,12 @@ fn the_view_moves_only_what_the_hub_calls_just_now() {
     }
     let mut app = app_with(snap);
     app.sel = Some("func".into());
+    app.full = true;
     assert!(
         line_with(&mut app, 100, 2, "5b1 ").contains("5b1 cc>codex "),
         "an ack stamped this second that the hub does not call just now walks nothing back"
     );
+    app.full = false;
     assert!(
         !screen_at(&mut app, 46, 2).iter().any(|l| l.contains('◉')),
         "nor does a job sent this second light"
@@ -5233,7 +6430,7 @@ fn a_wrapped_top_line_keeps_its_columns_with_a_queue_mark() {
     let roster = (0..6)
         .map(|i| {
             marked(
-                &format!("peer-{i}"),
+                &format!("{}-{i}", if i == 5 { "solo" } else { "peer" }),
                 crate::wire::DeliveryCondition::Push,
                 (i == 0).then_some((12, 150)),
             )
@@ -5250,7 +6447,7 @@ fn a_wrapped_top_line_keeps_its_columns_with_a_queue_mark() {
         [
             "6 online · ○ peer-0 ✉12  ○ peer-1",
             "           ○ peer-2      ○ peer-3",
-            "           ○ peer-4      ○ peer-5",
+            "           ○ peer-4      ○ solo-5",
         ]
     );
 }
@@ -5271,6 +6468,7 @@ fn the_job_card_says_why_its_open_ask_may_go_unseen() {
         }),
     });
     let mut app = app_with(snap);
+    app.full = true;
     app.sel = Some("perf".into());
     let lines = screen_at(&mut app, 100, 0);
     let at = lines
@@ -5311,14 +6509,15 @@ fn the_ask_card_says_why_an_open_ask_may_go_unseen() {
     }
     let mut app = app_with(snap);
     app.key(KeyCode::Char('a'));
+    app.key(KeyCode::Char('2'));
     let lines = screen_at(&mut app, 100, 0);
-    let to = lines
+    let route = lines
         .iter()
-        .position(|l| l.contains(PI2) && l.contains("now WORK"))
-        .unwrap_or_else(|| panic!("no to line:\n{}", lines.join("\n")));
+        .position(|l| l.contains("│ from    claude-code▸pi-2 · 00:13"))
+        .unwrap_or_else(|| panic!("no route line:\n{}", lines.join("\n")));
     assert!(
-        lines[to + 1].contains("no push · 1 queued for 2s"),
-        "the row under to says it:\n{}",
+        lines[route + 1].contains("no push · 1 queued for 2s"),
+        "the row under the route says it:\n{}",
         lines.join("\n")
     );
     app.key(KeyCode::Char('3'));
@@ -5405,14 +6604,18 @@ fn ev(seq: u64, kind: &str, from: &str, to: &str, body: &str) -> model::Event {
     }
 }
 
-/* the events screen of a view with one peer online, after `events` came in */
+/* the events screen of a view with two peers of one folder online, after `events` came in */
 fn events_app(events: Vec<model::Event>) -> App {
     let snap = Snapshot {
         captured_at: 1100,
         hub_epoch: "e1".into(),
         ..Default::default()
     };
-    let mut app = app_with(with_roster(snap, vec![peer("cc", "online", Some("idle"))]));
+    let roster = vec![
+        peer(CC, "online", Some("idle")),
+        peer(PI, "online", Some("idle")),
+    ];
+    let mut app = app_with(with_roster(snap, roster));
     app.key(KeyCode::Char('e'));
     app.take_events(Ok(events));
     app
@@ -5514,39 +6717,143 @@ fn a_hub_that_numbers_no_events_is_read_whole() {
 fn the_rows_read_time_kind_route_and_text() {
     let fan = |seq, to: &str| model::Event {
         id: "bc-1".into(),
-        ..ev(seq, "broadcast", "cc", to, "deploying at ten")
+        ..ev(seq, "broadcast", CC, to, "deploying at ten")
     };
     let chat = model::Event {
         seq: Some(7),
         at: Some(1007),
         kind: "chat".into(),
-        peer: "cc".into(),
+        peer: CC.into(),
         role: "user".into(),
         text: "hello there".into(),
         ..Default::default()
     };
     let mut app = events_app(vec![
-        ev(1, "ask", "cc", "pi", "list the modules\nsecond line"),
-        ev(2, "ack", "pi", "cc", "seven modules"),
-        ev(3, "notify", "amesh", "cc", "job j1 is stalled"),
-        fan(4, "a"),
-        fan(5, "b"),
-        fan(6, "c"),
+        ev(1, "ask", CC, PI, "list the modules\nsecond line"),
+        ev(2, "ack", PI, CC, "seven modules"),
+        ev(3, "notify", "amesh", CC, "job j1 is stalled"),
+        fan(4, CODEX),
+        fan(5, PI),
+        fan(6, PI2),
         chat,
     ]);
-    let rows: Vec<String> = screen_text(&mut app, 100, 40)
+    let rows = |app: &mut App, cols| -> Vec<String> {
+        screen_text(app, cols, 40)
+            .into_iter()
+            .filter(|l| l.starts_with("00:16"))
+            .collect()
+    };
+    assert_eq!(
+        rows(&mut app, 100),
+        [
+            "00:16:41 ask    claude-code▸pi  list the modules",
+            "00:16:42 ack ●  pi▸claude-code  seven modules",
+            "00:16:43 notify amesh▸claude-code  job j1 is stalled",
+            "00:16:44 bcast  claude-code▸3 peers  deploying at ten",
+            "00:16:47 chat   claude-code (user)  hello there",
+        ]
+    );
+    assert_eq!(
+        rows(&mut app, 46),
+        [
+            "00:16 ask    claude-code▸pi  list the modules",
+            "00:16 ack ●  pi▸claude-code  seven modules",
+            "00:16 notify amesh▸claude-code  job j1 is sta…",
+            "00:16 bcast  claude-code▸3 peers  deploying a…",
+            "00:16 chat   claude-code (user)  hello there",
+        ],
+        "a narrow pane gives the minutes and the short names, and every row keeps some text"
+    );
+}
+
+#[test]
+fn an_ack_says_how_it_ended_without_the_hubs_marker() {
+    use layout::Tone;
+    let said = |mut e: model::Event, failed: bool| {
+        e.failed = Some(failed);
+        e
+    };
+    let mut app = events_app(vec![
+        ev(1, "ack", CODEX, CC, "2 findings, both fixed"),
+        ev(2, "ack", PI2, CC, "[failed] build broke"),
+        ev(3, "notify", CC, PI, "[failed] is only an ack's"),
+        ev(4, "ack", PI, CC, "[failed]"),
+        said(ev(5, "ack", PI, CC, "amesh: job j1 set to failed"), true),
+        said(ev(6, "ack", PI, CC, "[failed]x is my own text"), false),
+    ]);
+    let rows: Vec<String> = screen_text(&mut app, 46, 40)
         .into_iter()
-        .filter(|l| l.starts_with("00:16:"))
+        .filter(|l| l.starts_with("00:16"))
         .collect();
     assert_eq!(
         rows,
         [
-            "00:16:41 ask    cc → pi  list the modules",
-            "00:16:42 ack    pi → cc  seven modules",
-            "00:16:43 notify amesh → cc  job j1 is stalled",
-            "00:16:44 bcast  cc → 3 peers  deploying at ten",
-            "00:16:47 chat   cc (user)  hello there",
+            "00:16 ack ●  codex▸claude-code  2 findings, b…",
+            "00:16 ack ×  pi-2▸claude-code  build broke",
+            "00:16 notify claude-code▸pi  [failed] is only…",
+            "00:16 ack ×  pi▸claude-code",
+            "00:16 ack ×  pi▸claude-code  amesh: job j1 se…",
+            "00:16 ack ●  pi▸claude-code  [failed]x is my …",
         ]
+    );
+    let items = super::feed::items(&app.feed);
+    let rows = super::feed::rows(&items, 46, "");
+    assert_eq!(cell(&rows[0], "ack ●"), Tone::Done);
+    assert_eq!(cell(&rows[1], "ack ×"), Tone::Fail);
+    let card = |i: usize| super::feed::card(&items[i], 46, Fit::Whole, "");
+    for (i, mark) in [
+        (0, ('●', Tone::Done)),
+        (1, ('×', Tone::Fail)),
+        (2, ('•', Tone::Plain)),
+    ] {
+        let corner = card(i).rows[&0][&1];
+        assert_eq!(
+            (corner.ch, corner.tone),
+            mark,
+            "only an ack says how it ended"
+        );
+    }
+    let failed = card(1).text();
+    assert!(
+        failed.contains("│ text    build broke ") && !failed.contains("[failed]"),
+        "{failed}"
+    );
+}
+
+#[test]
+fn the_card_under_the_list_shortens_names_and_the_full_card_keeps_them_whole() {
+    let chat = model::Event {
+        peer: CC.into(),
+        role: "user".into(),
+        ..ev(2, "chat", "", "", "hello there")
+    };
+    let mut app = events_app(vec![ev(1, "notify", CC, PI, "ask a3a0 waits"), chat]);
+    let names = |app: &mut App| -> Vec<String> {
+        screen_text(app, 46, 24)
+            .into_iter()
+            .filter(|l| l.starts_with("│ from") || l.starts_with("│ to"))
+            .collect()
+    };
+    assert_eq!(
+        names(&mut app),
+        ["│ from    claude-code (user)                 │"]
+    );
+    app.key(KeyCode::Char('k'));
+    assert_eq!(
+        names(&mut app),
+        [
+            "│ from    claude-code                        │",
+            "│ to      pi                                 │",
+        ]
+    );
+    app.key(KeyCode::Enter);
+    assert_eq!(
+        names(&mut app),
+        [
+            "│ from    openhitls-sm2-opt-claude-code      │",
+            "│ to      openhitls-sm2-opt-pi               │",
+        ],
+        "the full card fits the pane and still names them whole"
     );
 }
 
@@ -5614,6 +6921,10 @@ fn a_hub_restart_leaves_a_divider_and_takes_the_new_ring() {
         1,
         "one divider per restart"
     );
+    assert!(
+        screen_text(&mut app, 46, 40).iter().any(|l| l == divider),
+        "a narrow pane keeps the divider's seconds"
+    );
 }
 
 #[test]
@@ -5632,7 +6943,7 @@ fn the_events_screen_says_so_when_empty_or_a_read_fails() {
         "a failed read says so: {lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("cc → pi")),
+        lines.iter().any(|l| l.contains("cc▸pi")),
         "the list stays: {lines:?}"
     );
     app.take_events(Ok(Vec::new()));
@@ -5827,6 +7138,7 @@ fn a_failed_close_crosses_the_arrow_and_holds_it_still() {
             "a failed close by {by} (raw failed {failed}) is no answer walking back"
         );
         let mut app = app_with(closed(by, failed, outcome, true));
+        app.full = true;
         app.sel = Some("func".into());
         for tick in [0, 2, 4] {
             let line = line_with(&mut app, 100, tick, "5b1 ");
@@ -5896,7 +7208,7 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
         },
     ));
     assert!(
-        text.contains("worker w4 IDLE! 25s · not picked up"),
+        text.contains("why w4: not picked up · 25s worker w4 IDLE"),
         "{text}"
     );
     let text = card(&synth(
@@ -5907,7 +7219,10 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
             why: crate::wire::IdleWhy::TurnEnded,
         },
     ));
-    assert!(text.contains("worker w4 IDLE! 2m · turn ended"), "{text}");
+    assert!(
+        text.contains("why w4 ended its turn 2m ago worker w4 IDLE"),
+        "{text}"
+    );
     let tie = synth(
         1010,
         1000,
@@ -5918,7 +7233,7 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
     );
     let text = card(&tie);
     assert!(
-        text.contains("worker w4 IDLE! 10s · ask still open"),
+        text.contains("why w4: ask still open · 10s worker w4 IDLE"),
         "idle in the second the ask opened: {text}"
     );
     use crate::wire::{AskAction, AskState, IdleWhy, Progress};
@@ -5944,7 +7259,7 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
     };
     let state = |snap: &Snapshot| super::asks::state(snap, &snap.asks[0]);
     let ask_card = |snap: &Snapshot| {
-        flat(&super::asks::card(&as_frame(snap), &snap.asks[0], 1, 100, None, Fit::Whole).text())
+        flat(&super::asks::card(&as_frame(snap), &snap.asks[0], 1, 46, None, Fit::Whole).text())
     };
     let early = scene(
         1000,
@@ -5956,7 +7271,9 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
     );
     assert_eq!(state(&early), ("waiting 5s".into(), Tone::Run));
     assert!(
-        !ask_card(&early).contains("IDLE!") && !ask_card(&early).contains("nudge"),
+        !ask_card(&early).contains("IDLE")
+            && !ask_card(&early).contains("why")
+            && !ask_card(&early).contains("nudge"),
         "{}",
         ask_card(&early)
     );
@@ -5971,9 +7288,10 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
         },
         true,
     );
-    assert_eq!(state(&late), ("IDLE! 25s".into(), Tone::Fail));
+    assert_eq!(state(&late), ("IDLE 25s".into(), Tone::PillWait));
     assert!(
-        ask_card(&late).contains("IDLE! 25s · not picked up") && ask_card(&late).contains("nudge"),
+        ask_card(&late).contains("why openhitls-sm2-opt-pi: not picked up · 25s")
+            && ask_card(&late).contains("nudge"),
         "{}",
         ask_card(&late)
     );
@@ -5988,9 +7306,9 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
         },
         false,
     );
-    assert_eq!(state(&ended), ("IDLE! 10s".into(), Tone::Fail));
+    assert_eq!(state(&ended), ("IDLE 10s".into(), Tone::PillWait));
     assert!(
-        ask_card(&ended).contains("IDLE! 10s · turn ended"),
+        ask_card(&ended).contains("why openhitls-sm2-opt-pi ended its turn 10s ago"),
         "{}",
         ask_card(&ended)
     );
@@ -6005,9 +7323,9 @@ fn a_worker_idle_since_before_the_ask_gets_time_to_pick_it_up() {
         },
         false,
     );
-    assert_eq!(state(&tie), ("IDLE! 10s".into(), Tone::Fail));
+    assert_eq!(state(&tie), ("IDLE 10s".into(), Tone::PillWait));
     assert!(
-        ask_card(&tie).contains("IDLE! 10s · ask still open"),
+        ask_card(&tie).contains("why openhitls-sm2-opt-pi: ask still open · 10s"),
         "{}",
         ask_card(&tie)
     );
@@ -6046,8 +7364,8 @@ fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
     assert!(
         screen_at(&mut waiting, 100, 0)
             .iter()
-            .any(|l| l.contains("WAIT!")),
-        "the jobs fixture shows WAIT!"
+            .any(|l| l.contains(" WAIT ")),
+        "the jobs fixture shows WAIT"
     );
     check(&mut waiting, "jobs, WAIT!");
     let mut asks = app_with(with_asks(
@@ -6056,7 +7374,14 @@ fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
             ..Default::default()
         },
         vec![
-            lone("ask-x", CC, PI, Some(900)),
+            stamp(
+                lone("ask-x", CC, PI, Some(900)),
+                crate::wire::AskState::Open {
+                    progress: crate::wire::Progress::Work { since: 900 },
+                },
+                vec![],
+                None,
+            ),
             stamp(
                 lone("ask-y", CC, PI2, Some(900)),
                 crate::wire::AskState::Open {
@@ -6079,8 +7404,14 @@ fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
     assert!(
         screen_at(&mut asks, 100, 0)
             .iter()
-            .any(|l| l.contains("WAIT! 50s")),
-        "the asks fixture shows WAIT!"
+            .any(|l| l.contains("WAIT 50s")),
+        "the asks fixture shows WAIT"
+    );
+    assert!(
+        screen_at(&mut asks, 100, 4)
+            .iter()
+            .any(|l| l.contains("WAIT 50s")),
+        "and holds it on the odd half second"
     );
     check(&mut asks, "asks");
 }
@@ -6255,7 +7586,11 @@ fn b3b_card_wait() {
         ),
         vec![],
     );
-    assert!(text.contains("WAIT! 40s"), "{text}");
+    assert!(
+        text.lines().next().unwrap().ends_with("─ WAIT ┐")
+            && text.contains("│ why     waiting for permission "),
+        "{text}"
+    );
 }
 
 fn b3b_idle(why: crate::wire::IdleWhy) -> String {
@@ -6273,19 +7608,28 @@ fn b3b_idle(why: crate::wire::IdleWhy) -> String {
 #[test]
 fn b3b_card_idle_not_picked_up() {
     let text = b3b_idle(crate::wire::IdleWhy::NotPickedUp);
-    assert!(text.contains("IDLE! 1m · not picked up"), "{text}");
+    assert!(
+        text.contains("│ why     amesh-pi: not picked up · 1m "),
+        "{text}"
+    );
 }
 
 #[test]
 fn b3b_card_idle_still_open() {
     let text = b3b_idle(crate::wire::IdleWhy::AskStillOpen);
-    assert!(text.contains("IDLE! 1m · ask still open"), "{text}");
+    assert!(
+        text.contains("│ why     amesh-pi: ask still open · 1m "),
+        "{text}"
+    );
 }
 
 #[test]
 fn b3b_card_idle_turn_ended() {
     let text = b3b_idle(crate::wire::IdleWhy::TurnEnded);
-    assert!(text.contains("IDLE! 1m · turn ended"), "{text}");
+    assert!(
+        text.contains("│ why     amesh-pi ended its turn 1m ago "),
+        "{text}"
+    );
 }
 
 #[test]
@@ -6301,7 +7645,11 @@ fn b3b_card_gone() {
         ),
         vec![from],
     );
-    assert!(text.contains("amesh-pi · left the hub"), "{text}");
+    assert!(
+        text.contains("│ why     amesh-pi left the hub")
+            && !text.contains("amesh-pi · left the hub"),
+        "the why says it and the to row does not repeat it:\n{text}"
+    );
 }
 
 #[test]
@@ -6315,7 +7663,11 @@ fn b3b_card_offline() {
         ),
         vec![],
     );
-    assert!(text.contains("· offline"), "{text}");
+    assert!(
+        text.lines().next().unwrap().ends_with("─ OFFLINE ┐")
+            && text.contains("│ why     amesh-pi is offline "),
+        "{text}"
+    );
 }
 
 fn b3b_pending_to(kind: crate::wire::Liveness) -> String {
@@ -6576,7 +7928,7 @@ fn b3c_worker_idle() {
     });
     let text = b3c_card(job, vec![]);
     assert!(
-        text.contains("worker codex IDLE! 1m · turn ended"),
+        text.contains("why codex ended its turn 1m ago worker codex IDLE"),
         "{text}"
     );
 }
@@ -6851,7 +8203,10 @@ fn b3c_gone(to_id: &str, to_name: &str, assignee: Option<&str>) -> String {
 #[test]
 fn b3c_gone_label_to_peer_id() {
     let text = b3c_gone("pi", "display", Some("codex"));
-    assert!(text.contains("worker pi left the hub"), "{text}");
+    assert!(
+        text.contains("why pi left the hub worker pi left the hub"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -7015,7 +8370,7 @@ fn b3c_pending_no_word() {
 }
 
 #[test]
-fn b3c_unacked_fail_when_idle() {
+fn b3c_unacked_label_is_dim_when_idle() {
     let mut job = b3c_job("running");
     job.ask_id = Some("ask-1".into());
     job.relation = Some(crate::wire::JobRelation::Open);
@@ -7028,11 +8383,11 @@ fn b3c_unacked_fail_when_idle() {
     });
     let (_, grid) = b3c_scene(job, vec![b3c_ask("cc", "codex", "codex")], vec![]);
     assert!(grid.text().contains("unacked"));
-    assert_eq!(b3c_word_tone(&grid, "unacked"), layout::Tone::Fail);
+    assert_eq!(b3c_word_tone(&grid, "unacked"), layout::Tone::Dim);
 }
 
 #[test]
-fn b3c_unacked_plain_otherwise() {
+fn b3c_unacked_label_is_dim_while_working() {
     let mut job = b3c_job("running");
     job.ask_id = Some("ask-1".into());
     job.relation = Some(crate::wire::JobRelation::Open);
@@ -7042,7 +8397,7 @@ fn b3c_unacked_plain_otherwise() {
     });
     let (_, grid) = b3c_scene(job, vec![b3c_ask("cc", "codex", "codex")], vec![]);
     assert!(grid.text().contains("unacked"));
-    assert_eq!(b3c_word_tone(&grid, "unacked"), layout::Tone::Plain);
+    assert_eq!(b3c_word_tone(&grid, "unacked"), layout::Tone::Dim);
 }
 
 #[test]
@@ -7068,6 +8423,710 @@ fn b3c_times_running() {
         text.contains("sent 00:13") && text.contains("running 3m"),
         "{text}"
     );
+}
+
+fn sample() -> Snapshot {
+    Snapshot {
+        captured_at: 1000,
+        jobs: vec![Job {
+            job_id: "j".into(),
+            title: "review".into(),
+            state: "running".into(),
+            assigned_peer: Some("codex".into()),
+            worker: Some("codex".into()),
+            ask_id: Some("ask-1".into()),
+            relation: Some(JobRelation::Open),
+            progress: Some(JobProgress {
+                state: Some(Progress::Idle {
+                    since: 940,
+                    why: IdleWhy::TurnEnded,
+                }),
+                busy: false,
+            }),
+            prompt: "check the patch".into(),
+            actions: Some(vec![
+                JobAction::Nudge { to: "codex".into() },
+                JobAction::Resend,
+            ]),
+            ..Default::default()
+        }],
+        asks: vec![Ask {
+            correlation_id: "ask-1".into(),
+            from_peer: "boss".into(),
+            to_peer: "codex".into(),
+            to_peer_id: "codex".into(),
+            opened_at: Some(820),
+            open: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn card_grid(s: Snapshot, size: Fit, cols: usize) -> Grid {
+    let chain = model::chains(&s)
+        .into_iter()
+        .find(|c| c.topo().iter().any(|id| id == "j"))
+        .unwrap();
+    let num = Numbers::default()
+        .assign(&chain)
+        .into_iter()
+        .map(|(n, id)| (id, n))
+        .collect();
+    layout::card(
+        &View {
+            snap: model::Frame {
+                view: s,
+                ..Default::default()
+            },
+            chain: &chain,
+            num: &num,
+            base: 0,
+            sel: "j",
+        },
+        "j",
+        cols,
+        None,
+        size,
+    )
+}
+
+fn badge(g: &Grid, word: &str, tone: Tone, cols: usize) {
+    let start = cols - 1 - word.len();
+    for (i, ch) in word.chars().enumerate() {
+        let cell = &g.rows[&0][&(start + i)];
+        assert_eq!((cell.ch, cell.tone), (ch, tone), "badge {word}, cell {i}");
+    }
+}
+
+#[test]
+fn idle_badge_and_why() {
+    let g = card_grid(sample(), Fit::Rows(0), 80);
+    badge(&g, " IDLE ", Tone::PillWait, 80);
+    assert!(
+        g.text()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("why     codex ended its turn 1m ago"),
+        "{}",
+        g.text()
+    );
+}
+
+#[test]
+fn wait_badge_and_why() {
+    let mut s = sample();
+    s.jobs[0].progress.as_mut().unwrap().state = Some(Progress::Wait {
+        since: 940,
+        reason: Some("approve shell".into()),
+    });
+    let g = card_grid(s, Fit::Rows(0), 80);
+    badge(&g, " WAIT ", Tone::Badge, 80);
+    assert!(
+        g.text()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("why     approve shell"),
+        "{}",
+        g.text()
+    );
+}
+
+#[test]
+fn failed_badge_and_why() {
+    let mut s = sample();
+    s.jobs[0].state = "failed".into();
+    s.jobs[0].progress = None;
+    s.jobs[0].result = Some("build failed".into());
+    let g = card_grid(s, Fit::Whole, 46);
+    badge(&g, " FAILED ", Tone::PillFail, 46);
+    assert!(
+        g.text()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("why     build failed"),
+        "{}",
+        g.text()
+    );
+}
+
+#[test]
+fn blocked_badge_and_why() {
+    let mut s = sample();
+    s.jobs[0].state = "queued".into();
+    s.jobs[0].progress = None;
+    s.jobs[0].depends_on = vec!["dep".into()];
+    s.jobs[0].dispatch_state = Some(DispatchState::Blocked {
+        dependencies: vec!["dep".into()],
+        dependency: "dep".into(),
+        reason: BlockReason::Failed,
+    });
+    s.jobs.push(Job {
+        job_id: "dep".into(),
+        title: "compile".into(),
+        state: "failed".into(),
+        ..Default::default()
+    });
+    let g = card_grid(s, Fit::Rows(0), 80);
+    badge(&g, " BLOCKED ", Tone::PillText, 80);
+    assert!(
+        g.text()
+            .lines()
+            .nth(1)
+            .unwrap()
+            .contains("why     1 compile failed: retry it first"),
+        "{}",
+        g.text()
+    );
+}
+
+#[test]
+fn compact_card_keeps_commands_discoverable_and_details_in_full() {
+    let s = sample();
+    let compact = card_grid(s.clone(), Fit::Rows(12), 80).text();
+    assert!(
+        compact.contains("y copy nudge · Y copy resend · ⏎ full card"),
+        "{compact}"
+    );
+    assert!(compact
+        .lines()
+        .rev()
+        .nth(1)
+        .unwrap()
+        .contains("y copy nudge"));
+    assert!(!compact.contains("times"), "{compact}");
+    assert!(compact.contains("codex · ask 1 boss▸codex"), "{compact}");
+    assert!(card_grid(s, Fit::Whole, 80).text().contains("times"));
+}
+
+#[test]
+fn unacked_age_replaces_the_bar() {
+    let g = card_grid(sample(), Fit::Whole, 80);
+    assert!(g.text().contains("unacked 3m"), "{}", g.text());
+    assert_eq!(g.text().matches("unacked").count(), 1, "{}", g.text());
+    assert!(!g.text().contains('⣿'));
+    let row = g
+        .text()
+        .lines()
+        .position(|l| l.contains("unacked 3m"))
+        .unwrap();
+    let age = &g.rows[&row];
+    let chars: Vec<_> = age.values().collect();
+    let at = chars
+        .windows(2)
+        .position(|c| c[0].ch == '3' && c[1].ch == 'm')
+        .unwrap();
+    assert_eq!(chars[at].tone, Tone::Wait);
+}
+
+#[test]
+fn chain_median_counts_only_valid_done_durations() {
+    let mut s = with_done(
+        sample(),
+        &[
+            ("d1", "done", 60),
+            ("d2", "done", 300),
+            ("bad", "failed", 900),
+        ],
+    );
+    let text = card_grid(s.clone(), Fit::Whole, 80).text();
+    assert!(text.contains("chain median 3m"), "{text}");
+    s.jobs[2].finished_at = Some(99);
+    assert!(!card_grid(s, Fit::Whole, 80).text().contains("chain median"));
+}
+
+#[test]
+fn compact_text_limits_and_badge_absence() {
+    let mut s = sample();
+    s.jobs[0].state = "done".into();
+    s.jobs[0].progress = None;
+    s.jobs[0].result = Some("word ".repeat(100));
+    s.jobs[0].prompt = "promptword ".repeat(100);
+    for cols in [46, 80, 100] {
+        let g = card_grid(s.clone(), Fit::Rows(12), cols);
+        assert!(g.rows[&0].values().all(|c| !matches!(
+            c.tone,
+            Tone::Badge | Tone::PillWait | Tone::PillFail | Tone::PillText
+        )));
+        let text = g.text();
+        assert_eq!(
+            text.lines().filter(|l| l.contains("word word")).count(),
+            if cols >= 96 { 8 } else { 7 },
+            "{text}"
+        );
+        assert_eq!(
+            text.lines().filter(|l| l.contains("promptword")).count(),
+            if cols >= 96 { 9 } else { 1 },
+            "{text}"
+        );
+        assert!(text.lines().all(|l| layout::width(l) <= cols));
+    }
+    s.jobs[0].state = "running".into();
+    s.jobs[0].progress = Some(JobProgress {
+        state: Some(Progress::Work { since: 950 }),
+        busy: true,
+    });
+    assert!(!card_grid(s, Fit::Rows(0), 46).text().contains(" IDLE "));
+}
+
+#[test]
+fn median_is_sorted_and_scoped_to_the_selected_chain() {
+    let mut s = with_done(
+        sample(),
+        &[
+            ("a", "done", 300),
+            ("b", "done", 60),
+            ("c", "done", 120),
+            ("outside", "done", 900),
+        ],
+    );
+    s.jobs[0].depends_on.retain(|d| d != "outside");
+    let text = card_grid(s, Fit::Whole, 80).text();
+    assert!(text.contains("chain median 2m"), "{text}");
+}
+
+/* jobs j depends on, each sent at 100 and ended the given seconds later */
+fn with_done(mut s: Snapshot, jobs: &[(&str, &str, u64)]) -> Snapshot {
+    for &(id, state, secs) in jobs {
+        s.jobs[0].depends_on.push(id.into());
+        s.jobs.push(Job {
+            job_id: id.into(),
+            state: state.into(),
+            ask_id: Some(id.into()),
+            finished_at: Some(100 + secs),
+            ..Default::default()
+        });
+        s.asks.push(Ask {
+            correlation_id: id.into(),
+            opened_at: Some(100),
+            ..Default::default()
+        });
+    }
+    s
+}
+
+fn check_open_comparison(state: Progress, size: Fit) {
+    let mut s = with_done(sample(), &[("d1", "done", 60), ("d2", "done", 180)]);
+    s.jobs[0].progress.as_mut().unwrap().state = Some(state);
+    let text = card_grid(s, size, 80).text();
+    assert!(
+        text.contains("unacked 3m · chain median 2m"),
+        "{size:?}: {text}"
+    );
+    assert_eq!(text.matches("unacked").count(), 1, "{size:?}: {text}");
+}
+
+#[test]
+fn open_wait_compact_comparison() {
+    check_open_comparison(
+        Progress::Wait {
+            since: 940,
+            reason: Some("permission".into()),
+        },
+        Fit::Rows(12),
+    );
+}
+
+#[test]
+fn open_wait_full_comparison() {
+    check_open_comparison(
+        Progress::Wait {
+            since: 940,
+            reason: Some("permission".into()),
+        },
+        Fit::Whole,
+    );
+}
+
+#[test]
+fn open_work_compact_comparison() {
+    check_open_comparison(Progress::Work { since: 940 }, Fit::Rows(12));
+}
+
+#[test]
+fn open_work_full_comparison() {
+    check_open_comparison(Progress::Work { since: 940 }, Fit::Whole);
+}
+
+#[test]
+fn compact_fit_is_a_bound_and_keeps_keys() {
+    for cols in [30, 46, 80, 100] {
+        for height in 1..=12 {
+            let g = card_grid(sample(), Fit::Rows(height), cols);
+            assert!(
+                g.height() <= height,
+                "{cols}x{height}: {} rows\n{}",
+                g.height(),
+                g.text()
+            );
+            assert!(g.text().contains("y "), "{cols}x{height}: {}", g.text());
+        }
+    }
+}
+
+#[test]
+fn tiny_frame_has_no_overflow() {
+    for cols in [0, 1] {
+        let g = layout::framed(
+            ('x', Tone::Plain),
+            "title",
+            None,
+            &[vec![("body".into(), Tone::Plain)]],
+            &[],
+            cols,
+        );
+        assert!(g.rows.values().all(|row| row.keys().all(|c| *c < cols)));
+    }
+}
+
+#[test]
+fn compact_values_share_the_key_column() {
+    let g = card_grid(sample(), Fit::Rows(10), 80);
+    for value in ["codex · ask", "unacked 3m"] {
+        let row = g
+            .text()
+            .lines()
+            .find(|l| l.contains(value))
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            row.chars().collect::<String>().find(value),
+            Some(3 + 1 + layout::KEY),
+            "{row}"
+        );
+    }
+    assert!(g.text().contains("worker  codex · ask"), "{}", g.text());
+}
+
+#[test]
+fn spare_compact_rows_go_to_prompt() {
+    let mut s = sample();
+    s.jobs[0].prompt = "promptword ".repeat(100);
+    let text = card_grid(s, Fit::Rows(12), 46).text();
+    assert!(
+        text.lines().filter(|l| l.contains("promptword")).count() > 1,
+        "{text}"
+    );
+    assert!(
+        !text.lines().any(|l| l.trim_matches('│').trim().is_empty()),
+        "{text}"
+    );
+}
+
+#[test]
+fn smallest_jobs_pane_keeps_copy_keys() {
+    let mut a = copy_app();
+    let text = screen_text(&mut a, 30, 8).join("\n");
+    assert!(text.contains("y nudge"), "{text}");
+}
+
+#[test]
+fn tiny_card_has_no_overflow() {
+    for cols in [0, 1] {
+        let g = card_grid(sample(), Fit::Rows(8), cols);
+        assert!(g.rows.values().all(|row| row.keys().all(|c| *c < cols)));
+    }
+}
+
+fn idle_lead(why: IdleWhy, since: u64) -> String {
+    let mut s = sample();
+    s.jobs[0].progress.as_mut().unwrap().state = Some(Progress::Idle { since, why });
+    let g = card_grid(s, Fit::Rows(0), 80);
+    badge(&g, " IDLE ", Tone::PillWait, 80);
+    g.text()
+        .lines()
+        .nth(1)
+        .unwrap()
+        .trim_matches('│')
+        .trim()
+        .to_string()
+}
+
+#[test]
+fn not_picked_up_shows_idle_age() {
+    assert_eq!(
+        idle_lead(IdleWhy::NotPickedUp, 940),
+        "why     codex: not picked up · 1m"
+    );
+}
+
+#[test]
+fn ask_still_open_shows_idle_age() {
+    assert_eq!(
+        idle_lead(IdleWhy::AskStillOpen, 940),
+        "why     codex: ask still open · 1m"
+    );
+}
+
+#[test]
+fn unknown_idle_gives_no_cause() {
+    assert_eq!(idle_lead(IdleWhy::Unknown, 940), "why     codex idle · 1m");
+}
+
+#[test]
+fn future_idle_stamp_omits_age() {
+    for (why, text) in [
+        (IdleWhy::TurnEnded, "codex ended its turn"),
+        (IdleWhy::NotPickedUp, "codex: not picked up"),
+        (IdleWhy::AskStillOpen, "codex: ask still open"),
+        (IdleWhy::Unknown, "codex idle"),
+    ] {
+        assert_eq!(idle_lead(why, 1001), format!("why     {text}"));
+    }
+}
+
+fn explanation(s: Snapshot, expected: &str) {
+    let text = card_grid(s, Fit::Rows(12), 80).text();
+    assert!(text.contains("why"), "{text}");
+    assert!(text.contains(expected), "{text}");
+}
+
+#[test]
+fn compact_gone_explains_departure() {
+    let mut s = sample();
+    s.jobs[0].progress.as_mut().unwrap().state = Some(Progress::Gone);
+    explanation(s, "left the hub");
+}
+
+fn queued_explanation(state: DispatchState, expected: &str) {
+    let mut s = sample();
+    s.jobs[0].state = "queued".into();
+    s.jobs[0].progress = None;
+    s.jobs[0].dispatch_state = Some(state);
+    explanation(s, expected);
+}
+
+#[test]
+fn compact_held_explains_dispatch() {
+    queued_explanation(DispatchState::Held, "set its assignee again");
+}
+
+#[test]
+fn compact_unassigned_explains_dispatch() {
+    queued_explanation(DispatchState::Unassigned, "name an assignee");
+}
+
+#[test]
+fn compact_no_peer_explains_dispatch() {
+    queued_explanation(
+        DispatchState::NoPeer {
+            name: "lost".into(),
+        },
+        "no peer named lost",
+    );
+}
+
+#[test]
+fn compact_other_circle_explains_dispatch() {
+    queued_explanation(
+        DispatchState::OtherCircle {
+            peer_id: "far".into(),
+        },
+        "another circle",
+    );
+}
+
+#[test]
+fn compact_missing_explains_settlement() {
+    let mut s = sample();
+    s.asks.clear();
+    s.jobs[0].progress = None;
+    s.jobs[0].relation = Some(JobRelation::Missing { will_fail: true });
+    explanation(s, "the hub fails this job");
+}
+
+#[test]
+fn compact_blocked_preserves_instruction() {
+    let mut s = sample();
+    s.jobs[0].state = "queued".into();
+    s.jobs[0].progress = None;
+    s.jobs[0].depends_on = vec!["dep".into()];
+    s.jobs[0].dispatch_state = Some(DispatchState::Blocked {
+        dependencies: vec!["dep".into()],
+        dependency: "dep".into(),
+        reason: BlockReason::Failed,
+    });
+    s.jobs[0].prompt = "promptword ".repeat(100);
+    s.jobs.push(Job {
+        job_id: "dep".into(),
+        title: "dependency ".repeat(100),
+        state: "failed".into(),
+        ..Default::default()
+    });
+    for cols in [30, 46, 80, 100] {
+        let text = card_grid(s.clone(), Fit::Rows(0), cols).text();
+        let words = text
+            .lines()
+            .map(|l| l.split('│').nth(1).unwrap_or(l).trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(words.contains("failed: retry it first"), "{text}");
+    }
+}
+
+#[test]
+fn empty_done_result_has_no_field() {
+    let mut s = sample();
+    s.jobs[0].state = "done".into();
+    s.jobs[0].result = Some(String::new());
+    s.jobs[0].progress = None;
+    for size in [Fit::Whole, Fit::Rows(12)] {
+        let text = card_grid(s.clone(), size, 80).text();
+        assert!(!text.contains("result"), "{text}");
+    }
+}
+
+#[test]
+fn full_idle_is_wait_tone_without_repeated_age() {
+    let g = card_grid(sample(), Fit::Whole, 80);
+    let text = g.text();
+    let (r, line) = text
+        .lines()
+        .enumerate()
+        .find(|(_, l)| l.contains("worker"))
+        .unwrap();
+    assert!(line.contains("IDLE"), "{text}");
+    assert!(!line.contains("1m"), "{text}");
+    assert!(
+        g.rows[&r]
+            .values()
+            .any(|c| c.ch == 'I' && c.tone == Tone::Wait),
+        "{text}"
+    );
+    assert!(!text.contains("waiting 3m"), "{text}");
+}
+
+#[test]
+fn independent_jobs_have_no_chain_median() {
+    let mut s = with_done(sample(), &[("d1", "done", 60), ("d2", "done", 180)]);
+    s.jobs[0].depends_on.clear();
+    let text = card_grid(s, Fit::Rows(12), 80).text();
+    assert!(!text.contains("chain median"), "{text}");
+}
+
+#[test]
+fn header_leaves_separator_before_badge() {
+    for cols in 30..=130 {
+        let mut s = sample();
+        s.jobs[0].title = "longtitle ".repeat(100);
+        let g = card_grid(s, Fit::Rows(12), cols);
+        assert_eq!(
+            g.rows[&0][&(cols - 8)].tone,
+            Tone::Line,
+            "cols={cols}: {}",
+            g.text()
+        );
+    }
+}
+
+/* sample's job without progress, its worker and its ask's route set */
+fn route_card(worker: &str, from: &str, to: &str, cols: usize, size: Fit) -> Grid {
+    let mut s = sample();
+    s.jobs[0].worker = Some(worker.into());
+    s.jobs[0].progress = None;
+    s.asks[0].from_peer = from.into();
+    s.asks[0].to_peer = to.into();
+    s.asks[0].to_peer_id = "receiver".into();
+    card_grid(s, size, cols)
+}
+
+fn worker_value(g: &Grid) -> String {
+    let text = g.text();
+    let row = text.lines().find(|l| l.contains("│ worker  ")).unwrap();
+    let value = row.split("│ worker  ").nth(1).unwrap();
+    value.split('│').next().unwrap().trim_end().to_string()
+}
+
+#[test]
+fn a_long_sender_gives_way_before_the_recipient_and_time() {
+    for cols in [46, 80, 100] {
+        let value = worker_value(&route_card(
+            "id",
+            "very-long-sender-name",
+            "receiver",
+            cols,
+            Fit::Rows(10),
+        ));
+        assert!(
+            value.starts_with("id · ") && value.contains("receiver") && value.ends_with("00:13"),
+            "{cols}: {value}"
+        );
+    }
+}
+
+#[test]
+fn the_worker_row_leads_with_the_worker() {
+    for cols in 30..=130 {
+        let value = worker_value(&route_card(
+            "worker-peer-name",
+            "sender-peer-name",
+            "recipient-peer",
+            cols,
+            Fit::Rows(10),
+        ));
+        assert!(value.starts_with("worker-peer-name"), "{cols}: {value}");
+        assert!(!value.contains('…'), "{cols}: {value}");
+    }
+}
+
+#[test]
+fn a_route_without_names_uses_id_without_an_arrow() {
+    let g = route_card("id", "", "", 80, Fit::Rows(10));
+    let text = g.text();
+    let worker = text.lines().find(|l| l.contains("worker")).unwrap();
+    assert!(worker.contains("receiver"), "{worker}");
+    assert!(!worker.contains('▸'), "{worker}");
+}
+
+#[test]
+fn the_full_card_names_its_back_key() {
+    let text = route_card("id", "from", "to", 80, Fit::Whole).text();
+    assert!(text.contains("esc back"), "{text}");
+    assert!(!text.contains("full card"), "{text}");
+}
+
+fn key_letters_use_the_near_tone(size: Fit) {
+    for cols in [30, 80] {
+        let g = route_card("id", "from", "to", cols, size);
+        for ch in ['y', 'Y'] {
+            let cell = g
+                .rows
+                .values()
+                .rev()
+                .find_map(|r| r.values().find(|c| c.ch == ch))
+                .unwrap();
+            assert_eq!(cell.tone, Tone::Near, "{cols} {size:?} key {ch}");
+        }
+        let key = if matches!(size, Fit::Whole) {
+            'e'
+        } else {
+            '⏎'
+        };
+        assert!(
+            g.rows
+                .values()
+                .any(|r| r.values().any(|c| c.ch == key && c.tone == Tone::Near)),
+            "{cols} {size:?} key {key}"
+        );
+    }
+}
+
+#[test]
+fn full_card_keys_use_the_near_tone() {
+    key_letters_use_the_near_tone(Fit::Whole);
+}
+
+#[test]
+fn one_row_card_keys_use_the_near_tone() {
+    key_letters_use_the_near_tone(Fit::Rows(1));
+}
+
+#[test]
+fn compact_card_keys_use_the_near_tone() {
+    key_letters_use_the_near_tone(Fit::Rows(10));
 }
 
 fn b3d_row(condition: crate::wire::DeliveryCondition, stuck: Option<(usize, u64)>) -> String {
@@ -7519,7 +9578,7 @@ fn attention_view() -> Snapshot {
 }
 
 /* what attention_view's row under the rule reads */
-const ATTENTION: &str = "attention WAIT w3 2m Claude needs your permission to use Bash · IDLE w4 1m turn ended · ✉2 w5 no push · ✉1 w9 · × sec failed";
+const ATTENTION: &str = "attention  WAIT w3 2m  Claude needs your permission to use Bash  IDLE w4 1m  turn ended  ✉2 w5  no push  ✉1 w9   × sec";
 
 /* the first row drawn in rule characters */
 fn rule_row(lines: &[String]) -> usize {
@@ -7565,18 +9624,18 @@ fn the_attention_line_lists_what_needs_a_person() {
     assert_eq!(
         heads,
         [
-            layout::Tone::Warn,
-            layout::Tone::Fail,
-            layout::Tone::Warn,
-            layout::Tone::Warn,
-            layout::Tone::Fail
+            layout::Tone::Badge,
+            layout::Tone::PillWait,
+            layout::Tone::PillWait,
+            layout::Tone::PillWait,
+            layout::Tone::PillFail
         ]
     );
     app.opts.ascii = true;
     let lines = screen_text(&mut app, 160, 40);
     assert_eq!(
         lines[rule_row(&lines) + 1],
-        "attention WAIT w3 2m Claude needs your permission to use Bash | IDLE w4 1m turn ended | +2 w5 no push | +1 w9 | x sec failed"
+        "attention  WAIT w3 2m  Claude needs your permission to use Bash  IDLE w4 1m  turn ended  +2 w5  no push  +1 w9   x sec"
     );
     let mut app = app_with(s4());
     let lines = screen_text(&mut app, 100, 40);
@@ -7594,18 +9653,91 @@ fn a_stale_snapshot_leads_the_attention_line_and_the_edge_cuts_it() {
     let lines = screen_text(&mut app, 46, 40);
     assert_eq!(
         lines[rule_row(&lines) + 1],
-        "attention WAIT w3 2m Claude needs your permis…"
+        "attention  WAIT w3 2m   IDLE w4 1m   ✉2 w5   …",
+        "every head before any reason, the row cut at the edge"
     );
     app.apply(Err("connection refused".into()));
     /* the error leads in a few words, leaving the items room; the rule shows the age */
     let lines = screen_text(&mut app, 46, 40);
     assert_eq!(
         lines[rule_row(&lines) + 1],
-        "! connection refused · WAIT w3 2m Claude need…"
+        "! connection refused ·  WAIT w3 2m   IDLE w4 …"
     );
     let lines = screen_text(&mut app, 200, 40);
     let row = &lines[rule_row(&lines) + 1];
-    assert!(row.ends_with(" · × sec failed"), "{row}");
+    assert!(row.ends_with("   × sec"), "{row}");
+}
+
+fn attention_snapshot() -> Snapshot {
+    let mut w3 = super::model::Peer {
+        peer_id: "w3".into(),
+        name: "w3".into(),
+        status: "online".into(),
+        ..Default::default()
+    };
+    w3.liveness = Some(Liveness::Wait {
+        since: 880,
+        reason: Some("Claude needs your permission to use Bash".into()),
+    });
+    let mut w4 = w3.clone();
+    w4.peer_id = "w4".into();
+    w4.name = "w4".into();
+    w4.liveness = Some(Liveness::Idle { since: 940 });
+    let mut snap = Snapshot {
+        captured_at: 1000,
+        jobs: vec![job("sec", "failed", &[], 1)],
+        roster: vec![w3, w4],
+        ..Default::default()
+    };
+    snap.asks.push(super::model::Ask {
+        correlation_id: "ask-w4".into(),
+        to_peer: "w4".into(),
+        to_peer_id: "w4".into(),
+        open: true,
+        opened_at: Some(930),
+        state: Some(crate::wire::AskState::Open {
+            progress: Progress::Idle {
+                since: 940,
+                why: crate::wire::IdleWhy::TurnEnded,
+            },
+        }),
+        ..Default::default()
+    });
+    snap
+}
+
+fn attention_row(app: &mut App, cols: usize) -> String {
+    let lines = screen_text(app, cols, 40);
+    lines[rule_row(&lines) + 1].clone()
+}
+
+#[test]
+fn reasons_follow_their_heads_while_room_remains() {
+    let mut app = app_with(attention_snapshot());
+    assert_eq!(
+        attention_row(&mut app, 90),
+        "attention  WAIT w3 2m  Claude needs your permission to use Bash  IDLE w4 1m   × sec",
+        "the first reason fits after every head, the second does not"
+    );
+}
+
+#[test]
+fn the_attention_line_packs_six_thousand_heads_within_a_second() {
+    let snap = Snapshot {
+        jobs: (0..6000)
+            .map(|i| job(&format!("failed-{i}"), "failed", &[], i))
+            .collect(),
+        ..Default::default()
+    };
+    let a = app_with(snap);
+    let mut g = layout::Grid::default();
+    let start = std::time::Instant::now();
+    a.under_rule(&mut g, 0, 80, None);
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "6000 heads: {elapsed:?}"
+    );
 }
 
 #[test]
@@ -7683,14 +9815,14 @@ fn the_asks_and_events_screens_carry_the_attention_line_and_the_mark() {
     let lines = screen_text(&mut app, 160, 40);
     let row = &lines[rule_row(&lines) + 1];
     assert!(
-        row.starts_with("! connection refused · WAIT w3 2m"),
+        row.starts_with("! connection refused ·  WAIT w3 2m"),
         "{row}"
     );
     app.key(KeyCode::Char('e'));
     let lines = screen_text(&mut app, 160, 40);
     let row = &lines[rule_row(&lines) + 1];
     assert!(
-        row.starts_with("! connection refused · WAIT w3 2m"),
+        row.starts_with("! connection refused ·  WAIT w3 2m"),
         "{row}"
     );
 }
@@ -7700,7 +9832,7 @@ fn screens_with_nothing_listed_name_what_needs_a_person() {
     let mut snap = attention_view();
     snap.jobs.clear();
     let mut app = app_with(snap);
-    let items = ATTENTION.strip_suffix(" · × sec failed").unwrap();
+    let items = ATTENTION.strip_suffix("   × sec").unwrap();
     let lines = screen_text(&mut app, 200, 40);
     let at = first_row(&lines, "no jobs here yet");
     assert!(lines[at].ends_with(" 4 asks open · ●"), "{}", lines[at]);
@@ -7739,7 +9871,7 @@ fn screens_with_nothing_listed_name_what_needs_a_person() {
     assert!(lines[at].ends_with("  14 events · ●"), "{}", lines[at]);
     assert_eq!(
         lines[at + 1],
-        "attention WAIT w3 2m Claude needs your permission to use Bash · ✉2 w5 no push · ✉1 w9 · × sec failed",
+        "attention  WAIT w3 2m  Claude needs your permission to use Bash  ✉2 w5  no push  ✉1 w9   × sec",
         "{}",
         lines.join("\n")
     );
@@ -7849,13 +9981,20 @@ fn a_row_cut_where_a_piece_ends_still_ends_in_an_ellipsis() {
         let lines = screen_text(&mut app, 30, 40);
         lines[rule_row(&lines) + 1].clone()
     };
-    /* the WAIT item ends in the last column and more items follow */
-    assert_eq!(row("123456789"), "attention WAIT w3 2m 12345678…");
-    /* the same, ending in a wide character */
-    assert_eq!(row("1需要权限"), "attention WAIT w3 2m 1需要权…");
-    /* a row that fills the pane exactly is not cut */
+    /* the heads alone overflow: the IDLE item is cut where the edge falls and ends in … */
+    assert_eq!(row("123456789"), "attention  WAIT w3 2m   IDLE …");
+    /* a wide name at the edge still leaves a row no wider than the pane, ending in … */
+    let mut snap = attention_view();
+    snap.roster[0].name = "审查者审查者".into();
+    let mut app = app_with(snap);
+    for cols in 30..60 {
+        let lines = screen_text(&mut app, cols, 40);
+        let cut = &lines[rule_row(&lines) + 1];
+        assert!(cut.ends_with('…') && width(cut) <= cols, "{cols}: {cut}");
+    }
+    /* a row that fills the pane exactly is not cut; the last pill keeps its padding */
     let mut app = app_with(attention_view());
-    let lines = screen_text(&mut app, layout::width(ATTENTION), 40);
+    let lines = screen_text(&mut app, layout::width(ATTENTION) + 1, 40);
     assert_eq!(lines[rule_row(&lines) + 1], ATTENTION);
 }
 
@@ -7868,4 +10007,549 @@ fn a_long_piece_is_cut_in_one_pass() {
     let cut = layout::ellipsis(&long, 80);
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
     assert_eq!(cut, format!("{}…", "a".repeat(79)));
+}
+
+fn titled_job(id: &str, title: &str, state: &str, deps: &[&str], created: u64, peer: &str) -> Job {
+    Job {
+        job_id: id.into(),
+        title: title.into(),
+        state: state.into(),
+        assigned_peer: Some(peer.into()),
+        worker: Some(peer.into()),
+        assignee_id: Some(peer.into()),
+        depends_on: deps.iter().map(|d| (*d).into()).collect(),
+        dispatch: true,
+        created_at: Some(created),
+        from_peer: "lead".into(),
+        circle: "c".into(),
+        ..Default::default()
+    }
+}
+
+fn timeline_ask(id: &str, to: &str, opened: u64, open: bool, failed: bool) -> Ask {
+    Ask {
+        correlation_id: id.into(),
+        from_peer: "lead".into(),
+        to_peer: to.into(),
+        to_peer_id: to.into(),
+        open,
+        failed,
+        opened_at: Some(opened),
+        ..Default::default()
+    }
+}
+
+/* one chain: done, running, idle holder, failed, blocked, queued */
+fn timeline_chain() -> Snapshot {
+    let mut scope = titled_job("scope", "scope the work", "done", &[], 100, "cc");
+    scope.ask_id = Some("ask-scope".into());
+    scope.finished_at = Some(900);
+    let mut runit = titled_job("runit", "run the suite", "running", &["scope"], 101, "pi");
+    runit.ask_id = Some("ask-runit".into());
+    runit.progress = Some(crate::wire::JobProgress {
+        state: Some(Progress::Work { since: 850 }),
+        busy: true,
+    });
+    let mut idleh = titled_job("idleh", "hold the ask", "running", &["scope"], 102, "p2");
+    idleh.ask_id = Some("ask-idleh".into());
+    idleh.progress = Some(crate::wire::JobProgress {
+        state: Some(Progress::Idle {
+            since: 980,
+            why: IdleWhy::TurnEnded,
+        }),
+        busy: false,
+    });
+    let mut failj = titled_job("failj", "sec review", "failed", &["scope"], 103, "w3");
+    failj.ask_id = Some("ask-failj".into());
+    failj.finished_at = Some(950);
+    let mut block = titled_job("block", "blocked child", "queued", &["failj"], 104, "w4");
+    block.dispatch_state = Some(DispatchState::Blocked {
+        dependencies: vec!["failj".into()],
+        dependency: "failj".into(),
+        reason: BlockReason::Failed,
+    });
+    let queue = titled_job("queue", "queued last", "queued", &["block"], 105, "w5");
+    Snapshot {
+        schema_version: 2,
+        captured_at: 1000,
+        jobs: vec![scope, runit, idleh, failj, block, queue],
+        asks: vec![
+            timeline_ask("ask-scope", "cc", 800, false, false),
+            timeline_ask("ask-runit", "pi", 850, true, false),
+            timeline_ask("ask-idleh", "p2", 860, true, false),
+            timeline_ask("ask-failj", "w3", 870, false, true),
+        ],
+        ..Default::default()
+    }
+}
+
+fn timeline_of(snap: Snapshot, sel: &str, cols: usize) -> layout::Grid {
+    let (chain, num) = numbered(&snap);
+    let view = View {
+        snap: model::Frame {
+            view: snap,
+            fresh: true,
+        },
+        chain: &chain,
+        num: &num,
+        base: 0,
+        sel,
+    };
+    layout::timeline(&view, cols)
+}
+
+fn line_of(g: &layout::Grid, row: usize) -> String {
+    let w = g.width().max(1);
+    g.line(row, w)
+        .iter()
+        .filter(|cell| cell.ch != layout::SPACER)
+        .map(|cell| cell.ch)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
+#[test]
+fn t_toggles_the_jobs_body_between_flow_and_timeline() {
+    let mut app = app_with(timeline_chain());
+    let flow = screen_text(&mut app, 80, 40);
+    let flow_text = flow.join("\n");
+    assert!(
+        flow.iter()
+            .any(|l| l.contains('●') || l.contains('◆') || l.contains('○')),
+        "the flow is up first:\n{flow_text}"
+    );
+    assert!(
+        flow.last().is_some_and(|l| l.contains("t timeline")),
+        "footer names the toggle:\n{flow_text}"
+    );
+    assert!(
+        !flow_text.contains("now") || !flow.iter().any(|l| l.contains('━')),
+        "the timeline is not drawn yet:\n{flow_text}"
+    );
+
+    app.key(KeyCode::Char('t'));
+    let time = screen_text(&mut app, 80, 40);
+    let time_text = time.join("\n");
+    assert!(
+        time.iter().any(|l| l.contains("now")),
+        "the axis says now:\n{time_text}"
+    );
+    assert!(
+        time.iter().any(|l| l.contains('━') || l.contains('╌')),
+        "a bar is drawn:\n{time_text}"
+    );
+    assert!(
+        time.last().is_some_and(|l| l.contains("t flow")),
+        "footer names the way back:\n{time_text}"
+    );
+    assert!(
+        !time_text.contains("t timeline"),
+        "the flow hint is gone:\n{time_text}"
+    );
+
+    app.key(KeyCode::Char('t'));
+    let back = screen_text(&mut app, 80, 40);
+    assert!(
+        back.last().is_some_and(|l| l.contains("t timeline")),
+        "t returns to the flow:\n{}",
+        back.join("\n")
+    );
+    assert!(
+        back.iter()
+            .any(|l| l.contains('●') || l.contains('◆') || l.contains('○')),
+        "the flow body is back:\n{}",
+        back.join("\n")
+    );
+}
+
+#[test]
+fn timeline_rows_follow_flow_order_with_state_words() {
+    let g = timeline_of(timeline_chain(), "runit", 80);
+    let text = g.text();
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(
+        rows.iter().any(|l| l.contains("now")),
+        "shared axis:\n{text}"
+    );
+    let body: Vec<&str> = rows
+        .iter()
+        .copied()
+        .filter(|l| !l.contains("now"))
+        .collect();
+    let find = |needle: &str| {
+        body.iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("missing {needle} in\n{text}"))
+    };
+    let order = [
+        find("scope the"),
+        find("run the"),
+        find("hold the"),
+        find("sec review"),
+        find("blocked chi"),
+        find("queued last"),
+    ];
+    let mut sorted = order;
+    sorted.sort();
+    assert_eq!(order, sorted, "flow order:\n{text}");
+    assert!(text.contains("done"), "{text}");
+    assert!(text.contains("run "), "{text}");
+    assert!(text.contains("IDLE "), "{text}");
+    assert!(text.contains("failed"), "{text}");
+    assert!(text.contains("blocked"), "{text}");
+    assert!(text.contains("queued"), "{text}");
+    assert!(
+        text.contains("1 ") && text.contains("6 "),
+        "numbers:\n{text}"
+    );
+}
+
+#[test]
+fn timeline_bars_use_the_state_glyphs_and_tones() {
+    let g = timeline_of(timeline_chain(), "runit", 80);
+    let text = g.text();
+    let mut saw_done = false;
+    let mut saw_run = false;
+    let mut saw_idle = false;
+    let mut saw_fail = false;
+    let mut fail_ends_x = false;
+    for r in 0..g.height() {
+        let line = line_of(&g, r);
+        let cells = g.line(r, g.width().max(1));
+        let bars: Vec<_> = cells
+            .iter()
+            .filter(|c| c.ch == '━' || c.ch == '╌' || c.ch == '×')
+            .collect();
+        if line.contains("done") && !line.contains("now") {
+            assert!(
+                bars.iter().any(|c| c.ch == '━' && c.tone == Tone::Dim),
+                "done bar:\n{text}"
+            );
+            saw_done = true;
+        }
+        if line.contains("run ") {
+            assert!(
+                bars.iter().any(|c| c.ch == '━' && c.tone == Tone::Run),
+                "run bar:\n{text}"
+            );
+            saw_run = true;
+        }
+        if line.contains("IDLE ") {
+            assert!(
+                bars.iter().any(|c| c.ch == '╌' && c.tone == Tone::Wait),
+                "idle dash:\n{text}"
+            );
+            saw_idle = true;
+        }
+        if line.contains("failed") {
+            assert!(
+                bars.iter().any(|c| c.ch == '━' && c.tone == Tone::Fail),
+                "failed bar:\n{text}"
+            );
+            let last = bars.last().copied();
+            fail_ends_x = last.is_some_and(|c| c.ch == '×' && c.tone == Tone::Fail);
+            saw_fail = true;
+        }
+        if line.contains("blocked") || line.contains("queued") && !line.contains("blocked") {
+            assert!(
+                bars.is_empty(),
+                "queued/blocked have no bar: {line}\n{text}"
+            );
+        }
+    }
+    assert!(saw_done && saw_run && saw_idle && saw_fail, "{text}");
+    assert!(fail_ends_x, "failed ends in ×:\n{text}");
+}
+
+#[test]
+fn timeline_worker_is_soft() {
+    let g = timeline_of(timeline_chain(), "runit", 80);
+    let mut saw = false;
+    for r in 0..g.height() {
+        let line = line_of(&g, r);
+        if !line.contains("run the") {
+            continue;
+        }
+        for cell in g.line(r, g.width().max(1)) {
+            if cell.ch != 'p' && cell.ch != 'i' {
+                continue;
+            }
+            if cell.tone == Tone::Soft {
+                saw = true;
+            }
+        }
+    }
+    assert!(saw, "worker Tone::Soft:\n{}", g.text());
+}
+
+#[test]
+fn timeline_fits_46_80_and_100() {
+    for cols in [46, 80, 100] {
+        let g = timeline_of(timeline_chain(), "runit", cols);
+        let text = g.text();
+        assert!(
+            g.width() <= cols,
+            "{cols}: width {} > cols\n{text}",
+            g.width()
+        );
+        assert!(text.contains("now"), "{cols}: axis\n{text}");
+        assert!(text.contains("done"), "{cols}: done\n{text}");
+        assert!(
+            text.contains('━') || text.contains('╌'),
+            "{cols}: bar\n{text}"
+        );
+        let mut app = app_with(timeline_chain());
+        app.key(KeyCode::Char('t'));
+        let lines = screen_text(&mut app, cols, 40);
+        assert!(
+            lines.iter().any(|l| l.contains("now")),
+            "{cols}: screen axis\n{}",
+            lines.join("\n")
+        );
+        for line in &lines {
+            assert!(layout::width(line) <= cols, "{cols}: row overflows: {line}");
+        }
+    }
+}
+
+#[test]
+fn ascii_maps_timeline_bars() {
+    let mut app = app_with(timeline_chain());
+    app.opts.ascii = true;
+    app.key(KeyCode::Char('t'));
+    let text = screen_text(&mut app, 80, 40).join("\n");
+    assert!(text.contains('='), "━ → =\n{text}");
+    assert!(text.contains('~'), "╌ → ~\n{text}");
+    assert!(!text.contains('━') && !text.contains('╌'), "{text}");
+}
+
+#[test]
+fn the_timeline_scrolls_to_the_selected_row() {
+    let mut snap = Snapshot {
+        captured_at: 1000,
+        ..Default::default()
+    };
+    for n in 0..30 {
+        let id = format!("j{n:02}");
+        let prev = format!("j{:02}", n - 1);
+        let deps = [prev.as_str()];
+        snap.jobs.push(titled_job(
+            &id,
+            &id,
+            "queued",
+            if n == 0 { &[] } else { &deps },
+            n as u64,
+            "cc",
+        ));
+    }
+    let mut app = app_with(snap);
+    app.sel = Some("j29".into());
+    app.key(KeyCode::Char('t'));
+    let screen = screen_text(&mut app, 80, 20);
+    let body: Vec<_> = screen.iter().take_while(|l| !l.starts_with('┌')).collect();
+    assert!(
+        body.iter().any(|l| l.trim_start().starts_with("30 j29")),
+        "selected row absent from timeline:\n{}",
+        screen.join("\n")
+    );
+}
+
+#[test]
+fn the_timeline_names_the_actual_worker() {
+    let mut snap = timeline_chain();
+    snap.jobs[1].assigned_peer = Some("old".into());
+    snap.jobs[1].worker = Some("new-id".into());
+    snap.jobs[1].assignee_id = None;
+    snap.asks[1].to_peer_id = "new-id".into();
+    snap.asks[1].to_peer = "old".into();
+    snap.peers.push(model::Peer {
+        peer_id: "new-id".into(),
+        name: "new".into(),
+        ..Default::default()
+    });
+    let grid = timeline_of(snap, "runit", 80);
+    let line = grid
+        .text()
+        .lines()
+        .find(|l| l.contains("run the"))
+        .unwrap()
+        .to_string();
+    assert!(line.contains("new") && !line.contains("old"), "{line}");
+}
+
+#[test]
+fn a_cancelled_interval_takes_no_run_colour() {
+    let mut snap = timeline_chain();
+    snap.jobs[1].state = "cancelled".into();
+    snap.jobs[1].finished_at = Some(950);
+    snap.jobs[1].progress = None;
+    let grid = timeline_of(snap, "runit", 80);
+    let r = grid
+        .text()
+        .lines()
+        .position(|l| l.contains("cancelled"))
+        .unwrap();
+    assert!(
+        grid.line(r, grid.width())
+            .iter()
+            .filter(|c| c.ch == '━')
+            .all(|c| c.tone != Tone::Run),
+        "cancelled interval has Run tone:\n{}",
+        grid.text()
+    );
+}
+
+#[test]
+fn a_finished_job_without_an_end_draws_no_bar() {
+    let mut snap = timeline_chain();
+    snap.jobs[0].finished_at = None;
+    let grid = timeline_of(snap, "runit", 80);
+    let r = grid
+        .text()
+        .lines()
+        .position(|l| l.contains("scope the"))
+        .unwrap();
+    assert!(
+        grid.line(r, grid.width()).iter().all(|c| c.ch != '━'),
+        "done without finished_at is painted through now:\n{}",
+        grid.text()
+    );
+}
+
+#[test]
+fn extreme_idle_stamps_keep_the_timeline_inside_the_pane() {
+    for cols in [30, 46, 80, 100] {
+        for since in [0, 850, 980, 1000, 1100, u64::MAX] {
+            let mut snap = timeline_chain();
+            snap.jobs[2].progress.as_mut().unwrap().state = Some(Progress::Idle {
+                since,
+                why: IdleWhy::TurnEnded,
+            });
+            let g = timeline_of(snap, "idleh", cols);
+            assert!(g.width() <= cols, "{cols}, {since}: {}", g.text());
+        }
+    }
+}
+
+#[test]
+fn the_idle_dash_starts_where_the_worker_went_idle() {
+    for cols in [46, 80, 100] {
+        let g = timeline_of(timeline_chain(), "idleh", cols);
+        let axis = line_of(&g, 0);
+        assert!(
+            axis.contains(&layout::clock(Some(800)))
+                && axis.contains(&layout::clock(Some(900)))
+                && axis.contains("now"),
+            "{cols}: {axis}"
+        );
+        let row = g.text().lines().position(|l| l.contains("IDLE")).unwrap();
+        let cells = g.line(row, g.width());
+        let bars: Vec<_> = cells
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.ch == '━' || c.ch == '╌')
+            .collect();
+        let bar_start = axis.find(&layout::clock(Some(800))).unwrap();
+        let bar_end = axis.find("now").unwrap() + 3;
+        let expected = bar_start + ((980 - 800) * (bar_end - bar_start) / (1000 - 800));
+        let idle_start = bars.iter().find(|(_, c)| c.ch == '╌').unwrap().0;
+        assert_eq!(idle_start, expected, "{cols}: {}", g.text());
+    }
+}
+
+#[test]
+fn idle_segment_clamps_to_the_bar() {
+    for (since, last_only) in [(850, false), (1000, true), (1100, true)] {
+        let mut snap = timeline_chain();
+        snap.jobs[2].progress.as_mut().unwrap().state = Some(Progress::Idle {
+            since,
+            why: IdleWhy::TurnEnded,
+        });
+        let g = timeline_of(snap, "idleh", 80);
+        let r = g.text().lines().position(|l| l.contains("IDLE")).unwrap();
+        let bar: Vec<char> = g
+            .line(r, g.width())
+            .iter()
+            .map(|c| c.ch)
+            .filter(|&ch| ch == '━' || ch == '╌')
+            .collect();
+        let idle = bar.iter().filter(|&&ch| ch == '╌').count();
+        if last_only {
+            assert_eq!(idle, 1, "idle from {since}, at or after now:\n{}", g.text());
+            assert_eq!(bar.last(), Some(&'╌'), "{}", g.text());
+        } else {
+            assert_eq!(
+                idle,
+                bar.len(),
+                "idle from {since}, before the send:\n{}",
+                g.text()
+            );
+        }
+    }
+}
+
+#[test]
+fn an_inverted_finished_interval_draws_no_bar() {
+    let mut snap = timeline_chain();
+    snap.jobs[0].finished_at = Some(700);
+    let g = timeline_of(snap, "runit", 80);
+    let r = g
+        .text()
+        .lines()
+        .position(|l| l.contains("scope the"))
+        .unwrap();
+    assert!(
+        g.line(r, g.width()).iter().all(|c| c.ch != '━'),
+        "finished before it was sent:\n{}",
+        g.text()
+    );
+}
+
+#[test]
+fn timeline_hints_sit_where_the_row_starts() {
+    let mut app = app_with(timeline_chain());
+    app.key(KeyCode::Char('t'));
+    app.key(KeyCode::Char('f'));
+    let screen = screen_text(&mut app, 80, 40);
+    let axis = screen.iter().position(|l| l.ends_with("now")).unwrap();
+    let mut letters = Vec::new();
+    for title in ["scope", "run t", "hold ", "sec r", "block", "queued l"] {
+        let row = screen[axis + 1..]
+            .iter()
+            .find(|l| l.contains(title))
+            .unwrap_or_else(|| panic!("no row for {title}:\n{}", screen.join("\n")));
+        let first = row.chars().next().unwrap();
+        assert!(
+            super::input::HINT_KEYS.contains(first),
+            "the letter replaces the number at the row start: {row}"
+        );
+        letters.push(first);
+    }
+    letters.dedup();
+    assert_eq!(letters.len(), 6, "one letter per job: {letters:?}");
+}
+
+#[test]
+fn future_starts_leave_the_axis_at_the_snapshot() {
+    let mut snap = timeline_chain();
+    for ask in &mut snap.asks {
+        ask.opened_at = Some(1100);
+    }
+    let g = timeline_of(snap, "runit", 80);
+    let axis = line_of(&g, 0);
+    assert!(
+        !axis.contains(&layout::clock(Some(1100))) && axis.contains("now"),
+        "the axis ends at captured_at: {axis}"
+    );
+    let r = g
+        .text()
+        .lines()
+        .position(|l| l.contains("run the"))
+        .unwrap();
+    assert!(
+        g.line(r, g.width()).iter().all(|c| c.ch != '━'),
+        "a start after captured_at is no elapsed time:\n{}",
+        g.text()
+    );
 }

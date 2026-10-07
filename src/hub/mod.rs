@@ -1198,6 +1198,7 @@ fn close_open_asks(asks: &mut HashMap<String, Ask>, peer_id: &str, reason: &str)
                 "from_peer": ask.to_peer,
                 "to_peer": ask.from_peer,
                 "message": format!("[failed] {reason}"),
+                "failed": true,
             }));
         }
     }
@@ -2219,6 +2220,7 @@ async fn ack_ask(
         "from_peer": ask.to_peer,
         "to_peer": ask.from_peer,
         "message": message,
+        "failed": req.failed,
     });
     persist_then_deliver(&mut hub, &ask.from_peer, event, now)?;
     Ok(Json(
@@ -3332,6 +3334,7 @@ fn close_job_ask(hub: &mut Hub, job: &Job, reply: String, failed: bool) -> Optio
         "from_peer": ask.to_peer,
         "to_peer": ask.from_peer,
         "message": ask.reply,
+        "failed": failed,
     });
     /* a copy the worker has not taken yet would still be replayed to it and worked on */
     hub.inbox.retain(&worker, |record| {

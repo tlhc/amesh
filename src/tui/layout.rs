@@ -27,6 +27,13 @@ pub(crate) enum Tone {
     once the ack is in */
     Flow,
     Back,
+    /* what needs a person now: the wait colour as a solid block */
+    Badge,
+    /* a short label on the select background, in the colour of its state */
+    PillWait,
+    PillFail,
+    PillRun,
+    PillText,
 }
 
 /* a wide character fills its cell and leaves the next one as a spacer the renderer skips */
@@ -173,8 +180,9 @@ pub(crate) fn presence(snap: &Frame, cols: usize, spin: char, lit: bool) -> Vec<
     if online.is_empty() {
         return vec![(fit("no peers online", cols), Tone::Dim)];
     }
+    let prefix = prefix(snap);
     let label = label(online.len());
-    let need = |kept: &[&Peer]| line_width(&label, kept, online.len() - kept.len());
+    let need = |kept: &[&Peer]| line_width(&label, kept, online.len() - kept.len(), prefix);
     let mut kept = online.clone();
     if need(&kept) > cols {
         let mut ranked = online.clone();
@@ -197,7 +205,7 @@ pub(crate) fn presence(snap: &Frame, cols: usize, spin: char, lit: bool) -> Vec<
             out.push(("  ".into(), Tone::Plain));
         }
         out.push(mark(peer, spin, lit));
-        out.extend(named(peer));
+        out.extend(named(peer, prefix));
     }
     let hidden = online.len() - kept.len();
     if hidden > 0 {
@@ -218,12 +226,13 @@ pub(crate) fn presence_lines(
     lit: bool,
 ) -> Vec<Vec<(String, Tone)>> {
     let line = presence(snap, cols, spin, lit);
+    let prefix = prefix(snap);
     let online = online_peers(snap);
     let label = label(online.len());
-    let single = line_width(&label, &online, 0);
+    let single = line_width(&label, &online, 0, prefix);
     let cell = online
         .iter()
-        .map(|p| 2 + width(shown(p)) + width(&tail(p)))
+        .map(|p| 2 + width(brief(shown(p), prefix)) + width(&tail(p)))
         .chain([width(&format!("+{}", online.len()))])
         .max()
         .unwrap_or(0);
@@ -240,7 +249,7 @@ pub(crate) fn presence_lines(
     let hidden = online.len() - kept.len();
     let mut cells: Vec<Vec<(String, Tone)>> = kept
         .iter()
-        .map(|peer| [vec![mark(peer, spin, lit)], named(peer)].concat())
+        .map(|peer| [vec![mark(peer, spin, lit)], named(peer, prefix)].concat())
         .collect();
     if hidden > 0 {
         cells.push(vec![(format!("+{hidden}"), Tone::Dim)]);
@@ -283,11 +292,11 @@ fn label(online: usize) -> String {
 }
 
 /* the top line's width with `kept` shown after `label` and `hidden` counted */
-fn line_width(label: &str, kept: &[&Peer], hidden: usize) -> usize {
+fn line_width(label: &str, kept: &[&Peer], hidden: usize, prefix: &str) -> usize {
     width(label)
         + kept
             .iter()
-            .map(|p| 2 + width(shown(p)) + width(&tail(p)))
+            .map(|p| 2 + width(brief(shown(p), prefix)) + width(&tail(p)))
             .sum::<usize>()
         + 2 * kept.len().saturating_sub(1)
         + if hidden > 0 {
@@ -305,13 +314,49 @@ fn shown(peer: &Peer) -> &str {
     }
 }
 
+/* the prefix every peer in the view shares up to a '-': the {folder}- of {folder}-{backend}
+names, which tells nothing apart inside a circle */
+pub(crate) fn prefix(snap: &Snapshot) -> &str {
+    let mut names: Vec<&str> = snap
+        .roster
+        .iter()
+        .map(shown)
+        .filter(|name| !name.is_empty() && *name != "anonymous")
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let [first, .., last] = names.as_slice() else {
+        return "";
+    };
+    let same = first
+        .char_indices()
+        .zip(last.chars())
+        .take_while(|((_, a), b)| a == b)
+        .last()
+        .map_or(0, |((at, ch), _)| at + ch.len_utf8());
+    let prefix = first[..same].rfind('-').map_or("", |cut| &first[..=cut]);
+    match names.iter().all(|name| name.len() > prefix.len()) {
+        true => prefix,
+        false => "",
+    }
+}
+
+/* a name without the view's prefix; a peer that left or another circle's peer from the same
+folder loses it too */
+pub(crate) fn brief<'a>(name: &'a str, prefix: &str) -> &'a str {
+    match name.strip_prefix(prefix) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => name,
+    }
+}
+
 /* a name on the top line. NoPush dims it. A stuck queue under Push or NoPush adds the count */
-fn named(peer: &Peer) -> Vec<(String, Tone)> {
+fn named(peer: &Peer, prefix: &str) -> Vec<(String, Tone)> {
     let tone = match peer.delivery.as_ref().map(|row| row.condition) {
         Some(DeliveryCondition::NoPush) => Tone::Dim,
         _ => Tone::Soft,
     };
-    let mut out = vec![(format!(" {}", shown(peer)), tone)];
+    let mut out = vec![(format!(" {}", brief(shown(peer), prefix)), tone)];
     let mark = tail(peer);
     if !mark.is_empty() {
         out.push((mark, Tone::Warn));
@@ -353,10 +398,12 @@ pub(crate) fn delivery(snap: &Frame, peer: &Peer) -> Row {
 }
 
 /* what needs a person, from the hub's facts: a peer at a prompt, the recipient of an open
-ask the hub calls idle, a stuck queue, and a failed job, one item for each. The peers are
-the circle's and the recipients of its open asks, in another circle too */
+ask the hub calls idle, a stuck queue, and a failed job, one item for each: its head and,
+when there is one, its reason. The peers are the circle's and the recipients of its open
+asks, in another circle too */
 pub(crate) fn attention(snap: &Snapshot) -> Vec<Row> {
     let now = snap.captured_at;
+    let prefix = prefix(snap);
     let mut items: Vec<Row> = Vec::new();
     let recipients = snap
         .asks
@@ -372,13 +419,14 @@ pub(crate) fn attention(snap: &Snapshot) -> Vec<Row> {
         .collect();
     for peer in &peers {
         if let Some(Liveness::Wait { since, reason }) = &peer.liveness {
-            let mut item = vec![
-                ("WAIT ".to_string(), Tone::Warn),
-                (
-                    format!("{} {}", shown(peer), ago(now, Some(*since))),
-                    Tone::Plain,
+            let mut item = vec![(
+                format!(
+                    "WAIT {} {}",
+                    brief(shown(peer), prefix),
+                    ago(now, Some(*since))
                 ),
-            ];
+                Tone::Badge,
+            )];
             item.extend(reason.as_ref().map(|r| (format!(" {r}"), Tone::Dim)));
             items.push(item);
         }
@@ -402,13 +450,15 @@ pub(crate) fn attention(snap: &Snapshot) -> Vec<Row> {
         }
     }
     for (ask, since, why) in idle {
-        let name = snap
-            .peer_by_id(&ask.to_peer_id)
-            .map_or(ask.to_peer.as_str(), shown);
-        let mut item = vec![
-            ("IDLE ".to_string(), Tone::Fail),
-            (format!("{name} {}", ago(now, Some(since))), Tone::Plain),
-        ];
+        let name = brief(
+            snap.peer_by_id(&ask.to_peer_id)
+                .map_or(ask.to_peer.as_str(), shown),
+            prefix,
+        );
+        let mut item = vec![(
+            format!("IDLE {name} {}", ago(now, Some(since))),
+            Tone::PillWait,
+        )];
         let why = idle_why(why);
         if !why.is_empty() {
             item.push((format!(" {why}"), Tone::Dim));
@@ -427,20 +477,17 @@ pub(crate) fn attention(snap: &Snapshot) -> Vec<Row> {
         else {
             continue;
         };
-        let mut item = vec![
-            (format!("✉{} ", stuck.count), Tone::Warn),
-            (shown(peer).to_string(), Tone::Plain),
-        ];
+        let mut item = vec![(
+            format!("✉{} {}", stuck.count, brief(shown(peer), prefix)),
+            Tone::PillWait,
+        )];
         if no_push {
             item.push((" no push".into(), Tone::Dim));
         }
         items.push(item);
     }
     for job in snap.jobs.iter().filter(|job| job.state == "failed") {
-        items.push(vec![
-            ("× ".into(), Tone::Fail),
-            (format!("{} failed", job.title), Tone::Plain),
-        ]);
+        items.push(vec![(format!("× {}", job.title), Tone::PillFail)]);
     }
     items
 }
@@ -602,8 +649,36 @@ impl View<'_> {
             Tone::Select
         } else if needs(id, self.sel) || needs(self.sel, id) {
             Tone::Near
-        } else {
+        } else if self.waiting(id) || self.idle(id) {
+            Tone::Wait
+        } else if self.state(id) == "failed" {
+            Tone::Fail
+        } else if self.frontier(id) {
             Tone::Plain
+        } else {
+            Tone::Dim
+        }
+    }
+
+    /* a worker that ended its turn while the job's ask is still open */
+    fn idle(&self, id: &str) -> bool {
+        self.snap.job(id).and_then(idle_since).is_some()
+    }
+
+    /* where the eye should go: running or failed jobs, and queued ones a dependency blocks */
+    fn frontier(&self, id: &str) -> bool {
+        matches!(self.state(id), "running" | "failed")
+            || self.snap.job(id).is_some_and(|job| {
+                matches!(job.dispatch_state, Some(DispatchState::Blocked { .. }))
+            })
+    }
+
+    /* an edge takes the theme's line when it leads to a frontier job */
+    fn edge<'a>(&self, ids: impl IntoIterator<Item = &'a String>) -> Tone {
+        if ids.into_iter().any(|id| self.frontier(id)) {
+            Tone::Line
+        } else {
+            Tone::Dim
         }
     }
 
@@ -625,7 +700,7 @@ impl View<'_> {
         format!("{worker} {age}").trim().to_string()
     }
 
-    /* a flow row marks a worker waiting for a permission; an idle one shows in the card */
+    /* a flow row marks a worker waiting for a permission */
     fn waiting(&self, id: &str) -> bool {
         self.snap.job(id).is_some_and(|job| {
             matches!(
@@ -645,7 +720,25 @@ impl View<'_> {
 
     fn put_glyph(&self, g: &mut Grid, r: usize, c: usize, id: &str) {
         let (ch, tone) = glyph(self.state(id));
+        let tone = match self.waiting(id) || self.idle(id) {
+            true => Tone::Wait,
+            false => tone,
+        };
         g.put_node(r, c, &ch.to_string(), tone, self.node(id), true);
+    }
+
+    /* the tail in Dim, the worker's name at its front in Soft */
+    fn put_tail(&self, g: &mut Grid, r: usize, c: usize, id: &str, tail: &str) -> usize {
+        let end = g.put(r, c, tail, Tone::Dim);
+        let worker = self
+            .snap
+            .job(id)
+            .and_then(|job| job.assigned_peer.as_deref())
+            .unwrap_or("");
+        if !worker.is_empty() && tail.starts_with(worker) {
+            g.put(r, c, worker, Tone::Soft);
+        }
+        end
     }
 
     fn needs_note(&self, id: &str) -> Option<String> {
@@ -774,18 +867,19 @@ pub(crate) fn vertical(v: &View, cols: usize) -> Grid {
                 .find(|title| width(title) <= room - 4)
                 .map_or_else(|| fit(&counts, room - 4), |title| title.to_string());
             let half = (room - 2) / 2;
-            g.put(r, 0, &format!("┌{}┐", "─".repeat(room - 2)), Tone::Line);
+            let frame = v.edge(group);
+            g.put(r, 0, &format!("┌{}┐", "─".repeat(room - 2)), frame);
             if i > 0 {
-                g.put(r, center, "┴", Tone::Line);
+                g.put(r, center, "┴", frame);
             }
             r += 1;
-            g.put(r, 0, "│", Tone::Line);
-            g.put(r, room - 1, "│", Tone::Line);
+            g.put(r, 0, "│", frame);
+            g.put(r, room - 1, "│", frame);
             g.put(r, 2, &title, Tone::Dim);
             r += 1;
             for pair in group.chunks(2) {
-                g.put(r, 0, "│", Tone::Line);
-                g.put(r, room - 1, "│", Tone::Line);
+                g.put(r, 0, "│", frame);
+                g.put(r, room - 1, "│", frame);
                 for (k, id) in pair.iter().enumerate() {
                     let x = 2 + k * half;
                     v.put_glyph(&mut g, r, x, id);
@@ -801,9 +895,9 @@ pub(crate) fn vertical(v: &View, cols: usize) -> Grid {
                 }
                 r += 1;
             }
-            g.put(r, 0, &format!("└{}┘", "─".repeat(room - 2)), Tone::Line);
-            if i + 1 < groups.len() {
-                g.put(r, center, "┬", Tone::Line);
+            g.put(r, 0, &format!("└{}┘", "─".repeat(room - 2)), frame);
+            if let Some(next) = groups.get(i + 1) {
+                g.put(r, center, "┬", v.edge(next));
             }
             r += 1;
             continue;
@@ -822,10 +916,10 @@ pub(crate) fn vertical(v: &View, cols: usize) -> Grid {
             };
             let mut end = g.put_node(r, center + 2, &label, v.tone(id), v.node(id), false);
             if !tail.is_empty() {
-                end = g.put(r, end + 1, &tail, Tone::Dim);
+                end = v.put_tail(&mut g, r, end + 1, id, &tail);
             }
             if wait {
-                end = g.put(r, end + 1, "WAIT!", Tone::Wait);
+                end = g.put(r, end, " WAIT ", Tone::Badge);
             }
             pos.insert(id.clone(), (r, end));
             r += 1;
@@ -854,7 +948,7 @@ pub(crate) fn vertical(v: &View, cols: usize) -> Grid {
             continue;
         }
         if group.len() == 1 && next.len() == 1 {
-            g.put(r, center, "│", Tone::Line);
+            g.put(r, center, "│", v.edge(next));
             r += 1;
             continue;
         }
@@ -864,12 +958,30 @@ pub(crate) fn vertical(v: &View, cols: usize) -> Grid {
             .map(|n| center + n * slot - slot * (k - 1) / 2)
             .collect();
         let (a, b) = (xs[0], xs[k - 1]);
-        g.put(r, a, &"─".repeat(b - a + 1), Tone::Line);
-        for x in &xs[1..k - 1] {
-            g.put(r, *x, if fan_out { "┬" } else { "┴" }, Tone::Line);
+        /* a fan-in leads every branch to the next job; a fan-out leads each branch to its own
+        job, so a corner takes its job's tone and a run takes the line when a frontier job lies
+        beyond it */
+        let lead = |x: usize| {
+            if !fan_out {
+                return v.edge(next);
+            }
+            let past = |n: usize| {
+                (xs[n].min(center)..=xs[n].max(center)).contains(&x) && v.frontier(&next[n])
+            };
+            match xs.iter().position(|&p| p == x) {
+                Some(n) if x != center => v.edge([&next[n]]),
+                _ if (0..k).any(past) => Tone::Line,
+                _ => Tone::Dim,
+            }
+        };
+        for x in a..=b {
+            g.put(r, x, "─", lead(x));
         }
-        g.put(r, a, if fan_out { "┌" } else { "└" }, Tone::Line);
-        g.put(r, b, if fan_out { "┐" } else { "┘" }, Tone::Line);
+        for x in &xs[1..k - 1] {
+            g.put(r, *x, if fan_out { "┬" } else { "┴" }, lead(*x));
+        }
+        g.put(r, a, if fan_out { "┌" } else { "└" }, lead(a));
+        g.put(r, b, if fan_out { "┐" } else { "┘" }, lead(b));
         let join = if xs.contains(&center) {
             "┼"
         } else if fan_out {
@@ -877,7 +989,7 @@ pub(crate) fn vertical(v: &View, cols: usize) -> Grid {
         } else {
             "┬"
         };
-        g.put(r, center, join, Tone::Line);
+        g.put(r, center, join, lead(center));
         r += 1;
     }
     if !rails {
@@ -903,16 +1015,16 @@ pub(crate) fn vertical(v: &View, cols: usize) -> Grid {
             r0,
             c0 + 1,
             &format!("{}┐", "─".repeat(x - c0 - 1)),
-            Tone::Line,
+            v.edge([id]),
         );
         for rr in r0 + 1..r1 {
-            g.put(rr, x, "│", Tone::Line);
+            g.put(rr, x, "│", v.edge([id]));
         }
         g.put(
             r1,
             c1 + 1,
             &format!("◀{}┘", "─".repeat(x - c1 - 2)),
-            Tone::Line,
+            v.edge([id]),
         );
     }
     g
@@ -926,6 +1038,174 @@ pub(crate) fn horizontal(v: &View, cols: usize) -> Option<Grid> {
         .chain((8..=14).rev())
         .map(|max| horizontal_with(v, max))
         .find(|g| g.width() <= cols)
+}
+
+/* one row per job in flow order, bars on a shared sent→now axis */
+pub(crate) fn timeline(v: &View, cols: usize) -> Grid {
+    let mut ids = v.chain.topo();
+    ids.sort_by_key(|id| v.num[id]);
+    let now = v.snap.captured_at;
+    let sent_of = |id: &str| -> Option<u64> {
+        let job = v.snap.job(id)?;
+        if job.state == "queued" {
+            return None;
+        }
+        v.snap.ask(job.ask_id.as_deref()).and_then(|a| a.opened_at)
+    };
+    /* the axis ends at the snapshot; a start after it is not elapsed time */
+    let start_of = |id: &str| sent_of(id).filter(|&t| t <= now);
+    let t0 = ids
+        .iter()
+        .filter_map(|id| start_of(id))
+        .min()
+        .unwrap_or(now);
+    let digits = ids
+        .iter()
+        .map(|id| v.num[id].to_string().len())
+        .max()
+        .unwrap_or(1);
+    let state_w = if cols >= 80 { 10 } else { 8 };
+    let worker_w = if cols >= 100 {
+        8
+    } else if cols >= 80 {
+        6
+    } else {
+        3
+    };
+    let num_w = digits + 1;
+    let mut title_w = if cols >= 100 {
+        18
+    } else if cols >= 80 {
+        12
+    } else {
+        6
+    };
+    let mut bar_w = 4;
+    let fitted =
+        |title_w: usize, bar_w: usize| num_w + title_w + 1 + worker_w + 1 + bar_w + 1 + state_w;
+    while fitted(title_w, bar_w + 1) <= cols {
+        bar_w += 1;
+    }
+    while fitted(title_w, bar_w) > cols && title_w > 3 {
+        title_w -= 1;
+    }
+    let c_title = num_w;
+    let c_worker = c_title + title_w + 1;
+    let c_bar = c_worker + worker_w + 1;
+    let c_state = c_bar + bar_w + 1;
+    let mut g = Grid::default();
+    place_axis(&mut g, 0, c_bar, bar_w, t0, now);
+    for (i, id) in ids.iter().enumerate() {
+        let r = i + 1;
+        let Some(job) = v.snap.job(id) else {
+            continue;
+        };
+        let (num_tone, title_tone) = if *id == v.sel {
+            (Tone::Select, Tone::Select)
+        } else {
+            (Tone::Dim, Tone::Plain)
+        };
+        /* the row carries the job's node, so scrolling and hints find it without a glyph */
+        g.put_node(
+            r,
+            0,
+            &format!("{} ", v.num[id]),
+            num_tone,
+            v.node(id),
+            false,
+        );
+        g.put_node(
+            r,
+            c_title,
+            &fit(&v.title(id), title_w),
+            title_tone,
+            v.node(id),
+            false,
+        );
+        g.put(
+            r,
+            c_worker,
+            &fit(worker_name(&v.snap, job), worker_w),
+            Tone::Soft,
+        );
+        let (word, word_tone) = state_word(job, now, sent_of(id));
+        g.put(r, c_state, &fit(&word, state_w), word_tone);
+        /* only a running job ends at the snapshot; a finished one needs its own stamp */
+        let end = match job.state.as_str() {
+            "running" => Some(now),
+            _ => job.finished_at.map(|t| t.min(now)),
+        };
+        let (Some(sent), Some(ended)) = (start_of(id), end) else {
+            continue;
+        };
+        if ended < sent {
+            continue;
+        }
+        let a = map_t(sent, t0, now, bar_w).min(bar_w - 1);
+        let b = map_t(ended, t0, now, bar_w).max(a + 1).min(bar_w);
+        let idle = idle_since(job).map_or(b, |s| map_t(s, t0, now, bar_w).clamp(a, b - 1));
+        for x in a..b {
+            let (ch, tone) = match job.state.as_str() {
+                "failed" if x + 1 == b => ("×", Tone::Fail),
+                "failed" => ("━", Tone::Fail),
+                _ if x >= idle => ("╌", Tone::Wait),
+                "running" => ("━", Tone::Run),
+                _ => ("━", Tone::Dim),
+            };
+            g.put(r, c_bar + x, ch, tone);
+        }
+    }
+    g
+}
+
+fn idle_since(job: &Job) -> Option<u64> {
+    match job.progress.as_ref().and_then(|p| p.state.as_ref()) {
+        Some(Progress::Idle { since, .. }) if job.state == "running" => Some(*since),
+        _ => None,
+    }
+}
+
+fn state_word(job: &Job, now: u64, sent: Option<u64>) -> (String, Tone) {
+    if let Some(since) = idle_since(job) {
+        return (format!("IDLE {}", ago(now, Some(since))), Tone::PillWait);
+    }
+    if job.state == "queued" && matches!(job.dispatch_state, Some(DispatchState::Blocked { .. })) {
+        return ("blocked".into(), Tone::PillText);
+    }
+    match job.state.as_str() {
+        "done" => ("done".into(), Tone::Done),
+        "running" => (format!("run {}", ago(now, sent)), Tone::Run),
+        "failed" => ("failed".into(), Tone::PillFail),
+        other => (other.into(), Tone::Dim),
+    }
+}
+
+fn map_t(t: u64, t0: u64, t1: u64, bar_w: usize) -> usize {
+    if bar_w == 0 || t1 <= t0 {
+        return 0;
+    }
+    let dt = t.saturating_sub(t0).min(t1 - t0);
+    ((dt as u128) * (bar_w as u128) / ((t1 - t0) as u128)) as usize
+}
+
+fn place_axis(g: &mut Grid, r: usize, c_bar: usize, bar_w: usize, t0: u64, t1: u64) {
+    let start = clock(Some(t0));
+    let mid = clock(Some(t0 + t1.saturating_sub(t0) / 2));
+    let mut taken: Vec<(usize, usize)> = Vec::new();
+    let mut place = |c: usize, text: &str| {
+        let w = width(text);
+        let end = c + w;
+        if taken.iter().any(|&(a, b)| c < b && end > a) {
+            return;
+        }
+        g.put(r, c, text, Tone::Dim);
+        taken.push((c, end));
+    };
+    place(c_bar + bar_w.saturating_sub(width("now")), "now");
+    place(c_bar, &start);
+    if t1 > t0 {
+        place(c_bar + (bar_w / 2).saturating_sub(width(&mid) / 2), &mid);
+    }
 }
 
 fn horizontal_with(v: &View, max: usize) -> Grid {
@@ -949,12 +1229,13 @@ fn horizontal_with(v: &View, max: usize) -> Grid {
         };
         if group.len() > 1 {
             let x = c + 2 + w + 2;
+            let tone = v.edge(next);
             for (n, label) in labels.iter().enumerate() {
                 g.put(
                     n,
                     c + 2 + width(label),
                     &format!(" {}", "─".repeat(w - width(label) + 1)),
-                    Tone::Line,
+                    tone,
                 );
                 g.put(
                     n,
@@ -966,30 +1247,25 @@ fn horizontal_with(v: &View, max: usize) -> Grid {
                     } else {
                         "┘"
                     },
-                    Tone::Line,
+                    tone,
                 );
             }
-            g.put(0, x + 1, "── ", Tone::Line);
+            g.put(0, x + 1, "── ", tone);
             c = x + 4;
         } else if next.len() > 1 {
+            /* the trunk takes the line while a frontier job hangs below it, each branch its job's tone */
             let x = c + 2 + w + 1;
-            g.put(0, x, "─┬─ ", Tone::Line);
+            g.put(0, x, "─┬", v.edge(next));
+            g.put(0, x + 2, "─ ", v.edge([&next[0]]));
             for n in 1..next.len() {
-                g.put(
-                    n,
-                    x + 1,
-                    if n + 1 < next.len() {
-                        "├─ "
-                    } else {
-                        "└─ "
-                    },
-                    Tone::Line,
-                );
+                let trunk = if n + 1 < next.len() { "├" } else { "└" };
+                g.put(n, x + 1, trunk, v.edge(&next[n..]));
+                g.put(n, x + 2, "─ ", v.edge([&next[n]]));
             }
             c = x + 4;
         } else {
             let x = c + 2 + w + 1;
-            g.put(0, x, "── ", Tone::Line);
+            g.put(0, x, "── ", v.edge(next));
             c = x + 3;
         }
     }
@@ -1240,12 +1516,43 @@ pub(crate) fn columns(cols: usize) -> (bool, usize) {
 
 /* the design's card: fields on the left and, in a wide pane, the prompt and any command
 on the right */
-pub(super) fn idle_why(why: &IdleWhy) -> &'static str {
+fn idle_why(why: &IdleWhy) -> &'static str {
     match why {
         IdleWhy::NotPickedUp => "not picked up",
         IdleWhy::AskStillOpen => "ask still open",
         IdleWhy::TurnEnded => "turn ended",
         IdleWhy::Unknown => "",
+    }
+}
+
+/* why `name` holds an ask up, in the words the job card and the ask card share */
+pub(super) fn stall_why(progress: &Progress, name: &str, now: u64) -> Option<(String, Tone)> {
+    match progress {
+        Progress::Gone => Some((format!("{name} left the hub"), Tone::Warn)),
+        Progress::Offline => Some((format!("{name} is offline"), Tone::Warn)),
+        Progress::Wait { reason, .. } => Some((
+            reason
+                .as_deref()
+                .unwrap_or("waiting for permission")
+                .to_string(),
+            Tone::Wait,
+        )),
+        Progress::Idle { since, why } => {
+            let mut text = match why {
+                IdleWhy::TurnEnded => format!("{name} ended its turn"),
+                IdleWhy::Unknown => format!("{name} idle"),
+                _ => format!("{name}: {}", idle_why(why)),
+            };
+            if *since <= now {
+                let age = ago(now, Some(*since));
+                text.push_str(&match why {
+                    IdleWhy::TurnEnded => format!(" {age} ago"),
+                    _ => format!(" · {age}"),
+                });
+            }
+            Some((text, Tone::Wait))
+        }
+        _ => None,
     }
 }
 
@@ -1282,6 +1589,89 @@ fn now_word(snap: &Snapshot, job: &Job) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn job_commands(job: &Job) -> Vec<(&'static str, String)> {
+    let mut commands = Vec::new();
+    let id = &job.job_id;
+    for action in job.actions.iter().flatten() {
+        let peer = job.assigned_peer.as_deref().unwrap_or("PEER");
+        let mut command = match action {
+            JobAction::Retry {
+                needs_assignee: false,
+            } => {
+                format!("amesh jobs update {} --state queued", quote(id))
+            }
+            JobAction::Retry {
+                needs_assignee: true,
+            }
+            | JobAction::Send => format!(
+                "amesh jobs update {} --state queued --assigned-peer {}",
+                quote(id),
+                quote(peer)
+            ),
+            JobAction::Nudge { to } => format!(
+                "amesh peer notify {} {}",
+                quote(to),
+                quote(&format!("{}?", job.title))
+            ),
+            JobAction::Resend => format!(
+                "amesh jobs update {} --state queued --assigned-peer PEER",
+                quote(id)
+            ),
+            JobAction::Unknown => continue,
+        };
+        let key_name = match action {
+            JobAction::Retry { .. } => "retry",
+            JobAction::Send => "send",
+            JobAction::Nudge { .. } => "nudge",
+            JobAction::Resend => "resend",
+            JobAction::Unknown => continue,
+        };
+        command.retain(|c| !c.is_control());
+        commands.push((key_name, command));
+    }
+    commands
+}
+
+/* the key promises the worker, so its name leads whole; the route gives way, the sender
+first, then the ask, then the time */
+fn compact_route(name: &str, ask: &Ask, room: usize) -> String {
+    let to = if ask.to_peer.is_empty() {
+        &ask.to_peer_id
+    } else {
+        &ask.to_peer
+    };
+    let id = short(&ask.correlation_id);
+    let tail = format!(" · {}", clock(ask.opened_at));
+    let from = if ask.from_peer.is_empty() {
+        String::new()
+    } else {
+        format!("{}▸", ask.from_peer)
+    };
+    [
+        format!("{name} · ask {id} {from}{to}{tail}"),
+        format!("{name} · ask {id} {to}{tail}"),
+        format!("{name}{tail}"),
+    ]
+    .into_iter()
+    .find(|line| width(line) <= room)
+    .unwrap_or_else(|| fit(name, room))
+}
+
+fn card_keys(text: &str) -> Row {
+    text.split_inclusive(' ')
+        .map(|part| {
+            (
+                part.to_string(),
+                if matches!(part.trim(), "y" | "Y" | "⏎" | "esc") {
+                    Tone::Near
+                } else {
+                    Tone::Dim
+                },
+            )
+        })
+        .collect()
+}
+
 pub(crate) fn card(
     v: &View,
     id: &str,
@@ -1292,6 +1682,9 @@ pub(crate) fn card(
     #[cfg(test)]
     if matches!(size, Fit::Whole) {
         WHOLE_CARDS.with(|n| n.set(n.get() + 1));
+    }
+    if cols < 2 {
+        return Grid::default();
     }
     let snap = &v.snap;
     let job = snap.job(id).expect("selected job is in the snapshot");
@@ -1305,10 +1698,7 @@ pub(crate) fn card(
     let worker = job.assigned_peer.as_deref().unwrap_or("-");
     let state = job.state.as_str();
     let progress = job.progress.as_ref();
-    let idle = matches!(
-        progress.and_then(|p| p.state.as_ref()),
-        Some(Progress::Idle { .. })
-    );
+    let unacked = state == "running" && ask.is_some_and(|a| a.open);
     let sent = ask.and_then(|a| a.opened_at).filter(|_| state != "queued");
     /* up to three items share a line, so each name gets its share of the card's width */
     let share = |count: usize| {
@@ -1339,19 +1729,130 @@ pub(crate) fn card(
         ids.sort_by_key(|x| v.num.get(x).copied().unwrap_or(usize::MAX));
         ids
     };
-    let lead: Option<(&str, &str, Tone)> = match state {
-        "done" => Some(("result", result.unwrap_or("-"), Tone::Done)),
-        "failed" => Some((
-            "reason",
-            result
-                .filter(|r| !r.is_empty())
-                .unwrap_or("no reason given"),
-            Tone::Fail,
-        )),
+    let name = worker_name(snap, job);
+    let badge = match (
+        state,
+        progress.and_then(|p| p.state.as_ref()),
+        &job.dispatch_state,
+    ) {
+        ("failed", _, _) => Some((" FAILED ", Tone::PillFail)),
+        ("running", Some(Progress::Wait { .. }), _) => Some((" WAIT ", Tone::Badge)),
+        ("running", Some(Progress::Idle { .. }), _) => Some((" IDLE ", Tone::PillWait)),
+        ("queued", _, Some(DispatchState::Blocked { .. })) => Some((" BLOCKED ", Tone::PillText)),
         _ => None,
     };
+    let relation_text = job.ask_id.as_deref().and_then(|cid| match job.relation {
+        Some(JobRelation::Missing { will_fail: true }) => Some(format!(
+            "{cid} is missing: the hub fails this job at its next check"
+        )),
+        Some(JobRelation::Missing { will_fail: false }) => Some(format!(
+            "{cid} is missing; automatic settlement is disabled"
+        )),
+        Some(JobRelation::CleanedUp) => Some(format!("{cid} was cleaned up")),
+        Some(JobRelation::Closed) if state == "running" => {
+            Some("automatic settlement is disabled".into())
+        }
+        _ => None,
+    });
+    let dispatch_text = if state == "queued" {
+        match &job.dispatch_state {
+            Some(DispatchState::Held) => Some("held: set its assignee again to send it".into()),
+            Some(DispatchState::Unassigned) => {
+                Some("not dispatched: name an assignee to send it".into())
+            }
+            Some(DispatchState::NoPeer { name }) => Some(format!("no peer named {name}: not sent")),
+            Some(DispatchState::OtherCircle { .. }) => {
+                Some(format!("{worker} is in another circle: not sent"))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let why = match (
+        state,
+        progress.and_then(|p| p.state.as_ref()),
+        &job.dispatch_state,
+    ) {
+        ("done", _, _) => result
+            .filter(|r| !r.is_empty())
+            .map(|r| (r.to_string(), Tone::Done)),
+        ("failed", _, _) => Some((
+            result
+                .filter(|r| !r.is_empty())
+                .unwrap_or("no reason given")
+                .to_string(),
+            Tone::Fail,
+        )),
+        ("running", Some(p @ Progress::Gone), _) => stall_why(p, gone_label(ask, job), now),
+        ("running", Some(p @ (Progress::Wait { .. } | Progress::Idle { .. })), _) => {
+            stall_why(p, name, now)
+        }
+        (
+            "queued",
+            _,
+            Some(DispatchState::Blocked {
+                dependency, reason, ..
+            }),
+        ) => {
+            let label = match (v.num.get(dependency), snap.job(dependency)) {
+                (Some(n), Some(dep)) => format!(
+                    "{n} {}",
+                    fit(
+                        &dep.title,
+                        share(1).min(colw.saturating_sub(KEY + width(&format!("{n} cancelled: "))))
+                    )
+                ),
+                _ => dependency.clone(),
+            };
+            Some((
+                match reason {
+                    BlockReason::Failed => format!("{label} failed: retry it first"),
+                    BlockReason::Cancelled => format!("{label} cancelled: retry it first"),
+                    BlockReason::Deleted => format!("{label} deleted: update dependencies"),
+                    BlockReason::Unknown => format!("{label}: blocked"),
+                },
+                Tone::Dim,
+            ))
+        }
+        _ => relation_text
+            .clone()
+            .or_else(|| dispatch_text.clone())
+            .map(|text| (text, Tone::Dim)),
+    };
+    let lead = why.as_ref().map(|(text, tone)| {
+        (
+            if state == "done" { "result" } else { "why" },
+            text.as_str(),
+            *tone,
+        )
+    });
+    let mut waiting = vec![("unacked ".into(), Tone::Dim), (ago(now, sent), Tone::Wait)];
+    if unacked && !v.chain.loose {
+        let mut durations: Vec<_> = v
+            .chain
+            .topo()
+            .iter()
+            .filter_map(|id| {
+                let j = snap.job(id)?;
+                if j.state != "done" {
+                    return None;
+                }
+                j.finished_at?
+                    .checked_sub(snap.ask(j.ask_id.as_deref())?.opened_at?)
+            })
+            .collect();
+        durations.sort_unstable();
+        if durations.len() >= 2 {
+            let hi = durations[durations.len() / 2];
+            let lo = durations[(durations.len() - 1) / 2];
+            waiting.push((
+                format!(" · chain median {}", ago(lo + (hi - lo) / 2, Some(0))),
+                Tone::Dim,
+            ));
+        }
+    }
     /* Job.worker is a peer id. Null with no derived fields is the v1 assignee line */
-    let name = worker_name(snap, job);
     let worker_block = left.len();
     let bare = job.worker.is_none() && job.relation.is_none() && job.progress.is_none();
     if matches!(job.relation, Some(JobRelation::Missing { .. })) || bare {
@@ -1386,11 +1887,10 @@ pub(crate) fn card(
                     2,
                 );
             }
-            Some(Progress::Idle { since, why }) => left.push(vec![
+            Some(Progress::Idle { .. }) => left.push(vec![
                 key("worker", true),
                 (format!("{name} "), Tone::Plain),
-                (format!("IDLE! {}", ago(now, Some(*since))), Tone::Fail),
-                (format!(" · {}", idle_why(why)), Tone::Dim),
+                ("IDLE".into(), Tone::Wait),
             ]),
             Some(Progress::Work { since }) if progress.is_some_and(|p| p.busy) => left.push(vec![
                 key("worker", true),
@@ -1439,10 +1939,6 @@ pub(crate) fn card(
                 Tone::Warn,
             ),
             _ if state == "queued" => ("previous attempt".into(), Tone::Dim),
-            _ if state == "running" && matches!(job.relation, Some(JobRelation::Open)) => (
-                "unacked".into(),
-                if idle { Tone::Fail } else { Tone::Plain },
-            ),
             _ => (word, tone),
         };
         let to = if ask.to_peer.is_empty() {
@@ -1463,37 +1959,19 @@ pub(crate) fn card(
             route.push(mark);
         }
         route.push((to.clone(), Tone::Plain));
-        packed(
-            &mut left,
-            "ask",
-            vec![
-                route,
-                vec![(format!("· {}", clock(ask.opened_at)), Tone::Plain)],
-                vec![("· ".into(), Tone::Plain), (tail, tone)],
-            ],
-            colw,
-        );
-        if idle {
-            left.push(vec![
-                key("", false),
-                ("⣿".repeat(12), Tone::Fail),
-                (format!(" waiting {}", ago(now, ask.opened_at)), Tone::Fail),
-            ]);
+        let mut parts = vec![
+            route,
+            vec![(format!("· {}", clock(ask.opened_at)), Tone::Plain)],
+        ];
+        if !unacked {
+            parts.push(vec![("· ".into(), Tone::Plain), (tail, tone)]);
         }
-    } else if let Some(cid) = job.ask_id.as_deref() {
-        let text = match job.relation {
-            Some(JobRelation::Missing { will_fail: true }) => {
-                format!("{cid} is missing: the hub fails this job at its next check")
-            }
-            Some(JobRelation::Missing { will_fail: false }) => {
-                format!("{cid} is missing; automatic settlement is disabled")
-            }
-            Some(JobRelation::CleanedUp) => format!("{cid} was cleaned up"),
-            _ => String::new(),
-        };
-        if !text.is_empty() {
-            wrapped(&mut left, "ask", &text, Tone::Warn, colw, usize::MAX);
+        packed(&mut left, "ask", parts, colw);
+        if unacked {
+            left.push([vec![key("", false)], waiting.clone()].concat());
         }
+    } else if let Some(text) = &relation_text {
+        wrapped(&mut left, "ask", text, Tone::Warn, colw, usize::MAX);
     }
     if state == "queued" {
         match job.dispatch_state.clone() {
@@ -1543,38 +2021,16 @@ pub(crate) fn card(
                 };
                 wrapped(&mut left, "blocked", &text, tone, colw, usize::MAX);
             }
-            Some(DispatchState::Held) => wrapped(
-                &mut left,
-                "waits",
-                "held: set its assignee again to send it",
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            ),
-            Some(DispatchState::Unassigned) => wrapped(
-                &mut left,
-                "waits",
-                "not dispatched: name an assignee to send it",
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            ),
-            Some(DispatchState::NoPeer { name }) => wrapped(
-                &mut left,
-                "waits",
-                &format!("no peer named {name}: not sent"),
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            ),
-            Some(DispatchState::OtherCircle { .. }) => wrapped(
-                &mut left,
-                "waits",
-                &format!("{worker} is in another circle: not sent"),
-                Tone::Dim,
-                colw,
-                usize::MAX,
-            ),
+            Some(
+                DispatchState::Held
+                | DispatchState::Unassigned
+                | DispatchState::NoPeer { .. }
+                | DispatchState::OtherCircle { .. },
+            ) => {
+                if let Some(text) = &dispatch_text {
+                    wrapped(&mut left, "waits", text, Tone::Dim, colw, usize::MAX);
+                }
+            }
             Some(DispatchState::Ready { .. }) => wrapped(
                 &mut left,
                 "waits",
@@ -1620,88 +2076,108 @@ pub(crate) fn card(
         }
     };
     wrapped(&mut left, "times", &times, Tone::Dim, colw, usize::MAX);
-    for action in job.actions.iter().flatten() {
-        let peer = job.assigned_peer.as_deref().unwrap_or("PEER");
-        let command = match action {
-            JobAction::Retry {
-                needs_assignee: false,
-            } => {
-                format!("amesh jobs update {} --state queued", quote(id))
-            }
-            JobAction::Retry {
-                needs_assignee: true,
-            }
-            | JobAction::Send => format!(
-                "amesh jobs update {} --state queued --assigned-peer {}",
-                quote(id),
-                quote(peer)
-            ),
-            JobAction::Nudge { to } => format!(
-                "amesh peer notify {} {}",
-                quote(to),
-                quote(&format!("{}?", job.title))
-            ),
-            JobAction::Resend => format!(
-                "amesh jobs update {} --state queued --assigned-peer PEER",
-                quote(id)
-            ),
-            JobAction::Unknown => continue,
-        };
-        let key_name = match action {
-            JobAction::Retry { .. } => "retry",
-            JobAction::Send => "send",
-            JobAction::Nudge { .. } => "nudge",
-            JobAction::Resend => "resend",
-            JobAction::Unknown => continue,
-        };
+    let actions = job_commands(job);
+    for (key_name, command) in &actions {
         wrapped(
             &mut commands,
             key_name,
-            &command,
+            command,
             Tone::Dim,
             colw,
             usize::MAX,
         );
     }
-    /* result or reason and the prompt take the rows the pane has left, result first, and
-    the frame stretches to the rows it was given; a field cut short ends in … */
     let room = colw.saturating_sub(KEY);
-    let lead_lines = lead.map_or(Vec::new(), |(_, text, _)| wrap(text, room));
-    let prompt_lines = wrap(prompt, room);
-    let (want_r, want_p) = (lead_lines.len(), prompt_lines.len());
-    let least = |want: usize| want.min(1);
-    let (n_r, n_p) = match size {
-        Fit::Whole => (want_r, want_p),
-        Fit::Rows(h) if two => {
-            let inner = h.saturating_sub(2);
-            (
-                want_r
-                    .min(inner.saturating_sub(left.len()))
-                    .max(least(want_r)),
-                want_p
-                    .min(inner.saturating_sub(commands.len()))
-                    .max(least(want_p)),
-            )
+    let keys_for = |copy: &str, last: &str| {
+        let mut parts: Vec<String> = ["y", "Y"]
+            .iter()
+            .zip(&actions)
+            .map(|(k, (action, _))| format!("{k} {copy}{action}"))
+            .collect();
+        parts.push(last.into());
+        parts.join(" · ")
+    };
+    let mut keys = match size {
+        Fit::Whole => keys_for("copy ", "esc back"),
+        Fit::Rows(_) => keys_for("copy ", "⏎ full card"),
+    };
+    if matches!(size, Fit::Rows(_)) && width(&keys) > colw {
+        keys = fit(&keys_for("", "⏎"), colw);
+    }
+    if matches!(size, Fit::Rows(1 | 2)) {
+        let mut grid = Grid::default();
+        let mut col = 0;
+        for (text, tone) in card_keys(&fit(&keys, cols)) {
+            col = grid.put(0, col, &text, tone);
+        }
+        return grid;
+    }
+    let keys = wrap(&keys, colw);
+    match size {
+        Fit::Whole => {
+            if let Some((k, text, tone)) = lead {
+                left.splice(0..0, field(k, &wrap(text, room), usize::MAX, tone, room));
+            }
+            let side = if two { &mut right } else { &mut left };
+            side.extend(field(
+                "prompt",
+                &wrap(prompt, room),
+                usize::MAX,
+                Tone::Plain,
+                room,
+            ));
+            side.extend(commands);
+            left.resize(left.len().max(right.len()), Vec::new());
         }
         Fit::Rows(h) => {
-            let space = h.saturating_sub(2 + left.len() + commands.len());
-            let r = want_r
-                .min(space.saturating_sub(least(want_p)))
-                .max(least(want_r));
-            (r, want_p.min(space.saturating_sub(r)).max(least(want_p)))
+            /* the compact card keeps none of the full card's rows */
+            left.clear();
+            let why_lines = lead
+                .map(|(_, text, _)| wrap(text, room))
+                .unwrap_or_default();
+            let prompt_lines = wrap(prompt, room);
+            let fixed = 1 + usize::from(unacked);
+            let minimum = why_lines.len().min(2) + fixed + usize::from(!two);
+            let height = if h == 0 {
+                minimum
+            } else {
+                h.saturating_sub(2 + keys.len())
+            };
+            let mut why_rows = why_lines.len().min(2).min(height);
+            let worker_rows = usize::from(height > why_rows);
+            let waiting_rows = usize::from(unacked && height > why_rows + worker_rows);
+            let fixed = worker_rows + waiting_rows;
+            why_rows += (why_lines.len() - why_rows).min(
+                (height - why_rows - fixed)
+                    .saturating_sub(usize::from(!two && !prompt_lines.is_empty())),
+            );
+            let prompt_rows = prompt_lines.len().min(if two {
+                height
+            } else {
+                height - why_rows - fixed
+            });
+            if let Some((k, _, tone)) = lead {
+                left.extend(field(k, &why_lines, why_rows, tone, room));
+            }
+            if worker_rows > 0 {
+                let route = ask.map_or_else(|| fit(name, room), |a| compact_route(name, a, room));
+                left.push(vec![key("worker", true), (route, Tone::Soft)]);
+            }
+            if waiting_rows > 0 {
+                left.push([vec![key("", false)], waiting].concat());
+            }
+            let side = if two { &mut right } else { &mut left };
+            side.extend(field(
+                "prompt",
+                &prompt_lines,
+                prompt_rows,
+                Tone::Plain,
+                room,
+            ));
+            left.resize(height, Vec::new());
         }
-    };
-    if let Some((k, _, tone)) = lead {
-        left.splice(0..0, field(k, &lead_lines, n_r, tone, room));
     }
-    let side = if two { &mut right } else { &mut left };
-    side.extend(field("prompt", &prompt_lines, n_p, Tone::Plain, room));
-    side.extend(commands);
-    if let Fit::Rows(h) = size {
-        while 2 + left.len().max(right.len()) < h {
-            left.push(Vec::new());
-        }
-    }
+    left.extend(keys.into_iter().map(|line| card_keys(&line)));
     let state_text = match state {
         "done" => match (sent, end) {
             (Some(a), Some(b)) => format!("done · took {}", ago(b, Some(a))),
@@ -1726,7 +2202,8 @@ pub(crate) fn card(
         )
     };
     let bare = width(&format!(" {} · {state_text} ", v.num[id])) + 1;
-    let room = cols.saturating_sub(4 + bare);
+    let badge_w = badge.map_or(0, |(text, _)| width(text));
+    let room = cols.saturating_sub(4 + bare + badge_w);
     let keep_stage = width(&stage) + width(&job.title).min(16) <= room;
     let title = fit(
         &job.title,
@@ -1736,29 +2213,42 @@ pub(crate) fn card(
     if keep_stage {
         head.push_str(&stage);
     }
-    framed(glyph(state), &head, &left, &right, cols)
+    framed(glyph(state), &head, badge, &left, &right, cols)
 }
 
-/* a card's frame: the glyph and head in its top border, the left rows and, in a wide pane,
-the right rows beside them */
+/* a card's frame: the glyph, the head and a badge at its right end in the top border, the
+left rows and, in a wide pane, the right rows beside them */
 pub(crate) fn framed(
     mark: (char, Tone),
     head: &str,
+    badge: Option<(&str, Tone)>,
     left: &[Row],
     right: &[Row],
     cols: usize,
 ) -> Grid {
+    if cols < 2 {
+        return Grid::default();
+    }
     let (two, colw) = columns(cols);
+    let badge_w = badge.map_or(0, |(text, _)| width(text));
     let mut g = Grid::default();
     g.put(0, 0, "┌", Tone::Line);
     g.put(0, 1, &mark.0.to_string(), mark.1);
-    let at = g.put(0, 2, &fit(head, cols.saturating_sub(4)), Tone::Title);
+    let at = g.put(
+        0,
+        2,
+        &fit(head, cols.saturating_sub(4 + badge_w)),
+        Tone::Title,
+    );
     g.put(
         0,
         at,
         &format!("{}┐", "─".repeat(cols.saturating_sub(at + 1))),
         Tone::Line,
     );
+    if let Some((text, tone)) = badge {
+        g.put(0, cols.saturating_sub(1 + badge_w), text, tone);
+    }
     let draw = |g: &mut Grid, r: usize, start: usize, row: Option<&Row>| {
         let mut col = start;
         for (text, tone) in row.into_iter().flatten() {

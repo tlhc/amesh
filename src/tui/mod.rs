@@ -53,6 +53,7 @@ pub(crate) struct App {
     hints: Vec<String>,
     /* Numbers::renumbered when the last key was taken */
     typed_at: u64,
+    copied: Option<(Instant, String)>,
     /* the full-screen card's first shown line, and how many lines a page is */
     scroll: usize,
     page: usize,
@@ -69,6 +70,8 @@ pub(crate) struct App {
     of the one selected (None follows the newest), the last read's error, and the hub process
     the snapshots came from */
     events: bool,
+    /* the jobs-screen body is the selected chain's timeline instead of the flow */
+    timeline: bool,
     feed: Vec<feed::Held>,
     ev_sel: Option<u64>,
     ev_error: Option<String>,
@@ -96,6 +99,37 @@ impl Block {
 }
 
 impl App {
+    fn copy_command(&mut self, index: usize, tmux: bool, out: &mut impl std::io::Write) {
+        if self.events || self.asks {
+            return;
+        }
+        let Some(job) = self.snap.as_ref().and_then(|s| s.job(self.sel.as_deref()?)) else {
+            return;
+        };
+        let Some((_, command)) = layout::job_commands(job).into_iter().nth(index) else {
+            return;
+        };
+        let notice = match send_clipboard(&command, tmux, out) {
+            Ok(()) => format!(
+                "{}sent to clipboard (OSC 52): {command}",
+                if tmux {
+                    "tmux: set-clipboard on · "
+                } else {
+                    ""
+                }
+            ),
+            Err(error) => format!("copy failed: {error}"),
+        };
+        self.copied = Some((Instant::now(), notice));
+    }
+
+    fn copy_notice(&self) -> Option<String> {
+        self.copied
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < Duration::from_secs(2))
+            .map(|(_, notice)| notice.clone())
+    }
+
     pub fn new(opts: Opts) -> Self {
         Self {
             opts,
@@ -108,6 +142,7 @@ impl App {
             full: false,
             hints: Vec::new(),
             typed_at: 0,
+            copied: None,
             scroll: 0,
             page: 10,
             snaps: 0,
@@ -116,6 +151,7 @@ impl App {
             ask_sel: None,
             ask_order: Vec::new(),
             events: false,
+            timeline: false,
             feed: Vec::new(),
             ev_sel: None,
             ev_error: None,
@@ -340,6 +376,7 @@ impl App {
             }
             Act::Asks => self.flip(),
             Act::Events => self.open_events(),
+            Act::Timeline => self.timeline = !self.timeline,
             Act::Find(d) => {
                 let query = self.input.query.to_lowercase();
                 let snap = self.snap.as_ref();
@@ -628,46 +665,19 @@ impl App {
         let snap = self.snap.clone().expect("blocks come from a snapshot");
         let sel = self.sel.clone().expect("settle picked a job");
         let cur = &blocks[b];
-        let mut count: HashMap<&str, usize> = HashMap::new();
-        for id in &cur.order {
-            *count
-                .entry(snap.job(id).map_or("", |job| job.state.as_str()))
-                .or_default() += 1;
+        /* one row per block above the rule, leaving the view at least three rows */
+        let rows_free = rows.saturating_sub(peer_rows + 6).clamp(1, 4);
+        let chains = strip(&blocks, b, &snap, cols, rows_free);
+        for (r, row) in chains.iter().enumerate() {
+            let mut c = 0;
+            for (text, tone) in row {
+                c = g.put(peer_rows + r, c, text, *tone);
+            }
         }
-        let name = if cur.chain.loose {
-            "independent jobs".to_string()
-        } else {
-            format!("chain {}", cur.chain.name)
-        };
-        let n = |state: &str| count.get(state).copied().unwrap_or(0);
-        let head = header(
-            &name,
-            [n("done"), cur.order.len(), n("failed"), n("running")],
-            cols,
-        );
-        debug_assert!(layout::width(&head) <= cols, "{head} is wider than {cols}");
-        g.put(peer_rows, 0, &head, Tone::Plain);
-        g.put(peer_rows + 1, 0, &"─".repeat(cols), Tone::Line);
-        /* at the right end of the rule: which block of how many, and what runs in the others,
-        so work out of sight is not taken for work that stopped */
+        let rule = peer_rows + chains.len();
+        g.put(rule, 0, &"─".repeat(cols), Tone::Line);
         let mut right: Vec<(String, Tone)> = Vec::new();
-        if blocks.len() > 1 {
-            let elsewhere = blocks
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != b)
-                .flat_map(|(_, block)| &block.order)
-                .filter(|id| snap.job(id).is_some_and(|job| job.state == "running"))
-                .count();
-            let run = if elsewhere > 0 {
-                format!(" +{elsewhere} run ·")
-            } else {
-                String::new()
-            };
-            right.push((run, Tone::Run));
-            right.push((format!(" {}/{} ", b + 1, blocks.len()), Tone::Dim));
-        }
-        /* ahead of them the open asks and what the hub keeps, both as old as the snapshot while
+        /* the open asks and what the hub keeps, both as old as the snapshot while
         an error shows; the events are the first to go when the pane is narrow, the asks next */
         let tags: Vec<(String, Tone)> = [
             asks::tag(&snap).map(|t| (t, Tone::Near)),
@@ -697,14 +707,16 @@ impl App {
                 break;
             }
         }
-        self.rule_end(&mut g, peer_rows + 1, cols, right);
-        self.under_rule(&mut g, peer_rows + 2, cols, self.error_lead());
-        let top = peer_rows + 3;
+        self.rule_end(&mut g, rule, cols, right);
+        self.under_rule(&mut g, rule + 1, cols, self.error_lead());
+        let top = rule + 2;
         let avail = rows - 1 - top;
         let view = cur.view(snap, &sel);
         let snap = &view.snap;
         let body = if self.full {
             Grid::default()
+        } else if self.timeline {
+            layout::timeline(&view, cols)
         } else if cols >= 96 {
             layout::horizontal(&view, cols).unwrap_or_else(|| layout::vertical(&view, cols))
         } else {
@@ -735,17 +747,14 @@ impl App {
         /* only the full card needs all of a long text laid out; the card under the flow
         lays out the rows it has */
         let card = match self.full {
-            true => match card(Fit::Whole) {
-                whole if whole.height() > avail => whole,
-                _ => card(Fit::Rows(avail)),
-            },
+            true => card(Fit::Whole),
             false => card(Fit::Rows(avail - view_h)),
         };
         let node = cur.base + cur.num[&sel];
         let sel_row = body
             .rows
             .iter()
-            .find(|(_, row)| row.values().any(|cell| cell.glyph && cell.node == node))
+            .find(|(_, row)| row.values().any(|cell| cell.node == node))
             .map_or(0, |(r, _)| *r);
         let scroll = sel_row.saturating_sub(view_h / 2).min(body_h - view_h);
         g.blit(&body, scroll..scroll + view_h, top);
@@ -764,14 +773,22 @@ impl App {
                 "j/k ↑↓ scroll  space/b page  g/G top/end  h/l ←→ stage  esc back".into()
             }
             Mode::Normal if self.full => "j/k scroll  space/b page  h/l stage  esc back".into(),
-            Mode::Normal if cols >= 96 && asks::held(snap) => "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  tab chain  a asks".into(),
-            Mode::Normal if cols >= 96 => "j/k ↑↓ move  h/l ←→ stage  digits jump  f hints  / find  enter card  esc back  tab chain".into(),
-            Mode::Normal if asks::held(snap) => "j/k move  h/l stage  1-9 jump  f hint  a asks".into(),
-            Mode::Normal => "j/k move  h/l stage  digits jump  f hint".into(),
+            Mode::Normal => job_keys(
+                cols,
+                self.timeline,
+                snap.job(&sel)
+                    .is_some_and(|job| !layout::job_commands(job).is_empty()),
+                asks::held(snap),
+            ),
+        };
+        let footer = if self.input.mode == Mode::Normal {
+            self.copy_notice().unwrap_or(footer)
+        } else {
+            footer
         };
         g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
         /* the spinner turns at 8 frames a second on a job its worker is busy with and holds
-        its first frame when the pane is still; WAIT! blinks once a second */
+        its first frame when the pane is still */
         let ids: HashMap<usize, &String> = cur
             .order
             .iter()
@@ -782,9 +799,6 @@ impl App {
         let mut sent = Vec::new();
         for (r, row) in g.rows.iter_mut() {
             for (c, cell) in row.iter_mut() {
-                if cell.tone == Tone::Wait && moving && tick / 4 % 2 == 1 {
-                    cell.ch = ' ';
-                }
                 if !cell.glyph || cell.node == 0 {
                     continue;
                 }
@@ -823,22 +837,25 @@ impl App {
             .map(|n| cur.base + n)
             .collect();
         if matches!(self.input.mode, Mode::Hint) {
-            let mut seen: Vec<usize> = Vec::new();
-            for row in g.rows.values() {
-                for cell in row.values().filter(|cell| cell.glyph && cell.node > 0) {
-                    if !seen.contains(&cell.node) {
-                        seen.push(cell.node);
+            /* a job's letter takes its glyph; in a view without glyphs, the timeline, it takes
+            the first cell that carries the job */
+            let mut seen: Vec<(usize, (usize, usize))> = Vec::new();
+            for (r, row) in g.rows.iter() {
+                for (c, cell) in row.iter() {
+                    if cell.glyph != self.timeline
+                        && cell.node > 0
+                        && !seen.iter().any(|(node, _)| *node == cell.node)
+                    {
+                        seen.push((cell.node, (*r, *c)));
                     }
                 }
             }
             seen.truncate(HINT_KEYS.len());
-            self.hints = seen.iter().map(|node| ids[node].clone()).collect();
-            for row in g.rows.values_mut() {
-                for cell in row.values_mut().filter(|cell| cell.glyph) {
-                    if let Some(k) = seen.iter().position(|node| *node == cell.node) {
-                        cell.ch = HINT_KEYS.as_bytes()[k] as char;
-                        cell.tone = Tone::Warn;
-                    }
+            self.hints = seen.iter().map(|(node, _)| ids[node].clone()).collect();
+            for (k, (_, (r, c))) in seen.iter().enumerate() {
+                if let Some(cell) = g.rows.get_mut(r).and_then(|row| row.get_mut(c)) {
+                    cell.ch = HINT_KEYS.as_bytes()[k] as char;
+                    cell.tone = Tone::Warn;
                 }
             }
         }
@@ -1001,10 +1018,7 @@ impl App {
             list_h.min(avail.saturating_sub(least).max(avail / 2))
         };
         let card = match self.full {
-            true => match card(Fit::Whole) {
-                whole if whole.height() > avail => whole,
-                _ => card(Fit::Rows(avail)),
-            },
+            true => card(Fit::Whole),
             false => card(Fit::Rows(avail - view_h)),
         };
         /* the list scrolls to keep the selected ask in view; the blank row under it is the
@@ -1037,14 +1051,6 @@ impl App {
             _ => "j/k move  1-9 jump  enter card  a jobs".into(),
         };
         g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
-        /* WAIT! blinks once a second, as on the job screen */
-        if self.moving() && tick / 4 % 2 == 1 {
-            for cell in g.rows.values_mut().flat_map(|row| row.values_mut()) {
-                if cell.tone == Tone::Wait {
-                    cell.ch = ' ';
-                }
-            }
-        }
         walk(&mut g, tick, self.moving());
         let mut lines = self.lines(&g, cols, rows);
         if !self.full && (first..first + shown).contains(&at) {
@@ -1120,8 +1126,9 @@ impl App {
             .ev_sel
             .and_then(|seq| items.iter().position(|item| item.seq() == Some(seq)))
             .unwrap_or(items.len() - 1);
-        let list = feed::rows(&items, cols);
-        let card = |fit| feed::card(&items[at], cols, fit);
+        let prefix = self.snap.as_ref().map_or("", |snap| layout::prefix(snap));
+        let list = feed::rows(&items, cols, prefix);
+        let card = |fit| feed::card(&items[at], cols, fit, prefix);
         let list_h = if self.full { 0 } else { list.len() + 1 };
         let least = if self.full {
             0
@@ -1134,10 +1141,7 @@ impl App {
             list_h.min(avail.saturating_sub(least).max(avail / 2))
         };
         let card = match self.full {
-            true => match card(Fit::Whole) {
-                whole if whole.height() > avail => whole,
-                _ => card(Fit::Rows(avail)),
-            },
+            true => card(Fit::Whole),
             false => card(Fit::Rows(avail - view_h)),
         };
         let shown = view_h.min(list.len());
@@ -1287,20 +1291,46 @@ impl App {
         cols: usize,
         lead: Option<(String, Tone)>,
     ) -> bool {
-        let mut pieces: Vec<(String, Tone)> = lead.into_iter().collect();
-        for item in self
+        let items = self
             .snap
             .as_ref()
             .map(|snap| layout::attention(snap))
-            .unwrap_or_default()
-        {
-            let sep = if pieces.is_empty() {
-                "attention "
-            } else {
-                " · "
-            };
-            pieces.push((sep.into(), Tone::Dim));
-            pieces.extend(item);
+            .unwrap_or_default();
+        /* every head before any reason; reasons join in order while they fit; heads that already
+        overflow are cut */
+        let push_heads = |pieces: &mut Vec<(String, Tone)>, reasons: usize| {
+            for (i, item) in items.iter().enumerate() {
+                let sep = match (i, pieces.is_empty()) {
+                    (0, true) => "attention ",
+                    (0, false) => " · ",
+                    _ => " ",
+                };
+                pieces.push((sep.into(), Tone::Dim));
+                let (head, tone) = &item[0];
+                pieces.push((format!(" {head} "), *tone));
+                if i < reasons {
+                    pieces.extend(item[1..].iter().cloned());
+                }
+            }
+        };
+        let mut pieces: Vec<(String, Tone)> = lead.clone().into_iter().collect();
+        push_heads(&mut pieces, 0);
+        if row_width(&pieces) <= cols {
+            let mut used = row_width(&pieces);
+            let mut reasons = 0;
+            for item in &items {
+                let extra = row_width(&item[1..]);
+                if used + extra <= cols {
+                    used += extra;
+                    reasons += 1;
+                } else {
+                    break;
+                }
+            }
+            if reasons > 0 && items.iter().take(reasons).any(|item| item.len() > 1) {
+                pieces = lead.clone().into_iter().collect();
+                push_heads(&mut pieces, reasons);
+            }
         }
         let fits = pieces
             .iter()
@@ -1351,7 +1381,10 @@ impl App {
         if !self.opts.color {
             return match tone {
                 Tone::Select => Style::default().add_modifier(Modifier::REVERSED),
-                Tone::Title => Style::default().add_modifier(Modifier::BOLD),
+                Tone::Badge => Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                Tone::Title | Tone::PillWait | Tone::PillFail | Tone::PillRun | Tone::PillText => {
+                    Style::default().add_modifier(Modifier::BOLD)
+                }
                 _ => Style::default(),
             };
         }
@@ -1370,27 +1403,12 @@ impl App {
             Tone::Near | Tone::Flow => fg(t.near),
             Tone::Back => fg(t.done),
             Tone::Select => fg(t.select).bg(t.select_bg),
+            Tone::Badge => fg(t.wait).add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            Tone::PillWait => fg(t.wait).bg(t.select_bg),
+            Tone::PillFail => fg(t.fail).bg(t.select_bg),
+            Tone::PillRun => fg(t.run).bg(t.select_bg),
+            Tone::PillText => fg(t.text).bg(t.select_bg),
         }
-    }
-}
-
-/* the counts always show: the name takes the width they leave, cut when it must and dropped
-first; counts wider than the pane lose their words for the glyphs, not their numbers */
-fn header(name: &str, [done, total, failed, running]: [usize; 4], cols: usize) -> String {
-    let mut counts = format!(" · {done}/{total} done");
-    let mut glyphs = format!("{done}/{total}●");
-    for (k, label, glyph) in [(failed, "fail", '×'), (running, "run", '◆')] {
-        if k > 0 {
-            counts.push_str(&format!(" · {k} {label}"));
-            glyphs.push_str(&format!(" {k}{glyph}"));
-        }
-    }
-    let bare = counts.trim_start_matches(" · ");
-    match cols.checked_sub(layout::width(&counts)) {
-        Some(room) if layout::width(name) <= room => format!("{name}{counts}"),
-        Some(room) if room >= 14 => format!("{}{counts}", layout::fit(name, room)),
-        _ if layout::width(bare) <= cols => bare.to_string(),
-        _ => layout::fit(&glyphs, cols),
     }
 }
 
@@ -1449,15 +1467,103 @@ fn just_sent(snap: &model::Frame, job: &model::Job) -> bool {
             .is_some_and(|ask| ask.opened_just_now == Some(true))
 }
 
+/* the jobs screen's keys by priority: the view toggle and the asks screen stay, the others drop
+from the end until the row fits, so no key is cut in the middle */
+fn job_keys(cols: usize, timeline: bool, copy: bool, asks: bool) -> String {
+    let wide = cols >= 96;
+    let keys = [
+        (if wide { "j/k ↑↓ move" } else { "j/k move" }, true, false),
+        (
+            if wide {
+                "h/l ←→ stage"
+            } else {
+                "h/l stage"
+            },
+            true,
+            false,
+        ),
+        ("tab chain", true, false),
+        (if timeline { "t flow" } else { "t timeline" }, true, true),
+        ("enter card", true, false),
+        ("y copy", copy, false),
+        ("a asks", asks, true),
+        ("/ find", true, false),
+        (if wide { "f hints" } else { "f hint" }, true, false),
+        (if wide { "digits jump" } else { "1-9 jump" }, true, false),
+        ("esc back", true, false),
+    ];
+    let mut shown: Vec<(&str, bool)> = keys
+        .iter()
+        .filter(|(_, on, _)| *on)
+        .map(|(key, _, pinned)| (*key, *pinned))
+        .collect();
+    let used = |shown: &[(&str, bool)]| {
+        shown
+            .iter()
+            .map(|(key, _)| layout::width(key))
+            .sum::<usize>()
+            + 2 * shown.len().saturating_sub(1)
+    };
+    while used(&shown) > cols {
+        let Some(last) = shown.iter().rposition(|(_, pinned)| !pinned) else {
+            break;
+        };
+        shown.remove(last);
+    }
+    shown
+        .iter()
+        .map(|(key, _)| *key)
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn send_clipboard(command: &str, tmux: bool, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    if command.chars().any(char::is_control) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "command contains control characters",
+        ));
+    }
+    let osc = format!("\x1b]52;c;{}\x07", base64(command.as_bytes()));
+    let sequence = if tmux {
+        format!("{osc}\x1bPtmux;\x1b{osc}\x1b\\")
+    } else {
+        osc
+    };
+    out.write_all(sequence.as_bytes())?;
+    out.flush()
+}
+
+fn base64(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for b in bytes.chunks(3) {
+        let n = (u32::from(b[0]) << 16)
+            | (u32::from(*b.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*b.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            out.push(if i > b.len() {
+                '='
+            } else {
+                DIGITS[((n >> (18 - i * 6)) & 63) as usize] as char
+            });
+        }
+    }
+    out
+}
+
 fn ascii(ch: char) -> char {
     match ch {
         '─' => '-',
+        '━' => '=',
+        '╌' => '~',
         '│' => '|',
         '┌' | '┐' | '└' | '┘' | '┬' | '┴' | '┼' | '├' | '┤' => '+',
         '◀' | '←' | '◂' => '<',
         '●' => '*',
         '◆' => '>',
         '⣿' => '#',
+        '⏎' => '>',
         '↓' => 'v',
         '×' => 'x',
         '○' => 'o',
@@ -1649,6 +1755,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             }
             match app.key(key.code) {
                 Act::Quit => return Ok(()),
+                Act::Copy(index) => app.copy_command(
+                    index,
+                    std::env::var_os("TMUX").is_some(),
+                    &mut std::io::stdout(),
+                ),
                 Act::Refresh => {
                     let _ = poke_tx.send(());
                 }
@@ -1703,4 +1814,211 @@ fn stop_on_signals(stop: &Arc<AtomicBool>) {
             stop.store(true, Ordering::Relaxed);
         });
     }
+}
+
+/* one row per block, the selected one marked: a station per stage (its most urgent job),
+done/total, then what needs a person. Blocks with a failure or a person to answer come
+first; at most three rows and a count of the rest, and the selected block always shows */
+fn strip(
+    blocks: &[Block],
+    b: usize,
+    snap: &Snapshot,
+    cols: usize,
+    rows: usize,
+) -> Vec<layout::Row> {
+    let urgent = |i: usize| {
+        blocks[i]
+            .order
+            .iter()
+            .filter_map(|id| snap.job(id))
+            .any(|job| station(job).0 < 2)
+    };
+    let key = |i: &usize| (!urgent(*i), *i);
+    let mut order: Vec<usize> = (0..blocks.len()).collect();
+    order.sort_by_key(key);
+    let shown = match blocks.len() <= rows.min(3) {
+        true => blocks.len(),
+        false => rows.saturating_sub(1).clamp(1, 3),
+    };
+    let mut pick: Vec<usize> = order[..shown].to_vec();
+    if !pick.contains(&b) {
+        pick[shown - 1] = b;
+        pick.sort_by_key(key);
+    }
+    let name_w = pick
+        .iter()
+        .map(|&i| layout::width(block_name(&blocks[i])))
+        .max()
+        .unwrap_or(0)
+        .min(16);
+    let rest = blocks.len() - pick.len();
+    let more = (rest > 0).then(|| (format!("  +{rest} more"), Tone::Dim));
+    let fold = more.is_some() && pick.len() >= rows;
+    let more_w = more
+        .as_ref()
+        .map(|(text, _)| layout::width(text))
+        .unwrap_or(0);
+    let mut out: Vec<layout::Row> = pick
+        .iter()
+        .enumerate()
+        .map(|(idx, &i)| {
+            let row_cols = if fold && idx + 1 == pick.len() {
+                cols.saturating_sub(more_w)
+            } else {
+                cols
+            };
+            strip_row(&blocks[i], i == b, snap, name_w, row_cols)
+        })
+        .collect();
+    if let Some(more) = more {
+        if out.len() < rows {
+            out.push(vec![more]);
+        } else if let Some(last) = out.last_mut() {
+            last.push(more);
+        }
+    }
+    out
+}
+
+fn block_name(block: &Block) -> &str {
+    match block.chain.loose {
+        true => "independent jobs",
+        false => &block.chain.name,
+    }
+}
+
+fn row_width(row: &[(String, Tone)]) -> usize {
+    row.iter().map(|(text, _)| layout::width(text)).sum()
+}
+
+/* what a running job waits on a person for: a permission prompt or an idle holder */
+fn asking(job: &model::Job) -> Option<&'static str> {
+    match job.progress.as_ref().and_then(|p| p.state.as_ref()) {
+        Some(crate::wire::Progress::Wait { .. }) => Some("WAIT"),
+        Some(crate::wire::Progress::Idle { .. }) => Some("IDLE"),
+        _ => None,
+    }
+}
+
+/* a job's station: how soon a person should look (failed, then a person asked, then
+running, queued and done), its glyph and its tone */
+fn station(job: &model::Job) -> (u8, char, Tone) {
+    let (ch, tone) = layout::glyph(&job.state);
+    match job.state.as_str() {
+        "failed" => (0, ch, tone),
+        "running" if asking(job).is_some() => (1, ch, Tone::Wait),
+        "running" => (2, ch, tone),
+        "done" => (4, ch, tone),
+        _ => (3, ch, tone),
+    }
+}
+
+/* the pills give way first, then the stations from the right; done/total stays whole
+and the name shrinks; what still does not fit is cut */
+fn strip_row(block: &Block, sel: bool, snap: &Snapshot, name_w: usize, cols: usize) -> layout::Row {
+    let jobs: Vec<&model::Job> = block.order.iter().filter_map(|id| snap.job(id)).collect();
+    let stations: Vec<(char, Tone)> = block
+        .chain
+        .stages
+        .iter()
+        .filter_map(|stage| {
+            stage
+                .iter()
+                .filter_map(|id| snap.job(id))
+                .map(station)
+                .min_by_key(|s| s.0)
+        })
+        .map(|(_, ch, tone)| (ch, tone))
+        .collect();
+    let title = |job: &model::Job| layout::fit(&job.title, 12);
+    let mut pills: Vec<(String, Tone)> = jobs
+        .iter()
+        .filter(|job| job.state == "failed")
+        .map(|job| (format!("× {}", title(job)), Tone::PillFail))
+        .collect();
+    for (word, tone) in [("WAIT", Tone::Badge), ("IDLE", Tone::PillWait)] {
+        pills.extend(
+            jobs.iter()
+                .filter(|job| job.state == "running" && asking(job) == Some(word))
+                .map(|job| (format!("{word} {}", title(job)), tone)),
+        );
+    }
+    let running = jobs.iter().filter(|job| job.state == "running").count();
+    if pills.is_empty() && running > 0 {
+        pills.push((format!("{running} run"), Tone::PillRun));
+    }
+    let done = jobs.iter().filter(|job| job.state == "done").count();
+    let count_done = done.to_string();
+    let count_tot = format!("/{}", jobs.len());
+    let count_w = 2 + layout::width(&count_done) + layout::width(&count_tot);
+    let body_cols = cols.saturating_sub(count_w);
+    let front = |name_max: usize, keep_stations: usize| {
+        let name = layout::fit(block_name(block), name_max);
+        let pad = " ".repeat(name_max.saturating_sub(layout::width(&name)) + 2);
+        let mut row: layout::Row = vec![
+            ((if sel { "▸ " } else { "  " }).into(), Tone::Near),
+            (
+                format!("{name}{pad}"),
+                if sel { Tone::Title } else { Tone::Plain },
+            ),
+        ];
+        for (i, (ch, tone)) in stations.iter().take(keep_stations).enumerate() {
+            if i > 0 {
+                row.push(("─".into(), Tone::Dim));
+            }
+            row.push((ch.to_string(), *tone));
+        }
+        if keep_stations < stations.len() {
+            row.push(("…".into(), Tone::Dim));
+        }
+        row
+    };
+    let build = |name_max: usize, keep_stations: usize, keep_pills: usize| {
+        let mut row = front(name_max, keep_stations);
+        row.push(("  ".into(), Tone::Plain));
+        row.push((count_done.clone(), Tone::Done));
+        row.push((count_tot.clone(), Tone::Dim));
+        for (text, tone) in pills.iter().take(keep_pills) {
+            row.push((" ".into(), Tone::Plain));
+            row.push((format!(" {text} "), *tone));
+        }
+        row
+    };
+    let fits = |row: &layout::Row| row_width(row) <= cols;
+    if let Some(row) = (0..=pills.len())
+        .rev()
+        .map(|keep| build(name_w, stations.len(), keep))
+        .find(fits)
+    {
+        return row;
+    }
+    if let Some(row) = (1..stations.len())
+        .rev()
+        .map(|keep| build(name_w, keep, 0))
+        .find(fits)
+    {
+        return row;
+    }
+    let keep_st = 1.min(stations.len());
+    if let Some(row) = (0..=name_w).rev().map(|n| build(n, keep_st, 0)).find(fits) {
+        return row;
+    }
+    let mut out = Vec::new();
+    let mut c = 0;
+    for (text, tone) in front(1.min(name_w), keep_st) {
+        let w = layout::width(&text);
+        if c + w <= body_cols {
+            c += w;
+            out.push((text, tone));
+        } else {
+            if body_cols > c {
+                out.push((layout::ellipsis(&text, body_cols - c), tone));
+            }
+            break;
+        }
+    }
+    out.push(("  ".into(), Tone::Plain));
+    out.push((count_done, Tone::Done));
+    out.push((count_tot, Tone::Dim));
+    out
 }

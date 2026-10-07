@@ -131,35 +131,23 @@ amesh tui                    # this directory's circle
 amesh tui --all --ascii      # every circle, ASCII only
 ```
 
-- The top of the screen lists the peers online in this view and what each is doing.
-- The rule under the header shows how many events the hub keeps for this view, and ends in `●` while the snapshot is at most two seconds old, or `○ Ns` with its age once it is older (`*` and `o` in ASCII); with no jobs or asks yet, both go at the end of the message line.
-- The row under the rule, or under that message line, names what needs a person: a peer at a permission prompt (`WAIT`), the recipient of an open ask that stopped (`IDLE`), a stuck queue (`✉N`, `no push` when the peer has no push channel), and a failed job (`×`). On a screen with a rule, a hub error (`! error`) or the events screen's notice comes first on that row; with nothing listed, the error is the message line.
-- `a` shows the asks no job points at, open ones first: who waits on whom and for how long, the question and the reply, and a nudge or close command when an answer stalls. The rule counts the open ones.
-- `e` lists the hub's events, the newest at the bottom: asks, acks, notifies, broadcasts (one row each) and chat, with the whole text in the card; a divider marks a hub restart.
-- Each chain gets its own screen, with numbered jobs under a `chain <name> · done/total` header; jobs without dependencies share one block. The selected job's card shows its result or failure reason, worker, ask and dependencies, plus the command to retry it, nudge its worker, or hand it to another peer.
+- The top line lists the peers online and what each is doing. There, in the attention row and on the asks and events screens, names drop the `{folder}-` prefix the view's peers share; full cards keep whole names.
+- Below it, one row per chain (`independent jobs` for jobs without `depends_on`): the name, a glyph per stage for its most urgent job (× failed, ◆ running, ○ queued, ● done; waiting or idle in the wait colour), `done/total`, then pills (`× <title>`, `WAIT <title>`, `IDLE <title>`, or `N run`). Chains that failed or need a person come first, at most three rows and `+k more`; `▸` marks the selected chain, which always shows.
+- The rule counts the events the hub keeps and ends in `●` while the snapshot is at most 2 s old, `○ Ns` once older.
+- Under it, the attention row names what needs a person: `WAIT` (a permission prompt), `IDLE` (an open ask's recipient stopped), `✉N` (a stuck queue; `no push` without a push channel) and `×` (a failed job), with reasons while they fit. A hub error or the events screen's notice comes first.
+- The selected chain shows as a flow, or a timeline with `t`. Its card carries a badge (` WAIT `, ` IDLE `, ` FAILED `, ` BLOCKED `) and leads with `why`, or `result` once done; the compact card adds the `worker · ask · time` line, `unacked <age> · chain median <m>` while the ask is open (over the chain's done jobs, once it has two), the prompt and the copy keys. The full card shows every field.
+- `a` lists the asks no job points at: those a person must act on first (`WAIT`, `IDLE`, `LEFT`, `OFFLINE`, the longest stalled on top), then the other open ones, then the closed, the latest first. The card leads with a badge and `why`, or the reply, then `from▸to · sent` and the question; the full card adds both parties, the times and the nudge or close command.
+- `e` lists the hub's events, the newest at the bottom: time (`HH:MM`, seconds when wide), kind, `from▸to` (a chat's peer and role) and the text's first line; `ack ●` or `ack ×` says how the ask ended; a divider marks a hub restart.
 - Keys:
-  - `j`/`k`: move along the chain; `h`/`l`: move within a stage
-  - digits: jump by number; `f`: show letter hints
-  - `/`: search all chains; `n`/`N`: step through matches
-  - `Tab`/`Shift-Tab`: next/previous chain
-  - `Enter`: open the full card (scroll with `j`/`k`, the arrows, `space`/`b`, `PgDn`/`PgUp`, `g`/`G`; `Esc` goes back)
-  - `a`: the asks screen and back
-  - `e`: the events screen; `e` again goes to the jobs, `a` to the asks
-  - `r`: refresh; `q`: quit
+  - `j`/`k` along the chain, `h`/`l` within a stage; digits jump, `f` letter hints; `/` search, `n`/`N` next/previous match; `Tab`/`Shift-Tab` switch chains
+  - `t` timeline; `Enter` full card (scroll with `j`/`k`, `space`/`b`, `g`/`G`; `Esc` back); `a` asks, `e` events; `r` refresh; `q` quit
+  - `y`/`Y` copy the card's first or second command by OSC 52, under tmux also in the passthrough form (keep it with `set -g set-clipboard on` or `set -g allow-passthrough on`). The TUI cannot check the clipboard, so the footer says `sent to clipboard (OSC 52)`, or `copy failed:` when the write fails; control characters are never copied.
 - Activity:
-  - spinner: the worker is busy with this job (`--no-anim` freezes it)
-  - `sender─▸─recipient` on an open ask: the arrowhead steps toward a recipient that is working and holds still otherwise; for a second after the ack it steps back (`─◂─`)
-  - a dot on the rail into a job the hub has just sent, then its glyph lights
-  - `✉N` after a name (`+N` in ASCII): N records wait in that peer's inbox and the oldest has waited two seconds or more; the hub keeps each record's queue time, so a hub restart does not reset it; a card whose ask to it is open says `N queued for 38s` under the worker or `to` line
-  - a dimmed name: the peer is online without a push channel (its `amesh hook ws` or pi extension is not connected); such a card says `no push`
-  - `IDLE!`: the worker stopped with the ask open; the card gives a nudge command
-  - blinking `WAIT!`: Claude Code waits on a permission
-  - `offline`: the hub marks the worker offline, as when its connection drops; it replaces `WAIT!` and `IDLE!`, and a job sent by hand (no dispatch) whose ask closed or went missing says automatic settlement is disabled
-  - hooks installed before this reporting send none; rerun `amesh setup`
-- Colours:
-  - `tui-theme.json` next to the state file (default `~/.amesh`) overrides the roles `text title dim line done run fail wait worker near select select_bg`
-  - without `COLORTERM=truecolor`, colours map to the nearest of 256
-  - `NO_COLOR` or `--no-color` drops colour; every state keeps its own glyph
+  - a spinner on a job its worker is busy with (`--no-anim` stops it); `─▸─` steps toward a recipient at work, and back (`─◂─`) for a second after the ack; a dot runs into a job the hub just sent
+  - `✉N` after a name: N records have waited 2 s or more in that peer's inbox; a dimmed name has no push channel (`amesh hook ws` or the pi extension is not connected)
+  - `WAIT` (`WAIT!` on the job card's worker row): Claude Code waits on a permission; `IDLE`: the holder stopped with the ask open; `offline` replaces both
+  - hooks installed before this reporting send no marks; rerun `amesh setup`
+- Colours: `tui-theme.json` next to the state file (default `~/.amesh`) overrides the roles `text title dim line done run fail wait worker near select select_bg` (defaults include `run=#61afef`, `wait=#e5c07b`). Without `COLORTERM=truecolor` they map to the nearest of 256; `NO_COLOR` or `--no-color` drops colour and keeps every state's glyph.
 
 ## Environment
 
