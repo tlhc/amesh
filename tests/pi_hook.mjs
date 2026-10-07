@@ -20,6 +20,7 @@ console.error = (...args) => {
   ameshLogs.push(args.join(" "));
   origConsoleError.apply(console, args);
 };
+const NativeWebSocket = globalThis.WebSocket;
 globalThis.WebSocket = class {
   constructor(url) {
     wsAttempts += 1;
@@ -983,5 +984,92 @@ await test("startup delivers Inbox when the context query API is absent", async 
     assert.match(instance.users[0].content, /legacy-context-api/);
   } finally {
     await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("every connect reports activity again, so an ask to an idle pi reads not picked up", async () => {
+  const state = InboxSession();
+  let busy = false;
+  const ctx = { ...state.ctx, isIdle: () => !busy, hasPendingMessages: () => false };
+  const idle = { state: "idle", source: "pi-idle" };
+  const work = { state: "work", source: "pi-work" };
+  const real = [];
+  const fake = globalThis.WebSocket;
+  globalThis.WebSocket = class extends NativeWebSocket {
+    constructor(url) {
+      super(url);
+      real.push(this);
+    }
+  };
+  const view = async () => (await fetch(`http://${process.env.AMESH_BIND}/snapshot`, {
+    headers: { authorization: `Bearer ${process.env.AMESH_TOKEN}` },
+  })).json();
+  const record = async () => {
+    const found = (await view()).roster.find((peer) => peer.peer_id === state.id)?.activity;
+    return found ? { state: found.state, source: found.source } : null;
+  };
+  /* a loaded machine can take seconds to spawn the hook */
+  const reaches = async (want) => {
+    for (let i = 0; i < 300 && JSON.stringify(await record()) !== JSON.stringify(want); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    return record();
+  };
+  /* the hub drops a closed socket's activity, as a restarted hub has none; the extension
+  connects again a second later */
+  const drop = async () => {
+    real.at(-1).close();
+    assert.equal(await reaches(null), null, "the hub forgets activity with the socket");
+  };
+  const instance = InboxInstance(state);
+  let ask;
+  try {
+    await instance.handlers.get("session_start")({}, ctx);
+    assert.deepEqual(await reaches(idle), idle, "the first connect reports an idle pi");
+    await drop();
+    assert.deepEqual(await reaches(idle), idle, "a reconnect reports idle again");
+    busy = true;
+    await drop();
+    assert.deepEqual(await reaches(work), work, "a reconnect while pi runs reports work");
+    busy = false;
+    assert.deepEqual(await reaches(idle), idle, "then idle once pi is idle");
+    /* the hub stamps whole seconds, and an ask opened in the idle report's second reads
+    ask_still_open */
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    ask = SendInbox(state, "ask", "reconnect-question");
+    let progress;
+    for (let i = 0; i < 300 && progress?.kind !== "idle"; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      progress = (await view()).asks.find((row) => row.correlation_id === ask.correlation_id)?.state?.progress;
+    }
+    assert.deepEqual([progress?.kind, progress?.why], ["idle", "not_picked_up"], "an ask the idle pi leaves alone");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, ctx);
+    globalThis.WebSocket = fake;
+    if (ask) execFileSync(executable, ["peer", "ack", ask.correlation_id]);
+  }
+});
+
+await test("a report that fails on connect is logged, never thrown", async () => {
+  const state = InboxSession();
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const failing = `${cwd}/failing-report-amesh`;
+  writeFileSync(failing, `#!/bin/sh\n[ "$2" = work ] && { echo report-refused >&2; exit 1; }\nexec ${JSON.stringify(executable)} "$@"\n`);
+  chmodSync(failing, 0o755);
+  const text = source.split(JSON.stringify(executable)).join(JSON.stringify(failing));
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+  const instance = InboxInstance(state, false, hooks);
+  const busy = { ...state.ctx, isIdle: () => false, hasPendingMessages: () => false };
+  const from = ameshLogs.length;
+  try {
+    await instance.handlers.get("session_start")({}, busy);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+    assert.ok(
+      await waitUntil(() => ameshLogs.slice(from).some((line) => line.includes("report-refused")), 5000),
+      "the refused work report is logged",
+    );
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, busy);
   }
 });

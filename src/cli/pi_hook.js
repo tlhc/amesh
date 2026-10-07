@@ -361,6 +361,19 @@ export default function AmeshHooks(pi) {
         KeepSession(next);
       }
       Flush();
+      /* the hub drops activity with the socket and forgets it on restart, so every connect
+      reports it again: work while pi runs, idle once the idle check finds pi idle */
+      const use = lastCtx;
+      if (body.type === "connected" && use) {
+        CancelIdle();
+        if (use.isIdle?.() === false) {
+          settling = settling.then(() => Invoke("work", use)).then(
+            () => {},
+            (error) => console.error(`[amesh] ${error.message}`),
+          );
+        }
+        CheckIdle(use, 30);
+      }
       return false;
     }
     if (!body || !["ask", "notify", "broadcast", "ack"].includes(body.type)) {
@@ -638,6 +651,7 @@ export default function AmeshHooks(pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     UseSession(ctx);
+    lastCtx = ctx;
     try {
       await Ensure();
     } catch (error) {
