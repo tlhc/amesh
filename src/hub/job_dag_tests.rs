@@ -2443,6 +2443,26 @@ async fn reaping_a_closed_socket_clears_activity() {
 }
 
 #[tokio::test]
+async fn a_check_never_rewrites_what_the_hub_just_heard() {
+    let f = Fixture::new();
+    f.peer_in_session("w", "c1", "s1").await;
+    report(
+        &f,
+        json!({"session_id": "s1", "state": "wait", "reason": "new permission"}),
+    )
+    .await;
+    let check =
+        json!({"session_id": "s1", "state": "wait", "reason": "old permission", "check": true});
+    report(&f, check).await;
+    let reason = f.0.inner.lock().await.activity["w"].reason.clone();
+    assert_eq!(
+        reason.as_deref(),
+        Some("new permission"),
+        "a check gives way to a fresh report of the same state too"
+    );
+}
+
+#[tokio::test]
 async fn a_check_yields_to_work_reported_within_the_grace() {
     let f = Fixture::new();
     f.peer_in_session("w", "c1", "s1").await;

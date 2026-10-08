@@ -937,9 +937,15 @@ fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
     Some(abs.canonicalize().unwrap_or(abs))
 }
 
+/* the circle hashes the directory that holds .git, which is the directory itself before
+git init, so init keeps the circle and linked worktrees share the main checkout's. A common
+dir under another name (a bare repo, a submodule) is hashed as it is */
 pub(crate) fn project_circle(path: &Path) -> String {
-    let root = git_common_dir(path)
-        .unwrap_or_else(|| path.canonicalize().unwrap_or_else(|_| path.to_path_buf()));
+    let root = match git_common_dir(path) {
+        Some(dir) if dir.ends_with(".git") => dir.parent().unwrap_or(&dir).to_path_buf(),
+        Some(dir) => dir,
+        None => path.canonicalize().unwrap_or_else(|_| path.to_path_buf()),
+    };
     let hex = format!("{:x}", Sha256::digest(root.to_string_lossy().as_bytes()));
     format!("project-{}", &hex[..12])
 }
@@ -1537,6 +1543,16 @@ pub(crate) fn gc_candidates(
                         out.push(file_path);
                     }
                 }
+            }
+            continue;
+        }
+        if name.starts_with("hook-activity-") {
+            let old = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > ACTIVITY_KEEP));
+            if old {
+                out.push(path);
             }
             continue;
         }
@@ -2938,6 +2954,9 @@ async fn hook_ws_once(
                     app = None;
                     next_app_try = Instant::now();
                     beat.reset_immediately();
+                    if backend == "claude-code" {
+                        tell_activity_again(owner.as_deref());
+                    }
                     continue;
                 }
                 if !crate::bridge::is_inbound(kind) {
@@ -3344,8 +3363,16 @@ fn mesh_primer(peer_id: &str, backend: &str, circle: &str) -> String {
 }
 
 /* best effort: the request gets a one-second budget and its errors are ignored; starting
-the hook and scheduling it take their own time */
-fn report_activity(session: &str, state: &str, source: &str, ends_wait: bool) {
+the hook and scheduling it take their own time. A Claude session also remembers it */
+fn report_activity(session: &str, state: &str, backend: &str, what: &str, ends_wait: bool) {
+    let source = format!("{backend}-{what}");
+    if backend == "claude-code" {
+        remember_activity(
+            session,
+            &json!({"state": state, "source": source}),
+            ends_wait,
+        );
+    }
     let _ = request(
         "POST",
         "/activity",
@@ -3353,6 +3380,73 @@ fn report_activity(session: &str, state: &str, source: &str, ends_wait: bool) {
             json!({"session_id": session, "state": state, "source": source, "ends_wait": ends_wait}),
         ),
     );
+}
+
+/* the hub keeps activity in memory only, so a Claude session's hooks leave their last report
+here for its drainer to tell a hub that restarted or lost the socket; it goes a week after the
+last report */
+const ACTIVITY_KEEP: Duration = Duration::from_secs(7 * 86400);
+/* hooks of one session can run at once, a late tool beside the stop: each holds this lock to
+read, decide and write */
+const ACTIVITY_LOCK: &str = "hook-activity.lock";
+
+fn activity_memory(session: &str) -> Option<PathBuf> {
+    if session.is_empty()
+        || !session
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return None;
+    }
+    Some(hook_ws_dir()?.join(format!("hook-activity-{session}.json")))
+}
+
+/* a record only: a file that holds anything else reports nothing */
+fn remembered(path: &Path) -> Option<Value> {
+    serde_json::from_str::<Value>(&fs::read_to_string(path).ok()?)
+        .ok()
+        .filter(Value::is_object)
+}
+
+fn remember_activity(session: &str, activity: &Value, ends_wait: bool) {
+    if let Some(path) = activity_memory(session) {
+        remember_at(&path, activity, ends_wait);
+    }
+}
+
+/* a finished tool can land after the stop that ended its turn: as on the hub, it ends a wait,
+never an idle. The record is replaced whole and kept private */
+fn remember_at(path: &Path, activity: &Value, ends_wait: bool) {
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path.with_file_name(ACTIVITY_LOCK));
+    /* without the lock the update cannot be ordered, so the record stays as it was */
+    let Some(_held) = lock.ok().filter(|file| file.lock().is_ok()) else {
+        return;
+    };
+    if ends_wait && remembered(path).is_some_and(|old| old["state"] == "idle") {
+        return;
+    }
+    let _ = write_atomic(path, activity.to_string().as_bytes());
+}
+
+/* the session's last report goes to the hub again as a check, which gives way to anything the
+hub heard in the last seconds; read and sent off the drainer's task */
+fn tell_activity_again(session: Option<&str>) {
+    let Some(session) = session.filter(|session| !session.is_empty()) else {
+        return;
+    };
+    let session = session.to_string();
+    drop(tokio::task::spawn_blocking(move || {
+        let Some(mut body) = activity_memory(&session).and_then(|path| remembered(&path)) else {
+            return false;
+        };
+        body["session_id"] = json!(session);
+        body["check"] = json!(true);
+        request("POST", "/activity", Some(body)).is_ok()
+    }));
 }
 
 fn hook(raw: &[String]) -> Result<()> {
@@ -3387,8 +3481,7 @@ fn hook(raw: &[String]) -> Result<()> {
         let found = serde_json::from_reader::<_, Session>(io::stdin().lock());
         if let Some(session) = found.ok().map(|s| s.session_id).filter(|s| !s.is_empty()) {
             let state = if event == "Idle" { "idle" } else { "work" };
-            let source = format!("{backend}-{}", raw[0]);
-            report_activity(&session, state, &source, event == "PostToolUse");
+            report_activity(&session, state, &backend, &raw[0], event == "PostToolUse");
         }
         if backend == "pi" {
             println!("{{}}");
@@ -3407,7 +3500,7 @@ fn hook(raw: &[String]) -> Result<()> {
     /* Claude stops for good after a stop the hook already blocked once */
     if event == "Stop" && payload["stop_hook_active"] == true {
         if let Some(session) = session.filter(|_| backend != "pi") {
-            report_activity(session, "idle", &format!("{backend}-stop"), false);
+            report_activity(session, "idle", &backend, "stop", false);
         }
         return Ok(());
     }
@@ -3438,6 +3531,9 @@ fn hook(raw: &[String]) -> Result<()> {
         _ => None,
     };
     if let Some(activity) = activity {
+        if backend == "claude-code" {
+            remember_activity(session, &activity, false);
+        }
         body["activity"] = activity;
     }
     if let Some(id) = claimed_peer_id(&args) {
@@ -3507,7 +3603,7 @@ fn hook(raw: &[String]) -> Result<()> {
         if !asks.is_empty() || inbox.map(|v| !v.is_empty()).unwrap_or(false) {
             println!("{}", json!({"decision": "block", "reason": context}));
         } else {
-            report_activity(session, "idle", &format!("{backend}-stop"), false);
+            report_activity(session, "idle", &backend, "stop", false);
         }
     } else if event == "Notification" {
         if !asks.is_empty() || inbox.map(|v| !v.is_empty()).unwrap_or(false) {

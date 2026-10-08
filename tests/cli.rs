@@ -2300,6 +2300,43 @@ fn hook_all_backends_share_cwd_circle_and_worktrees_share_git_common_dir() {
 }
 
 #[test]
+fn hook_git_init_keeps_the_directory_circle() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let register = |id: &str| {
+        let out = sandbox.run_text(
+            &["hook", "session", "--backend", "pi", "--peer-id", id],
+            &json!({"session_id": id, "cwd": &sandbox.root}).to_string(),
+            &[],
+        );
+        assert!(
+            out.status.success(),
+            "{id}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    register("before");
+    let status = Command::new("git")
+        .current_dir(&sandbox.root)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    register("after");
+    let peers = sandbox.json(&["peer", "list"], None);
+    let circle_of = |id: &str| {
+        peers
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["peer_id"] == id)
+            .unwrap()["circle"]
+            .clone()
+    };
+    assert_eq!(circle_of("after"), circle_of("before"));
+}
+
+#[test]
 fn setup_rejects_invalid_settings_without_overwriting() {
     let sandbox = Sandbox::new();
     fs::create_dir_all(sandbox.root.join(".claude")).unwrap();
@@ -6417,6 +6454,10 @@ fn setup_refuses_an_invalid_peer_id_before_writing_anything() {
 }
 
 fn activity_of(sandbox: &Sandbox, peer: &str) -> Value {
+    snapshot_row(sandbox, peer)["activity"].clone()
+}
+
+fn snapshot_row(sandbox: &Sandbox, peer: &str) -> Value {
     let output = Command::new("curl")
         .args([
             "--silent",
@@ -6434,8 +6475,113 @@ fn activity_of(sandbox: &Sandbox, peer: &str) -> Value {
         .unwrap()
         .iter()
         .find(|row| row["peer_id"] == peer)
-        .map(|row| row["activity"].clone())
+        .cloned()
         .unwrap_or(Value::Null)
+}
+
+/* the hub keeps activity in memory, so a restart forgets that Claude went idle; its drainer
+tells the new hub the session's last report again, and a tool that landed after the stop does
+not turn that back into work */
+#[test]
+fn a_restarted_hub_hears_a_claude_sessions_last_activity_again() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let claude = sandbox.id("claude-act");
+    let hook = |event: &str| {
+        let body = json!({"session_id": "S1", "cwd": sandbox.root});
+        let args = [
+            "hook",
+            event,
+            "--backend",
+            "claude-code",
+            "--peer-id",
+            claude,
+        ];
+        let output = sandbox.run(&args, Some(body));
+        assert!(
+            output.status.success(),
+            "{event}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    hook("stop");
+    hook("tool");
+    /* the snapshot lists the peers its jobs and asks refer to */
+    sandbox.json(&["jobs", "create", "watch", "--from-peer", claude], None);
+    assert_eq!(activity_of(&sandbox, claude)["state"], "idle");
+    let sock = claude_socket_path(&sandbox);
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let _drainer = KillChild(Some(
+        sandbox
+            .command()
+            .args([
+                "hook",
+                "ws",
+                "--peer-id",
+                claude,
+                "--backend",
+                "claude-code",
+            ])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+            .env("AMESH_WS_RETRY_SECS", "30")
+            .spawn()
+            .unwrap(),
+    ));
+    /* push is the drainer's socket: the restart below must cut a live one */
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while snapshot_row(&sandbox, claude)["push"] != true {
+        assert!(Instant::now() < deadline, "the drainer connects");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    sandbox.start();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while activity_of(&sandbox, claude)["state"] != "idle" && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        activity_of(&sandbox, claude)["state"],
+        "idle",
+        "the restarted hub hears the last report again"
+    );
+    /* a report the restarted hub hears before the drainer is back is fresher: the replay goes
+    as a check and yields to it */
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    sandbox.start();
+    let fresher = Command::new("curl")
+        .args([
+            "--silent",
+            "--noproxy",
+            "*",
+            "--header",
+            "Authorization: Bearer cli-test-token",
+            "--header",
+            "Content-Type: application/json",
+            "--data",
+            r#"{"session_id": "S1", "state": "work", "source": "fresher"}"#,
+            &format!("http://{}/activity", sandbox.bind),
+        ])
+        .output()
+        .unwrap();
+    let fresher = String::from_utf8_lossy(&fresher.stdout);
+    assert!(fresher.contains(r#""state":"work""#), "{fresher}");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while snapshot_row(&sandbox, claude)["push"] != true {
+        assert!(Instant::now() < deadline, "the drainer connects again");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(
+        activity_of(&sandbox, claude)["state"],
+        "work",
+        "the replay yields to a fresher report"
+    );
 }
 
 #[test]

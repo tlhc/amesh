@@ -1299,7 +1299,8 @@ struct ActivityReport {
     source: Option<String>,
     #[serde(default)]
     reason: Option<String>,
-    /* a runtime's own look at its state, such as Codex's drainer reading its thread */
+    /* a runtime's own look at its state, such as Codex's drainer reading its thread or Claude's
+    telling a restarted hub its last report: it gives way to any report heard within the grace */
     #[serde(default)]
     check: bool,
     /* a finished tool, reported without Claude waiting for it, so it can arrive after the
@@ -1567,9 +1568,7 @@ fn check_activity(report: &ActivityReport) -> Result<(), (StatusCode, Json<Value
 reports it again; reason and source are cut and stripped of control characters because
 they are shown as they are */
 fn set_activity(hub: &mut Hub, peer_id: &str, report: &ActivityReport, now: u64) {
-    let fresh = |old: &Activity| {
-        old.state != report.state && now.saturating_sub(old.observed_at) < CHECK_GRACE_SECS
-    };
+    let fresh = |old: &Activity| now.saturating_sub(old.observed_at) < CHECK_GRACE_SECS;
     if report.check && hub.activity.get(peer_id).is_some_and(fresh) {
         return;
     }

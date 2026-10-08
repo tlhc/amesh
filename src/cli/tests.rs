@@ -361,3 +361,147 @@ fn gc_deletes_attachments_older_than_the_days_given() {
     assert!(recent.exists(), "two hours old is within one day");
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn gc_drops_the_activity_a_claude_session_left_a_week_ago() {
+    let root = std::env::temp_dir().join(format!("amesh-gc-activity-{}", std::process::id()));
+    let home = root.join(".amesh");
+    fs::create_dir_all(&home).unwrap();
+    let aged = |name: &str, secs: u64| {
+        let path = home.join(name);
+        fs::write(&path, "{}").unwrap();
+        let at = std::time::SystemTime::now() - Duration::from_secs(secs);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(at)
+            .unwrap();
+        path
+    };
+    let old = aged("hook-activity-old.json", 8 * 86400);
+    let recent = aged("hook-activity-recent.json", 86400);
+    let args: Vec<String> = ["--home", &root.display().to_string(), "--apply", "true"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    gc(&Args::parse(&args, &["home", "apply", "attachments-days"]).unwrap()).unwrap();
+    assert!(!old.exists(), "a week after the last report is stale");
+    assert!(recent.exists(), "a day old may still be told again");
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn only_a_plain_session_id_names_an_activity_file() {
+    for session in ["", "../x", "a/b", "a b", "s.json"] {
+        assert!(activity_memory(session).is_none(), "{session:?}");
+    }
+}
+
+fn activity_dir(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("amesh-activity-{name}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn hooks_of_one_session_at_once_leave_a_whole_private_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = activity_dir("whole");
+    let path = dir.join("hook-activity-s.json");
+    let gate = std::sync::Arc::new(std::sync::Barrier::new(3));
+    let bodies = [
+        json!({"state": "idle", "source": "claude-code-stop"}),
+        json!({"state": "wait", "source": "claude-permission", "reason": "permission for a tool"}),
+    ];
+    let writers: Vec<_> = bodies
+        .into_iter()
+        .map(|body| {
+            let (gate, path) = (gate.clone(), path.clone());
+            thread::spawn(move || {
+                for _ in 0..200 {
+                    gate.wait();
+                    remember_at(&path, &body, false);
+                    gate.wait();
+                }
+            })
+        })
+        .collect();
+    let mut torn = 0;
+    for _ in 0..200 {
+        gate.wait();
+        gate.wait();
+        torn += usize::from(remembered(&path).is_none());
+    }
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let mode = fs::metadata(&path).unwrap().permissions().mode();
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(torn, 0, "two hooks at once leave one whole record");
+    assert_eq!(
+        mode & 0o077,
+        0,
+        "a permission prompt stays private: {mode:o}"
+    );
+}
+
+#[test]
+fn a_late_tool_waits_for_the_lock_and_keeps_the_idle_the_stop_wrote() {
+    let dir = activity_dir("late");
+    let path = dir.join("hook-activity-s.json");
+    remember_at(&path, &json!({"state": "wait"}), false);
+    let stop = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(ACTIVITY_LOCK))
+        .unwrap();
+    stop.lock().unwrap();
+    let late = {
+        let path = path.clone();
+        thread::spawn(move || remember_at(&path, &json!({"state": "work"}), true))
+    };
+    thread::sleep(Duration::from_millis(200));
+    let waited = remembered(&path).unwrap()["state"].clone();
+    fs::write(&path, json!({"state": "idle"}).to_string()).unwrap();
+    drop(stop);
+    late.join().unwrap();
+    let kept = remembered(&path).unwrap()["state"].clone();
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        waited, "wait",
+        "the late tool waits while the stop holds the lock"
+    );
+    assert_eq!(kept, "idle", "then finds the idle and leaves it");
+}
+
+#[test]
+fn a_record_that_is_no_object_reports_nothing() {
+    let dir = activity_dir("shape");
+    let path = dir.join("hook-activity-s.json");
+    let mut seen = Vec::new();
+    for text in ["[1, 2]", "5", "\"idle\"", "{\"state\": \"idle\"}"] {
+        fs::write(&path, text).unwrap();
+        seen.push(remembered(&path).is_some());
+    }
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(seen, [false, false, false, true]);
+}
+
+#[test]
+fn a_record_without_its_lock_stays_as_it_was() {
+    let dir = activity_dir("unlocked");
+    let path = dir.join("hook-activity-s.json");
+    remember_at(&path, &json!({"state": "wait"}), false);
+    fs::remove_file(dir.join(ACTIVITY_LOCK)).unwrap();
+    fs::create_dir(dir.join(ACTIVITY_LOCK)).unwrap();
+    remember_at(&path, &json!({"state": "idle"}), false);
+    let state = remembered(&path).unwrap()["state"].clone();
+    let _ = fs::remove_dir_all(&dir);
+    assert_eq!(
+        state, "wait",
+        "an update that cannot take the lock is dropped"
+    );
+}
