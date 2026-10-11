@@ -51,9 +51,9 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - `assigned_peer` reassigns and `prompt` rewrites the next attempt; both are refused (409) while the new state is `running`
   - a dispatched job enters `running` only by being sent (409 otherwise)
 - `DELETE /jobs/{id}` is 409 while a queued or running job depends on it.
-- Jobs record `created_at` and asks `opened_at` and `closed_by` (`recipient`, `hand` or `hub`: who closed it); rows written before these fields existed leave them empty. A binary from before them rewrites the tables without them, so after a downgrade the times read as empty again.
+- Jobs record `created_at` and asks `opened_at` and `closed_by` (`recipient`, `hand` or `hub`: who closed it); rows written before these fields existed leave them empty. A binary from before them rewrites the tables without them, so after a downgrade the times read as empty again. Asks also store `from_circle` and `to_circle`; a row without `to_circle`, written by an older binary or rewritten by one after a downgrade, takes both from the stored peers and jobs when the hub starts.
 - MCP job tools that name a caller act only on jobs in the caller's circle unless `cross_circle` is set.
-- Cleanup, with both periods set in `config.toml` (default one hour):
+- Cleanup, with both periods set in `config.toml` (default 24 hours):
   - a chain of jobs whose jobs all ended at least `job_keep_secs` ago is deleted
   - a closed ask is deleted once it has been closed `ask_keep_secs` and no job refers to it
   - copies of closed or deleted asks are never delivered
@@ -72,12 +72,12 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - `?since=<seq>` returns the entries after that seq; an event id is taken too and stands for its entry. An id the ring no longer holds, or a seq above the newest entry's, returns everything held. A seq inside the current run's own range is read as this run's: a clock set back to the previous start, within as many microseconds as the two runs pushed entries, can hide the entries up to it.
   - `?circle=NAME` keeps events whose `from_circle` or `to_circle` matches
 - An ask's or job's events leave the ring when the hub deletes it, at the cleanup pass that deletes it.
-- The MCP tool `amesh_events` without `since` lists the last hour; it shows `seq` as text and takes a string or a number for `since`.
+- The MCP tool `amesh_events` without `since` lists the last 24 hours; it shows `seq` as text and takes a string or a number for `since`.
 
 ## Snapshot
 
 - `GET /snapshot` is the read-only view for monitors such as `amesh tui`: the jobs, the asks they point at, the asks no job points at and the peers they name, copied under one lock.
-  - `?circle=NAME` filters the jobs, and keeps the asks no job points at whose sender's name or recipient's id is a peer in that circle (every such ask without `circle`); `?detail=JOB_ID` also returns that job's title, prompt and result in full, `?ask=ASK_ID` that ask's `text` and `reply` in full as `ask_detail`.
+  - `?circle=NAME` filters the jobs, and keeps the asks no job points at whose stored sender or recipient circle matches (every such ask without `circle`); `?detail=JOB_ID` also returns that job's title, prompt and result in full, `?ask=ASK_ID` that ask's `text` and `reply` in full as `ask_detail`.
   - Text fields, titles included, are cut to 400 characters, with `*_len` giving the full length; references that no longer resolve are listed under `missing` by kind: `asks`, `peers`, and `jobs` for a dependency the hub no longer has.
   - An ask's `to_peer_id` is matched by peer id only, so a recipient that left is listed under `missing` even when another peer has taken its name since. Assignees and senders are names, resolved the way the hub resolves them next.
   - Each peer carries its `activity` (below), or null while unknown, and `running`: its running jobs in every circle, counted by recipient (a job run by hand, which has no ask, by its assignee), so a filtered view can tell whether a job is its only one.
@@ -126,3 +126,9 @@ Same handlers, no extra semantics:
 | `POST /sessions/resume` | `session_id` in body, then `session_notify` |
 | `POST /sessions/{id}/controls/notify` | `session_notify` |
 | `POST /sessions/{id}/controls/resume` | `session_notify` |
+
+## Detailed peer discovery
+
+- `amesh_list_peers(detail=true)` returns a JSON array of the same `PeerView` rows used by the snapshot roster, after the usual peer probe and circle check.
+- Rows are sorted by peer ID. The default response keeps its five tab-separated columns.
+- `running` counts jobs; `queued` counts retained inbox records; `activity: null` means unknown. `push` and `acks` describe the current transport.

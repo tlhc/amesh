@@ -43,10 +43,7 @@ impl<'a> ReadModel<'a> {
                 None => missing_asks.push(cid.clone()),
             }
         }
-        /* and the asks no job points at, for the TUI's asks screen: in the view's circle when the
-        sender's name resolves to a row there or the recipient's id is one there; all of them
-        without a circle. An omitted sender is stored as anonymous and names no circle, whoever
-        took that name */
+        /* Legacy asks without stored circles remain available in the unscoped view. */
         let taken: HashSet<&str> = hub
             .jobs
             .values()
@@ -56,16 +53,7 @@ impl<'a> ReadModel<'a> {
             .asks
             .values()
             .filter(|ask| !taken.contains(ask.correlation_id.as_str()))
-            .filter(|ask| {
-                circle.is_none_or(|c| {
-                    (ask.from_peer != "anonymous"
-                        && resolve(hub, &ask.from_peer).is_some_and(|peer| peer.circle == c))
-                        || hub
-                            .peers
-                            .get(&ask.to_peer_id)
-                            .is_some_and(|peer| peer.circle == c)
-                })
-            })
+            .filter(|ask| circle.is_none_or(|c| ask.from_circle == c || ask.to_circle == c))
             .collect();
         loose.sort_by(|a, b| a.correlation_id.cmp(&b.correlation_id));
         asks.extend(loose);

@@ -233,8 +233,8 @@ impl App {
         }
     }
 
-    /* another hub_epoch means the hub restarted and its ring started over: while any event is
-    held, a divider goes after what is held, one for each restart */
+    /* another hub_epoch means the hub restarted and its ring started over: what is held went
+    with the old one, and so does a selection on it */
     fn mark_restart(&mut self, snap: &model::Frame) {
         if snap.hub_epoch.is_empty() {
             return;
@@ -242,14 +242,12 @@ impl App {
         let before = std::mem::replace(&mut self.epoch, snap.hub_epoch.clone());
         if !before.is_empty() && before != snap.hub_epoch {
             self.ring += 1;
-            if self.feed.iter().any(|h| matches!(h, feed::Held::Event(..))) {
-                self.feed.push(feed::Held::Restart(snap.captured_at));
-            }
+            self.feed.clear();
+            self.ev_sel = None;
         }
     }
 
-    /* events read from the hub: those newer than any held since the last restart, or the whole
-    ring from a hub that numbers none; the oldest go past feed::KEEP */
+    /* a successful read replaces what is held with the hub's ring, deletions included */
     pub fn take_events(&mut self, got: std::result::Result<Vec<model::Event>, String>) {
         let list = match got {
             Ok(list) => list,
@@ -259,33 +257,11 @@ impl App {
             }
         };
         self.ev_error = None;
-        let list: Vec<model::Event> = list
+        self.feed = list
             .into_iter()
             .filter(|e| e.kind != "chat_turn_delta")
+            .map(|e| feed::Held(self.ring, Box::new(e)))
             .collect();
-        /* a hub that numbers no events sends its whole ring on every read, an empty one too */
-        let whole = list.iter().any(|e| e.seq.is_none())
-            || (list.is_empty() && feed::unnumbered(&self.feed));
-        if !whole {
-            let newest = feed::newest(&self.feed);
-            self.feed.extend(
-                list.into_iter()
-                    .filter(|e| e.seq > newest)
-                    .map(|e| feed::Held::Event(self.ring, Box::new(e))),
-            );
-        } else {
-            /* the ring read whole stands for what came after the last restart only */
-            let kept = self
-                .feed
-                .iter()
-                .rposition(|h| matches!(h, feed::Held::Restart(_)))
-                .map_or(0, |at| at + 1);
-            self.feed.truncate(kept);
-            self.feed.extend(
-                list.into_iter()
-                    .map(|e| feed::Held::Event(self.ring, Box::new(e))),
-            );
-        }
         feed::trim(&mut self.feed, feed::KEEP);
         if self.ev_sel.is_some_and(|key| !feed::holds(&self.feed, key)) {
             self.ev_sel = None;
@@ -2096,17 +2072,11 @@ enum Got {
     Events(std::result::Result<Vec<model::Event>, String>),
 }
 
-/* GET /events for the view's circle, after `since` */
-fn read_events(
-    circle: Option<&str>,
-    since: Option<u64>,
-) -> std::result::Result<Vec<model::Event>, String> {
+/* Read the full ring so deletion and an empty ring reach the view. */
+fn read_events(circle: Option<&str>) -> std::result::Result<Vec<model::Event>, String> {
     let mut query: Vec<String> = Vec::new();
     if let Some(c) = circle {
         query.push(format!("circle={c}"));
-    }
-    if let Some(s) = since {
-        query.push(format!("since={s}"));
     }
     let path = match query.is_empty() {
         true => "/events".to_string(),
@@ -2129,7 +2099,7 @@ fn decoded(value: serde_json::Value) -> std::result::Result<(model::HubMode, Sna
 
 /* a request a second on a background thread, so the screen never waits for the network;
 a poke (r, or a new selection) asks sooner, at most five times a second. While the events
-screen is up the events follow each snapshot, only those after the newest seq read */
+screen or HOME is up, the full event ring follows each snapshot */
 fn fetch(
     circle: Option<String>,
     want: Arc<Mutex<Want>>,
@@ -2137,7 +2107,6 @@ fn fetch(
     poke: mpsc::Receiver<()>,
 ) {
     std::thread::spawn(move || {
-        let mut since: Option<u64> = None;
         loop {
             let started = Instant::now();
             let wanted = want.lock().map(|w| w.clone()).unwrap_or_default();
@@ -2160,10 +2129,7 @@ fn fetch(
                 return;
             }
             if wanted.events {
-                let events = read_events(circle.as_deref(), since);
-                if let Ok(list) = &events {
-                    since = list.iter().filter_map(|e| e.seq).max().or(since);
-                }
+                let events = read_events(circle.as_deref());
                 if tx.send(Got::Events(events)).is_err() {
                     return;
                 }

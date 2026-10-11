@@ -708,6 +708,8 @@ async fn a_reply_to_a_departed_peer_leaves_no_permanent_queue() {
             closed_at: None,
             opened_at: None,
             closed_by: None,
+            from_circle: String::new(),
+            to_circle: String::new(),
         },
     );
     persist(&mut hub).unwrap();
@@ -1187,10 +1189,9 @@ fn list_peers_schema_exposes_circle_and_cross_circle() {
         tool["inputSchema"]["properties"]["cross_circle"]["type"],
         "boolean"
     );
-    assert_eq!(
-        tool["description"],
+    assert!(tool["description"].as_str().unwrap().starts_with(
         "List peers in your circle; cross_circle without circle lists all"
-    );
+    ));
 }
 
 async fn mcp_tool(app: Router, name: &str, args: Value) -> (StatusCode, Value) {
@@ -4174,6 +4175,8 @@ fn abandoned_hub(path: &Path) -> Hub {
             closed_at: None,
             opened_at: None,
             closed_by: None,
+            from_circle: String::new(),
+            to_circle: String::new(),
         },
     );
     persist_then_deliver(
@@ -4233,6 +4236,10 @@ async fn a_backlog_follows_its_session_to_a_new_name() {
         assert_eq!(
             hub.asks["ask-y"].to_peer_id, "tmp-pi-2",
             "an open ask is re-pointed at the new name"
+        );
+        assert_eq!(
+            hub.asks["ask-y"].to_circle, "default",
+            "and at the circle the new name registered in"
         );
     }
     let (_, pending) = json_req(
@@ -5745,6 +5752,8 @@ async fn legacy_ids_with_control_characters_never_reach_a_primer() {
                     closed_at: None,
                     opened_at: None,
                     closed_by: None,
+                    from_circle: String::new(),
+                    to_circle: String::new(),
                 },
             );
         }
@@ -6002,6 +6011,8 @@ async fn over_long_legacy_backlogs_are_kept_for_their_session() {
                 closed_at: None,
                 opened_at: None,
                 closed_by: None,
+                from_circle: String::new(),
+                to_circle: String::new(),
             },
         );
         persist(&mut hub).unwrap();

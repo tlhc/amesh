@@ -12,9 +12,7 @@ After `amesh setup`, each runtime calls the hub's tools through MCP (`amesh mcp`
 
 ![Three peers on one hub](docs/mesh.svg)
 
-- `ask` is tracked:
-  - the recipient closes it with `amesh_ack` (CLI: `peer ack`)
-  - the asker waits by `correlation_id` with `amesh_wait` (CLI: `peer wait`)
+- `ask` is tracked: the recipient closes it with `amesh_ack`, and the asker waits on its `correlation_id` with `amesh_wait`.
 - `notify` is fire-and-forget.
 - `broadcast` goes to the caller's circle.
 
@@ -58,13 +56,7 @@ amesh peer ask amesh-pi "status of the tests" --from-peer operator
 | claude-code | hooks in `~/.claude/settings.json`, MCP in `~/.claude.json` |
 | codex | hooks in `~/.codex/hooks.json`, MCP in `~/.codex/config.toml` |
 
-Setup follows config symlinks and keeps file modes; `--home DIR` overrides the install root. A taken name gets `-2`, `-3`; pin one with `--peer-id ID` or `AMESH_PEER_ID`. Ids and circle names are 1-128 characters of `[A-Za-z0-9._-]`; the hub rejects anything else.
-
-pi uses the extension, so setup disables imported amesh MCP entries in `~/.pi/agent/mcp.json`, which would call under another runtime's identity. A file it cannot safely rewrite is left unchanged with a warning; uninstall keeps the override. `PI_CODING_AGENT_DIR` overrides `~/.pi/agent` unless `--home` is given.
-
-`amesh mcp`, `amesh hook`, and the pi extension start `amesh serve` when the hub is down and `AMESH_BIND` is loopback or unspecified (`0.0.0.0` / `::`); `status`, `doctor`, and `peer` do not. Log: `serve.log` next to the state file.
-
-`amesh uninstall [runtime] --apply true` removes the hooks and MCP entries.
+A taken name gets `-2`, `-3`; pin one with `--peer-id ID` or `AMESH_PEER_ID`. `amesh mcp`, `amesh hook`, and the pi extension start `amesh serve` when the hub is down and `AMESH_BIND` is loopback, `0.0.0.0` or `::`; it logs to `serve.log` next to the state file. `amesh uninstall [runtime] --apply true` removes the hooks and MCP entries.
 
 ### Codex (App Server)
 
@@ -76,36 +68,26 @@ codex --remote unix:// -C "$PWD"           # new session in this repo
 codex --remote unix:// -C "$PWD" resume --last
 ```
 
-Pass `-C "$PWD"` to both, since App Server starts in `/`. `amesh hook ws` uses the socket above. Codex binds its peer once it learns the thread from App Server, `CODEX_THREAD_ID`, or the first tool call; resume and hooks reuse that peer. Older clients without thread IDs use separate rows, and pushed delivery needs a known thread.
-
-`amesh setup codex --peer-id ID` pins the name for both MCP and hooks; setting only MCP's `AMESH_PEER_ID` gives the hooks a different peer.
+Pass `-C "$PWD"` to both, since App Server starts in `/`. `amesh setup codex --peer-id ID` pins the name for both MCP and hooks.
 
 ## Circles and tools
 
-A **circle** is one git repo: `project-` plus a short hash of the git common dir, or of the directory without git. MCP tools default to the caller's circle; another circle needs `cross_circle=true`. `broadcast` also needs that `circle`, and list tools with the flag but no `circle` return every circle.
+A **circle** is one git repo: `project-` plus a short hash of the git common dir, or of the directory without git. MCP tools default to the caller's circle; another circle needs `cross_circle=true`.
 
 | MCP | purpose |
 |-----|---------|
 | `amesh_whoami` | this peer |
-| `amesh_list_peers` | roster |
+| `amesh_list_peers` | roster; `detail=true` adds load and delivery state |
 | `amesh_ask` / `amesh_ack` / `amesh_wait` | tracked question |
 | `amesh_notify_peer` / `amesh_broadcast` / `amesh_ask_many` | notify / broadcast / fan-out |
 | `amesh_events` | recent events (this circle) |
-| `amesh_job_*` / `amesh_schedule_*` | jobs with dependencies / timed notify or ask (another circle needs `cross_circle`) |
+| `amesh_job_*` / `amesh_schedule_*` | jobs with dependencies / timed notify or ask |
 
 The CLI mirrors this under `amesh peer`, `amesh jobs`, and `amesh schedule`; `amesh --help` lists the flags.
 
-`amesh_wait` returns status and reply, including `failed`; it waits 45 seconds by default (Codex: 8), at most 50, and returns early when the recipient stops at a prompt or ends its turn. Acks normally arrive as peer-messages; wait again only if one is missing. `amesh_events` returns 20 entries by default, up to 50, with text trimmed to 200 characters.
-
-MCP list tools and `amesh_events` are circle-scoped; CLI `peer list` shows all peers unless `--cwd` or `--circle` is given. HTTP `GET /peers`, `/jobs`, `/schedules`, and `/events` return every circle and untrimmed records; `GET /events?circle=NAME` filters.
-
 ## Jobs
 
-The hub dispatches a job to `assigned_peer` as a tracked ask once all its `depends_on` jobs are `done`, quoting each upstream result up to `job_upstream_chars`. The worker's `amesh_ack` completes it; `failed=true` marks it failed and prefixes the creator's reply with `[failed]`.
-
-Failed or cancelled dependencies leave downstream jobs `queued`. Retry with `amesh_job_update` and `state=queued`; the same update can change `assigned_peer` or `prompt`.
-
-To hand a job to another coordinator, send `coordinator` alone (`amesh jobs update ID --coordinator PEER`): later acks of its open ask, its reminders and its next dispatch go to that peer, which gets one notice; results already delivered stay where they were.
+The hub dispatches a job to `assigned_peer` as a tracked ask once all its `depends_on` jobs are `done`. The worker's `amesh_ack` completes it; `failed=true` marks it failed. A failed or cancelled dependency leaves downstream jobs `queued`; retry with `amesh_job_update` and `state=queued`. `amesh jobs update ID --coordinator PEER` hands a job's later acks, reminders and dispatch to another peer.
 
 ```bash
 amesh jobs create audit --prompt "list stale docs" --assigned-peer amesh-codex --from-peer amesh-claude-code
@@ -113,43 +95,18 @@ amesh jobs create fix --prompt "fix them" --assigned-peer amesh-pi --depends-on 
 amesh peer ack ask-5e6f7a8b --message "no fixture" --failed true --from-peer amesh-pi
 ```
 
-- The hub checks jobs every second and reminds creators every `job_nudge_secs` about unanswered, unreachable, or blocked jobs.
-- Moving a running job to another state closes its ask. Deleting a job with queued or running dependents returns 409.
-- Legacy jobs dispatch only after an explicit `assigned_peer` update.
-- Set `from_peer` to receive replies and reminders; anonymous jobs keep results only in `amesh jobs show`, until cleanup.
-- A chain of jobs joined by `depends_on` is deleted `job_keep_secs` after all its jobs end, and a closed ask `ask_keep_secs` after closing once no job refers to it; `amesh_wait` and repeated acks then return 404, so take results from the ack. `amesh gc --apply true` cleans up now.
-- An ask whose recipient leaves with no session to come back for is closed as failed at once; `amesh_ask_many` batches are not kept across a hub restart (wait on each ask by id).
-- Reconnect MCP to load new tool parameters; until then use `amesh peer ack <cid> --failed true --from-peer <id>`.
-- Pin workers with `amesh setup <runtime> --peer-id`: after a restart under a new name, work waits on the old identity until reassigned.
+Ended chains and closed asks are deleted after `job_keep_secs` / `ask_keep_secs` (default 24 h), so take results from the ack; `amesh gc --apply true` cleans up now.
 
-### Watching jobs
+## TUI
 
-`amesh tui` draws this directory's circle as dependency flows, refreshed every second. It only reads `GET /snapshot`, and `GET /events` while HOME or the events screen is up. What it shows is decided by the hub (snapshot schema 2); against an older hub it shows jobs and asks without alarms, queue marks or dispatch notes (failed jobs still show) until that hub restarts on the current amesh; against a newer one it says `unsupported hub` in place of jobs, asks and peers.
+`amesh tui` shows this directory's circle, refreshed every second: HOME with the open asks, job chains and newest events, and the jobs (`c`), asks (`a`) and events (`e`) screens.
 
 ```bash
 amesh tui                    # this directory's circle
 amesh tui --all --ascii      # every circle, ASCII only
 ```
 
-- The top line lists the peers online and what each is doing. There, in the attention row, on HOME and on the asks and events screens, names drop the `{folder}-` prefix the view's peers share; full cards keep whole names.
-- It opens on HOME: a box each for the open asks (those a person must act on first, the rest counted in the box's title), the chains and the newest events, then the card of the one selection (`▸`). The first box ends in `●` or `○ Ns`; a hub or events error takes a row above the boxes. From 96 columns the card stands to the right.
-- The jobs screen (`c`) has one row per chain (`independent jobs` for jobs without `depends_on`): the name, a glyph per stage for its most urgent job (× failed, ◆ running, ○ queued, ● done; waiting or idle in the wait colour), `done/total`, then pills (`× <title>`, `WAIT <title>`, `IDLE <title>`, or `N run`). Chains that failed or need a person come first, at most three rows and `+k more`; `▸` marks the selected chain, which always shows.
-- The rule counts the events the hub keeps and ends in `●` while the snapshot is at most 2 s old, `○ Ns` once older.
-- Under it, the attention row names what needs a person: `WAIT` (a permission prompt), `IDLE` (an open ask's recipient stopped), `✉N` (a stuck queue; `no push` without a push channel) and `×` (a failed job), with reasons while they fit. A hub error or the events screen's notice comes first.
-- The selected chain shows as a flow, or a timeline with `t`. Its card carries a badge (` WAIT `, ` IDLE `, ` FAILED `, ` BLOCKED `) and leads with `why`, or `result` once done; the compact card adds the `worker · ask · time` line, `unacked <age> · chain median <m>` while the ask is open (over the chain's done jobs, once it has two), the prompt and the copy keys. The full card shows every field.
-- `a` lists the asks no job points at: those a person must act on first (`WAIT`, `IDLE`, `LEFT`, `OFFLINE`, the longest stalled on top), then the other open ones (`no activity <age>` while the recipient has reported none), then the closed, the latest first. The card leads with a badge and `why`, or the reply, then `from▸to · sent` and the question; the full card adds both parties, the times and the nudge or close command.
-- `e` lists the hub's events, the newest at the bottom: time (`HH:MM`, seconds when wide), kind, `from▸to` (a chat's peer and role) in one column and, where 16 columns are left, the text's first line. One ask sent to several peers at once is one row, its card listing each recipient's state, and `a` opens it on the asks screen when that screen lists it. The hub's own notices read `hub`; `ack ●` or `ack ×` says how the ask ended; a rule across the pane marks a hub restart.
-- Keys:
-  - HOME: `j`/`k` across the boxes, `Tab` to the next chain, `Enter` the selection's own screen with its full card; `c` jobs, `a` asks, `e` events open those screens (on the selection where it belongs), and the same letter again or `Esc` comes back
-  - `j`/`k` along the chain, `h`/`l` within a stage; digits jump, `f` letter hints; `/` search (an ask also by its id), `n`/`N` next/previous match; `Tab`/`Shift-Tab` switch chains
-  - `t` timeline; `Enter` full card (scroll with `j`/`k`, `space`/`b`, `g`/`G`; `Esc` back); `c` jobs, `a` asks, `e` events; `r` refresh; `q` quit
-  - `y`/`Y` copy the job or ask card's first or second command by OSC 52, under tmux also in the passthrough form (keep it with `set -g set-clipboard on` or `set -g allow-passthrough on`). The TUI cannot check the clipboard, so the footer says `sent to clipboard (OSC 52)`, or `copy failed:` when the write fails; control characters are never copied.
-- Activity:
-  - a spinner on a job its worker is busy with (`--no-anim` stops it); `─▸─` steps toward a recipient at work, and back (`─◂─`) for a second after the ack; a dot runs into a job the hub just sent
-  - `✉N` after a name: N records have waited 2 s or more in that peer's inbox; a dimmed name has no push channel (`amesh hook ws` or the pi extension is not connected)
-  - `WAIT` (`WAIT!` on the job card's worker row): Claude Code waits on a permission; `IDLE`: the holder stopped with the ask open; `offline` replaces both
-  - hooks installed before this reporting send no marks; rerun `amesh setup`
-- Colours: `tui-theme.json` next to the state file (default `~/.amesh`) overrides the roles `text title dim line done run fail wait worker near select select_bg` (defaults include `run=#61afef`, `wait=#e5c07b`). Without `COLORTERM=truecolor` they map to the nearest of 256; `NO_COLOR` or `--no-color` drops colour and keeps every state's glyph.
+Keys: `j`/`k` move, `Enter` full card, `Esc` back, `/` search, `t` timeline, `y`/`Y` copy a card's command, `r` refresh, `q` quit.
 
 ## Environment
 
@@ -160,16 +117,16 @@ amesh tui --all --ascii      # every circle, ASCII only
 | `AMESH_STATE` | `~/.amesh/state.db` |
 | `AMESH_PEER_ID` | peer name override, read by `mcp` / `hook`; `setup` writes it only with `--peer-id` |
 
-`serve` reads `config.toml` next to the state file (default `~/.amesh/config.toml`) once at start; the first start writes it with every key commented out. A commented or missing key keeps the default. A value below its minimum and an unknown key are logged and ignored; a file that cannot be read or is not valid TOML is logged and ignored as a whole. Restart the hub after changing it.
+`serve` reads `config.toml` next to the state file once at start; the first start writes it with every key commented out. Restart the hub after changing it.
 
 | key | default | minimum | meaning |
 |-----|---------|---------|---------|
-| `job_keep_secs` | 3600 | 60 | a chain of jobs is deleted this long after all its jobs end |
-| `ask_keep_secs` | 3600 | 60 | a closed ask no job refers to is deleted this long after closing |
+| `job_keep_secs` | 86400 | 60 | a chain of jobs is deleted this long after all its jobs end |
+| `ask_keep_secs` | 86400 | 60 | a closed ask no job refers to is deleted this long after closing |
 | `sweep_secs` | 60 | 1 | how often the hub looks for what to delete |
 | `job_nudge_secs` | 3600 | 60 | how often a stalled job reminds its creator |
 | `job_upstream_chars` | 2000 | 0 | characters of each upstream result quoted into a dependent job's ask |
-| `attachment_keep_secs` | 604800 | 60 | an attachment is deleted this long after its upload (by file time) at the hub's next 60-second file pass; reading it or an ask that names it does not keep it |
+| `attachment_keep_secs` | 604800 | 60 | an attachment is deleted this long after its upload |
 
 ## Security
 
@@ -179,15 +136,10 @@ Set `AMESH_TOKEN` before exposing the port and restart the hub after changing it
 
 ## Limits
 
-- `GET /peers` (and so `amesh status` / `peer list`) probes sockets, drops closed ones, then removes peers with no live WebSocket and `last_seen` older than 30s, and may persist. A removed peer with a session keeps its name for that session while messages or open asks wait for it, up to 24h; then those asks close with a reason. `gc` dry-run can hit this path too; `--home` skips the probe.
-- A pinned name is for one session at a time. A different session claiming it closes pending asks, notifies their askers, and discards undelivered messages.
-- The event ring keeps the last 500 entries, drops an ask's or job's events when the hub deletes it, and clears on restart; it is not an audit log.
-- The hub keeps activity (`WORK`, `IDLE`, `WAIT`) in memory. After a restart pi reports it again when it reconnects, Codex at its drainer's next check, and Claude Code from its last hook through its drainer; ages then count from that report.
-- The hub reclaims unused database space and trims its runtime logs.
-- On start, peers whose id, name or circle carry characters outside `[A-Za-z0-9._-]` are dropped from the state file and their open asks are closed with a reason; over-long but clean legacy ids are kept.
-- `amesh hook ws` keeps undelivered inbound messages in memory; restarting that process drops the queue.
-- An older amesh run on the same state file rewrites it without the job fields added for dependencies (`depends_on`, `from_peer`, `ask_id`, `dispatch`, `nudge_at`), the ask `failed` flag, the times the TUI shows (`created_at`, `opened_at`) how an ask closed (`closed_by`), a job's last handoff notice (`handoff`) or when each inbox record was queued (`queued_at`; the next start counts such records from that moment). Copy `state.db` before downgrading, and to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
-- `gc` and `uninstall` are dry-run until `--apply true`. `gc` leaves attachments alone unless `--attachments-days N`; the hub deletes them `attachment_keep_secs` after upload.
+- A roster read (`amesh status`, `peer list`) removes peers with no live WebSocket that have been silent for 30 s.
+- The hub keeps the last 500 events in memory and clears them on restart; they are not an audit log.
+- An older amesh rewrites the state file without the fields it does not know. Copy `state.db` before downgrading; to keep in-flight jobs, stop the hub and restore that copy when upgrading back.
+- `gc` and `uninstall` are dry-run until `--apply true`.
 
 ## Troubleshooting
 

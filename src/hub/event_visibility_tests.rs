@@ -250,7 +250,7 @@ async fn events_mcp_scope_matrix_and_literal_all_circle() {
 }
 
 #[tokio::test]
-async fn events_legacy_online_success_remains_outside_the_ring() {
+async fn events_legacy_online_success_is_recorded() {
     let f = Fixture::new();
     f.peer("legacy", "one", "pi").await;
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -264,7 +264,8 @@ async fn events_legacy_online_success_remains_outside_the_ring() {
     )
     .unwrap();
     assert_eq!(rx.try_recv().unwrap().event()["id"], "live");
-    assert!(hub.events.is_empty());
+    assert_eq!(hub.events.len(), 1);
+    assert_eq!(hub.events[0]["id"], "live");
 }
 
 #[test]
@@ -423,7 +424,7 @@ async fn a_cursor_the_ring_cannot_place_starts_from_the_oldest_entry() {
 }
 
 #[tokio::test]
-async fn the_tool_orients_on_the_last_hour_and_a_cursor_reaches_further_back() {
+async fn the_tool_orients_on_the_last_day_and_a_cursor_reaches_further_back() {
     let f = Fixture::new();
     f.peer("a", "one", "pi").await;
     let first = {
@@ -440,7 +441,7 @@ async fn the_tool_orients_on_the_last_hour_and_a_cursor_reaches_further_back() {
     assert_eq!(
         view.as_array().unwrap().len(),
         1,
-        "the two older than an hour are left out"
+        "the two older than a day are left out"
     );
     let paged = f
         .mcp(json!({"from_peer": "a", "since": (first - 1).to_string()}))

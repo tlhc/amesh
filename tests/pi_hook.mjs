@@ -101,6 +101,7 @@ assert.equal(schemas.amesh_schedule_create.properties.text.type, "string");
 assert.equal(schemas.amesh_schedule_create.properties.message, undefined);
 assert.equal(schemas.amesh_schedule_create.properties.cross_circle.type, "boolean");
 assert.equal(schemas.amesh_ask_many.properties.cross_circle.type, "boolean");
+assert.equal(schemas.amesh_list_peers.properties.detail?.type, "boolean", "installed Pi peer detail schema");
 assert.equal(schemas.amesh_events.properties.circle.type, "string");
 assert.equal(schemas.amesh_events.properties.cross_circle.type, "boolean");
 assert.equal(schemas.amesh_events.properties.limit.type, "integer");

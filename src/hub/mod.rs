@@ -100,6 +100,10 @@ struct Ask {
     from_peer: String,
     to_peer: String,
     to_peer_id: String,
+    #[serde(default)]
+    from_circle: String,
+    #[serde(default)]
+    to_circle: String,
     text: String,
     open: bool,
     reply: Option<String>,
@@ -304,7 +308,9 @@ CREATE TABLE IF NOT EXISTS asks (
   failed INTEGER NOT NULL DEFAULT 0,
   closed_at INTEGER,
   opened_at INTEGER,
-  closed_by TEXT
+  closed_by TEXT,
+  from_circle TEXT NOT NULL DEFAULT '',
+  to_circle TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY,
@@ -436,6 +442,8 @@ fn open_db(path: &Path, now: u64) -> Result<Connection, String> {
         "ALTER TABLE asks ADD COLUMN closed_at INTEGER",
         "ALTER TABLE asks ADD COLUMN opened_at INTEGER",
         "ALTER TABLE asks ADD COLUMN closed_by TEXT",
+        "ALTER TABLE asks ADD COLUMN from_circle TEXT NOT NULL DEFAULT ''",
+        "ALTER TABLE asks ADD COLUMN to_circle TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE jobs ADD COLUMN created_at INTEGER",
         "ALTER TABLE jobs ADD COLUMN handoff TEXT",
     ] {
@@ -499,8 +507,8 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
     }
     for a in disk.asks.values() {
         tx.execute(
-            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-            params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64), a.opened_at.map(|v| v as i64), a.closed_by],
+            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64), a.opened_at.map(|v| v as i64), a.closed_by, a.from_circle, a.to_circle],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -602,12 +610,14 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
     }
     let mut stmt = db
         .prepare(
-            "SELECT correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by FROM asks",
+            "SELECT correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle FROM asks",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
             Ok(Ask {
+                from_circle: r.get(11)?,
+                to_circle: r.get(12)?,
                 correlation_id: r.get(0)?,
                 from_peer: r.get(1)?,
                 to_peer: r.get(2)?,
@@ -806,6 +816,33 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
     });
     disk.recv_peers
         .retain(|peer_id| disk.peers.contains_key(peer_id) || disk.owed.contains_key(peer_id));
+    /* every ask written since asks kept their circles names its recipient's, so a row without
+    one came from an older binary: it takes them from the rows on disk, as the view used to */
+    for ask in disk
+        .asks
+        .values_mut()
+        .filter(|ask| ask.to_circle.is_empty())
+    {
+        if let Some(peer) = disk.peers.get(&ask.to_peer_id) {
+            ask.to_circle = peer.circle.clone();
+        }
+        if ask.from_circle.is_empty() {
+            let job = disk.jobs.values().find(|job| {
+                job.ask_id.as_deref() == Some(ask.correlation_id.as_str()) && !job.circle.is_empty()
+            });
+            let sender = Some(ask.from_peer.as_str())
+                .filter(|name| *name != "anonymous")
+                .and_then(|name| {
+                    disk.peers
+                        .get(name)
+                        .or_else(|| disk.peers.values().find(|peer| peer.name == name))
+                });
+            ask.from_circle = job
+                .map(|job| job.circle.clone())
+                .or_else(|| sender.map(|peer| peer.circle.clone()))
+                .unwrap_or_default();
+        }
+    }
     Ok(disk)
 }
 
@@ -1171,6 +1208,7 @@ fn persist_then_deliver(
     if let Some(tx) = live {
         persist_ok(hub)?;
         if tx.send(Outbound::Record(record.clone())).is_ok() {
+            push_event(hub, event);
             return Ok(());
         }
         hub.sockets.remove(&key);
@@ -1195,7 +1233,7 @@ fn close_open_asks(asks: &mut HashMap<String, Ask>, peer_id: &str, reason: &str)
             replies.push(json!({
                 "type": "ack",
                 "correlation_id": ask.correlation_id,
-                "from_peer": ask.to_peer,
+                "from_peer": ask.to_peer_id,
                 "to_peer": ask.from_peer,
                 "message": format!("[failed] {reason}"),
                 "failed": true,
@@ -1927,6 +1965,7 @@ async fn register_peer(
             for ask in hub.asks.values_mut() {
                 if ask.open && ask.to_peer_id == old {
                     ask.to_peer_id = peer_id.clone();
+                    ask.to_circle = peer.circle.clone();
                 }
             }
         }
@@ -2123,6 +2162,13 @@ async fn open_ask(
         from_peer: sender_id(&hub, req.from_peer.as_deref()).unwrap_or_else(|| "anonymous".into()),
         to_peer: req.to_peer.clone(),
         to_peer_id: to_peer_id.clone(),
+        from_circle: req
+            .from_peer
+            .as_deref()
+            .and_then(|id| resolve(&hub, id))
+            .map(|p| p.circle.clone())
+            .unwrap_or_default(),
+        to_circle: target.circle.clone(),
         text: req.text.clone(),
         open: true,
         reply: None,
@@ -2216,7 +2262,7 @@ async fn ack_ask(
     let event = json!({
         "type": "ack",
         "correlation_id": req.correlation_id,
-        "from_peer": ask.to_peer,
+        "from_peer": ask.to_peer_id,
         "to_peer": ask.from_peer,
         "message": message,
         "failed": req.failed,
@@ -2425,7 +2471,7 @@ struct McpServerReq {
 
 const EVENTS_KEEP: usize = 500;
 /* amesh_events without a cursor lists what happened within this many seconds */
-const EVENTS_VIEW_SECS: u64 = 3600;
+const EVENTS_VIEW_SECS: u64 = 86400;
 const EVENTS_DEFAULT: usize = 20;
 const EVENTS_MAX: usize = 50;
 const EVENT_TEXT_CHARS: usize = 200;
@@ -2470,11 +2516,24 @@ fn push_event(hub: &mut Hub, mut event: Value) {
         Some("chat" | "chat_turn_delta") => [("from_circle", "peer"), ("to_circle", "peer")],
         _ => [("from_circle", "from_peer"), ("to_circle", "to_peer")],
     };
+    let ask = event["correlation_id"]
+        .as_str()
+        .and_then(|id| hub.asks.get(id));
+    let circles = match (event["type"].as_str(), ask) {
+        (Some("ask"), Some(ask)) => Some((&ask.from_circle, &ask.to_circle)),
+        (Some("ack"), Some(ask)) => Some((&ask.to_circle, &ask.from_circle)),
+        _ => None,
+    };
     for (label, field) in fields {
-        let circle = event[field]
-            .as_str()
-            .and_then(|peer| resolve(hub, peer))
-            .map(|peer| peer.circle.clone());
+        let circle = if let Some((from, to)) = circles {
+            let circle = if label == "from_circle" { from } else { to };
+            (!circle.is_empty()).then(|| circle.clone())
+        } else {
+            event[field]
+                .as_str()
+                .and_then(|peer| resolve(hub, peer))
+                .map(|peer| peer.circle.clone())
+        };
         if let Some(object) = event.as_object_mut() {
             object.remove(label);
             if let Some(circle) = circle {
@@ -2824,16 +2883,17 @@ async fn list_events(
         .get("since")
         .filter(|s| !s.is_empty())
         .map(|since| event_cursor(&hub, since));
-    let mut events: Vec<Value> = hub
+    /* the TUI reads the whole ring every second: only what is returned is copied under the
+    lock, and only once */
+    let circle = q.get("circle").filter(|s| !s.is_empty());
+    let events: Vec<Value> = hub
         .events
         .iter()
         .filter(|event| cursor.is_none_or(|seq| event["seq"].as_u64().unwrap_or(0) > seq))
+        .filter(|event| circle.is_none_or(|c| event_in_circle(event, c)))
         .cloned()
         .collect();
-    if let Some(circle) = q.get("circle").filter(|s| !s.is_empty()) {
-        events.retain(|event| event_in_circle(event, circle));
-    }
-    Ok(Json(json!(events)))
+    Ok(Json(Value::Array(events)))
 }
 
 async fn ingest_chat(
@@ -3330,7 +3390,7 @@ fn close_job_ask(hub: &mut Hub, job: &Job, reply: String, failed: bool) -> Optio
     let ack = json!({
         "type": "ack",
         "correlation_id": ask.correlation_id,
-        "from_peer": ask.to_peer,
+        "from_peer": ask.to_peer_id,
         "to_peer": ask.from_peer,
         "message": ask.reply,
         "failed": failed,
@@ -3506,7 +3566,7 @@ fn hand_off(
             Json(json!({"error": "coordinator is in another circle"})),
         ));
     }
-    let target = peer.peer_id.clone();
+    let (target, target_circle) = (peer.peer_id.clone(), peer.circle.clone());
     let settled = settle_job(hub, id);
     let job = hub.jobs[id].clone();
     if job.from_peer == target {
@@ -3527,6 +3587,7 @@ fn hand_off(
         .filter(|ask| ask.open);
     if let Some(ask) = open {
         ask.from_peer = target.clone();
+        ask.from_circle = target_circle;
     }
     let ask = job
         .ask_id
@@ -3790,8 +3851,8 @@ async fn sweep_runtime_files(app: &App) {
 
 const JOB_NUDGE_SECS: u64 = 3600;
 const JOB_UPSTREAM_CHARS: u64 = 2000;
-const JOB_KEEP_SECS: u64 = 3600;
-const ASK_KEEP_SECS: u64 = 3600;
+const JOB_KEEP_SECS: u64 = 86400;
+const ASK_KEEP_SECS: u64 = 86400;
 const SWEEP_SECS: u64 = 60;
 const ATTACHMENT_KEEP_SECS: u64 = 7 * 86400;
 
@@ -4181,6 +4242,8 @@ fn advance_jobs(hub: &mut Hub) {
         let from = Some(job.from_peer.clone())
             .filter(|peer| !peer.is_empty())
             .unwrap_or_else(|| "anonymous".into());
+        let from_circle = job.circle.clone();
+        let to_circle = hub.peers[&worker].circle.clone();
         let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
         hub.asks.insert(
             cid.clone(),
@@ -4189,6 +4252,8 @@ fn advance_jobs(hub: &mut Hub) {
                 from_peer: from.clone(),
                 to_peer: target.clone(),
                 to_peer_id: worker,
+                from_circle,
+                to_circle,
                 text: text.clone(),
                 open: true,
                 reply: None,
@@ -4370,6 +4435,14 @@ async fn tick_schedules(app: &App) {
     };
     for sched in due {
         let mut hub = app.inner.lock().await;
+        let Some(sched) = hub
+            .schedules
+            .get(&sched.schedule_id)
+            .filter(|s| s.fire_at <= now)
+            .cloned()
+        else {
+            continue;
+        };
         let queued_at = now_unix();
         if resolve(&hub, &sched.to_peer).is_none() {
             continue;
@@ -4384,6 +4457,10 @@ async fn tick_schedules(app: &App) {
                 from_peer: sched.from_peer.clone(),
                 to_peer: sched.to_peer.clone(),
                 to_peer_id: to_peer_id.clone(),
+                from_circle: sched.circle.clone(),
+                to_circle: resolve(&hub, &sched.to_peer)
+                    .map(|p| p.circle.clone())
+                    .unwrap_or_default(),
                 text: sched.text.clone(),
                 open: true,
                 reply: None,
@@ -4590,8 +4667,9 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "List peers in your circle; cross_circle without circle lists all",
+                "List peers in your circle; cross_circle without circle lists all. detail=true returns JSON with activity, running jobs, queued messages, push/recv support, last_seen, liveness and delivery; use it before assigning work",
                 json!({
+                    "detail": {"type": "boolean"},
                     "circle": {"type": "string"},
                     "cross_circle": {"type": "boolean"}
                 }),
@@ -4752,7 +4830,7 @@ fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "List events in your circle: newest 20 by default from the last hour, limit up to 50, text trimmed to 200 chars; cross_circle without circle lists all. Each has a seq: pass since=<seq of the last one you saw> to page forward from it. The hub keeps about 500 events, drops an ask's or job's events when it deletes it, and clears them on restart",
+                "List events in your circle: newest 20 by default from the last 24 hours, limit up to 50, text trimmed to 200 chars; cross_circle without circle lists all. Each has a seq: pass since=<seq of the last one you saw> to page forward from it. The hub keeps about 500 events, drops an ask's or job's events when it deletes it, and clears them on restart",
                 json!({
                     "since": {"type": "string", "description": "seq of the last event you saw; returns the events after it"},
                     "limit": {"type": "integer"},
@@ -4785,17 +4863,31 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             let mut hub = app.inner.lock().await;
             probe_peers(&mut hub)?;
             let filter = mcp_scope(&hub, &args)?;
-            hub.peers
+            let mut peers: Vec<_> = hub
+                .peers
                 .values()
                 .filter(|peer| filter.as_deref().is_none_or(|circle| peer.circle == circle))
-                .map(|p| {
-                    format!(
-                        "{}\t{}\t{}\t{}\t{}",
-                        p.peer_id, p.name, p.circle, p.backend, p.status
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
+                .collect();
+            peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+            if args.get("detail").and_then(Value::as_bool).unwrap_or(false) {
+                let model = derive::ReadModel::new(&hub, now_unix());
+                json!(peers
+                    .iter()
+                    .map(|peer| model.peer(peer))
+                    .collect::<Vec<_>>())
+                .to_string()
+            } else {
+                peers
+                    .iter()
+                    .map(|p| {
+                        format!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            p.peer_id, p.name, p.circle, p.backend, p.status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
         }
         "amesh_ask" => {
             let to = args
@@ -5198,7 +5290,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             let res = list_events(State(app.clone()), auth_headers(app), Query(q)).await?;
             let from_cursor = since.is_some();
             let mut rows = res.0;
-            /* without a cursor the tool orients: what happened within the last hour */
+            /* without a cursor the tool orients: what happened within the last 24 hours */
             if !from_cursor {
                 let floor = now_unix().saturating_sub(EVENTS_VIEW_SECS);
                 if let Some(list) = rows.as_array_mut() {

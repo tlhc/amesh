@@ -7,73 +7,36 @@ use super::model::{Ask, Event, Snapshot};
 /* events the screen holds at most, as many as the hub keeps */
 pub(crate) const KEEP: usize = 500;
 
-const ABOVE: &str = "the rows above came from the previous hub process";
-
 /* what the events screen holds, oldest first: the hub's events, each with the hub run it was
-read in, and where the hub restarted between them */
+read in */
 #[derive(Clone, Debug)]
-pub(crate) enum Held {
-    Event(u64, Box<Event>),
-    Restart(u64),
-}
+pub(crate) struct Held(pub(crate) u64, pub(crate) Box<Event>);
 
-/* a row of the list: an event with the other records of its broadcast or fan-out and its hub
-run, or a restart */
-pub(crate) enum Item<'a> {
-    Event(u64, Vec<&'a Event>),
-    Restart(u64),
-}
+/* a row of the list: an event with the other records of its broadcast or fan-out, and its hub
+run */
+pub(crate) struct Item<'a>(pub(crate) u64, pub(crate) Vec<&'a Event>);
 
 impl Item<'_> {
     /* what the selection holds on: the row's hub run and its first record's seq, so a ring that
-    numbers from below again after the clock stepped back keeps to its own rows, however the
-    oldest rows and restarts go */
+    numbers from below again after the clock stepped back keeps to its own rows */
     pub fn key(&self) -> Option<(u64, u64)> {
-        match self {
-            Item::Event(ring, group) => Some((*ring, group[0].seq?)),
-            Item::Restart(_) => None,
-        }
+        Some((self.0, self.1[0].seq?))
     }
 }
 
-/* the newest seq held since the last restart: a ring that started over is all new */
-pub(crate) fn newest(held: &[Held]) -> Option<u64> {
-    held.iter()
-        .rev()
-        .map_while(|h| match h {
-            Held::Event(_, e) => Some(e.seq),
-            Held::Restart(_) => None,
-        })
-        .flatten()
-        .max()
-}
-
-/* the events held since the last restart came from a hub that numbers none; an earlier ring
-says nothing about this one */
+/* the events held came from a hub that numbers none */
 pub(crate) fn unnumbered(held: &[Held]) -> bool {
-    held.iter()
-        .rev()
-        .take_while(|h| matches!(h, Held::Event(..)))
-        .any(|h| matches!(h, Held::Event(_, e) if e.seq.is_none()))
+    held.iter().any(|h| h.1.seq.is_none())
 }
 
 pub(crate) fn holds(held: &[Held], key: (u64, u64)) -> bool {
     items(held).iter().any(|item| item.key() == Some(key))
 }
 
-/* the oldest go once more than `keep` events are held, and a restart with nothing before it
-goes with them */
+/* the oldest go once more than `keep` events are held */
 pub(crate) fn trim(held: &mut Vec<Held>, keep: usize) {
-    let mut over = held
-        .iter()
-        .filter(|h| matches!(h, Held::Event(..)))
-        .count()
-        .saturating_sub(keep);
-    while !held.is_empty() && (over > 0 || matches!(held[0], Held::Restart(_))) {
-        if matches!(held.remove(0), Held::Event(..)) {
-            over -= 1;
-        }
-    }
+    let over = held.len().saturating_sub(keep);
+    held.drain(..over);
 }
 
 /* the rows of the list: the records of one broadcast are one row, and so are the asks one
@@ -90,21 +53,11 @@ pub(crate) fn items(held: &[Held]) -> Vec<Item<'_>> {
             }
     };
     let mut out: Vec<Item> = Vec::new();
-    for h in held {
-        match h {
-            Held::Restart(at) => out.push(Item::Restart(*at)),
-            Held::Event(ring, e) => {
-                let e: &Event = e;
-                let joins =
-                    matches!(out.last(), Some(Item::Event(_, group)) if together(group[0], e));
-                if joins {
-                    if let Some(Item::Event(_, group)) = out.last_mut() {
-                        group.push(e);
-                    }
-                } else {
-                    out.push(Item::Event(*ring, vec![e]));
-                }
-            }
+    for Held(ring, e) in held {
+        let e: &Event = e;
+        match out.last_mut().filter(|item| together(item.1[0], e)) {
+            Some(item) => item.1.push(e),
+            None => out.push(Item(*ring, vec![e])),
         }
     }
     out
@@ -112,10 +65,7 @@ pub(crate) fn items(held: &[Held]) -> Vec<Item<'_>> {
 
 /* how many events are held, and when the newest happened */
 pub(crate) fn kept(held: &[Held]) -> (usize, Option<u64>) {
-    held.iter().fold((0, None), |(n, newest), h| match h {
-        Held::Event(_, e) => (n + 1, newest.max(e.at)),
-        Held::Restart(_) => (n, newest),
-    })
+    (held.len(), held.iter().filter_map(|h| h.1.at).max())
 }
 
 pub(crate) fn header(held: &[Held], all: bool) -> String {
@@ -184,49 +134,35 @@ fn route(group: &[&Event], prefix: &str) -> String {
 
 /* one row per item: the time, to the second in a wide pane, the kind, who to whom in a column
 as wide as the widest route, and the text's first line where asks::PREVIEW_MIN columns are left
-for it; a restart is a rule across the pane. HOME's calm rows give the kind words no colour of
-their own */
+for it. HOME's calm rows give the kind words no colour of their own */
 pub(crate) fn rows(items: &[Item], cols: usize, prefix: &str, calm: bool) -> Vec<Row> {
     let wide = layout::columns(cols).0;
     let time = |at| if wide { stamp(at) } else { clock(at) };
     let rw = items
         .iter()
-        .filter_map(|item| match item {
-            Item::Event(_, group) => Some(width(&route(group, prefix))),
-            Item::Restart(_) => None,
-        })
+        .map(|Item(_, group)| width(&route(group, prefix)))
         .max()
         .unwrap_or(0)
         .min(cols.saturating_sub(width(&time(None)) + 1 + 7));
     items
         .iter()
-        .map(|item| match item {
-            Item::Restart(at) => {
-                let line = match wide {
-                    true => format!("─── hub restarted {} · {ABOVE} ", stamp(Some(*at))),
-                    false => format!("─── hub restarted {} ", clock(Some(*at))),
-                };
-                let rule = "─".repeat(cols.saturating_sub(width(&line)));
-                vec![(fit(&line, cols) + &rule, Tone::Line)]
+        .map(|Item(_, group)| {
+            let e = group[0];
+            let (text, (glyph, tone)) = body(e);
+            let tone = match calm && kind(e) != "ack" {
+                true => Tone::Dim,
+                false => tone,
+            };
+            let mut row: Row = vec![(format!("{} ", time(e.at)), Tone::Dim)];
+            row.extend(label(kind(e), (glyph, tone)));
+            row.push((asks::pad(&fit(&route(group, prefix), rw), rw), Tone::Soft));
+            let used: usize = row.iter().map(|(t, _)| width(t)).sum();
+            let rest = cols.saturating_sub(used + 2);
+            let first = text.lines().next().unwrap_or("");
+            if rest >= asks::PREVIEW_MIN && !first.is_empty() {
+                row.push((format!("  {}", fit(first, rest)), Tone::Plain));
             }
-            Item::Event(_, group) => {
-                let e = group[0];
-                let (text, (glyph, tone)) = body(e);
-                let tone = match calm && kind(e) != "ack" {
-                    true => Tone::Dim,
-                    false => tone,
-                };
-                let mut row: Row = vec![(format!("{} ", time(e.at)), Tone::Dim)];
-                row.extend(label(kind(e), (glyph, tone)));
-                row.push((asks::pad(&fit(&route(group, prefix), rw), rw), Tone::Soft));
-                let used: usize = row.iter().map(|(t, _)| width(t)).sum();
-                let rest = cols.saturating_sub(used + 2);
-                let first = text.lines().next().unwrap_or("");
-                if rest >= asks::PREVIEW_MIN && !first.is_empty() {
-                    row.push((format!("  {}", fit(first, rest)), Tone::Plain));
-                }
-                row
-            }
+            row
         })
         .collect()
 }
@@ -234,7 +170,7 @@ pub(crate) fn rows(items: &[Item], cols: usize, prefix: &str, calm: bool) -> Vec
 /* the ask a opens on the asks screen: of an ask's records, the one that screen lists first */
 pub(crate) fn opens<'a>(item: &Item, snap: &'a Snapshot) -> Option<&'a Ask> {
     match item {
-        Item::Event(_, group) if group[0].kind == "ask" => asks::order(snap)
+        Item(_, group) if group[0].kind == "ask" => asks::order(snap)
             .into_iter()
             .find(|ask| group.iter().any(|e| e.correlation_id == ask.correlation_id)),
         _ => None,
@@ -317,8 +253,8 @@ fn recipients(group: &[&Event], snap: Option<&Snapshot>, prefix: &str, room: usi
 }
 
 /* the selected row's card: who to whom, each recipient of an ask with how its ask stands, the
-topic when it says more than the id, the whole text and the keys; a restart says what it means
-for the rows above it. A card the pane gives no room for its frame is its keys alone */
+topic when it says more than the id, the whole text and the keys. A card the pane gives no room
+for its frame is its keys alone */
 pub(crate) fn card(item: &Item, cols: usize, size: Fit, snap: Option<&Snapshot>) -> Grid {
     card_in(item, cols, size, snap, layout::framed)
 }
@@ -354,67 +290,55 @@ pub(crate) fn card_in(
         .map(|line| layout::card_keys(line))
         .collect();
     let (mut left, mut right): (Vec<Row>, Vec<Row>) = (Vec::new(), Vec::new());
-    let (mark, head) = match item {
-        Item::Restart(at) => {
-            let note = format!("{ABOVE}, which kept its events in memory only");
-            layout::wrapped(&mut left, "note", &note, Tone::Dim, colw, usize::MAX);
-            (
-                ('─', Tone::Dim),
-                format!(" hub restarted · {} ", stamp(Some(*at))),
-            )
+    let Item(_, group) = item;
+    let e = group[0];
+    let (text, mark) = body(e);
+    let id = if e.correlation_id.is_empty() {
+        e.id.as_str()
+    } else {
+        e.correlation_id.as_str()
+    };
+    let from = match e.kind.as_str() {
+        "chat" => route(group, prefix),
+        _ => brief(&e.from_peer, prefix).to_string(),
+    };
+    layout::wrapped(&mut left, "from", &from, Tone::Soft, colw, usize::MAX);
+    match e.kind.as_str() {
+        "ask" => left.extend(recipients(group, snap, prefix, room)),
+        "chat" => {}
+        _ => {
+            let to: Vec<&str> = group.iter().map(|r| brief(&r.to_peer, prefix)).collect();
+            layout::wrapped(
+                &mut left,
+                "to",
+                &to.join(", "),
+                Tone::Soft,
+                colw,
+                usize::MAX,
+            );
         }
-        Item::Event(_, group) => {
-            let e = group[0];
-            let (text, mark) = body(e);
-            let id = if e.correlation_id.is_empty() {
-                e.id.as_str()
-            } else {
-                e.correlation_id.as_str()
-            };
-            let from = match e.kind.as_str() {
-                "chat" => route(group, prefix),
-                _ => brief(&e.from_peer, prefix).to_string(),
-            };
-            layout::wrapped(&mut left, "from", &from, Tone::Soft, colw, usize::MAX);
-            match e.kind.as_str() {
-                "ask" => left.extend(recipients(group, snap, prefix, room)),
-                "chat" => {}
-                _ => {
-                    let to: Vec<&str> = group.iter().map(|r| brief(&r.to_peer, prefix)).collect();
-                    layout::wrapped(
-                        &mut left,
-                        "to",
-                        &to.join(", "),
-                        Tone::Soft,
-                        colw,
-                        usize::MAX,
-                    );
-                }
-            }
-            if !e.topic.is_empty() && e.topic != id {
-                layout::wrapped(&mut left, "topic", &e.topic, Tone::Dim, colw, usize::MAX);
-            }
-            let lines: Vec<String> = text.split('\n').flat_map(|part| wrap(part, room)).collect();
-            let n = match size {
-                Fit::Whole => lines.len(),
-                Fit::Rows(h) if two => lines.len().min(h.saturating_sub(2)).max(1),
-                Fit::Rows(h) => lines
-                    .len()
-                    .min(h.saturating_sub(2 + left.len() + keys.len()))
-                    .max(1),
-            };
-            let side = if two { &mut right } else { &mut left };
-            side.extend(layout::field("text", &lines, n, Tone::Plain, room));
-            let tag = match group.len() {
-                1 => id.to_string(),
-                n => format!("{n} peers"),
-            };
-            let head = match tag.as_str() {
-                "" => format!(" {} · {} ", kind(e), stamp(e.at)),
-                _ => format!(" {} · {} · {tag} ", kind(e), stamp(e.at)),
-            };
-            (mark, head)
-        }
+    }
+    if !e.topic.is_empty() && e.topic != id {
+        layout::wrapped(&mut left, "topic", &e.topic, Tone::Dim, colw, usize::MAX);
+    }
+    let lines: Vec<String> = text.split('\n').flat_map(|part| wrap(part, room)).collect();
+    let n = match size {
+        Fit::Whole => lines.len(),
+        Fit::Rows(h) if two => lines.len().min(h.saturating_sub(2)).max(1),
+        Fit::Rows(h) => lines
+            .len()
+            .min(h.saturating_sub(2 + left.len() + keys.len()))
+            .max(1),
+    };
+    let side = if two { &mut right } else { &mut left };
+    side.extend(layout::field("text", &lines, n, Tone::Plain, room));
+    let tag = match group.len() {
+        1 => id.to_string(),
+        n => format!("{n} peers"),
+    };
+    let head = match tag.as_str() {
+        "" => format!(" {} · {} ", kind(e), stamp(e.at)),
+        _ => format!(" {} · {} · {tag} ", kind(e), stamp(e.at)),
     };
     /* the keys end the card: under the text in a full one, on its last row under the list */
     match size {

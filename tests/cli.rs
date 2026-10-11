@@ -6930,3 +6930,5 @@ fn a_codex_drainer_that_dies_inside_the_inject_leaves_the_frame_with_the_hub() {
         "the frame stays with the hub until the inject returns: {pending}"
     );
 }
+
+include!("support/peer_handoff.rs");

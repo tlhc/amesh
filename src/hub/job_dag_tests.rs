@@ -4,6 +4,10 @@ use axum::http::Request;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+include!("../../tests/support/event_retention.rs");
+include!("../../tests/support/data_consistency.rs");
+include!("../../tests/support/peer_details.rs");
+
 /* a hub, and the directory it made for itself; one opened on a test's own path leaves that
 directory to the test */
 struct Fixture(App, Option<TempState>);
@@ -1414,7 +1418,7 @@ fn job_schema_has_new_fields() {
 }
 
 #[tokio::test]
-async fn ended_chain_goes_an_hour_after_its_last_job() {
+async fn ended_chain_goes_a_day_after_its_last_job() {
     let f = team("one", &["boss", "w1"]).await;
     let a = f
         .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
@@ -1433,7 +1437,7 @@ async fn ended_chain_goes_an_hour_after_its_last_job() {
     let (cid_a, cid_b) = (f.ask_id(&a).await, f.ask_id(&b).await);
     let last = f.row(&b).await.finished_at.unwrap();
 
-    /* a finished long ago; b, the last to finish, still inside its hour */
+    /* a finished long ago; b, the last to finish, still inside its day */
     f.0.inner.lock().await.jobs.get_mut(&a).unwrap().finished_at = Some(last - 100);
     assert!(f.sweep(last + JOB_KEEP_SECS - 50).await.jobs.is_empty());
     let swept = f.sweep(last + JOB_KEEP_SECS).await;
@@ -1464,7 +1468,7 @@ async fn a_retry_restarts_the_clock() {
 }
 
 #[tokio::test]
-async fn closed_asks_go_an_hour_after_closing_unless_a_job_holds_them() {
+async fn closed_asks_go_a_day_after_closing_unless_a_job_holds_them() {
     let f = team("one", &["boss", "w1"]).await;
     let open = f.open_ask("boss", "w1").await;
     let closed = f.open_ask("boss", "w1").await;
@@ -1583,7 +1587,7 @@ async fn gc_previews_without_writing_and_stamps_before_deleting() {
     assert_eq!(
         applied["jobs"],
         json!([]),
-        "a row stamped now waits its hour"
+        "a row stamped now waits its day"
     );
     assert!(f.row(&a).await.finished_at.is_some());
 }
@@ -2855,7 +2859,7 @@ async fn snapshot_lists_the_asks_no_job_points_at_by_circle() {
 }
 
 #[tokio::test]
-async fn snapshot_lists_an_ask_whose_rows_are_gone_only_without_a_circle() {
+async fn snapshot_keeps_an_ask_in_its_circle_after_peer_removal() {
     let f = team("c1", &["boss", "one"]).await;
     let cid = f.open_ask("boss", "one").await;
     {
@@ -2864,8 +2868,8 @@ async fn snapshot_lists_an_ask_whose_rows_are_gone_only_without_a_circle() {
         hub.peers.remove("one");
     }
     assert!(
-        !ask_ids(&snapshot_of(&f, "?circle=c1").await).contains(&cid),
-        "no row places it in a circle"
+        ask_ids(&snapshot_of(&f, "?circle=c1").await).contains(&cid),
+        "stored ownership survives peer removal"
     );
     assert!(ask_ids(&snapshot_of(&f, "").await).contains(&cid));
 }

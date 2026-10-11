@@ -12,6 +12,8 @@ use ratatui::Terminal;
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
 
+include!("../../tests/support/tui_event_sync.rs");
+
 fn job(id: &str, state: &str, deps: &[&str], created: u64) -> Job {
     Job {
         job_id: id.into(),
@@ -6891,13 +6893,7 @@ fn fan_events(seq: u64) -> Vec<model::Event> {
 }
 
 fn held_seqs(app: &App) -> Vec<Option<u64>> {
-    app.feed
-        .iter()
-        .map(|h| match h {
-            super::feed::Held::Event(_, e) => e.seq,
-            super::feed::Held::Restart(_) => None,
-        })
-        .collect()
+    app.feed.iter().map(|h| h.1.seq).collect()
 }
 
 #[test]
@@ -6936,7 +6932,7 @@ fn e_opens_the_events_screen_and_e_or_a_leaves_it() {
 }
 
 #[test]
-fn the_feed_keeps_what_is_new_and_at_most_500() {
+fn the_feed_replaces_the_ring_and_keeps_at_most_500() {
     let mut app = events_app(vec![
         ev(1, "ask", "cc", "pi", "q1"),
         ev(2, "ack", "pi", "cc", "a1"),
@@ -6947,11 +6943,11 @@ fn the_feed_keeps_what_is_new_and_at_most_500() {
     ]));
     assert_eq!(
         held_seqs(&app),
-        vec![Some(1), Some(2), Some(3)],
-        "what is held already is not taken twice"
+        vec![Some(2), Some(3)],
+        "the response replaces the previous ring"
     );
     app.take_events(Ok(vec![ev(4, "chat_turn_delta", "", "", "partial")]));
-    assert_eq!(held_seqs(&app).len(), 3, "streaming deltas stay out");
+    assert!(held_seqs(&app).is_empty(), "streaming deltas stay out");
     app.take_events(Ok((10..610)
         .map(|s| ev(s, "notify", "cc", "pi", "n"))
         .collect()));
@@ -6971,14 +6967,7 @@ fn a_hub_that_numbers_no_events_is_read_whole() {
     };
     let mut app = events_app(vec![bare("one"), bare("two")]);
     app.take_events(Ok(vec![bare("two"), bare("three")]));
-    let texts: Vec<String> = app
-        .feed
-        .iter()
-        .filter_map(|h| match h {
-            super::feed::Held::Event(_, e) => Some(e.message.clone()),
-            super::feed::Held::Restart(_) => None,
-        })
-        .collect();
+    let texts: Vec<String> = app.feed.iter().map(|h| h.1.message.clone()).collect();
     assert_eq!(texts, ["two", "three"]);
 }
 
@@ -7143,7 +7132,9 @@ fn the_selection_follows_the_newest_until_moved_and_holds_its_event() {
     assert!(card(&mut app).contains("00:16:43"), "the newest first");
     app.key(KeyCode::Char('k'));
     assert!(card(&mut app).contains("00:16:42"));
-    app.take_events(Ok(vec![ev(4, "notify", "cc", "pi", "n4")]));
+    app.take_events(Ok((1..=4)
+        .map(|s| ev(s, "notify", "cc", "pi", &format!("n{s}")))
+        .collect()));
     assert!(
         card(&mut app).contains("00:16:42"),
         "a new event leaves the selection where it is"
@@ -7151,7 +7142,9 @@ fn the_selection_follows_the_newest_until_moved_and_holds_its_event() {
     app.key(KeyCode::Char('j'));
     app.key(KeyCode::Char('j'));
     assert_eq!(app.ev_sel, None, "the newest row follows the newest again");
-    app.take_events(Ok(vec![ev(5, "notify", "cc", "pi", "n5")]));
+    app.take_events(Ok((1..=5)
+        .map(|s| ev(s, "notify", "cc", "pi", &format!("n{s}")))
+        .collect()));
     assert!(card(&mut app).contains("00:16:45"));
     app.key(KeyCode::Char('k'));
     app.take_events(Ok((10..510)
@@ -7164,7 +7157,7 @@ fn the_selection_follows_the_newest_until_moved_and_holds_its_event() {
 }
 
 #[test]
-fn a_hub_restart_leaves_a_divider_and_takes_the_new_ring() {
+fn a_hub_restart_replaces_the_old_ring_with_lower_seqs() {
     let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
     let mut snap = app.snap.clone().unwrap().view;
     snap.hub_epoch = "e2".into();
@@ -7173,30 +7166,11 @@ fn a_hub_restart_leaves_a_divider_and_takes_the_new_ring() {
     app.apply(Ok(snap.clone()));
     app.take_events(Ok(vec![ev(1, "ask", "cc", "pi", "after")]));
     app.apply(Ok(snap));
-    let lines = screen_text(&mut app, 100, 40);
-    let at = |needle: &str| {
-        lines
-            .iter()
-            .position(|l| l.contains(needle))
-            .unwrap_or_else(|| panic!("no {needle}:\n{}", lines.join("\n")))
-    };
-    let divider = "─── hub restarted 00:20:00 · ";
-    assert!(at("before") < at(divider));
-    assert!(
-        at(divider) < at("after"),
-        "the new ring comes in even with lower numbers"
-    );
-    assert_eq!(
-        lines.iter().filter(|l| l.contains("hub restarted")).count(),
-        1,
-        "one divider per restart"
-    );
-    assert!(
-        screen_text(&mut app, 46, 40)
-            .iter()
-            .any(|l| l.starts_with("─── hub restarted 00:20 ─")),
-        "a narrow pane gives the divider's minutes"
-    );
+    assert_eq!(held_seqs(&app), [Some(1)]);
+    let lines = screen_text(&mut app, 100, 40).join("\n");
+    assert!(lines.contains("after"));
+    assert!(!lines.contains("before"));
+    assert!(!lines.contains("hub restarted"));
 }
 
 #[test]
@@ -7313,47 +7287,21 @@ fn the_events_screen_says_when_its_hub_numbers_no_events() {
 }
 
 #[test]
-fn a_hub_that_numbers_no_events_keeps_what_came_before_its_restart() {
+fn a_hub_that_numbers_no_events_replaces_previous_hub_history() {
     let mut app = events_app(vec![unnumbered("before")]);
     let mut snap = app.snap.clone().unwrap().view;
     snap.hub_epoch = "e2".into();
     snap.captured_at = 1200;
     app.apply(Ok(snap));
     app.take_events(Ok(vec![unnumbered("after")]));
-    let lines = screen_text(&mut app, 100, 40);
-    let at = |needle: &str| {
-        lines
-            .iter()
-            .position(|l| l.contains(needle))
-            .unwrap_or_else(|| panic!("no {needle}:\n{}", lines.join("\n")))
-    };
-    let divider = "hub restarted 00:20:00";
-    assert!(
-        at("before") < at(divider) && at(divider) < at("after"),
-        "the ring read whole after a restart replaces only what came after it"
-    );
+    assert_eq!(app.feed.len(), 1);
+    let lines = screen_text(&mut app, 100, 40).join("\n");
+    assert!(lines.contains("after"));
+    assert!(!lines.contains("before"));
 }
 
 #[test]
-fn each_restart_gets_its_divider_even_with_no_events_between() {
-    let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
-    for (epoch, at) in [("e2", 1200), ("e3", 1260)] {
-        let mut snap = app.snap.clone().unwrap().view;
-        snap.hub_epoch = epoch.into();
-        snap.captured_at = at;
-        app.apply(Ok(snap));
-    }
-    let lines = screen_text(&mut app, 100, 40);
-    for divider in ["hub restarted 00:20:00", "hub restarted 00:21:00"] {
-        assert!(
-            lines.iter().any(|l| l.contains(divider)),
-            "each restart gets its own divider: {divider} missing in {lines:?}"
-        );
-    }
-}
-
-#[test]
-fn a_hub_upgraded_to_number_its_events_is_read_by_seq_again() {
+fn a_hub_upgraded_to_number_its_events_still_replaces_the_ring() {
     let mut app = events_app(vec![unnumbered("old")]);
     let mut snap = app.snap.clone().unwrap().view;
     snap.hub_epoch = "e2".into();
@@ -7363,8 +7311,8 @@ fn a_hub_upgraded_to_number_its_events_is_read_by_seq_again() {
     app.take_events(Ok(Vec::new()));
     let lines = screen_text(&mut app, 100, 40);
     assert!(
-        lines.iter().any(|l| l.contains("fresh-ring")),
-        "an empty read from a hub that numbers its events keeps what it has: {lines:?}"
+        app.feed.is_empty(),
+        "an empty ring removes the previous response: {lines:?}"
     );
     assert!(
         !lines.iter().any(|l| l.contains("numbers no events")),
@@ -7387,14 +7335,11 @@ fn asks_from_one_sender_with_one_text_in_one_second_are_one_row() {
     let sizes = |events: Vec<model::Event>| -> Vec<usize> {
         let held: Vec<super::feed::Held> = events
             .into_iter()
-            .map(|e| super::feed::Held::Event(0, Box::new(e)))
+            .map(|e| super::feed::Held(0, Box::new(e)))
             .collect();
         super::feed::items(&held)
             .iter()
-            .map(|item| match item {
-                super::feed::Item::Event(_, group) => group.len(),
-                super::feed::Item::Restart(_) => 0,
-            })
+            .map(|item| item.1.len())
             .collect()
     };
     let one = || ask(1, Some(5), CC, "q");
@@ -7502,7 +7447,7 @@ fn an_asks_card_lists_each_recipient_as_the_asks_screen_orders_them() {
         correlation_id: "ask-0000feed".into(),
         ..fan_events(2).remove(0)
     };
-    let held = vec![super::feed::Held::Event(0, Box::new(far))];
+    let held = vec![super::feed::Held(0, Box::new(far))];
     let card = super::feed::card(&super::feed::items(&held)[0], 30, Fit::Whole, Some(&snap));
     assert!(
         card.text()
@@ -7518,7 +7463,7 @@ fn an_asks_card_lists_each_recipient_as_the_asks_screen_orders_them() {
     });
     let held: Vec<super::feed::Held> = fan_events(2)
         .into_iter()
-        .map(|e| super::feed::Held::Event(0, Box::new(e)))
+        .map(|e| super::feed::Held(0, Box::new(e)))
         .collect();
     let card = super::feed::card(&super::feed::items(&held)[0], 30, Fit::Whole, Some(&hand)).text();
     assert!(
@@ -7640,42 +7585,6 @@ fn event_rows_name_peers_soft_and_colour_only_asks_hub_notices_and_ack_glyphs() 
 }
 
 #[test]
-fn the_restart_row_is_a_rule_across_the_pane() {
-    let mut app = events_app(vec![ev(5, "ask", "cc", "pi", "before")]);
-    let mut snap = app.snap.clone().unwrap().view;
-    snap.hub_epoch = "e2".into();
-    snap.captured_at = 1200;
-    app.apply(Ok(snap));
-    app.take_events(Ok(vec![ev(1, "ask", "cc", "pi", "after")]));
-    let row = |app: &mut App, cols| {
-        screen_text(app, cols, 24)
-            .into_iter()
-            .find(|l| l.contains("hub restarted"))
-            .unwrap()
-    };
-    let narrow = format!("─── hub restarted 00:20 {}", "─".repeat(22));
-    assert_eq!(row(&mut app, 46), narrow);
-    assert_eq!(
-        row(&mut app, 100),
-        format!(
-            "─── hub restarted 00:20:00 · the rows above came from the previous hub process {}",
-            "─".repeat(21)
-        )
-    );
-    let items = super::feed::items(&app.feed);
-    assert_eq!(
-        super::feed::rows(&items, 46, "", false)[1],
-        [(narrow, Tone::Line)],
-        "the whole row is the rule's colour"
-    );
-    assert_eq!(
-        super::feed::rows(&items, 20, "", false)[1],
-        [("─── hub restarted 0…".to_string(), Tone::Line)],
-        "a pane too narrow for even the minutes cuts the row"
-    );
-}
-
-#[test]
 fn the_selection_keeps_to_its_ring_when_the_new_ring_repeats_its_seqs() {
     let mut app = events_app(vec![
         ev(5, "notify", "cc", "pi", "old five"),
@@ -7699,22 +7608,15 @@ fn the_selection_keeps_to_its_ring_when_the_new_ring_repeats_its_seqs() {
     assert_eq!(app.ev_sel, Some((1, 5)));
     assert!(text(&mut app).contains("new five"), "{}", text(&mut app));
     app.key(KeyCode::Char('k'));
-    assert!(text(&mut app).contains("old six"), "{}", text(&mut app));
-    app.key(KeyCode::Char('j'));
     assert!(text(&mut app).contains("new five"), "{}", text(&mut app));
-    /* the old ring goes, and its restart with it */
+    app.key(KeyCode::Char('j'));
+    assert!(text(&mut app).contains("new six"), "{}", text(&mut app));
+    /* A replacement ring also removes the selected event. */
     app.take_events(Ok((10..508)
         .map(|s| ev(s, "notify", "cc", "pi", "n"))
         .collect()));
-    assert!(!app
-        .feed
-        .iter()
-        .any(|h| matches!(h, super::feed::Held::Restart(_))));
-    assert!(
-        text(&mut app).contains("new five"),
-        "the selection stays on its event, now in the first ring: {}",
-        text(&mut app)
-    );
+    assert_eq!(app.ev_sel, None);
+    assert_eq!(held_seqs(&app).first(), Some(&Some(10)));
 }
 
 #[test]
@@ -11292,10 +11194,7 @@ fn event_rows_fit_the_pane_whatever_the_kind() {
                 text: "preview of a real event".into(),
                 ..Default::default()
             };
-            let items = vec![
-                super::feed::Item::Event(0, vec![&event]),
-                super::feed::Item::Restart(1000),
-            ];
+            let items = vec![super::feed::Item(0, vec![&event])];
             for cols in 30..=120 {
                 for calm in [false, true] {
                     for row in super::feed::rows(&items, cols, "", calm) {
@@ -11351,7 +11250,7 @@ fn a_boxed_card_keeps_every_head_framed_keeps() {
 fn held_from(events: Vec<model::Event>) -> Vec<super::feed::Held> {
     events
         .into_iter()
-        .map(|e| super::feed::Held::Event(0, Box::new(e)))
+        .map(|e| super::feed::Held(0, Box::new(e)))
         .collect()
 }
 
@@ -12357,8 +12256,7 @@ fn an_events_only_fan_out_keeps_its_cards_keys_at_30x8() {
 }
 
 #[test]
-fn restarts_and_unnumbered_events_show_on_home_but_take_no_selection() {
-    use super::Pick;
+fn unnumbered_events_show_on_home_but_take_no_selection_and_a_restart_clears_them() {
     let plain = |epoch: &str, at| Snapshot {
         captured_at: at,
         hub_epoch: epoch.into(),
@@ -12393,25 +12291,15 @@ fn restarts_and_unnumbered_events_show_on_home_but_take_no_selection() {
     app.key(KeyCode::Enter);
     assert!(app.home && !app.full && app.home_sel.is_none());
     let mut app = home_app((plain("e1", 1000), vec![ev(1, "notify", CC, PI, "before")]));
-    app.apply(Ok(plain("e2", 1010)));
     let (rows, _) = rows_of(&mut app);
     assert!(rows[0].starts_with("│▸ 00:16 notify"), "{rows:?}");
-    assert!(rows[1].starts_with("│  ─── hub restarted"), "{rows:?}");
-    assert_eq!(app.home_rows, [Pick::Event((0, 1))]);
-    app.key(KeyCode::Char('j'));
-    assert_eq!(
-        app.home_sel,
-        Some(Pick::Event((0, 1))),
-        "j passes no restart"
-    );
-    app.feed = vec![super::feed::Held::Restart(1010)];
-    let (rows, below) = rows_of(&mut app);
-    assert!(rows[0].starts_with("│  ─── hub restarted"), "{rows:?}");
-    assert!(app.home_rows.is_empty() && app.home_sel.is_none());
+    app.apply(Ok(plain("e2", 1010)));
+    let screen = screen_text(&mut app, 46, 24).join("\n");
     assert!(
-        !below.iter().any(|l| l.starts_with('┌')),
-        "no card: {below:?}"
+        !screen.contains("notify"),
+        "the old ring's row goes at once:\n{screen}"
     );
+    assert!(app.home_rows.is_empty() && app.home_sel.is_none());
 }
 
 #[test]
@@ -12569,14 +12457,4 @@ fn home_walks_the_arrow_of_an_ask_at_work() {
         row(&mut app, 2).contains("claude-code──▸pi-2"),
         "the arrow steps toward the recipient"
     );
-}
-
-#[test]
-fn the_events_kept_are_events_and_restarts_are_not_counted() {
-    let mut held = held_from(vec![
-        ev(1, "ask", CC, PI, "one"),
-        ev(2, "ack", PI, CC, "two"),
-    ]);
-    held.insert(1, super::feed::Held::Restart(1001));
-    assert_eq!(super::feed::kept(&held), (2, Some(1002)));
 }

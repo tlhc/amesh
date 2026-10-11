@@ -66,6 +66,8 @@ fn ask() -> Ask {
         closed_at: None,
         opened_at: Some(90),
         closed_by: None,
+        from_circle: String::new(),
+        to_circle: String::new(),
     }
 }
 fn job() -> Job {

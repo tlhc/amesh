@@ -514,7 +514,8 @@ export default function AmeshHooks(pi) {
         correlation_id: { type: "string" },
         timeout_seconds: { type: "integer" },
       }, ["correlation_id"]],
-      ["list_peers", "List peers in your circle; cross_circle without circle lists all", {
+      ["list_peers", "List peers in your circle; cross_circle without circle lists all. detail=true returns JSON with activity, running jobs, queued messages, push/recv support, last_seen, liveness and delivery; use it before assigning work", {
+        detail: { type: "boolean" },
         circle: { type: "string" },
         cross_circle: { type: "boolean" },
       }, []],

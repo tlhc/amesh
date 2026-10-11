@@ -71,7 +71,10 @@ async fn http_open_wait_derived() {
 fn fixture_hub(hub: &mut Hub, fixture: &Value) {
     hub.epoch = fixture["hub_epoch"].as_str().unwrap().into();
     for row in fixture["asks"].as_array().unwrap() {
-        let ask: Ask = serde_json::from_value(row.clone()).unwrap();
+        let mut ask: Ask = serde_json::from_value(row.clone()).unwrap();
+        /* These fixtures describe asks created in circle c. */
+        ask.from_circle = "c".into();
+        ask.to_circle = "c".into();
         hub.asks.insert(ask.correlation_id.clone(), ask);
     }
     for row in fixture["jobs"].as_array().unwrap() {
