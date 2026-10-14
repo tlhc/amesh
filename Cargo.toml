@@ -2,7 +2,7 @@
 name = "amesh"
 version = "0.1.0"
 edition = "2021"
-description = "Local agent mesh for pi, Codex, and Claude Code."
+description = "Local agent mesh for pi, Codex, Claude Code, and OpenCode."
 license = "MIT"
 authors = ["tlhc <tlhcd@outlook.com>"]
 repository = "https://github.com/tlhc/amesh"

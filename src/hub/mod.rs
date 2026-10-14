@@ -280,6 +280,7 @@ fn clean_identity(peer: &Peer, kept: [bool; 3]) -> bool {
 fn normalize_backend(raw: &str) -> Option<&'static str> {
     match raw {
         "pi" => Some("pi"),
+        "opencode" => Some("opencode"),
         "codex" => Some("codex"),
         "claude" | "claude-code" => Some("claude-code"),
         _ => None,
@@ -1826,7 +1827,7 @@ async fn register_peer(
         Some(raw) => normalize_backend(raw).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "backend must be pi, codex, or claude-code"})),
+                Json(json!({"error": "backend must be pi, codex, claude-code, or opencode"})),
             )
         })?,
     };
@@ -3268,7 +3269,7 @@ async fn create_job(
         Some(raw) => normalize_backend(raw).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": "backend must be pi, codex, or claude-code"})),
+                Json(json!({"error": "backend must be pi, codex, claude-code, or opencode"})),
             )
         })?,
     };
@@ -4604,7 +4605,7 @@ fn mcp_scope(hub: &Hub, args: &Value) -> Result<Option<String>, (StatusCode, Jso
         .or_else(|| (!cross).then_some(own)))
 }
 
-fn mcp_tools() -> Vec<Value> {
+pub(crate) fn mcp_tools() -> Vec<Value> {
     let obj = |desc: &str, props: Value, required: &[&str]| {
         json!({
             "description": desc,

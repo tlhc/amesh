@@ -1,6 +1,6 @@
 # amesh
 
-Local hub that lets `pi`, Codex, and Claude Code sessions on one machine `ask` / `ack` / `notify` one another.
+Local hub that lets `pi`, Codex, Claude Code, and OpenCode sessions on one machine `ask` / `ack` / `notify` one another.
 
 One Rust binary, SQLite state, HTTP + WebSocket on `127.0.0.1:8378`. Each running session is a **peer**; peers in the same git repo share a **circle**.
 
@@ -36,7 +36,7 @@ amesh --help
 amesh serve
 
 # terminal 2
-amesh setup pi          # bare `amesh setup` writes all three: ~/.pi, ~/.claude, ~/.codex
+amesh setup pi          # bare `amesh setup` installs all four runtimes
 curl -s http://127.0.0.1:8378/health
 amesh doctor
 ```
@@ -55,8 +55,9 @@ amesh peer ask amesh-pi "status of the tests" --from-peer operator
 | pi | `~/.pi/agent/extensions/amesh.ts` |
 | claude-code | hooks in `~/.claude/settings.json`, MCP in `~/.claude.json` |
 | codex | hooks in `~/.codex/hooks.json`, MCP in `~/.codex/config.toml` |
+| opencode | `~/.config/opencode/plugins/amesh/{server,tui}.js` |
 
-A taken name gets `-2`, `-3`; pin one with `--peer-id ID` or `AMESH_PEER_ID`. `amesh mcp`, `amesh hook`, and the pi extension start `amesh serve` when the hub is down and `AMESH_BIND` is loopback, `0.0.0.0` or `::`; it logs to `serve.log` next to the state file. `amesh uninstall [runtime] --apply true` removes the hooks and MCP entries.
+A taken name gets `-2`, `-3`; pi, Claude Code, and Codex can pin one with `--peer-id ID` or `AMESH_PEER_ID`. OpenCode assigns an identity per root session. `amesh mcp`, `amesh hook`, and the pi extension start `amesh serve` when the hub is down and `AMESH_BIND` is loopback, `0.0.0.0` or `::`; it logs to `serve.log` next to the state file. `amesh uninstall [runtime] --apply true` removes the hooks and MCP entries.
 
 ### Codex (App Server)
 
@@ -69,6 +70,21 @@ codex --remote unix:// -C "$PWD" resume --last
 ```
 
 Pass `-C "$PWD"` to both, since App Server starts in `/`. `amesh setup codex --peer-id ID` pins the name for both MCP and hooks.
+
+### OpenCode v2
+
+Tested with OpenCode v2.0.25. Install and reload:
+
+```bash
+amesh setup opencode
+opencode reload
+```
+
+TUI sessions join automatically when opened or restored; child agents share the root peer. Other clients join on a prompt or tool call.
+
+Joined sessions can still wake after the TUI closes. Reload may interrupt active work.
+
+`amesh setup` includes OpenCode; rerun it after upgrades. Check with `amesh doctor`. Preview removal with `amesh uninstall opencode`, then add `--apply true` to confirm.
 
 ## Circles and tools
 

@@ -1,3 +1,6 @@
+#[path = "support/opencode.rs"]
+mod opencode_tests;
+
 use serde_json::{json, Value};
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -33,6 +36,8 @@ fn isolate_session_env<'a>(command: &'a mut Command, root: &Path) -> &'a mut Com
         .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
         .env_remove("CLAUDE_CODE_MESSAGING_TOKEN")
         .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("OPENCODE_CONFIG_DIR")
+        .env_remove("XDG_CONFIG_HOME")
         .env("CODEX_HOME", root.join(".codex"))
 }
 
@@ -1668,6 +1673,14 @@ fn setup_merges_hooks_and_preserves_existing_settings() {
         "{}",
         String::from_utf8_lossy(&with_id.stderr)
     );
+    assert!(String::from_utf8_lossy(&with_id.stderr).contains("--peer-id not applied"));
+    let opencode = fs::read_to_string(
+        sandbox
+            .root
+            .join(".config/opencode/plugins/amesh/server.js"),
+    )
+    .unwrap();
+    assert!(!opencode.contains("alice"));
     let config = fs::read_to_string(sandbox.root.join(".codex/config.toml")).unwrap();
     assert!(config.contains("AMESH_PEER_ID"));
     assert!(config.contains("AMESH_BACKEND"));
@@ -2860,7 +2873,7 @@ fn codex_stop_blocks_when_ask_is_open() {
         .stdout
         .is_empty());
     let bad = sandbox.run(
-        &["hook", "stop", "--backend", "opencode"],
+        &["hook", "stop", "--backend", "unsupported-runtime"],
         Some(json!({"session_id": "codex-a", "cwd": sandbox.root})),
     );
     assert!(!bad.status.success());

@@ -18,6 +18,7 @@ use toml_edit::{value, DocumentMut};
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 pub(crate) const DAEMON_UNREACHABLE: &str = "amesh daemon unreachable";
+const AMESH_OPENCODE_HOOK_MARK: &str = "/* amesh-plugin:opencode:v1 */";
 const AMESH_PI_HOOK_MARK: &str = "export default function AmeshHooks";
 const AMESH_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session"),
@@ -37,9 +38,9 @@ daemon
   gc [--apply true] [--attachments-days N] [--home DIR]
                                    Default dry-run. --apply true deletes leftover stamps/logs and dead pid files.
                                    Attachments are skipped unless --attachments-days N is set.
-  setup [pi|claude-code|codex] [--home DIR] [--peer-id ID]
-                                   Default peer_id is {folder}-{backend}, then -2; --peer-id / AMESH_PEER_ID overrides
-  uninstall [pi|claude-code|codex] [--home DIR] [--apply true]
+  setup [pi|claude-code|codex|opencode] [--home DIR] [--peer-id ID]
+                                   Default installs all four runtimes. --peer-id applies to pi/Claude/Codex; OpenCode names peers per session.
+  uninstall [pi|claude-code|codex|opencode] [--home DIR] [--apply true]
                                    Default dry-run. --apply true strips amesh hooks and MCP entries.
   tui [--circle NAME | --all] [--ascii] [--no-color] [--no-anim]
                                    Watch jobs as dependency flows; read-only. Default circle: this directory's.
@@ -49,7 +50,7 @@ mesh
   peer list [--cwd PATH] [--circle CIRCLE]
                                    Default all peers. --cwd uses that directory's project circle.
                                    --circle NAME wins if both are set. TTY prints a table; pipes stay JSON.
-  peer register [--name NAME] [--backend pi|claude-code|codex] [--path PATH]
+  peer register [--name NAME] [--backend pi|claude-code|codex|opencode] [--path PATH]
                 [--peer-id ID] [--circle CIRCLE]
   peer whoami [--peer-id ID]         Defaults to AMESH_PEER_ID
   peer asks [--peer-id ID]
@@ -1371,6 +1372,26 @@ fn pi_agent_dir(args: &Args, root: &Path) -> PathBuf {
     }
 }
 
+fn opencode_dir(args: &Args, root: &Path) -> Result<PathBuf> {
+    if args.flags.contains_key("home") {
+        return Ok(root.join(".config/opencode"));
+    }
+    for key in ["OPENCODE_CONFIG_DIR", "XDG_CONFIG_HOME"] {
+        if let Some(value) = std::env::var_os(key).filter(|value| !value.is_empty()) {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(format!("{key} must be an absolute path").into());
+            }
+            return Ok(if key == "XDG_CONFIG_HOME" {
+                path.join("opencode")
+            } else {
+                path
+            });
+        }
+    }
+    Ok(root.join(".config/opencode"))
+}
+
 fn available(binary: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|path| path.join(binary).is_file()))
@@ -1399,10 +1420,20 @@ fn doctor(args: &Args) -> Result<Value> {
         ),
         ("claude-code", "claude", root.join(".claude/settings.json")),
         ("codex", "codex", root.join(".codex/hooks.json")),
+        (
+            "opencode",
+            "opencode",
+            opencode_dir(args, &root)?.join("plugins/amesh/server.js"),
+        ),
     ] {
         let installed = fs::read_to_string(&path).is_ok_and(|text| {
             if backend == "pi" {
                 return text.contains(AMESH_PI_HOOK_MARK);
+            }
+            if backend == "opencode" {
+                return text.starts_with(AMESH_OPENCODE_HOOK_MARK)
+                    && fs::read_to_string(path.with_file_name("tui.js"))
+                        .is_ok_and(|source| source.starts_with(AMESH_OPENCODE_HOOK_MARK));
             }
             serde_json::from_str::<Value>(&text).is_ok_and(|config| {
                 ["SessionStart", "UserPromptSubmit", "Stop"]
@@ -1426,6 +1457,46 @@ fn doctor(args: &Args) -> Result<Value> {
             runtime["mcp_installed"] = json!(mcp);
         } else if backend == "claude-code" {
             runtime["mcp_installed"] = json!(claude_mcp_installed(&root));
+        }
+        if backend == "opencode" {
+            runtime["path"] = json!(path);
+            runtime["version"] = (move || -> io::Result<std::process::Output> {
+                let mut child = Command::new("opencode")
+                    .arg("--version")
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null())
+                    .spawn()?;
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    if child.try_wait()?.is_some() {
+                        return child.wait_with_output();
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "opencode version timed out",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| json!(String::from_utf8_lossy(&output.stdout).trim()))
+            .unwrap_or(Value::Null);
+            let peers: Vec<Value> = output["peers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|peer| peer["backend"] == "opencode")
+                .cloned()
+                .collect();
+            runtime["registered_peers"] = json!(peers);
+            runtime["loaded"] =
+                json!("unverified: registration alone does not prove current plugin loading");
+            runtime["delivery"] = json!("unverified: perform a bidirectional ask/ack");
         }
         output["runtimes"][backend] = runtime;
     }
@@ -1712,13 +1783,63 @@ fn setup(args: &Args) -> Result<()> {
         }
     }
     let runtimes: &[&str] = match args.pos.first().map(String::as_str) {
-        None => &["pi", "claude-code", "codex"],
+        None => &["pi", "claude-code", "codex", "opencode"],
         Some("pi") => &["pi"],
         Some("claude-code") => &["claude-code"],
         Some("codex") => &["codex"],
-        _ => return Err("setup supports pi, claude-code and codex".into()),
+        Some("opencode") => &["opencode"],
+        _ => return Err("setup supports pi, claude-code, codex and opencode".into()),
     };
+    if args
+        .pos
+        .first()
+        .is_some_and(|runtime| runtime == "opencode")
+        && args.flags.contains_key("peer-id")
+    {
+        return Err(
+            "OpenCode does not support --peer-id; select another runtime explicitly".into(),
+        );
+    }
     let root = home(args)?;
+    let opencode_paths = if runtimes.contains(&"opencode") {
+        let directory = opencode_dir(args, &root)?.join("plugins");
+        let plugin_directory = directory.join("amesh");
+        match fs::symlink_metadata(&plugin_directory) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_dir() {
+                    return Err(
+                        format!("{}: ownership mismatch", plugin_directory.display()).into(),
+                    );
+                }
+                for entry in fs::read_dir(&plugin_directory)? {
+                    let entry = entry?;
+                    if !entry.file_type()?.is_file()
+                        || !matches!(entry.file_name().to_str(), Some("server.js" | "tui.js"))
+                    {
+                        return Err(
+                            format!("{}: ownership mismatch", entry.path().display()).into()
+                        );
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let paths = [
+            directory.join("amesh.js"),
+            directory.join("amesh/server.js"),
+            directory.join("amesh/tui.js"),
+        ];
+        for path in &paths {
+            let text = read_optional(path)?;
+            if path.exists() && !text.starts_with(AMESH_OPENCODE_HOOK_MARK) {
+                return Err(format!("{}: ownership mismatch", path.display()).into());
+            }
+        }
+        Some(paths)
+    } else {
+        None
+    };
     let executable = std::env::current_exe()?.to_string_lossy().into_owned();
     if executable.contains("/target/debug/") || executable.contains("/target/release/") {
         eprintln!(
@@ -1736,6 +1857,29 @@ fn setup(args: &Args) -> Result<()> {
             let pi_dir = pi_agent_dir(args, &root);
             write_atomic(&pi_dir.join("extensions/amesh.ts"), script.as_bytes())?;
             disable_pi_mcp(&root, &pi_dir)?;
+        } else if *backend == "opencode" {
+            if args.flags.contains_key("peer-id") {
+                eprintln!("opencode names peers per session; --peer-id not applied");
+            }
+            let script = include_str!("opencode_hook.js")
+                .replace("__AMESH_EXECUTABLE__", &serde_json::to_string(&executable)?)
+                .replace(
+                    "__AMESH_BIND__",
+                    &serde_json::to_string(
+                        &std::env::var("AMESH_BIND").unwrap_or_else(|_| "127.0.0.1:8378".into()),
+                    )?,
+                )
+                .replace(
+                    "__AMESH_CATALOG__",
+                    &serde_json::to_string(&crate::hub::mcp_tools())?,
+                );
+            let paths = opencode_paths.as_ref().unwrap();
+            write_atomic(&paths[1], script.as_bytes())?;
+            write_atomic(&paths[2], include_str!("opencode_tui.js").as_bytes())?;
+            if paths[0].exists() {
+                fs::remove_file(&paths[0])?;
+            }
+            println!("OpenCode: run opencode reload to load the plugin; reload rebuilds all locations and may interrupt active work");
         } else {
             install_hooks(
                 &root,
@@ -1751,7 +1895,14 @@ fn setup(args: &Args) -> Result<()> {
                 args.flags.get("peer-id").map(String::as_str),
             )?;
         }
-        println!("installed {backend} hooks under {}", root.display());
+        if *backend == "opencode" {
+            println!(
+                "installed opencode plugin at {}",
+                opencode_paths.as_ref().unwrap()[1].display()
+            );
+        } else {
+            println!("installed {backend} hooks under {}", root.display());
+        }
     }
     Ok(())
 }
@@ -2094,10 +2245,11 @@ fn uninstall(args: &Args) -> Result<Value> {
     args.count(0, 1)?;
     let apply = args.get("apply", "false") == "true";
     let runtimes: &[&str] = match args.pos.first().map(String::as_str) {
-        None => &["pi", "claude-code", "codex"],
+        None => &["pi", "claude-code", "codex", "opencode"],
         Some("pi") => &["pi"],
         Some("claude-code") => &["claude-code"],
         Some("codex") => &["codex"],
+        Some("opencode") => &["opencode"],
         Some(other) => return Err(format!("unknown runtime {other}").into()),
     };
     let root = home(args)?;
@@ -2106,6 +2258,24 @@ fn uninstall(args: &Args) -> Result<Value> {
     let mut writes: Vec<(PathBuf, Vec<u8>)> = Vec::new();
     let mut deletes: Vec<PathBuf> = Vec::new();
 
+    if runtimes.contains(&"opencode") {
+        let directory = opencode_dir(args, &root)?.join("plugins");
+        for path in [
+            directory.join("amesh.js"),
+            directory.join("amesh/server.js"),
+            directory.join("amesh/tui.js"),
+        ] {
+            match fs::read_to_string(&path) {
+                Ok(text) if text.starts_with(AMESH_OPENCODE_HOOK_MARK) => {
+                    would_remove.push(json!({"path": path, "kind": "file"}));
+                    deletes.push(path);
+                }
+                Ok(_) => skipped.push(json!({"path": path, "reason": "ownership mismatch"})),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("{}: {error}", path.display()).into()),
+            }
+        }
+    }
     if runtimes.contains(&"pi") {
         let path = pi_agent_dir(args, &root).join("extensions/amesh.ts");
         match fs::read_to_string(&path) {
@@ -2230,6 +2400,18 @@ fn uninstall(args: &Args) -> Result<Value> {
         }
         for path in &deletes {
             fs::remove_file(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        }
+        if runtimes.contains(&"opencode") {
+            let directory = opencode_dir(args, &root)?.join("plugins/amesh");
+            match fs::remove_dir(&directory) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => return Err(format!("{}: {error}", directory.display()).into()),
+            }
         }
     }
 
@@ -3462,13 +3644,33 @@ fn hook(raw: &[String]) -> Result<()> {
         Some("tool" | "PostToolUse") => "PostToolUse",
         Some("idle") => "Idle",
         Some("work") => "Work",
+        Some("wait") => "Wait",
         _ => return Err("unknown hook event".into()),
     };
     let args = Args::parse(&raw[1..], &["backend", "peer-id"])?;
     args.count(0, 0)?;
     let backend = args.get("backend", "claude-code");
-    if !["pi", "claude-code", "codex"].contains(&backend.as_str()) {
+    if !["pi", "claude-code", "codex", "opencode"].contains(&backend.as_str()) {
         return Err("unsupported hook backend".into());
+    }
+    if backend == "opencode" && matches!(event, "Idle" | "Work" | "Wait") {
+        let payload: Value = serde_json::from_reader(io::stdin().take(1024 * 1024))?;
+        let session = payload["session_id"]
+            .as_str()
+            .filter(|id| id.starts_with("opencode:"))
+            .ok_or("OpenCode activity requires namespaced session_id")?;
+        request(
+            "POST",
+            "/activity",
+            Some(json!({
+                "session_id": session, "state": event.to_ascii_lowercase(), "source": "opencode-event",
+                "reason": payload["reason"], "check": payload["check"].as_bool().unwrap_or(false)
+            })),
+        )?;
+        return Ok(());
+    }
+    if event == "Wait" {
+        return Err("wait hook requires opencode backend".into());
     }
     /* a tool finishing (Claude) or the agent settling (pi) only reports activity: no
     registration, no daemon start, nothing printed but what pi parses. A tool's output can be
@@ -3546,10 +3748,9 @@ fn hook(raw: &[String]) -> Result<()> {
     /* every event registers the session, so any of them can move the name */
     if let Some(id) = claimed_peer_id(&args).filter(|id| claude && crate::hub::valid_peer_id(id)) {
         if !retire_foreign_claude_drainer(&id) {
-            return Err(format!(
-                "cannot confirm the previous Claude drainer for {id} has exited"
-            )
-            .into());
+            return Err(
+                format!("cannot confirm the previous Claude drainer for {id} has exited").into(),
+            );
         }
     }
     let registered = request("POST", "/peers", Some(body))?;
@@ -3561,6 +3762,13 @@ fn hook(raw: &[String]) -> Result<()> {
         .as_str()
         .map(str::to_string)
         .unwrap_or(circle);
+    if backend == "opencode" {
+        println!(
+            "{}",
+            json!({"peer_id": peer_id, "circle": circle, "context": mesh_primer(&peer_id, &backend, &circle)})
+        );
+        return Ok(());
+    }
     if claude && (event == "SessionStart" || event == "UserPromptSubmit") {
         ensure_peer_ws(&peer_id, &backend);
     }

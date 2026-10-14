@@ -17,6 +17,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `POST /peers` registers (alias `POST /peer/register`):
   - `peer_id`, `name` and `circle` must be 1-128 characters of `[A-Za-z0-9._-]`; anything else is 400
   - an omitted `name` keeps the stored one, else defaults to `peer_id`
+  - supported backends are `pi`, `codex`, `claude-code` (alias `claude`) and `opencode`
 - `GET /peers` probes sockets, then drops peers with no live WebSocket and `last_seen` older than 30s (`PEER_ONLINE_SECS`), and may persist.
 
 ## Ask
