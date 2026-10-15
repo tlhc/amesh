@@ -101,9 +101,21 @@ A **circle** is one git repo: `project-` plus a short hash of the git common dir
 
 The CLI mirrors this under `amesh peer`, `amesh jobs`, and `amesh schedule`; `amesh --help` lists the flags.
 
+- Use `amesh_notify_peer` when no reply is needed.
+- Use `amesh_ask` for questions, clarifications, decisions, or status.
+- Use `amesh_ask_many` for the same question to several peers.
+- Delegate work with its own acceptance criteria through `amesh_job_create` with `assigned_peer`, including a frozen-input review, implementation, test run, or research report, even for one worker with no dependencies.
+- Fan out same-circle work as one job per peer; use `ask_many` for questions.
+- A doubt about an existing result is a question.
+- Add `depends_on` only for real prerequisites.
+- Questions and notifications to another circle need `cross_circle=true`.
+- Jobs stay within one circle; cross-circle work uses `amesh_ask` or `amesh_ask_many` with `cross_circle=true`, with completion tracked by the coordinator.
+
 ## Jobs
 
 The hub dispatches a job to `assigned_peer` as a tracked ask once all its `depends_on` jobs are `done`. The worker's `amesh_ack` completes it; `failed=true` marks it failed. A failed or cancelled dependency leaves downstream jobs `queued`; retry with `amesh_job_update` and `state=queued`. `amesh jobs update ID --coordinator PEER` hands a job's later acks, reminders and dispatch to another peer.
+
+Send progress and extra context with notify. To change scope, acceptance or assignee, the coordinator updates the job with `state=queued` and the new `prompt` or `assigned_peer`; this closes the old ask and dispatches a new one. When requeuing a running job, the old ask's synthetic failed ACK closes the previous attempt; track the replacement `ask_id` or the job's current state for the new attempt's result. Workers leave requeue decisions to the coordinator. A new independent deliverable gets a new job. Workers ack the dispatched ask, including jobs they created and assigned to themselves, and the hub settles the job. Collect results from the pushed ack or job status; creation can return `ask_id=null` until dispatch, so use `amesh_wait` only after job status provides an ask ID.
 
 ```bash
 amesh jobs create audit --prompt "list stale docs" --assigned-peer amesh-codex --from-peer amesh-claude-code
