@@ -3189,7 +3189,7 @@ async fn ownership_expiry_notifies_the_connected_asker_after_commit() {
         hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
         persist(&mut hub).unwrap();
         hub.db.execute_batch(
-            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            "CREATE TEMP TRIGGER fail_write BEFORE UPDATE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
         ).unwrap();
         rx
     };
@@ -3257,7 +3257,7 @@ async fn ownership_expiry_sends_ack_from_the_schedule_tick() {
         hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
         persist(&mut hub).unwrap();
         hub.db.execute_batch(
-            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            "CREATE TEMP TRIGGER fail_write BEFORE UPDATE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
         ).unwrap();
         (rx, PathBuf::from(hub.db.path().unwrap()))
     };
@@ -3317,7 +3317,7 @@ async fn ownership_expiry_write_failure_does_not_release_an_open_ask() {
         hub.owed.get_mut("tmp-codex").unwrap().since = now_unix() - OWED_TTL_SECS - 1;
         persist(&mut hub).unwrap();
         hub.db.execute_batch(
-            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            "CREATE TEMP TRIGGER fail_write BEFORE UPDATE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
         ).unwrap();
         hub.asks.keys().next().unwrap().clone()
     };
@@ -3435,7 +3435,7 @@ async fn ownership_replacement_notifies_the_connected_asker_after_commit() {
         let rx = recv_peer(&mut hub, "boss");
         persist(&mut hub).unwrap();
         hub.db.execute_batch(
-            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            "CREATE TEMP TRIGGER fail_write BEFORE INSERT ON peers WHEN NEW.peer_id = 'tmp-codex' BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
         ).unwrap();
         rx
     };
@@ -3604,7 +3604,7 @@ async fn ownership_session_change_closes_asks_even_when_the_pin_is_connected() {
         assert!(hub.asks.values().next().unwrap().open);
         assert!(rx.try_recv().is_err());
         hub.db.execute_batch(
-            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            "CREATE TEMP TRIGGER fail_write BEFORE UPDATE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
         ).unwrap();
     }
     claim["session_id"] = json!("B");
@@ -3762,7 +3762,7 @@ async fn ownership_first_session_binding_keeps_queued_asks() {
         let mut hub = hub.lock().await;
         persist(&mut hub).unwrap();
         hub.db.execute_batch(
-            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            "CREATE TEMP TRIGGER fail_write BEFORE UPDATE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
         ).unwrap();
     }
     let (status, _) = json_req(app.clone(), "POST", "/peers", claim.clone()).await;
@@ -3829,7 +3829,7 @@ fn ownership_rollback_keeps_the_live_receivers_unacknowledged_queue() {
     persist(&mut hub).unwrap();
     hub.recv_known.insert("w".into());
     hub.db.execute_batch(
-        "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        "CREATE TEMP TRIGGER fail_write BEFORE INSERT ON recv_peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
     ).unwrap();
     assert!(persist_ok(&mut hub).is_err());
     hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
@@ -3855,7 +3855,7 @@ async fn ownership_rollback_keeps_an_unproven_rows_reservation() {
         let hub = hub.lock().await;
         assert_eq!(hub.owed["tmp-codex"].owner, "A");
         hub.db.execute_batch(
-            "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+            "CREATE TEMP TRIGGER fail_write BEFORE INSERT ON recv_peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
         ).unwrap();
     }
     let (status, _) = json_req(
@@ -6097,7 +6097,7 @@ async fn a_write_that_fails_leaves_no_event_in_the_ring() {
         register(app.clone(), id, "pi", "c").await;
     }
     hub.lock().await.db.execute_batch(
-        "CREATE TEMP TRIGGER fail_write BEFORE DELETE ON peers BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
+        "CREATE TEMP TRIGGER fail_write BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;",
     ).unwrap();
     let notify = json!({"from_peer": "a", "to_peer": "b", "message": "ghost-check"});
     let (status, _) = json_req(app.clone(), "POST", "/notify", notify.clone()).await;

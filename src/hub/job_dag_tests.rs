@@ -3047,7 +3047,7 @@ async fn ask_many_names_the_asks_it_opened_before_a_later_one_failed() {
         .lock()
         .await
         .db
-        .execute_batch("CREATE TEMP TRIGGER fail_write BEFORE DELETE ON asks BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;")
+        .execute_batch("CREATE TEMP TRIGGER fail_write BEFORE INSERT ON asks WHEN NEW.to_peer = 'w2' BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;")
         .unwrap();
     let (status, body) = f
         .request(

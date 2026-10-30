@@ -399,9 +399,8 @@ fn open_db(path: &Path, now: u64) -> Result<Connection, String> {
     let db = Connection::open(path).map_err(|e| e.to_string())?;
     db.busy_timeout(Duration::from_millis(5000))
         .map_err(|e| e.to_string())?;
-    /* every change rewrites the whole state, so auto_vacuum's page map would slow every
-    write; a VACUUM gives space back instead, here and after a sweep deletes rows. The log is
-    cut back to WAL_LIMIT whenever it resets */
+    /* VACUUM reclaims space at startup and after a sweep deletes rows.
+    The log is cut back to WAL_LIMIT whenever it resets. */
     let mode = auto_vacuum(&db);
     db.pragma_update(None, "journal_mode", "WAL")
         .map_err(|e| e.to_string())?;
@@ -495,28 +494,83 @@ fn cut_back_log(db: &Connection) -> Result<(), String> {
 
 fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
     let tx = db.transaction().map_err(|e| e.to_string())?;
-    tx.execute_batch(
-        "DELETE FROM peers; DELETE FROM asks; DELETE FROM jobs; DELETE FROM schedules; DELETE FROM inbox; DELETE FROM mcp_servers; DELETE FROM recv_peers;",
-    )
-    .map_err(|e| e.to_string())?;
+    /* shortcut: scan current IDs on each save; add dirty tracking if this scan becomes costly. */
+    for (table, key, retained) in [
+        (
+            "peers",
+            "peer_id",
+            disk.peers
+                .values()
+                .map(|p| p.peer_id.as_str())
+                .collect::<HashSet<_>>(),
+        ),
+        (
+            "asks",
+            "correlation_id",
+            disk.asks
+                .values()
+                .map(|a| a.correlation_id.as_str())
+                .collect(),
+        ),
+        (
+            "jobs",
+            "job_id",
+            disk.jobs.values().map(|j| j.job_id.as_str()).collect(),
+        ),
+        (
+            "schedules",
+            "schedule_id",
+            disk.schedules
+                .values()
+                .map(|s| s.schedule_id.as_str())
+                .collect(),
+        ),
+        (
+            "mcp_servers",
+            "peer_id",
+            disk.mcp_servers.keys().map(String::as_str).collect(),
+        ),
+        (
+            "recv_peers",
+            "peer_id",
+            disk.recv_peers.iter().map(String::as_str).collect(),
+        ),
+    ] {
+        let mut select = tx
+            .prepare(&format!("SELECT {key} FROM {table}"))
+            .map_err(|e| e.to_string())?;
+        let keys = select
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        let mut delete = tx
+            .prepare(&format!("DELETE FROM {table} WHERE {key} = ?"))
+            .map_err(|e| e.to_string())?;
+        for id in keys {
+            if !retained.contains(id.as_str()) {
+                delete.execute([id]).map_err(|e| e.to_string())?;
+            }
+        }
+    }
     for p in disk.peers.values() {
-        tx.execute(
-            "INSERT INTO peers(peer_id,name,path,backend,circle,status,description,session_id,last_seen) VALUES (?,?,?,?,?,?,?,?,?)",
-            params![p.peer_id, p.name, p.path, p.backend, p.circle, p.status, p.description, p.session_id, p.last_seen as i64],
+        tx.prepare_cached(
+            "INSERT INTO peers(peer_id,name,path,backend,circle,status,description,session_id,last_seen) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(peer_id) DO UPDATE SET (name,path,backend,circle,status,description,session_id,last_seen) = (excluded.name,excluded.path,excluded.backend,excluded.circle,excluded.status,excluded.description,excluded.session_id,excluded.last_seen) WHERE (name,path,backend,circle,status,description,session_id,last_seen) IS NOT (excluded.name,excluded.path,excluded.backend,excluded.circle,excluded.status,excluded.description,excluded.session_id,excluded.last_seen)",
+        ).map_err(|e| e.to_string())?.execute(params![p.peer_id, p.name, p.path, p.backend, p.circle, p.status, p.description, p.session_id, p.last_seen as i64],
         )
         .map_err(|e| e.to_string())?;
     }
     for a in disk.asks.values() {
-        tx.execute(
-            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64), a.opened_at.map(|v| v as i64), a.closed_by, a.from_circle, a.to_circle],
+        tx.prepare_cached(
+            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(correlation_id) DO UPDATE SET (from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) = (excluded.from_peer,excluded.to_peer,excluded.to_peer_id,excluded.text,excluded.open,excluded.reply,excluded.failed,excluded.closed_at,excluded.opened_at,excluded.closed_by,excluded.from_circle,excluded.to_circle) WHERE (from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) IS NOT (excluded.from_peer,excluded.to_peer,excluded.to_peer_id,excluded.text,excluded.open,excluded.reply,excluded.failed,excluded.closed_at,excluded.opened_at,excluded.closed_by,excluded.from_circle,excluded.to_circle)",
+        ).map_err(|e| e.to_string())?.execute(params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64), a.opened_at.map(|v| v as i64), a.closed_by, a.from_circle, a.to_circle],
         )
         .map_err(|e| e.to_string())?;
     }
     for j in disk.jobs.values() {
-        tx.execute(
-            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            params![
+        tx.prepare_cached(
+            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET (title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) = (excluded.title,excluded.prompt,excluded.path,excluded.backend,excluded.assigned_peer,excluded.state,excluded.result_summary,excluded.circle,excluded.depends_on,excluded.ask_id,excluded.from_peer,excluded.dispatch,excluded.nudge_at,excluded.finished_at,excluded.created_at,excluded.handoff) WHERE (title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) IS NOT (excluded.title,excluded.prompt,excluded.path,excluded.backend,excluded.assigned_peer,excluded.state,excluded.result_summary,excluded.circle,excluded.depends_on,excluded.ask_id,excluded.from_peer,excluded.dispatch,excluded.nudge_at,excluded.finished_at,excluded.created_at,excluded.handoff)",
+        ).map_err(|e| e.to_string())?.execute(params![
                 j.job_id,
                 j.title,
                 j.prompt,
@@ -539,31 +593,80 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     for s in disk.schedules.values() {
-        tx.execute(
-            "INSERT INTO schedules(schedule_id,from_peer,to_peer,text,kind,fire_at,every_seconds,circle) VALUES (?,?,?,?,?,?,?,?)",
-            params![s.schedule_id, s.from_peer, s.to_peer, s.text, s.kind, s.fire_at as i64, s.every_seconds.map(|v| v as i64), s.circle],
+        tx.prepare_cached(
+            "INSERT INTO schedules(schedule_id,from_peer,to_peer,text,kind,fire_at,every_seconds,circle) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(schedule_id) DO UPDATE SET (from_peer,to_peer,text,kind,fire_at,every_seconds,circle) = (excluded.from_peer,excluded.to_peer,excluded.text,excluded.kind,excluded.fire_at,excluded.every_seconds,excluded.circle) WHERE (from_peer,to_peer,text,kind,fire_at,every_seconds,circle) IS NOT (excluded.from_peer,excluded.to_peer,excluded.text,excluded.kind,excluded.fire_at,excluded.every_seconds,excluded.circle)",
+        ).map_err(|e| e.to_string())?.execute(params![s.schedule_id, s.from_peer, s.to_peer, s.text, s.kind, s.fire_at as i64, s.every_seconds.map(|v| v as i64), s.circle],
         )
         .map_err(|e| e.to_string())?;
     }
-    for (peer_id, events) in &disk.inbox {
-        for (seq, record) in events.iter().enumerate() {
-            tx.execute(
-                "INSERT INTO inbox(peer_id,seq,payload,queued_at) VALUES (?,?,?,?)",
-                params![
-                    peer_id,
-                    seq as i64,
-                    record.event().to_string(),
-                    record.queued_at() as i64
-                ],
-            )
+    {
+        let mut select_peers = tx
+            .prepare("SELECT DISTINCT peer_id FROM inbox")
             .map_err(|e| e.to_string())?;
+        let mut peers = select_peers
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<HashSet<_>, _>>()
+            .map_err(|e| e.to_string())?;
+        peers.extend(disk.inbox.keys().cloned());
+        let mut select = tx
+            .prepare("SELECT seq,payload,queued_at FROM inbox WHERE peer_id = ? ORDER BY seq")
+            .map_err(|e| e.to_string())?;
+        let mut delete = tx
+            .prepare("DELETE FROM inbox WHERE peer_id = ? AND seq = ?")
+            .map_err(|e| e.to_string())?;
+        let mut insert = tx
+            .prepare("INSERT INTO inbox(peer_id,seq,payload,queued_at) VALUES (?,?,?,?)")
+            .map_err(|e| e.to_string())?;
+        for peer in peers {
+            let old = select
+                .query_map([&peer], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?;
+            let mut cursor = 0;
+            let mut seq = old.last().map_or(-1, |row| row.0);
+            for record in disk.inbox.get(&peer).into_iter().flatten() {
+                let payload = record.event().to_string();
+                let queued_at = record.queued_at() as i64;
+                let found = old[cursor..]
+                    .iter()
+                    .position(|row| row.1 == payload && row.2 == queued_at)
+                    .map(|offset| cursor + offset);
+                let end = found.unwrap_or(old.len());
+                for row in &old[cursor..end] {
+                    delete
+                        .execute(params![peer, row.0])
+                        .map_err(|e| e.to_string())?;
+                }
+                if let Some(index) = found {
+                    cursor = index + 1;
+                } else {
+                    cursor = old.len();
+                    seq = seq.checked_add(1).ok_or("inbox sequence exhausted")?;
+                    insert
+                        .execute(params![peer, seq, payload, queued_at])
+                        .map_err(|e| e.to_string())?;
+                }
+            }
+            for row in &old[cursor..] {
+                delete
+                    .execute(params![peer, row.0])
+                    .map_err(|e| e.to_string())?;
+            }
         }
     }
     for peer_id in &disk.recv_peers {
         let owed = disk.owed.get(peer_id);
-        tx.execute(
-            "INSERT INTO recv_peers(peer_id,pruned_at,owner) VALUES (?,?,?)",
-            params![
+        tx.prepare_cached(
+            "INSERT INTO recv_peers(peer_id,pruned_at,owner) VALUES (?,?,?) ON CONFLICT(peer_id) DO UPDATE SET (pruned_at,owner) = (excluded.pruned_at,excluded.owner) WHERE (pruned_at,owner) IS NOT (excluded.pruned_at,excluded.owner)",
+        ).map_err(|e| e.to_string())?.execute(params![
                 peer_id,
                 owed.map(|o| o.since as i64).unwrap_or(0),
                 owed.map(|o| o.owner.as_str()).unwrap_or("")
@@ -572,9 +675,9 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     }
     for (peer_id, servers) in &disk.mcp_servers {
-        tx.execute(
-            "INSERT INTO mcp_servers(peer_id,payload) VALUES (?,?)",
-            params![
+        tx.prepare_cached(
+            "INSERT INTO mcp_servers(peer_id,payload) VALUES (?,?) ON CONFLICT(peer_id) DO UPDATE SET (payload) = (excluded.payload) WHERE (payload) IS NOT (excluded.payload)",
+        ).map_err(|e| e.to_string())?.execute(params![
                 peer_id,
                 serde_json::to_string(servers).unwrap_or_else(|_| "[]".into())
             ],
@@ -5565,6 +5668,10 @@ mod job_dag_tests;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "../../tests/support/incremental_persistence.rs"]
+mod incremental_persistence_tests;
 
 #[cfg(test)]
 mod dispatch_tests;
