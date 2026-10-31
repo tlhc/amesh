@@ -2611,7 +2611,8 @@ fn inject_claude_inbox(socket: &str, token: Option<&str>, text: &str) -> io::Res
     {
         use std::os::unix::net::UnixStream;
         let path = socket.strip_prefix("uds:").unwrap_or(socket).to_string();
-        // ponytail: thread+recv_timeout; UnixStream has no connect_timeout on rustc 1.98
+        /* UnixStream has no connect_timeout on rustc 1.98, so the connect runs in a thread
+        bounded by recv_timeout */
         let mut conn = run_with_timeout(Duration::from_secs(2), move || UnixStream::connect(path))?;
         conn.set_read_timeout(Some(Duration::from_secs(2)))?;
         conn.set_write_timeout(Some(Duration::from_secs(2)))?;
@@ -3153,7 +3154,7 @@ fn remember_hook_inbound(accepted: &mut VecDeque<String>, id: Option<&str>) {
         accepted.remove(index);
     }
     accepted.push_back(id.to_string());
-    // ponytail: 256 process-local IDs; eviction and process restart permit replay.
+    /* 256 process-local IDs; an evicted ID, or any ID after a process restart, can be replayed */
     if accepted.len() > 256 {
         accepted.pop_front();
     }
