@@ -1631,6 +1631,7 @@ fn router(app: App) -> Router {
         .route("/activity", post(report_activity))
         .route("/schedules", get(list_schedules).post(create_schedule))
         .route("/schedules/{id}", delete(delete_schedule))
+        .route("/knowledge", get(knowledge_read))
         .route("/knowledge/{action}", post(knowledge_request))
         .route("/mcp", post(mcp))
         .route("/ask-many", post(ask_many))
@@ -4613,6 +4614,28 @@ async fn tick_schedules(app: &App) {
         if let Err((_, Json(err))) = persist_then_deliver(&mut hub, &to, event, queued_at) {
             eprintln!("amesh persist: {err}");
         }
+    }
+}
+
+/* the terminal reads the table without claiming to be a peer: token and circle only */
+#[derive(Deserialize)]
+struct KnowledgeQuery {
+    circle: Option<String>,
+    id: Option<String>,
+}
+
+async fn knowledge_read(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(q): Query<KnowledgeQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let circle = q.circle.as_deref().filter(|name| !name.is_empty());
+    let hub = app.inner.lock().await;
+    let now = now_unix();
+    match q.id.as_deref().filter(|id| !id.is_empty()) {
+        Some(id) => knowledge::monitor_detail(&hub.db, id, circle, now).map(Json),
+        None => knowledge::monitor_list(&hub.db, circle, now).map(Json),
     }
 }
 

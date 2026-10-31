@@ -571,7 +571,7 @@ pub(crate) fn stamp(t: Option<u64>) -> String {
 }
 
 #[cfg(not(test))]
-fn utc_offset(t: u64) -> i64 {
+pub(crate) fn utc_offset(t: u64) -> i64 {
     let time = t as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {
@@ -581,7 +581,7 @@ fn utc_offset(t: u64) -> i64 {
 }
 
 #[cfg(test)]
-fn utc_offset(_: u64) -> i64 {
+pub(crate) fn utc_offset(_: u64) -> i64 {
     0
 }
 

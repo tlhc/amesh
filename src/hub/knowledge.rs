@@ -39,6 +39,8 @@ const TTL_MAX: u64 = 30 * 86400;
 /* how long an expired or revoked entry stays readable by id before purge deletes it */
 const KEEP_SECS: u64 = 7 * 86400;
 const SEARCH_LIMIT: u64 = 5;
+/* the terminal page: one screenful, and the total says what the rest is */
+pub(super) const KNOWLEDGE_PAGE: u64 = 50;
 const QUERY_BYTES: usize = 256;
 const QUERY_TERMS: usize = 8;
 const EXCERPT_CHARS: usize = 300;
@@ -269,13 +271,7 @@ fn load(db: &Connection, id: &str, circle: &str, now: u64) -> Result<Value, Fail
 fn entry(row: &Row, now: u64) -> rusqlite::Result<Value> {
     let expires_at: i64 = row.get(9)?;
     let revoked_at: Option<i64> = row.get(10)?;
-    let status = if revoked_at.is_some() {
-        "revoked"
-    } else if expires_at <= secs(now) {
-        "expired"
-    } else {
-        "active"
-    };
+    let status = status(revoked_at, expires_at, now);
     Ok(json!({
         "id": row.get::<_, String>(0)?,
         "circle": row.get::<_, String>(1)?,
@@ -293,6 +289,77 @@ fn entry(row: &Row, now: u64) -> rusqlite::Result<Value> {
         "revoked_by_session": row.get::<_, Option<String>>(13)?,
         "status": status,
     }))
+}
+
+/* a row's state from its two timestamps; the operator list and every card use this one rule */
+fn status(revoked_at: Option<i64>, expires_at: i64, now: u64) -> &'static str {
+    if revoked_at.is_some() {
+        "revoked"
+    } else if expires_at <= secs(now) {
+        "expired"
+    } else {
+        "active"
+    }
+}
+
+/* the operator's reads: token and circle only, no peer identity, so a terminal can show the
+table without claiming to be a peer. Active rows come first and history follows, each newest
+first, and the limit is applied after that order so history never crowds out a live row */
+pub(super) fn monitor_list(
+    db: &Connection,
+    circle: Option<&str>,
+    now: u64,
+) -> Result<Value, Failure> {
+    let total: i64 = db
+        .query_row(
+            "SELECT count(*) FROM knowledge WHERE (?1 IS NULL OR circle = ?1)",
+            params![circle],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    let mut statement = db
+        .prepare(
+            "SELECT id,circle,title,created_at,expires_at,revoked_at FROM knowledge
+             WHERE (?1 IS NULL OR circle = ?1)
+             ORDER BY (revoked_at IS NOT NULL OR expires_at <= ?2), created_at DESC, id ASC
+             LIMIT ?3",
+        )
+        .map_err(internal)?;
+    let items = statement
+        .query_map(params![circle, secs(now), KNOWLEDGE_PAGE as i64], |row| {
+            let expires_at: i64 = row.get(4)?;
+            let revoked_at: Option<i64> = row.get(5)?;
+            Ok(json!({
+                "id": row.get::<_, String>(0)?,
+                "circle": row.get::<_, String>(1)?,
+                "title": row.get::<_, String>(2)?,
+                "created_at": row.get::<_, i64>(3)?,
+                "expires_at": expires_at,
+                "revoked_at": revoked_at,
+                "status": status(revoked_at, expires_at, now),
+            }))
+        })
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)?;
+    Ok(json!({"captured_at": now, "total": total, "items": items}))
+}
+
+/* the selected row's full text, with the same circle scoping as the list */
+pub(super) fn monitor_detail(
+    db: &Connection,
+    id: &str,
+    circle: Option<&str>,
+    now: u64,
+) -> Result<Value, Failure> {
+    db.query_row(
+        &format!("SELECT {COLUMNS} FROM knowledge WHERE id = ?1 AND (?2 IS NULL OR circle = ?2)"),
+        params![id, circle],
+        |row| entry(row, now),
+    )
+    .optional()
+    .map_err(internal)?
+    .ok_or_else(not_found)
 }
 
 /* a derived struct also deserializes from an array, filling fields by position */

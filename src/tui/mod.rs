@@ -1,6 +1,7 @@
 mod asks;
 mod feed;
 mod input;
+mod knowledge;
 mod layout;
 mod model;
 #[cfg(test)]
@@ -8,7 +9,7 @@ mod tests;
 mod theme;
 
 use input::{Act, Input, Mode, HINT_KEYS};
-use layout::{Cell, Fit, Grid, Tone, View, SPACER};
+use layout::{Cell, Fit, Grid, Row, Tone, View, SPACER};
 use model::{Chain, Numbers, Snapshot};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::style::{Color, Modifier, Style};
@@ -83,6 +84,15 @@ pub(crate) struct App {
     home_sel: Option<Pick>,
     home_rows: Vec<Pick>,
     home_job: Option<String>,
+    /* the knowledge screen: the fetched page, its own error, the list selection and order,
+    and the detail the card holds */
+    knowledge: bool,
+    kn: Option<knowledge::Page>,
+    kn_error: Option<String>,
+    kn_sel: Option<String>,
+    kn_order: Vec<String>,
+    kn_detail: Option<knowledge::Detail>,
+    kn_detail_stale: bool,
 }
 
 /* what HOME's selection is on: an ask, a chain by its block's first job, or an event by its hub
@@ -116,7 +126,7 @@ impl Block {
 
 impl App {
     fn copy_command(&mut self, index: usize, tmux: bool, out: &mut impl std::io::Write) {
-        if self.events {
+        if self.events || self.knowledge {
             return;
         }
         let snap = self.snap.as_ref();
@@ -187,6 +197,13 @@ impl App {
             home_sel: None,
             home_rows: Vec::new(),
             home_job: None,
+            knowledge: false,
+            kn: None,
+            kn_error: None,
+            kn_sel: None,
+            kn_order: Vec::new(),
+            kn_detail: None,
+            kn_detail_stale: false,
         }
     }
 
@@ -268,6 +285,58 @@ impl App {
         }
     }
 
+    /* a page answers only while the screen is open; a changed order retires a pending jump */
+    pub fn take_knowledge(&mut self, got: std::result::Result<knowledge::Page, String>) {
+        if !self.knowledge {
+            return;
+        }
+        let page = match got {
+            Ok(page) => page,
+            Err(error) => {
+                self.kn_error = Some(error);
+                return;
+            }
+        };
+        let order: Vec<String> = page.items.iter().map(|item| item.id.clone()).collect();
+        if order != self.kn_order && matches!(self.input.mode, Mode::Jump(_)) {
+            self.input.mode = Mode::Normal;
+        }
+        let first = page.items.first().map(|item| item.id.clone());
+        self.kn_order = order;
+        self.kn = Some(page);
+        self.kn_error = None;
+        /* the first page selects a row */
+        if self.kn_sel.is_none() {
+            self.kn_sel = first;
+        }
+    }
+
+    /* a 404 after leaving the page must not close another page's card */
+    pub fn take_knowledge_detail(
+        &mut self,
+        id: &str,
+        got: std::result::Result<Option<knowledge::Detail>, String>,
+    ) {
+        if !self.knowledge || self.kn_sel.as_deref() != Some(id) {
+            return;
+        }
+        match got {
+            Ok(Some(detail)) => {
+                self.kn_detail = Some(detail);
+                self.kn_detail_stale = false;
+            }
+            Ok(None) => {
+                self.kn_detail = None;
+                self.kn_detail_stale = false;
+                if self.full {
+                    self.full = false;
+                    self.scroll = 0;
+                }
+            }
+            Err(_) => self.kn_detail_stale = true,
+        }
+    }
+
     fn blocks(&mut self) -> Vec<Block> {
         let Some(snap) = &self.snap else {
             return Vec::new();
@@ -331,6 +400,9 @@ impl App {
         if self.asks {
             return self.ask_key(code);
         }
+        if self.knowledge {
+            return self.knowledge_key(code);
+        }
         let blocks = self.blocks();
         /* digits typed against numbers that have since changed would land on another job */
         if matches!(self.input.mode, Mode::Jump(_)) && self.numbers.renumbered != self.typed_at {
@@ -345,6 +417,7 @@ impl App {
                 Act::Jobs | Act::Card(false) => self.go_home(),
                 Act::Asks => self.flip(),
                 Act::Events => self.open_events(),
+                Act::Knowledge => self.open_knowledge(),
                 _ => {}
             }
             return act;
@@ -391,6 +464,7 @@ impl App {
             Act::Jobs => self.go_home(),
             Act::Asks => self.flip(),
             Act::Events => self.open_events(),
+            Act::Knowledge => self.open_knowledge(),
             Act::Timeline => self.timeline = !self.timeline,
             Act::Find(d) => {
                 let query = self.input.query.to_lowercase();
@@ -437,6 +511,88 @@ impl App {
         }
     }
 
+    /* the knowledge screen's keys: the list selection, the card, and the same letters the
+    other screens use for each other */
+    fn knowledge_key(&mut self, code: KeyCode) -> Act {
+        let count = self.kn_order.len();
+        let act = self.input.key(code, count);
+        /* the page carries no letter hints */
+        if matches!(self.input.mode, Mode::Hint) {
+            self.input.mode = Mode::Normal;
+        }
+        let at = self
+            .kn_sel
+            .as_ref()
+            .and_then(|id| self.kn_order.iter().position(|x| x == id))
+            .unwrap_or(0);
+        let before = self.kn_sel.clone();
+        match act {
+            Act::Knowledge => self.go_home(),
+            Act::Jobs => {
+                self.knowledge = false;
+                self.full = false;
+                self.scroll = 0;
+            }
+            Act::Asks => {
+                self.knowledge = false;
+                self.flip();
+            }
+            Act::Events => {
+                self.knowledge = false;
+                self.open_events();
+            }
+            Act::Move(d) if self.full => {
+                self.scroll = self.scroll.saturating_add_signed(d as isize);
+            }
+            Act::Page(d) if self.full => {
+                self.scroll = self
+                    .scroll
+                    .saturating_add_signed(d as isize * self.page as isize);
+            }
+            Act::Edge(d) if self.full => self.scroll = if d < 0 { 0 } else { usize::MAX },
+            Act::Card(false) if !self.full => self.go_home(),
+            Act::Card(true) if count == 0 => {}
+            Act::Card(open) => {
+                self.full = open;
+                self.scroll = 0;
+            }
+            _ if count == 0 => {}
+            Act::Pick(n) => self.kn_sel = self.kn_order.get(n - 1).cloned().or(before.clone()),
+            Act::Move(d) => {
+                let n = count as i32;
+                self.kn_sel = Some(self.kn_order[(at as i32 + d).rem_euclid(n) as usize].clone());
+            }
+            Act::Find(d) => {
+                let query = self.input.query.to_lowercase();
+                let hit = |id: &String| {
+                    id.to_lowercase().contains(&query)
+                        || self.kn.as_ref().is_some_and(|page| {
+                            page.items.iter().any(|item| {
+                                &item.id == id && item.title.to_lowercase().contains(&query)
+                            })
+                        })
+                };
+                let n = count as i32;
+                let (start, step) = if d == 0 {
+                    (at as i32, 1)
+                } else {
+                    (at as i32 + d, d.signum())
+                };
+                if let Some(id) = (0..n)
+                    .map(|k| &self.kn_order[(start + k * step).rem_euclid(n) as usize])
+                    .find(|id| hit(id))
+                {
+                    self.kn_sel = Some(id.clone());
+                }
+            }
+            _ => {}
+        }
+        if self.kn_sel != before {
+            self.scroll = 0;
+        }
+        act
+    }
+
     fn ask_key(&mut self, code: KeyCode) -> Act {
         let order: Vec<String> = self.snap.as_ref().map_or(Vec::new(), |snap| {
             asks::order(snap)
@@ -466,6 +622,7 @@ impl App {
             Act::Asks => self.go_home(),
             Act::Jobs => self.flip(),
             Act::Events => self.open_events(),
+            Act::Knowledge => self.open_knowledge(),
             Act::Move(d) if self.full => {
                 self.scroll = self.scroll.saturating_add_signed(d as isize);
             }
@@ -524,11 +681,22 @@ impl App {
         act
     }
 
+    /* the knowledge page from any screen; its own key toggles back to HOME */
+    fn open_knowledge(&mut self) {
+        self.home = false;
+        self.asks = false;
+        self.events = false;
+        self.knowledge = true;
+        self.full = false;
+        self.scroll = 0;
+    }
+
     /* HOME from any screen: a full card closes and no screen stays up under it */
     fn go_home(&mut self) {
         self.home = true;
         self.asks = false;
         self.events = false;
+        self.knowledge = false;
         self.full = false;
         self.scroll = 0;
     }
@@ -604,6 +772,7 @@ impl App {
                     self.ev_sel = Some(key);
                 }
             }
+            Act::Knowledge => self.open_knowledge(),
             _ => {}
         }
         if act == Act::Card(true) && !self.home {
@@ -635,6 +804,7 @@ impl App {
         let before = self.ev_sel;
         match act {
             Act::Events => self.go_home(),
+            Act::Knowledge => self.open_knowledge(),
             Act::Jobs => {
                 self.events = false;
                 self.asks = false;
@@ -697,7 +867,7 @@ impl App {
         let blocks = self.blocks();
         /* settling picks a job and starts its card at the top; the asks screen keeps its own
         place in the card it shows */
-        let settled = if self.asks || self.events || self.home {
+        let settled = if self.asks || self.events || self.home || self.knowledge {
             None
         } else {
             self.settle(&blocks)
@@ -734,6 +904,9 @@ impl App {
         }
         if self.asks {
             return self.asks_screen(g, peer_rows, cols, rows, tick);
+        }
+        if self.knowledge {
+            return self.knowledge_screen(g, peer_rows, cols, rows);
         }
         let Some((b, _)) = settled else {
             let stale;
@@ -1043,6 +1216,154 @@ impl App {
             );
         } else {
             g.blit(card, 0..card_h, top + view_h);
+        }
+    }
+
+    /* the knowledge page: the read-only list and the selected row's record; active rows come
+    first and history after, and the line under the rule says what the page left out */
+    fn knowledge_screen(
+        &mut self,
+        mut g: Grid,
+        peer_rows: usize,
+        cols: usize,
+        rows: usize,
+    ) -> Vec<Line<'static>> {
+        let scope = self.opts.circle.as_deref().unwrap_or("all circles");
+        g.put(
+            peer_rows,
+            0,
+            &layout::fit(&format!("knowledge · {scope}"), cols),
+            Tone::Plain,
+        );
+        g.put(peer_rows + 1, 0, &"─".repeat(cols), Tone::Line);
+        let note = self.knowledge_problem().or_else(|| {
+            let page = self.kn.as_ref()?;
+            knowledge::notice(page.items.len(), page.total, cols).map(|text| (text, Tone::Dim))
+        });
+        self.under_rule(&mut g, peer_rows + 2, cols, note);
+        let top = peer_rows + 3;
+        let avail = rows - 1 - top;
+        let footer = match (&self.input.mode, self.full) {
+            (Mode::Jump(buf), _) => {
+                let c = self.input.candidates(self.kn_order.len());
+                format!(
+                    "jump {buf}_ → {}  enter · esc",
+                    c.iter().map(usize::to_string).collect::<Vec<_>>().join(" ")
+                )
+            }
+            (Mode::Search(q), _) => format!("/{q}_"),
+            (_, true) if cols >= 96 => "j/k ↑↓ scroll  space/b page  g/G top/end  esc back".into(),
+            (_, true) => "j/k scroll  space/b page  esc back".into(),
+            _ if cols >= 96 => "j/k ↑↓ move  / find  enter card  esc back  i home  c jobs".into(),
+            _ => "j/k move  enter card  i home  c jobs".into(),
+        };
+        g.put(rows - 1, 0, &layout::fit(&footer, cols), Tone::Dim);
+        let Some(page) = self.kn.clone() else {
+            let text = match &self.kn_error {
+                Some(error) => format!("! knowledge: {error}"),
+                None => "waiting for the hub".to_string(),
+            };
+            for (r, line) in layout::wrap(&text, cols).iter().enumerate() {
+                g.put(top + r, 0, line, Tone::Warn);
+            }
+            if self.kn_error.is_some() {
+                for (r, line) in layout::wrap("i: back", cols).iter().enumerate() {
+                    g.put(top + 1 + r, 0, line, Tone::Dim);
+                }
+            }
+            return self.lines(&g, cols, rows);
+        };
+        if page.items.is_empty() && !self.full {
+            g.put(
+                top,
+                0,
+                &layout::fit("no knowledge here yet", cols),
+                Tone::Warn,
+            );
+            let hint = "notes appear when a peer calls amesh_knowledge_publish; i: back";
+            for (r, line) in layout::wrap(hint, cols).iter().enumerate() {
+                g.put(top + 1 + r, 0, line, Tone::Dim);
+            }
+            return self.lines(&g, cols, rows);
+        }
+        /* the selection falls back to the row that is here, as the asks list does, but only
+        while no full card holds it: that card closes on the detail 404, not on a list refresh */
+        let mut at = self
+            .kn_sel
+            .as_ref()
+            .and_then(|id| page.items.iter().position(|item| &item.id == id))
+            .unwrap_or(0);
+        if !self.full && self.kn_sel.as_ref() != page.items.get(at).map(|item| &item.id) {
+            self.kn_sel = page.items.first().map(|item| item.id.clone());
+            at = 0;
+        }
+        let list: Vec<Row> = page
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                knowledge::row(
+                    item,
+                    i + 1,
+                    page.captured_at,
+                    self.opts.circle.is_none(),
+                    cols,
+                )
+            })
+            .collect();
+        let shown_id = self.kn_sel.clone();
+        let card = shown_id
+            .as_ref()
+            .and_then(|id| self.kn_detail.as_ref().filter(|detail| &detail.id == id))
+            .map_or_else(Grid::default, |detail| {
+                knowledge::card(detail, page.captured_at, cols)
+            });
+        let list_h = if self.full { 0 } else { list.len() + 1 };
+        let least = if self.full { 0 } else { card.height().max(1) };
+        let view_h = if list_h + least <= avail {
+            list_h
+        } else {
+            list_h.min(avail.saturating_sub(least).max(avail / 2))
+        };
+        let shown = view_h.min(list.len());
+        let first = at
+            .saturating_sub(shown / 2)
+            .min(list.len().saturating_sub(shown));
+        for (i, row) in list.iter().skip(first).take(shown).enumerate() {
+            let mut c = 0;
+            for (text, tone) in row {
+                c = g.put(top + i, c, text, *tone);
+            }
+        }
+        self.place(&mut g, &card, top, view_h, avail, cols);
+        let mut lines = self.lines(&g, cols, rows);
+        if !self.full && (first..first + shown).contains(&at) {
+            if let Some(line) = lines.get_mut(top + at - first) {
+                for span in &mut line.spans {
+                    span.style = match self.opts.color {
+                        true => span.style.bg(self.opts.theme.select_bg),
+                        false => span.style.add_modifier(Modifier::REVERSED),
+                    };
+                }
+            }
+        }
+        lines
+    }
+
+    /* what the page says about its own reads: the list error, or a detail that failed while
+    the card keeps the row it had */
+    fn knowledge_problem(&self) -> Option<(String, Tone)> {
+        match (&self.kn_error, &self.kn) {
+            (Some(error), Some(_)) => Some((
+                format!("! knowledge: {error} · showing the last read"),
+                Tone::Warn,
+            )),
+            (Some(error), None) => Some((format!("! knowledge: {error}"), Tone::Warn)),
+            (None, Some(_)) if self.kn_detail_stale => Some((
+                "! the last detail read failed · showing the old row".into(),
+                Tone::Warn,
+            )),
+            _ => None,
         }
     }
 
@@ -1594,10 +1915,7 @@ impl App {
     /* HOME's keys on the last row, or the copy notice; `fresh` ends the row in the freshness
     when no box carries it */
     fn home_footer(&self, g: &mut Grid, cols: usize, rows: usize, fresh: bool) {
-        let keys = match cols >= 96 {
-            true => "j/k ↑↓ move  tab chain  enter card  c jobs  a asks  e events",
-            false => "j/k move  c jobs  a asks  e events  enter card",
-        };
+        let keys = home_keys(cols);
         let footer = self.copy_notice().unwrap_or(keys.into());
         let room = cols.saturating_sub(if fresh { self.mark_room() } else { 0 });
         let taken = g.put(rows - 1, 0, &layout::fit(&footer, room), Tone::Dim);
@@ -1619,8 +1937,13 @@ impl App {
             (false, _, false, false) => self.sel.as_ref().map(|id| format!("detail={id}")),
         };
         Want {
-            detail,
+            detail: detail.filter(|_| !self.knowledge),
             events: self.events || self.home,
+            knowledge: self.knowledge,
+            kdetail: match self.knowledge {
+                true => self.kn_sel.clone(),
+                false => None,
+            },
         }
     }
 
@@ -1908,6 +2231,21 @@ fn just_sent(snap: &model::Frame, job: &model::Job) -> bool {
             .is_some_and(|ask| ask.opened_just_now == Some(true))
 }
 
+/* HOME's key line: the wide form lists every screen and the card; a narrow pane keeps the
+screens it can and gives up the newest key before the key that opens a row */
+fn home_keys(cols: usize) -> &'static str {
+    let wide = "j/k ↑↓ move  tab chain  enter card  c jobs  a asks  e events  i knowledge";
+    let full = "j/k move  c jobs  a asks  e events  enter card  i knowledge";
+    let tight = "j/k move  c jobs  a asks  e events  enter card";
+    if cols >= 96 {
+        wide
+    } else if cols >= layout::width(full) {
+        full
+    } else {
+        tight
+    }
+}
+
 /* the jobs screen's keys by priority: the view toggle and the asks screen stay, the others drop
 from the end until the row fits, so no key is cut in the middle */
 fn job_keys(cols: usize, timeline: bool, copy: bool, asks: bool) -> String {
@@ -2064,12 +2402,19 @@ events while their screen is up */
 pub(crate) struct Want {
     pub detail: Option<String>,
     pub events: bool,
+    pub knowledge: bool,
+    pub kdetail: Option<String>,
 }
 
 /* what the fetch thread sends: a snapshot, or the events read after it */
 enum Got {
     Snap(Box<std::result::Result<(model::HubMode, Snapshot), String>>),
     Events(std::result::Result<Vec<model::Event>, String>),
+    Knowledge(Box<std::result::Result<knowledge::Page, String>>),
+    KnowledgeDetail {
+        id: String,
+        got: Box<std::result::Result<Option<knowledge::Detail>, String>>,
+    },
 }
 
 /* Read the full ring so deletion and an empty ring reach the view. */
@@ -2085,6 +2430,34 @@ fn read_events(circle: Option<&str>) -> std::result::Result<Vec<model::Event>, S
     crate::cli::request("GET", &path, None)
         .map_err(|e| e.to_string())
         .and_then(|v| serde_json::from_value::<Vec<model::Event>>(v).map_err(|e| e.to_string()))
+}
+
+/* the terminal's reads: one page of the circle's rows, and the selected row's record */
+fn read_knowledge(circle: Option<&str>) -> std::result::Result<knowledge::Page, String> {
+    let path = match circle {
+        Some(circle) => format!("/knowledge?circle={circle}"),
+        None => "/knowledge".to_string(),
+    };
+    crate::cli::request("GET", &path, None)
+        .map_err(|error| error.to_string())
+        .and_then(|value| serde_json::from_value(value).map_err(|error| error.to_string()))
+}
+
+fn read_knowledge_detail(
+    circle: Option<&str>,
+    id: &str,
+) -> std::result::Result<Option<knowledge::Detail>, String> {
+    let mut path = format!("/knowledge?id={id}");
+    if let Some(circle) = circle {
+        path.push_str(&format!("&circle={circle}"));
+    }
+    match crate::cli::request("GET", &path, None) {
+        Ok(value) => serde_json::from_value(value)
+            .map(Some)
+            .map_err(|error| error.to_string()),
+        Err(error) if error.to_string().contains("returned error: 404") => Ok(None),
+        Err(error) => Err(error.to_string()),
+    }
 }
 
 fn decoded(value: serde_json::Value) -> std::result::Result<(model::HubMode, Snapshot), String> {
@@ -2134,6 +2507,24 @@ fn fetch(
                     return;
                 }
             }
+            if wanted.knowledge {
+                let page = read_knowledge(circle.as_deref());
+                if tx.send(Got::Knowledge(Box::new(page))).is_err() {
+                    return;
+                }
+                if let Some(id) = wanted.kdetail.as_deref() {
+                    let got = read_knowledge_detail(circle.as_deref(), id);
+                    if tx
+                        .send(Got::KnowledgeDetail {
+                            id: id.to_string(),
+                            got: Box::new(got),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
             let _ = poke.recv_timeout(Duration::from_secs(1));
             /* a held key pokes on every step; five fetches a second follow it well enough */
             std::thread::sleep(Duration::from_millis(200).saturating_sub(started.elapsed()));
@@ -2161,6 +2552,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 match got {
                     Got::Snap(snap) => app.receive(*snap),
                     Got::Events(events) => app.take_events(events),
+                    Got::Knowledge(page) => app.take_knowledge(*page),
+                    Got::KnowledgeDetail { id, got } => app.take_knowledge_detail(&id, *got),
                 }
             }
             /* a new selection fetches its full text now instead of on the next second */

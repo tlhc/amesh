@@ -29,6 +29,8 @@ pub(crate) enum Act {
     Asks,
     /* the events screen and back */
     Events,
+    /* the knowledge screen and back */
+    Knowledge,
     /* the jobs-screen body: flow or the selected chain's timeline */
     Timeline,
     Copy(usize),
@@ -150,6 +152,7 @@ impl Input {
                 KeyCode::Char('c') => Act::Jobs,
                 KeyCode::Char('a') => Act::Asks,
                 KeyCode::Char('e') => Act::Events,
+                KeyCode::Char('i') => Act::Knowledge,
                 KeyCode::Char('t') => Act::Timeline,
                 KeyCode::Char('y') => Act::Copy(0),
                 KeyCode::Char('Y') => Act::Copy(1),
