@@ -251,7 +251,7 @@ for (const action of ["publish", "search", "get"]) {
     assert.equal(defs[name].description, canonical.description);
   });
 }
-for (const field of ["title", "body", "applies_to", "evidence", "replaces"]) {
+for (const field of ["title", "body", "applies_to", "evidence", "replaces", "ttl_seconds"]) {
   await test(`knowledge ${field} description matches MCP guidance`, () => {
     const canonical = catalog.find((entry) => entry.name === "amesh_knowledge_publish");
     assert.equal(schemas.amesh_knowledge_publish.properties[field].description,

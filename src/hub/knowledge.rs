@@ -100,9 +100,11 @@ pub(super) fn call(
     }
 }
 
+/* an unrevoked row goes a week after its expiry; a revoked one goes a week after the stored
+revocation, even when that came long after the expiry */
 pub(super) fn purge(db: &Connection, now: u64) -> Result<usize, String> {
     db.execute(
-        "DELETE FROM knowledge WHERE expires_at < ?1 OR revoked_at < ?1",
+        "DELETE FROM knowledge WHERE (revoked_at IS NULL AND expires_at < ?1) OR revoked_at < ?1",
         [secs(now.saturating_sub(KEEP_SECS))],
     )
     .map_err(|e| e.to_string())

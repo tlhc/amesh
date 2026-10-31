@@ -978,3 +978,34 @@ fn publish_rejects_a_body_over_the_raw_limit_that_trims_under_it() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(rows(&db), 0, "a rejected publish writes nothing");
 }
+
+/* a row that expired long before it was revoked keeps seven days from the stored revocation,
+not from its expiry */
+#[test]
+fn purge_keeps_a_late_revocation_for_seven_days() {
+    let mut db = store();
+    let author = peer("p1", "c1");
+    let id = publish(
+        &mut db,
+        &author,
+        NOW - 10 * DAY,
+        with(entry("late"), "ttl_seconds", json!(DAY)),
+    )["id"]
+        .clone();
+    ok(
+        &mut db,
+        "revoke",
+        json!({"id": id, "reason": "stale"}),
+        &author,
+        NOW - DAY,
+    );
+
+    assert_eq!(
+        purge(&db, NOW).unwrap(),
+        0,
+        "a fresh revocation must outlive an old expiry"
+    );
+    /* exactly seven days after the revocation the row is still there, one second later it goes */
+    assert_eq!(purge(&db, NOW + 6 * DAY).unwrap(), 0);
+    assert_eq!(purge(&db, NOW + 6 * DAY + 1).unwrap(), 1);
+}

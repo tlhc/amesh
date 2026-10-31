@@ -199,6 +199,11 @@ fn knowledge_mcp_schemas_expose_only_the_four_minimal_tools() {
         ),
         (
             "publish",
+            "ttl_seconds",
+            vec!["go past the default", "replayable", "before reuse"],
+        ),
+        (
+            "publish",
             "replaces",
             vec![
                 "same scope",
