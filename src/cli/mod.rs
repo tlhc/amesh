@@ -89,6 +89,9 @@ knowledge
                                      Read applies-to and evidence before relying on a hit.
   knowledge get ID                   One entry, expired or revoked status included
   knowledge revoke ID --reason TEXT  Withdraw an entry; the reason is required
+  knowledge delete ID                Delete one entry; the hub then tries to move the body out of its
+                                     database file and WAL (see compacted). Irreversible, one id per
+                                     call; use revoke when a reason should stay.
 
   Values that begin with -- can be given inline (--body=...); empty values are still rejected.
 
@@ -1354,7 +1357,7 @@ fn knowledge(raw: &[String]) -> Result<Value> {
     let command = raw
         .first()
         .map(String::as_str)
-        .ok_or("knowledge requires a subcommand: publish, search, get or revoke")?;
+        .ok_or("knowledge requires a subcommand: publish, search, get, revoke or delete")?;
     let allowed: &[&str] = match command {
         "publish" => &[
             "title",
@@ -1369,6 +1372,7 @@ fn knowledge(raw: &[String]) -> Result<Value> {
         "search" => &["limit", "from-peer", "peer-id"],
         "get" => &["from-peer", "peer-id"],
         "revoke" => &["reason", "from-peer", "peer-id"],
+        "delete" => &["from-peer", "peer-id"],
         _ => return Err(format!("unknown knowledge command: {command}").into()),
     };
     let args = Args::parse_inline(&raw[1..], allowed)?;
@@ -1409,15 +1413,15 @@ fn knowledge(raw: &[String]) -> Result<Value> {
             }
             request("POST", "/knowledge/search", Some(body))
         }
-        "get" => {
+        "get" | "delete" => {
             args.count(1, 1)?;
             request(
                 "POST",
-                "/knowledge/get",
+                &format!("/knowledge/{command}"),
                 Some(json!({"from_peer": from_peer, "id": args.pos[0]})),
             )
         }
-        _ => {
+        "revoke" => {
             args.count(1, 1)?;
             let reason = bounded_flag(&args, "reason", KNOWLEDGE_REASON_MAX)?;
             request(
@@ -1426,6 +1430,7 @@ fn knowledge(raw: &[String]) -> Result<Value> {
                 Some(json!({"from_peer": from_peer, "id": args.pos[0], "reason": reason})),
             )
         }
+        _ => Err(format!("unknown knowledge command: {command}").into()),
     }
 }
 

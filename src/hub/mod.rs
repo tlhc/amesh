@@ -392,13 +392,14 @@ fn attachments_dir(app: &App) -> PathBuf {
 }
 
 const WAL_LIMIT: i64 = 1 << 20;
+pub(super) const BUSY_MS: u64 = 5000;
 
 fn open_db(path: &Path, now: u64) -> Result<Connection, String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let db = Connection::open(path).map_err(|e| e.to_string())?;
-    db.busy_timeout(Duration::from_millis(5000))
+    db.busy_timeout(Duration::from_millis(BUSY_MS))
         .map_err(|e| e.to_string())?;
     /* VACUUM reclaims space at startup and after a sweep deletes rows.
     The log is cut back to WAL_LIMIT whenever it resets. */
@@ -4654,7 +4655,7 @@ async fn knowledge_action(
     action: &str,
     mut args: Value,
 ) -> Result<Value, (StatusCode, Json<Value>)> {
-    if !matches!(action, "publish" | "search" | "get" | "revoke") {
+    if !matches!(action, "publish" | "search" | "get" | "revoke" | "delete") {
         return Err((
             StatusCode::NOT_FOUND,
             Json(json!({"error": "unknown knowledge action"})),
@@ -5070,6 +5071,15 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
             t["name"] = json!("amesh_knowledge_revoke");
             t
         },
+        {
+            let mut t = obj(
+                "Content is wrong or stale? Use amesh_knowledge_revoke instead: it keeps the reason. Only delete what must become unreadable now: this is irreversible, one id per call, and the hub also tries to move the body out of its database file and its write-ahead log; the answer says whether that worked (compacted). Copies in asks and inbox, text a client already read, a TUI card already shown, and backups or snapshots stay; a leaked secret still needs rotation. 404 means no such entry in your circle.",
+                json!({"id":{"type":"string"}}),
+                &["id"],
+            );
+            t["name"] = json!("amesh_knowledge_delete");
+            t
+        },
     ]
 }
 
@@ -5084,7 +5094,8 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
         "amesh_knowledge_publish"
         | "amesh_knowledge_search"
         | "amesh_knowledge_get"
-        | "amesh_knowledge_revoke" => {
+        | "amesh_knowledge_revoke"
+        | "amesh_knowledge_delete" => {
             knowledge_action(app, name.trim_start_matches("amesh_knowledge_"), args)
                 .await?
                 .to_string()

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::http::StatusCode;
 use axum::Json;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
@@ -39,6 +41,8 @@ const TTL_MAX: u64 = 30 * 86400;
 /* how long an expired or revoked entry stays readable by id before purge deletes it */
 const KEEP_SECS: u64 = 7 * 86400;
 const SEARCH_LIMIT: u64 = 5;
+/* a delete waits this long for another connection before it reports the bytes as left behind */
+const ERASE_BUSY_MS: u64 = 500;
 /* the terminal page: one screenful, and the total says what the rest is */
 pub(super) const KNOWLEDGE_PAGE: u64 = 50;
 const QUERY_BYTES: usize = 256;
@@ -67,7 +71,7 @@ struct SearchArgs {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct GetArgs {
+struct IdArgs {
     id: String,
 }
 
@@ -89,7 +93,7 @@ pub(super) fn call(
         "publish" => publish(db, parse(args)?, peer, now),
         "search" => search(db, parse(args)?, peer, now),
         "get" => {
-            let args: GetArgs = parse(args)?;
+            let args: IdArgs = parse(args)?;
             Ok(json!({"knowledge": load(db, &args.id, &peer.circle, now)?}))
         }
         "revoke" => {
@@ -98,8 +102,39 @@ pub(super) fn call(
             mark_revoked(db, &args.id, &reason, peer, now)?;
             Ok(json!({"ok": true, "id": args.id}))
         }
+        "delete" => erase(db, &parse::<IdArgs>(args)?.id, peer),
         _ => Err(fail(StatusCode::NOT_FOUND, "unknown knowledge action")),
     }
+}
+
+/* the row goes first, outside a transaction: VACUUM cannot run in one */
+fn erase(db: &Connection, id: &str, peer: &Peer) -> Result<Value, Failure> {
+    let changed = db
+        .execute(
+            "DELETE FROM knowledge WHERE id = ?1 AND circle = ?2",
+            params![id, peer.circle],
+        )
+        .map_err(internal)?;
+    if changed != 1 {
+        return Err(not_found());
+    }
+    let _ = db.busy_timeout(Duration::from_millis(ERASE_BUSY_MS));
+    let compacted = super::compact(db).and_then(|()| super::cut_back_log(db));
+    let _ = db.busy_timeout(Duration::from_millis(super::BUSY_MS));
+    let error = compacted
+        .as_ref()
+        .err()
+        .map(|error| format!(" error={error:?}"))
+        .unwrap_or_default();
+    eprintln!(
+        "amesh: knowledge deleted id={:?} circle={:?} peer={:?} session={:?} compacted={}{error}",
+        id,
+        peer.circle,
+        peer.peer_id,
+        peer.session_id,
+        compacted.is_ok()
+    );
+    Ok(json!({"ok": true, "id": id, "compacted": compacted.is_ok()}))
 }
 
 /* an unrevoked row goes a week after its expiry; a revoked one goes a week after the stored

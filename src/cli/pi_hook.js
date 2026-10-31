@@ -594,6 +594,13 @@ export default function AmeshHooks(pi) {
       ["id", "reason"],
       (params) => Cli(["knowledge", "revoke", params.id, `--reason=${params.reason}`, ...FromPeer()]),
     );
+    tool(
+      "knowledge_delete",
+      "Content is wrong or stale? Use amesh_knowledge_revoke instead: it keeps the reason. Only delete what must become unreadable now: this is irreversible, one id per call, and the hub also tries to move the body out of its database file and its write-ahead log; the answer says whether that worked (compacted). Copies in asks and inbox, text a client already read, a TUI card already shown, and backups or snapshots stay; a leaked secret still needs rotation. 404 means no such entry in your circle.",
+      { id: { type: "string" } },
+      ["id"],
+      (params) => Cli(["knowledge", "delete", params.id, ...FromPeer()]),
+    );
   }
 
   let retry;

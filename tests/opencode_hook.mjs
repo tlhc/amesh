@@ -170,8 +170,8 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
   try {
     cleanup = await plugin.setup(ctx);
     await t.test("catalog is directly visible with JSON schemas", () => {
-      assert.equal(tools.size, 22);
-      for (const action of ["publish", "search", "get", "revoke"]) {
+      assert.equal(tools.size, 23);
+      for (const action of ["publish", "search", "get", "revoke", "delete"]) {
         assert(tools.has(`amesh_knowledge_${action}`));
       }
       for (const tool of tools.values()) {

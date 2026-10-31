@@ -97,7 +97,7 @@ async fn knowledge_http_round_trip_and_same_circle_revoke() {
 #[tokio::test]
 async fn knowledge_requires_registered_caller_for_every_action() {
     let (app, _path) = fixture().await;
-    for action in ["publish", "search", "get", "revoke"] {
+    for action in ["publish", "search", "get", "revoke", "delete"] {
         let (status, _) = request(
             router(app.clone()),
             &format!("/knowledge/{action}"),
@@ -145,7 +145,7 @@ async fn knowledge_cross_circle_reads_writes_and_replacement_are_hidden() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["items"], json!([]));
-    for action in ["get", "revoke"] {
+    for action in ["get", "revoke", "delete"] {
         let mut args = json!({"from_peer":"outsider", "id":id});
         if action == "revoke" {
             args["reason"] = json!("wrong circle");
@@ -168,7 +168,7 @@ async fn knowledge_cross_circle_reads_writes_and_replacement_are_hidden() {
 }
 
 #[test]
-fn knowledge_mcp_schemas_expose_only_the_four_minimal_tools() {
+fn knowledge_mcp_schemas_expose_only_the_five_minimal_tools() {
     let tools = mcp_tools();
     let mut missing = Vec::new();
     for (name, field, rules) in [
@@ -233,6 +233,18 @@ fn knowledge_mcp_schemas_expose_only_the_four_minimal_tools() {
                 "git status --porcelain --untracked-files=all",
             ],
         ),
+        (
+            "delete",
+            "",
+            vec![
+                "amesh_knowledge_revoke",
+                "irreversible",
+                "one id per call",
+                "asks and inbox",
+                "rotation",
+                "404",
+            ],
+        ),
     ] {
         let tool = tools
             .iter()
@@ -259,7 +271,7 @@ fn knowledge_mcp_schemas_expose_only_the_four_minimal_tools() {
         .iter()
         .filter(|t| t["name"].as_str().unwrap().starts_with("amesh_knowledge_"))
         .collect();
-    assert_eq!(knowledge.len(), 4);
+    assert_eq!(knowledge.len(), 5);
     for tool in knowledge {
         let properties = tool["inputSchema"]["properties"].as_object().unwrap();
         assert!(!properties.contains_key("circle"));
@@ -286,6 +298,7 @@ async fn knowledge_mcp_calls_use_the_same_store() {
         ("search", json!({"query":"ACK"})),
         ("get", json!({"id":id})),
         ("revoke", json!({"id":id,"reason":"reviewed"})),
+        ("delete", json!({"id":id})),
     ] {
         let mut args = args;
         args["from_peer"] = json!("reader");
@@ -500,6 +513,7 @@ fn knowledge_mcp_catalog_preserves_existing_tool_order() {
             "amesh_knowledge_search",
             "amesh_knowledge_get",
             "amesh_knowledge_revoke",
+            "amesh_knowledge_delete",
         ]
     );
 }
@@ -659,4 +673,180 @@ async fn knowledge_monitor_reads_need_the_token_but_not_a_peer() {
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let (status, body) = get(router(guarded), "/knowledge", Some("terminal-token")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+fn person(id: &str, circle: &str) -> Peer {
+    Peer {
+        peer_id: id.into(),
+        name: id.into(),
+        path: "/tmp".into(),
+        backend: "pi".into(),
+        circle: circle.into(),
+        status: "online".into(),
+        description: String::new(),
+        session_id: format!("session-{id}"),
+        last_seen: now_unix(),
+    }
+}
+
+fn store_publish(db: &mut Connection, peer: &Peer, body: &str, now: u64, ttl: u64) -> String {
+    let out = knowledge::call(
+        db,
+        "publish",
+        json!({"title": "t", "body": body, "applies_to": "a", "evidence": "e", "ttl_seconds": ttl}),
+        peer,
+        now,
+    )
+    .unwrap();
+    out["knowledge"]["id"].as_str().unwrap().to_string()
+}
+
+fn holds(path: &Path, needle: &[u8]) -> bool {
+    fs::read(path).is_ok_and(|bytes| bytes.windows(needle.len()).any(|w| w == needle))
+}
+
+fn wal_holds(path: &Path, needle: &[u8]) -> bool {
+    holds(&path.with_extension("db-wal"), needle)
+}
+
+#[test]
+fn knowledge_delete_is_open_to_the_circle_and_gone_for_everyone() {
+    let path = tests::TempState::new("knowledge-delete-circle");
+    let mut db = open_db(&path, now_unix()).unwrap();
+    let author = person("author", "c");
+    let reader = person("reader", "c");
+    let outsider = person("outsider", "other");
+    let now = now_unix();
+    let id = store_publish(&mut db, &author, "erase the circle copy", now, 3600);
+    let foreign = knowledge::call(&mut db, "delete", json!({"id": id}), &outsider, now);
+    assert_eq!(foreign.unwrap_err().0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        knowledge::call(&mut db, "get", json!({"id": id}), &author, now).unwrap()["knowledge"]
+            ["id"],
+        id,
+        "a foreign circle deleted the row"
+    );
+    let out = knowledge::call(&mut db, "delete", json!({"id": id}), &reader, now).unwrap();
+    assert_eq!(out["compacted"], true, "{out}");
+    let busy: i64 = db
+        .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+        .unwrap();
+    assert_eq!(busy, 5000, "the erase timeout was not restored");
+    assert_eq!(
+        knowledge::call(&mut db, "get", json!({"id": id}), &author, now)
+            .unwrap_err()
+            .0,
+        StatusCode::NOT_FOUND,
+        "the row survived its delete"
+    );
+    assert_eq!(
+        knowledge::call(&mut db, "delete", json!({"id": id}), &author, now)
+            .unwrap_err()
+            .0,
+        StatusCode::NOT_FOUND,
+        "a repeat delete is not 404"
+    );
+}
+
+#[test]
+fn knowledge_delete_takes_any_state_it_is_asked_for() {
+    let path = tests::TempState::new("knowledge-delete-states");
+    let mut db = open_db(&path, now_unix()).unwrap();
+    let peer = person("author", "c");
+    let now = now_unix();
+    let at = now as i64;
+    for (id, expires, revoked) in [
+        ("kn-active", at + 3600, false),
+        ("kn-expired", at - 30, false),
+        ("kn-revoked", at + 3600, true),
+    ] {
+        db.execute(
+            "INSERT INTO knowledge(id,circle,title,body,applies_to,evidence,publisher_peer,publisher_session,created_at,expires_at,revoked_at,revoke_reason,revoked_by_peer,revoked_by_session) VALUES (?1,'c','t','b','a','e','author','session-author',?2,?3,?4,?5,?6,?6)",
+            params![
+                id,
+                at - 60,
+                expires,
+                revoked.then_some(at - 10),
+                revoked.then_some("why"),
+                revoked.then_some("author")
+            ],
+        )
+        .unwrap();
+        let out = knowledge::call(&mut db, "delete", json!({"id": id}), &peer, now).unwrap();
+        assert_eq!(out["compacted"], true, "{id}: {out}");
+        let left: i64 = db
+            .query_row("SELECT count(*) FROM knowledge WHERE id = ?1", [id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(left, 0, "{id} survived");
+    }
+}
+
+#[test]
+fn knowledge_delete_takes_the_body_out_of_the_file_and_the_log() {
+    let path = tests::TempState::new("knowledge-delete-bytes");
+    let mut db = open_db(&path, now_unix()).unwrap();
+    let peer = person("author", "c");
+    let now = now_unix();
+    let marker = b"delete-marker-7f3a91c2";
+    let id = store_publish(&mut db, &peer, "delete-marker-7f3a91c2 body", now, 3600);
+    assert!(wal_holds(&path, marker), "the body never reached the log");
+    db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+        .unwrap();
+    assert!(holds(&path, marker), "the body never reached the file");
+    knowledge::call(&mut db, "delete", json!({"id": id}), &peer, now).unwrap();
+    assert!(!holds(&path, marker), "the body is still in the file");
+    assert!(!wal_holds(&path, marker), "the body is still in the log");
+}
+
+#[test]
+fn knowledge_delete_404_leaves_the_bytes_alone() {
+    let path = tests::TempState::new("knowledge-delete-404");
+    let mut db = open_db(&path, now_unix()).unwrap();
+    let peer = person("author", "c");
+    let now = now_unix();
+    let marker = b"purged-marker-2d4c8e10";
+    let id = store_publish(&mut db, &peer, "purged-marker-2d4c8e10 body", now, 1);
+    db.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+        .unwrap();
+    db.execute("DELETE FROM knowledge WHERE id = ?1", [&id])
+        .unwrap();
+    assert!(holds(&path, marker), "the deleted body left the file early");
+    let gone = knowledge::call(&mut db, "delete", json!({"id": id}), &peer, now);
+    assert_eq!(gone.unwrap_err().0, StatusCode::NOT_FOUND);
+    assert!(holds(&path, marker), "a missing id compacted the file");
+}
+
+#[test]
+fn knowledge_delete_beside_a_reader_reports_the_bytes_as_left_behind() {
+    let path = tests::TempState::new("knowledge-delete-reader");
+    let mut db = open_db(&path, now_unix()).unwrap();
+    let peer = person("author", "c");
+    let now = now_unix();
+    let id = store_publish(&mut db, &peer, "erase beside a reader", now, 3600);
+    let reader = Connection::open(&path).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT count(*) FROM peers;")
+        .unwrap();
+    let started = std::time::Instant::now();
+    let out = knowledge::call(&mut db, "delete", json!({"id": id}), &peer, now).unwrap();
+    let took = started.elapsed();
+    assert_eq!(out["compacted"], false, "{out}");
+    assert!(
+        took < Duration::from_millis(2500),
+        "the erase waited {took:?} on another connection"
+    );
+    assert_eq!(
+        knowledge::call(&mut db, "get", json!({"id": id}), &peer, now)
+            .unwrap_err()
+            .0,
+        StatusCode::NOT_FOUND,
+        "the row was not deleted"
+    );
+    let busy: i64 = db
+        .pragma_query_value(None, "busy_timeout", |row| row.get(0))
+        .unwrap();
+    assert_eq!(busy, 5000, "the erase timeout was not restored");
+    reader.execute_batch("ROLLBACK").unwrap();
 }

@@ -104,6 +104,7 @@ assert.deepEqual(registrationOrder.slice(18), [
   "amesh_knowledge_search",
   "amesh_knowledge_get",
   "amesh_knowledge_revoke",
+  "amesh_knowledge_delete",
 ]);
 assert.deepEqual(tools.sort(), [
   "amesh_ack",
@@ -117,6 +118,7 @@ assert.deepEqual(tools.sort(), [
   "amesh_job_list",
   "amesh_job_status",
   "amesh_job_update",
+  "amesh_knowledge_delete",
   "amesh_knowledge_get",
   "amesh_knowledge_publish",
   "amesh_knowledge_revoke",
@@ -151,6 +153,7 @@ assert.deepEqual(schemas.amesh_knowledge_search.required, ["query"]);
 assert.equal(schemas.amesh_knowledge_search.properties.limit.type, "integer");
 assert.deepEqual(schemas.amesh_knowledge_get.required, ["id"]);
 assert.deepEqual(schemas.amesh_knowledge_revoke.required, ["id", "reason"]);
+assert.deepEqual(schemas.amesh_knowledge_delete.required, ["id"]);
 await test("exec failures name the kill reason", () => {
   const killed = ExecError({ killed: true, signal: "SIGTERM", message: "Command failed: amesh mcp" }, "", "", 65000);
   assert.match(killed.message, /SIGTERM/);
@@ -244,7 +247,7 @@ const catalog = JSON.parse(execFileSync(executable, ["mcp", "--peer-id", peerId]
   input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }) + "\n",
   encoding: "utf8",
 })).result.tools;
-for (const action of ["publish", "search", "get"]) {
+for (const action of ["publish", "search", "get", "delete"]) {
   const name = `amesh_knowledge_${action}`;
   const canonical = catalog.find((entry) => entry.name === name);
   await test(`${name} description matches MCP guidance`, () => {

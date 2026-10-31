@@ -264,7 +264,7 @@ fn knowledge_search_rejects_out_of_range_limit() {
 }
 
 #[test]
-fn knowledge_get_and_revoke_post_the_id() {
+fn knowledge_get_revoke_and_delete_post_the_id() {
     let sandbox = Sandbox::new();
     let seen = hub_once(
         &sandbox.bind,
@@ -292,6 +292,28 @@ fn knowledge_get_and_revoke_post_the_id() {
     assert_eq!(body["id"], "kn-1");
     assert_eq!(body["reason"], "superseded");
     assert_eq!(body["from_peer"], "p-test");
+
+    let seen = hub_once(
+        &sandbox.bind,
+        "200 OK",
+        json!({"ok": true, "id": "kn-1", "compacted": true}),
+    );
+    let output = sandbox.run_text(
+        &["knowledge", "delete", "kn-1"],
+        "",
+        &[("AMESH_PEER_ID", "p-test")],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let body = seen.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(
+        body,
+        json!({"from_peer": "p-test", "id": "kn-1"}),
+        "delete sent more than the caller and the id"
+    );
+    fails_with(
+        &["knowledge", "delete", "kn-1", "--reason", "why"],
+        "unknown option --reason",
+    );
 }
 
 #[test]
@@ -327,6 +349,7 @@ fn knowledge_help_lists_every_subcommand() {
         "knowledge search",
         "knowledge get",
         "knowledge revoke",
+        "knowledge delete",
     ] {
         assert!(help.contains(line), "help is missing {line}:\n{help}");
     }
