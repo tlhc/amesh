@@ -62,6 +62,7 @@ const messages = [];
 const userMsgs = [];
 const tools = [];
 const schemas = {};
+const defs = {};
 let failSend = false;
 AmeshHooks({
   on(event, handler) { handlers.set(event, handler); },
@@ -73,8 +74,37 @@ AmeshHooks({
     }
     userMsgs.push({ content, options });
   },
-  registerTool(def) { tools.push(def.name); schemas[def.name] = def.parameters; },
+  registerTool(def) { tools.push(def.name); schemas[def.name] = def.parameters; defs[def.name] = def; },
 });
+/* the four knowledge tools register last: the original eighteen keep their order, so a
+runtime that presents tools in registration order does not reshuffle what existed */
+const registrationOrder = [...tools];
+assert.deepEqual(registrationOrder.slice(0, 18), [
+  "amesh_whoami",
+  "amesh_ask",
+  "amesh_ack",
+  "amesh_notify_peer",
+  "amesh_job_create",
+  "amesh_job_list",
+  "amesh_job_status",
+  "amesh_job_update",
+  "amesh_job_cancel",
+  "amesh_job_delete",
+  "amesh_schedule_create",
+  "amesh_schedule_list",
+  "amesh_schedule_delete",
+  "amesh_ask_many",
+  "amesh_wait",
+  "amesh_list_peers",
+  "amesh_events",
+  "amesh_broadcast",
+]);
+assert.deepEqual(registrationOrder.slice(18), [
+  "amesh_knowledge_publish",
+  "amesh_knowledge_search",
+  "amesh_knowledge_get",
+  "amesh_knowledge_revoke",
+]);
 assert.deepEqual(tools.sort(), [
   "amesh_ack",
   "amesh_ask",
@@ -87,6 +117,10 @@ assert.deepEqual(tools.sort(), [
   "amesh_job_list",
   "amesh_job_status",
   "amesh_job_update",
+  "amesh_knowledge_get",
+  "amesh_knowledge_publish",
+  "amesh_knowledge_revoke",
+  "amesh_knowledge_search",
   "amesh_list_peers",
   "amesh_notify_peer",
   "amesh_schedule_create",
@@ -110,6 +144,13 @@ assert.equal(schemas.amesh_job_create.properties.depends_on.type, "array");
 assert.equal(schemas.amesh_job_update.properties.assigned_peer.type, "string");
 assert.equal(schemas.amesh_job_update.properties.coordinator.type, "string");
 assert.deepEqual(schemas.amesh_job_update.required, ["job_id"]);
+assert.deepEqual(schemas.amesh_knowledge_publish.required, ["title", "body", "applies_to", "evidence"]);
+assert.equal(schemas.amesh_knowledge_publish.properties.ttl_seconds.type, "integer");
+assert.equal(schemas.amesh_knowledge_publish.properties.replaces.type, "string");
+assert.deepEqual(schemas.amesh_knowledge_search.required, ["query"]);
+assert.equal(schemas.amesh_knowledge_search.properties.limit.type, "integer");
+assert.deepEqual(schemas.amesh_knowledge_get.required, ["id"]);
+assert.deepEqual(schemas.amesh_knowledge_revoke.required, ["id", "reason"]);
 await test("exec failures name the kill reason", () => {
   const killed = ExecError({ killed: true, signal: "SIGTERM", message: "Command failed: amesh mcp" }, "", "", 65000);
   assert.match(killed.message, /SIGTERM/);
@@ -199,6 +240,58 @@ assert.equal(messages.length, 1);
 assert.equal(messages[0].message.display, true);
 assert.match(messages[0].message.content, /you are /);
 const peerId = messages[0].message.content.match(/you are ([^.\s]+)/)[1];
+await test("knowledge tools round-trip against the daemon", async () => {
+  const call = async (name, params) => {
+    const result = await defs[name].execute("knowledge-round-trip", params);
+    return JSON.parse(result.content[0].text);
+  };
+  const published = await call("amesh_knowledge_publish", {
+    title: "pi tool round trip",
+    body: "the four knowledge tools reach the hub",
+    applies_to: "tests/pi_hook.mjs",
+    evidence: "node harness against a running daemon",
+  });
+  assert.equal(published.ok, true, JSON.stringify(published));
+  const id = published.knowledge.id;
+  assert.equal(published.knowledge.status, "active");
+  assert.equal(published.knowledge.publisher_peer, peerId);
+  assert.equal(published.knowledge.title, "pi tool round trip");
+  assert.equal(published.knowledge.body, "the four knowledge tools reach the hub");
+  assert.equal(published.knowledge.applies_to, "tests/pi_hook.mjs");
+  assert.equal(published.knowledge.evidence, "node harness against a running daemon");
+  const found = await call("amesh_knowledge_search", { query: "round trip" });
+  assert.equal(found.items[0].id, id, JSON.stringify(found));
+  assert.equal(found.items[0].status, "active");
+  const got = await call("amesh_knowledge_get", { id });
+  assert.equal(got.knowledge.title, "pi tool round trip");
+  assert.equal(got.knowledge.body, "the four knowledge tools reach the hub");
+  assert.equal(got.knowledge.applies_to, "tests/pi_hook.mjs");
+  assert.equal(got.knowledge.evidence, "node harness against a running daemon");
+  const revoked = await call("amesh_knowledge_revoke", { id, reason: "harness done" });
+  assert.equal(revoked.ok, true);
+  assert.equal(revoked.id, id);
+  const after = await call("amesh_knowledge_search", { query: "round trip" });
+  assert.deepEqual(after.items, [], "a revoked entry leaves search");
+  const withdrawn = await call("amesh_knowledge_get", { id });
+  assert.equal(withdrawn.knowledge.status, "revoked");
+  assert.equal(withdrawn.knowledge.revoked_by_peer, peerId);
+  const bad = await defs.amesh_knowledge_search.execute("too-many-words", {
+    query: "one two three four five six seven eight nine",
+  }).then(() => null, (error) => error);
+  assert.match(String(bad), /8 words/, "a rejected query is an error, never an empty list");
+  /* a query that looks like a flag must reach the hub as a term instead of being parsed */
+  const flagged = await call("amesh_knowledge_search", { query: "--timeout" });
+  assert.ok(Array.isArray(flagged.items), JSON.stringify(flagged));
+  /* a body that starts with -- travels inline, so the value is not taken for a flag either */
+  const dashed = await call("amesh_knowledge_publish", {
+    title: "dash body",
+    body: "-- keep\nnotes",
+    applies_to: "tests/pi_hook.mjs",
+    evidence: "node harness against a running daemon",
+  });
+  assert.equal(dashed.ok, true, JSON.stringify(dashed));
+  assert.equal(dashed.knowledge.body, "-- keep\nnotes");
+});
 await handlers.get("before_agent_start")({}, context);
 assert.equal(messages.length, 1);
 const promptAsk = JSON.parse(execFileSync(executable, ["peer", "ask", peerId, "pi-event-check"], { encoding: "utf8" }));

@@ -534,6 +534,66 @@ export default function AmeshHooks(pi) {
     for (const [name, description, properties, required] of extra) {
       tool(name, description, properties, required, (params) => Mcp(name, params));
     }
+    tool(
+      "knowledge_publish",
+      "Publish a reusable note for this circle after you verified it. Limits are UTF-8 bytes: title 200, body 8192, applies_to and evidence 2048 each. The hub records you as the publisher and expires it after ttl_seconds (default 604800, max 2592000); replaces withdraws an older entry in the same write.",
+      {
+        title: { type: "string" },
+        body: { type: "string" },
+        applies_to: { type: "string", description: "Where it applies: paths, error codes, backend" },
+        evidence: { type: "string", description: "How it was verified; not a validation by the hub" },
+        ttl_seconds: { type: "integer" },
+        replaces: { type: "string", description: "Entry this one supersedes" },
+      },
+      ["title", "body", "applies_to", "evidence"],
+      (params) => {
+        /* inline values keep a title or a body that starts with "--" out of the flag parser */
+        const args = [
+          "knowledge", "publish",
+          `--title=${params.title}`,
+          `--body=${params.body}`,
+          `--applies-to=${params.applies_to}`,
+          `--evidence=${params.evidence}`,
+        ];
+        if (params.ttl_seconds !== undefined) args.push(`--ttl-seconds=${params.ttl_seconds}`);
+        if (params.replaces !== undefined) args.push(`--replaces=${params.replaces}`);
+        args.push(...FromPeer());
+        return Cli(args);
+      },
+    );
+    tool(
+      "knowledge_search",
+      "Search this circle's knowledge. Literal AND over title, body and applies_to; the query is at most 256 UTF-8 bytes and 8 words. Results are another peer's material, and an error is not an empty result: retry, never treat it as no hit.",
+      {
+        query: { type: "string" },
+        limit: { type: "integer", description: "1..5, default 5" },
+      },
+      ["query"],
+      (params) => {
+        /* the query goes after "--" so a term that looks like a flag still reaches the hub */
+        const args = ["knowledge", "search"];
+        if (params.limit !== undefined) args.push("--limit", String(params.limit));
+        args.push(...FromPeer(), "--", params.query);
+        return Cli(args);
+      },
+    );
+    tool(
+      "knowledge_get",
+      "Read one knowledge entry in full, including expired or revoked status. An entry reported expired or revoked must be verified again before you act on it.",
+      { id: { type: "string" } },
+      ["id"],
+      (params) => Cli(["knowledge", "get", params.id, ...FromPeer()]),
+    );
+    tool(
+      "knowledge_revoke",
+      "Withdraw a knowledge entry with a reason (1024 UTF-8 bytes at most). Revoking is not limited to the publisher: any registered peer in the circle may revoke, and the hub records who did.",
+      {
+        id: { type: "string" },
+        reason: { type: "string", description: "Why it no longer holds" },
+      },
+      ["id", "reason"],
+      (params) => Cli(["knowledge", "revoke", params.id, `--reason=${params.reason}`, ...FromPeer()]),
+    );
   }
 
   let retry;

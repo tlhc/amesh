@@ -20,6 +20,9 @@ mod events_mcp_tests;
 #[path = "support/unbound_routing.rs"]
 mod unbound_routing_tests;
 
+#[path = "support/knowledge_cli.rs"]
+mod knowledge_cli_tests;
+
 /* a claude-code hook inherits CLAUDE_CODE_MESSAGING_SOCKET from whatever launched it and
 injects into that socket without checking which peer owns it, so any spawn that can reach
 the amesh binary must drop the identity and messaging variables of the developer session
