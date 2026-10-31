@@ -67,14 +67,17 @@ def RunCase(binary, root, case):
                     db.execute('UPDATE knowledge SET created_at=?, expires_at=? WHERE id=?',
                                (int(time.time()) - 200, int(time.time()) - 100, entry['id']))
         prompt = ('本次是受控测试环境 fixture-1，执行器报 KX741。请给出有依据的处置方案，'
-                  '本会话仅提供 amesh 工具，无需执行本地检查或修复命令。'
                   '需要协作时可问 reviewer，发出问题后结束，不等待回复。')
         if case == 'expired':
             prompt += '上次处理时留下的记录 ID 是 ' + entry['id'] + '。'
         if case == 'publish':
             prompt = ('这项受控 fixture-1 排障任务已完成：错误 KX741 通过设置 recovery_marker='
                       + secret + ' 后重试一次消失。验证证据：fixture-1-run.log 中首次退出码 74，'
-                      '设置后退出码 0；适用范围仅 fixture-1。请完成协作收尾。')
+                      '设置后退出码 0；适用范围仅 fixture-1。这是用户提供的受控测试结果，'
+                      '日志文件未挂载到本会话；保存时注明证据来源。请完成协作收尾。')
+        if case == 'skip':
+            prompt = '请把“测试完成”翻译成英文。'
+        prompt += '本会话仅提供 amesh 工具，无需执行本地检查或修复命令。'
         mcp = {'mcpServers': {'amesh': {'command': binary,
             'args': ['mcp', '--peer-id', 'eval-coordinator'],
             'env': {k: v for k, v in hubEnv.items()
@@ -104,6 +107,12 @@ def RunCase(binary, root, case):
         (root / 'result.json').write_text(json.dumps(report, indent=2))
         assert agent.returncode == 0 and results and not results[-1].get('is_error'), 'agent failed'
         assert not errors, errors
+        assert all(call['name'].startswith('mcp__amesh__') for call in calls), names
+        if case == 'skip':
+            assert 'amesh_knowledge_publish' not in names, names
+            assert final.strip(), 'missing translation'
+            print(case, names, flush=True)
+            return
         if case == 'publish':
             assert names.count('amesh_knowledge_publish') == 1, names
             entries = Request('/knowledge/search', {'from_peer': 'reviewer', 'query': 'KX741'})['items']
@@ -111,6 +120,7 @@ def RunCase(binary, root, case):
             record = Request('/knowledge/get', {'from_peer': 'reviewer', 'id': entries[0]['id']})['knowledge']
             assert secret in record['body'] and 'fixture-1' in record['applies_to'], record
             assert 'fixture-1-run.log' in record['evidence'], record
+            assert re.search(r'用户|\buser\b', record['evidence'], re.I), record
             print(case, names, flush=True)
             return
         assert 'amesh_knowledge_search' in names, names
@@ -146,7 +156,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--binary', required=True)
     parser.add_argument('--output', required=True)
-    parser.add_argument('--case', choices=['hit', 'miss', 'expired', 'publish', 'all'], default='all')
+    parser.add_argument('--case', choices=['hit', 'miss', 'expired', 'publish', 'skip', 'all'], default='all')
     args = parser.parse_args()
-    for case in ['hit', 'miss', 'expired', 'publish'] if args.case == 'all' else [args.case]:
+    for case in ['hit', 'miss', 'expired', 'publish', 'skip'] if args.case == 'all' else [args.case]:
         RunCase(str(pathlib.Path(args.binary).resolve()), pathlib.Path(args.output).resolve() / case, case)

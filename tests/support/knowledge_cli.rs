@@ -370,6 +370,37 @@ fn session_primer_announces_the_knowledge_tools() {
     assert!(output.status.success(), "{}", stderr(&output));
     let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
     let context = reply["context"].as_str().unwrap_or_default();
+    let missing: Vec<_> = [
+        "Skipping publication is normal",
+        "For all other tasks, skip publication",
+        "your own search missed and checked evidence later answered it",
+        "a blocker took substantial investigation to resolve",
+        "a measurement contradicted the default assumption",
+        "an existing entry proved wrong",
+        "Keep duplicates unchanged",
+        "rerun the original query",
+        "add the missing terms",
+        "never publish a second copy",
+        "a hit is a candidate",
+    ]
+    .into_iter()
+    .filter(|rule| !context.contains(rule))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "missing publication rules: {missing:#?}"
+    );
+    let obsolete: Vec<_> = [
+        "publish what is reusable",
+        "reuse a hit instead of asking again",
+    ]
+    .into_iter()
+    .filter(|rule| context.contains(rule))
+    .collect();
+    assert!(
+        obsolete.is_empty(),
+        "obsolete knowledge rules: {obsolete:#?}"
+    );
     assert!(
         context.contains("amesh_knowledge_search"),
         "the primer must name the search tool:\n{context}"

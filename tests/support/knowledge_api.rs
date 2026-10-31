@@ -170,6 +170,86 @@ async fn knowledge_cross_circle_reads_writes_and_replacement_are_hidden() {
 #[test]
 fn knowledge_mcp_schemas_expose_only_the_four_minimal_tools() {
     let tools = mcp_tools();
+    let mut missing = Vec::new();
+    for (name, field, rules) in [
+        (
+            "publish",
+            "title",
+            vec!["project", "question", "identifiers"],
+        ),
+        (
+            "publish",
+            "body",
+            vec![
+                "first 300 characters",
+                "keys:",
+                "one reusable question",
+                "inferred",
+            ],
+        ),
+        (
+            "publish",
+            "applies_to",
+            vec!["pin:", "watch:", "working-tree", "environment"],
+        ),
+        (
+            "publish",
+            "evidence",
+            vec!["commands", "observed results", "durable", "temporary"],
+        ),
+        (
+            "publish",
+            "replaces",
+            vec![
+                "same scope",
+                "duplicates unchanged",
+                "different version or scope",
+            ],
+        ),
+        (
+            "search",
+            "",
+            vec![
+                "title, body and applies_to",
+                "excludes evidence",
+                "newest first",
+                "at most 5",
+            ],
+        ),
+        (
+            "get",
+            "",
+            vec![
+                "working-tree",
+                "dependencies",
+                "environment",
+                "inferred",
+                "git diff --stat <commit> --",
+                "git status --porcelain --untracked-files=all",
+            ],
+        ),
+    ] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == format!("amesh_knowledge_{name}"))
+            .unwrap();
+        let description = if field.is_empty() {
+            &tool["description"]
+        } else {
+            &tool["inputSchema"]["properties"][field]["description"]
+        }
+        .as_str()
+        .unwrap_or_default();
+        for rule in rules {
+            if !description.contains(rule) {
+                missing.push(format!("{name}.{field}: {rule}"));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "missing knowledge guidance: {missing:#?}"
+    );
     let knowledge: Vec<_> = tools
         .iter()
         .filter(|t| t["name"].as_str().unwrap().starts_with("amesh_knowledge_"))

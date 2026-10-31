@@ -240,6 +240,24 @@ assert.equal(messages.length, 1);
 assert.equal(messages[0].message.display, true);
 assert.match(messages[0].message.content, /you are /);
 const peerId = messages[0].message.content.match(/you are ([^.\s]+)/)[1];
+const catalog = JSON.parse(execFileSync(executable, ["mcp", "--peer-id", peerId], {
+  input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }) + "\n",
+  encoding: "utf8",
+})).result.tools;
+for (const action of ["publish", "search", "get"]) {
+  const name = `amesh_knowledge_${action}`;
+  const canonical = catalog.find((entry) => entry.name === name);
+  await test(`${name} description matches MCP guidance`, () => {
+    assert.equal(defs[name].description, canonical.description);
+  });
+}
+for (const field of ["title", "body", "applies_to", "evidence", "replaces"]) {
+  await test(`knowledge ${field} description matches MCP guidance`, () => {
+    const canonical = catalog.find((entry) => entry.name === "amesh_knowledge_publish");
+    assert.equal(schemas.amesh_knowledge_publish.properties[field].description,
+      canonical.inputSchema.properties[field].description);
+  });
+}
 await test("knowledge tools round-trip against the daemon", async () => {
   const call = async (name, params) => {
     const result = await defs[name].execute("knowledge-round-trip", params);
