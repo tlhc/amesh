@@ -466,7 +466,7 @@ export default function AmeshHooks(pi) {
       },
     );
     const extra = [
-      ["job_create", "Create a job. With assigned_peer, the hub sends the prompt to that peer as a tracked ask once every depends_on job is done; the peer's ack completes the job and the reply becomes result_summary.", {
+      ["job_create", "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.", {
         title: { type: "string" },
         prompt: { type: "string" },
         path: { type: "string" },
@@ -479,7 +479,7 @@ export default function AmeshHooks(pi) {
         cross_circle: { type: "boolean" },
       }, []],
       ["job_status", "Show a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
-      ["job_update", "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it); moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.", {
+      ["job_update", "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.", {
         job_id: { type: "string" },
         state: { type: "string" },
         result_summary: { type: "string" },

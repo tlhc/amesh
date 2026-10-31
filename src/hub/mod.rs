@@ -3409,9 +3409,14 @@ async fn create_job(
         created_at: Some(now_unix()),
         handoff: None,
     };
-    hub.jobs.insert(job_id.clone(), job.clone());
+    hub.jobs.insert(job_id.clone(), job);
+    let now = now_unix();
+    let mut events = Vec::new();
+    dispatch_job(&mut hub, &job_id, now, &mut events);
+    let queued = queue_replies(&mut hub, events, now);
     persist_ok(&mut hub)?;
-    Ok(Json(json!(job)))
+    deliver_queued(&mut hub, queued);
+    Ok(Json(json!(hub.jobs[&job_id])))
 }
 
 /* a dispatched job is an ask on its creator's behalf, so its assignee follows the ask
@@ -3601,13 +3606,13 @@ async fn update_job(
             Json(json!({"error": "set state queued to change a job's prompt"})),
         ));
     }
-    let mut replies = Vec::new();
+    let mut events = Vec::new();
     if current.state == "running" && state != "running" {
         let reply = match &req.result_summary {
             Some(summary) => format!("amesh: job {id} set to {state}: {summary}"),
             None => format!("amesh: job {id} set to {state}"),
         };
-        replies.extend(close_job_ask(&mut hub, &current, reply, state != "done"));
+        events.extend(close_job_ask(&mut hub, &current, reply, state != "done"));
     }
     let Some(job) = hub.jobs.get_mut(&id) else {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
@@ -3631,8 +3636,11 @@ async fn update_job(
     if let Some(to) = moved_to.clone() {
         job.assigned_peer = Some(to);
     }
+    /* a requeue retires the old ask: no reader may see a closed id again */
+    if state == "queued" {
+        job.ask_id = None;
+    }
     let job = job.clone();
-    let replies = queue_replies(&mut hub, replies, now);
     /* the peer that held the job hears about the change, including where it went */
     let notice = match moved_to {
         Some(to) => format!(
@@ -3641,14 +3649,20 @@ async fn update_job(
         ),
         None => format!("job {} {} {}", job.job_id, job.title, job.state),
     };
-    let holder = job_holder(&hub, &current).or_else(|| job_holder(&hub, &job));
-    if let Some(to) = holder {
-        deliver_notify(&mut hub, &to, notice, now)?;
-    } else {
-        persist_ok(&mut hub)?;
+    if let Some(to) = job_holder(&hub, &current).or_else(|| job_holder(&hub, &job)) {
+        events.push(json!({
+            "type": "notify",
+            "id": format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]),
+            "from_peer": "amesh",
+            "to_peer": to,
+            "message": notice,
+        }));
     }
-    deliver_queued(&mut hub, replies);
-    Ok(Json(json!(job)))
+    dispatch_job(&mut hub, &id, now, &mut events);
+    let queued = queue_replies(&mut hub, events, now);
+    persist_ok(&mut hub)?;
+    deliver_queued(&mut hub, queued);
+    Ok(Json(json!(hub.jobs[&id])))
 }
 
 /* a coordinator-only update: the job's later acks, its reminders and its next dispatch go to
@@ -4305,6 +4319,58 @@ fn set_job_state(job: &mut Job, state: &str, now: u64) {
     job.state = state.into();
 }
 
+/* one queued job that can go out now: its ask, its ask event and the move to running. The
+caller owns the write and the delivery, so a request can dispatch inside its own answer and
+the tick can do the same work in its batch */
+fn dispatch_job(hub: &mut Hub, id: &str, now: u64, events: &mut Vec<Value>) -> Option<()> {
+    let job = hub.jobs.get(id).filter(|job| job.state == "queued")?;
+    let crate::wire::DispatchState::Ready { peer_id: worker } =
+        derive::assess_dispatch(hub, job).state
+    else {
+        return None;
+    };
+    let target = job.assigned_peer.clone().unwrap_or_default();
+    let text = job_ask_text(hub, job);
+    let from = Some(job.from_peer.clone())
+        .filter(|peer| !peer.is_empty())
+        .unwrap_or_else(|| "anonymous".into());
+    let from_circle = job.circle.clone();
+    let to_circle = hub.peers[&worker].circle.clone();
+    let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
+    hub.asks.insert(
+        cid.clone(),
+        Ask {
+            correlation_id: cid.clone(),
+            from_peer: from.clone(),
+            to_peer: target.clone(),
+            to_peer_id: worker,
+            from_circle,
+            to_circle,
+            text: text.clone(),
+            open: true,
+            reply: None,
+            failed: false,
+            closed_at: None,
+            opened_at: Some(now_unix()),
+            closed_by: None,
+        },
+    );
+    events.push(json!({
+        "type": "ask",
+        "correlation_id": cid,
+        "from_peer": from,
+        "to_peer": target,
+        "text": text,
+    }));
+    let nudge_at = now + hub.config.job_nudge_secs;
+    if let Some(job) = hub.jobs.get_mut(id) {
+        set_job_state(job, "running", now);
+        job.ask_id = Some(cid);
+        job.nudge_at = Some(nudge_at);
+    }
+    Some(())
+}
+
 /* Jobs move here, in one pass under one lock. Settling comes first, so a job whose
 last dependency finished in this pass is sent in the same pass. A job that can make no
 progress on its own reminds its creator every JOB_NUDGE_SECS: running without an ack,
@@ -4327,65 +4393,23 @@ fn advance_jobs(hub: &mut Hub) {
         changed |= settle_job(hub, id);
     }
     for id in &ids {
+        if dispatch_job(hub, id, now, &mut events).is_some() {
+            changed = true;
+            continue;
+        }
         let Some(job) = hub.jobs.get(id).filter(|job| job.state == "queued") else {
             continue;
         };
         let assessment = derive::assess_dispatch(hub, job);
-        let derive::DispatchAssessment {
-            state: crate::wire::DispatchState::Ready { peer_id: worker },
-            ..
-        } = assessment
-        else {
-            let nudge_at = assessment
-                .nudge_eligible
-                .then(|| job.nudge_at.unwrap_or(now + config.job_nudge_secs));
-            if job.nudge_at != nudge_at {
-                if let Some(job) = hub.jobs.get_mut(id) {
-                    job.nudge_at = nudge_at;
-                }
-                changed = true;
+        let nudge_at = assessment
+            .nudge_eligible
+            .then(|| job.nudge_at.unwrap_or(now + config.job_nudge_secs));
+        if job.nudge_at != nudge_at {
+            if let Some(job) = hub.jobs.get_mut(id) {
+                job.nudge_at = nudge_at;
             }
-            continue;
-        };
-        let target = job.assigned_peer.clone().unwrap_or_default();
-        let text = job_ask_text(hub, job);
-        let from = Some(job.from_peer.clone())
-            .filter(|peer| !peer.is_empty())
-            .unwrap_or_else(|| "anonymous".into());
-        let from_circle = job.circle.clone();
-        let to_circle = hub.peers[&worker].circle.clone();
-        let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
-        hub.asks.insert(
-            cid.clone(),
-            Ask {
-                correlation_id: cid.clone(),
-                from_peer: from.clone(),
-                to_peer: target.clone(),
-                to_peer_id: worker,
-                from_circle,
-                to_circle,
-                text: text.clone(),
-                open: true,
-                reply: None,
-                failed: false,
-                closed_at: None,
-                opened_at: Some(now_unix()),
-                closed_by: None,
-            },
-        );
-        events.push(json!({
-            "type": "ask",
-            "correlation_id": cid,
-            "from_peer": from,
-            "to_peer": target,
-            "text": text,
-        }));
-        if let Some(job) = hub.jobs.get_mut(id) {
-            set_job_state(job, "running", now);
-            job.ask_id = Some(cid);
-            job.nudge_at = Some(now + config.job_nudge_secs);
+            changed = true;
         }
-        changed = true;
     }
     for id in &ids {
         let Some(job) = hub
@@ -4877,7 +4901,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Create a job. With assigned_peer, the hub sends the prompt to that peer as a tracked ask once every depends_on job is done; the peer's ack completes the job and the reply becomes result_summary.",
+                "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.",
                 json!({
                     "title": {"type": "string"},
                     "prompt": {"type": "string"},
@@ -4914,7 +4938,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it); moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.",
+                "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.",
                 json!({
                     "job_id": {"type": "string"},
                     "state": {"type": "string"},

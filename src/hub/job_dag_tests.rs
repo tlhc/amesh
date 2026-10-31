@@ -162,15 +162,11 @@ async fn job_dispatch_sends_ask() {
         .job(json!({"title": "audit", "prompt": "read the docs",
                     "assigned_peer": "w1", "from_peer": "boss"}))
         .await;
-    assert_eq!(f.row(&id).await.state, "queued", "only the loop dispatches");
-    assert!(
-        f.inbox("w1").await.is_empty(),
-        "creating a job sends nothing"
-    );
-
-    f.advance().await;
     let job = f.row(&id).await;
-    assert_eq!(job.state, "running");
+    assert_eq!(
+        job.state, "running",
+        "a ready job goes out in the create call"
+    );
     let cid = job.ask_id.clone().unwrap();
     let inbox = f.inbox("w1").await;
     assert_eq!(inbox.len(), 1, "{inbox:?}");
@@ -669,8 +665,9 @@ async fn job_nudges_orchestrator() {
     let c = f
         .job(json!({"title": "c", "assigned_peer": "w3", "from_peer": "boss"}))
         .await;
-    /* w3 leaves before the loop gets to c */
+    /* w3 leaves, and c is requeued: ready with nobody to send it to */
     f.0.inner.lock().await.peers.remove("w3");
+    f.set_state(&c, json!({"state": "queued"})).await;
     f.advance().await;
     assert_eq!(f.row(&a).await.state, "running");
     let waiting = f.row(&c).await;
@@ -1161,6 +1158,7 @@ async fn job_tools_enforce_circle() {
     let a = f
         .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
         .await;
+    let before = f.row(&a).await;
     for (tool, args) in [
         ("amesh_job_update", json!({"job_id": a, "state": "done"})),
         ("amesh_job_status", json!({"job_id": a})),
@@ -1172,7 +1170,12 @@ async fn job_tools_enforce_circle() {
         let (status, body) = f.tool(tool, args).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{tool}: {body}");
     }
-    assert_eq!(f.row(&a).await.state, "queued");
+    let after = f.row(&a).await;
+    assert_eq!(after.state, before.state, "a forbidden call moved the job");
+    assert_eq!(
+        after.ask_id, before.ask_id,
+        "a forbidden call changed its ask"
+    );
 
     let (status, body) = f
         .tool(
@@ -2346,9 +2349,13 @@ async fn a_peer_counts_its_running_jobs_in_every_circle() {
     f.job(json!({"title": "here", "from_peer": "boss1", "assigned_peer": "w"}))
         .await;
     f.0.inner.lock().await.peers.get_mut("w").unwrap().circle = "c2".into();
-    f.job(json!({"title": "there", "from_peer": "boss2", "assigned_peer": "w"}))
+    let there = f
+        .job(json!({"title": "there", "from_peer": "boss2", "assigned_peer": "w"}))
         .await;
     f.0.inner.lock().await.peers.get_mut("w").unwrap().circle = "c1".into();
+    /* the retry cannot reach a worker outside the job's circle */
+    let (status, _) = f.set_state(&there, json!({"state": "queued"})).await;
+    assert_eq!(status, StatusCode::OK);
     f.advance().await;
     let s = snapshot_of(&f, "?circle=c1").await;
     assert_eq!(s["jobs"].as_array().unwrap().len(), 1, "{s}");
@@ -3306,4 +3313,320 @@ async fn an_asker_away_with_its_session_kept_is_owed_its_answer() {
             "{what} waits with the backlog for the asker's session: {pending}"
         );
     }
+}
+
+#[tokio::test]
+async fn job_create_dispatches_a_ready_job_in_the_call() {
+    let f = team("one", &["boss", "w1"]).await;
+    let (status, job) = f
+        .request(
+            "POST",
+            "/jobs",
+            json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["state"], "running", "{job}");
+    let cid = job["ask_id"].as_str().expect("ask id in the create answer");
+    let ask = f.ask(cid).await;
+    assert!(ask.open, "the new ask is open");
+    assert_eq!(ask.to_peer_id, "w1");
+    let inbox = f.inbox("w1").await;
+    assert_eq!(inbox.len(), 1, "{inbox:?}");
+    assert_eq!(inbox[0]["correlation_id"], cid);
+    /* the worker acks at once; the next pass must not send the job a second time */
+    let (status, body) = f
+        .ack(cid, json!({"message": "done", "from_peer": "w1"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.advance().await;
+    let id = job["job_id"].as_str().unwrap();
+    assert_eq!(f.row(id).await.state, "done");
+    assert_eq!(f.inbox("w1").await.len(), 1, "a second ask was sent");
+}
+
+#[tokio::test]
+async fn job_create_leaves_a_blocked_job_queued_without_an_ask() {
+    let f = team("one", &["boss", "w1", "w2"]).await;
+    let a = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let (status, b) = f
+        .request(
+            "POST",
+            "/jobs",
+            json!({"title": "b", "assigned_peer": "w2", "from_peer": "boss", "depends_on": [a]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{b}");
+    assert_eq!(b["state"], "queued", "{b}");
+    assert!(b["ask_id"].is_null(), "{b}");
+    /* the dependency finishing sends it on the next pass */
+    let cid = f.ask_id(&a).await;
+    f.ack(&cid, json!({"message": "a done", "from_peer": "w1"}))
+        .await;
+    f.advance().await;
+    let row = f.row(b["job_id"].as_str().unwrap()).await;
+    assert_eq!(row.state, "running");
+    assert!(row.ask_id.is_some());
+}
+
+#[tokio::test]
+async fn job_create_without_a_ready_assignee_stays_queued() {
+    let f = team("one", &["boss"]).await;
+    let (status, job) = f
+        .request("POST", "/jobs", json!({"title": "a", "from_peer": "boss"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["state"], "queued");
+    assert!(job["ask_id"].is_null());
+}
+
+#[tokio::test]
+async fn job_requeue_retires_the_old_ask_and_returns_the_new_one() {
+    let f = team("one", &["boss", "w1"]).await;
+    let id = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let old = f.ask_id(&id).await;
+    let (status, job) = f
+        .set_state(&id, json!({"state": "queued", "assigned_peer": "w1"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["state"], "running", "{job}");
+    let new = job["ask_id"].as_str().expect("the requeue dispatched");
+    assert_ne!(new, old, "the answer carries the retired id");
+    let old_ask = f.ask(&old).await;
+    assert!(!old_ask.open, "the old ask stayed open");
+    assert!(old_ask.failed, "a requeue closes the old ask as failed");
+    assert!(f.ask(new).await.open);
+    let row = f.row(&id).await;
+    assert_eq!(
+        row.ask_id.as_deref(),
+        Some(new),
+        "the stored row names another ask"
+    );
+    assert_eq!(row.state, "running");
+}
+
+#[tokio::test]
+async fn job_requeue_keeps_the_old_ask_reply_and_failed_flag() {
+    let f = team("one", &["boss", "w1"]).await;
+    let id = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let cid = f.ask_id(&id).await;
+    f.ack(
+        &cid,
+        json!({"message": "the first answer", "from_peer": "w1"}),
+    )
+    .await;
+    f.advance().await;
+    assert_eq!(f.row(&id).await.state, "done");
+    let (status, _) = f.set_state(&id, json!({"state": "queued"})).await;
+    assert_eq!(status, StatusCode::OK);
+    let kept = f.ask(&cid).await;
+    assert_eq!(
+        kept.reply.as_deref(),
+        Some("the first answer"),
+        "the old reply was rewritten"
+    );
+    assert!(!kept.failed, "the old failed flag was rewritten");
+    let again = f
+        .ask(&f.row(&id).await.ask_id.expect("the retry dispatched"))
+        .await;
+    assert_ne!(again.correlation_id, cid, "the old ask was handed back");
+    assert!(again.open, "the retry's ask is not open");
+}
+
+#[tokio::test]
+async fn two_requeues_leave_one_open_ask() {
+    let f = team("one", &["boss", "w1"]).await;
+    let id = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let first = f.ask_id(&id).await;
+    let (_, job) = f.set_state(&id, json!({"state": "queued"})).await;
+    let second = job["ask_id"].as_str().unwrap().to_string();
+    let (_, job) = f.set_state(&id, json!({"state": "queued"})).await;
+    let third = job["ask_id"].as_str().unwrap().to_string();
+    assert_ne!(first, second);
+    assert_ne!(second, third);
+    let hub = f.0.inner.lock().await;
+    let open = hub
+        .asks
+        .values()
+        .filter(|ask| ask.open && ask.to_peer_id == "w1")
+        .count();
+    assert_eq!(open, 1, "a requeue left more than one open ask");
+}
+
+#[tokio::test]
+async fn job_create_persist_failure_leaves_nothing_behind() {
+    let f = team("one", &["boss", "w1"]).await;
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .pragma_update(None, "query_only", true)
+        .unwrap();
+    let (status, body) = f
+        .request(
+            "POST",
+            "/jobs",
+            json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert!(
+        f.0.inner.lock().await.jobs.is_empty(),
+        "the job stayed in memory"
+    );
+    assert!(
+        f.0.inner.lock().await.asks.is_empty(),
+        "the ask stayed in memory"
+    );
+    assert!(f.inbox("w1").await.is_empty(), "a message was delivered");
+    assert!(
+        !f.0.inner
+            .lock()
+            .await
+            .events
+            .iter()
+            .any(|event| event["type"] == "ask"),
+        "the ask reached the ring before the write"
+    );
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .pragma_update(None, "query_only", false)
+        .unwrap();
+    let id = f
+        .job(json!({"title": "b", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    assert_eq!(f.row(&id).await.state, "running");
+}
+
+#[tokio::test]
+async fn job_requeue_without_a_worker_returns_null() {
+    let f = team("one", &["boss", "w1"]).await;
+    let id = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let old = f.ask_id(&id).await;
+    f.0.inner.lock().await.peers.remove("w1");
+    let (status, job) = f.set_state(&id, json!({"state": "queued"})).await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["state"], "queued", "{job}");
+    assert!(
+        job["ask_id"].is_null(),
+        "the answer carries the retired ask: {job}"
+    );
+    let row = f.row(&id).await;
+    assert!(row.ask_id.is_none(), "the stored row names the retired ask");
+    assert!(!f.ask(&old).await.open, "the old ask stayed open");
+}
+
+#[tokio::test]
+async fn a_handoff_before_dispatch_names_the_new_coordinator_in_the_ask() {
+    let f = team("one", &["boss", "deputy", "w1"]).await;
+    let dep = f
+        .job(json!({"title": "dep", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let id = f
+        .job(json!({"title": "b", "assigned_peer": "w1", "from_peer": "boss", "depends_on": [dep]}))
+        .await;
+    assert!(
+        f.row(&id).await.ask_id.is_none(),
+        "a blocked job has no ask"
+    );
+    let (status, _) = f
+        .request(
+            "PATCH",
+            &format!("/jobs/{id}"),
+            json!({"coordinator": "deputy"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    f.ack(
+        &f.ask_id(&dep).await,
+        json!({"message": "dep done", "from_peer": "w1"}),
+    )
+    .await;
+    f.advance().await;
+    let row = f.row(&id).await;
+    assert_eq!(row.state, "running");
+    let cid = row.ask_id.expect("the dependency unblocked it");
+    assert_eq!(f.ask(&cid).await.from_peer, "deputy");
+    let inbox = f.inbox("w1").await;
+    assert!(
+        inbox.iter().any(|event| {
+            event["type"] == "ask"
+                && event["correlation_id"] == cid.as_str()
+                && event["from_peer"] == "deputy"
+        }),
+        "{inbox:?}"
+    );
+}
+
+#[tokio::test]
+async fn job_requeue_persist_failure_keeps_the_run() {
+    let f = team("one", &["boss", "w1"]).await;
+    let id = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let cid = f.ask_id(&id).await;
+    let (boss_before, w1_before) = (f.inbox("boss").await, f.inbox("w1").await);
+    let (asks_before, events_before) = {
+        let hub = f.0.inner.lock().await;
+        (hub.asks.len(), hub.events.len())
+    };
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .pragma_update(None, "query_only", true)
+        .unwrap();
+    let (status, body) = f.set_state(&id, json!({"state": "queued"})).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    {
+        let hub = f.0.inner.lock().await;
+        assert!(hub.asks[&cid].open, "the old ask was closed");
+        assert_eq!(hub.jobs[&id].state, "running", "the job left its run");
+        assert_eq!(
+            hub.jobs[&id].ask_id.as_deref(),
+            Some(cid.as_str()),
+            "the job lost its ask"
+        );
+        assert_eq!(hub.asks.len(), asks_before, "a new ask survived");
+        assert_eq!(hub.events.len(), events_before, "an event was published");
+    }
+    assert_eq!(f.inbox("boss").await, boss_before, "boss got a message");
+    assert_eq!(f.inbox("w1").await, w1_before, "w1 got a message");
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .pragma_update(None, "query_only", false)
+        .unwrap();
+}
+
+#[tokio::test]
+async fn job_terminal_requeue_without_a_worker_returns_null() {
+    let f = team("one", &["boss", "w1"]).await;
+    let id = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let cid = f.ask_id(&id).await;
+    f.ack(&cid, json!({"message": "done", "from_peer": "w1"}))
+        .await;
+    f.advance().await;
+    assert_eq!(f.row(&id).await.state, "done");
+    f.0.inner.lock().await.peers.remove("w1");
+    let (status, job) = f.set_state(&id, json!({"state": "queued"})).await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["state"], "queued", "{job}");
+    assert!(job["ask_id"].is_null(), "{job}");
+    assert_eq!(f.row(&id).await.ask_id, None, "the stored row kept the id");
 }

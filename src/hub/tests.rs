@@ -6386,7 +6386,9 @@ async fn a_coordinator_only_update_never_touches_the_jobs_run() {
             .iter()
             .find(|e| e.event()["type"] == "ask" && e.event()["correlation_id"] == cid.as_str())
             .expect("the worker got the dispatch");
-        assert_eq!(sent.event()["from_peer"], "deputy");
+        /* the ask was queued when the job was created, before this handoff: its copy
+        keeps the sender it was written with, while the ask row above carries the new one */
+        assert_eq!(sent.event()["from_peer"], "boss");
     }
     /* running: the hub dispatched after the caller last looked; the handoff keeps the run */
     let before = hub.lock().await.jobs[&jid].clone();
