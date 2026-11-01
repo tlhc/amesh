@@ -2788,6 +2788,8 @@ struct CapturedWait {
     ask: Ask,
     derived: Option<crate::wire::WaitDerived>,
     pushed: bool,
+    /* decided where the wait returned, never inferred from the fields above */
+    timed_out: bool,
 }
 
 #[derive(Serialize)]
@@ -2798,12 +2800,19 @@ struct HttpAskWait<'a> {
     derived: &'a Option<crate::wire::WaitDerived>,
 }
 
-fn capture_wait(hub: &Hub, ask: &Ask, caller: Option<&str>, now: u64) -> CapturedWait {
+fn capture_wait(
+    hub: &Hub,
+    ask: &Ask,
+    caller: Option<&str>,
+    now: u64,
+    timed_out: bool,
+) -> CapturedWait {
     let model = derive::ReadModel::new(hub, now);
     CapturedWait {
         ask: ask.clone(),
         derived: ask.open.then(|| model.wait(ask)),
         pushed: model.wait_push_hint(ask, caller),
+        timed_out,
     }
 }
 
@@ -2814,7 +2823,7 @@ fn wait_summary(captured: &CapturedWait, timeout: u64) -> Value {
         "from_peer": ask.from_peer,
         "to_peer": ask.to_peer,
         "open": ask.open,
-        "timed_out": ask.open,
+        "timed_out": captured.timed_out,
         "reply": ask.reply,
         "failed": ask.failed,
         "timeout_seconds": timeout,
@@ -2868,7 +2877,9 @@ async fn wait_capture(
                 }
             ) && began.as_ref().is_some_and(|first| *first != reported);
             if !ask.open || stop || tokio::time::Instant::now() >= deadline {
-                return Ok(capture_wait(&hub, ask, caller, now));
+                /* open and not stopped here means the deadline ran out */
+                let timed_out = ask.open && !stop;
+                return Ok(capture_wait(&hub, ask, caller, now, timed_out));
             }
             began.get_or_insert(reported);
             hub.changes.subscribe()

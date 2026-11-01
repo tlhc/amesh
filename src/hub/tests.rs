@@ -216,14 +216,20 @@ async fn a_wait_wakes_on_the_commit_that_closes_its_ask() {
     let started = tokio::time::Instant::now();
     let waiter = tokio::spawn({
         let (app, cid) = (app.clone(), cid.clone());
-        async move { wait_capture(&app, &cid, WAIT_MAX_SECS, None).await.is_ok() }
+        async move { wait_capture(&app, &cid, WAIT_MAX_SECS, None).await.unwrap() }
     });
     tokio::task::yield_now().await;
     let subscribed = app.inner.lock().await.changes.receiver_count();
     assert_eq!(subscribed, 1, "the wait subscribed before the ack");
     let pong = json!({"correlation_id": cid, "message": "pong"});
     let _ = json_req(router(app.clone()), "POST", "/ack", pong).await;
-    assert!(waiter.await.unwrap());
+    let captured = waiter.await.unwrap();
+    let summary = wait_summary(&captured, 0);
+    assert_eq!(summary["open"], false, "{summary}");
+    assert_eq!(
+        summary["timed_out"], false,
+        "an ack is not a timeout: {summary}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(WAIT_MAX_SECS),
         "the commit woke the wait before its deadline"
@@ -276,7 +282,13 @@ async fn a_wait_ends_when_its_recipient_stops_during_it() {
         "elapsed time woken by another peer, or a resumed recipient, leaves it running"
     );
     report("worker", "wait").await;
-    assert!(waiter.await.unwrap().ask.open);
+    let captured = waiter.await.unwrap();
+    assert!(captured.ask.open);
+    let summary = wait_summary(&captured, 0);
+    assert_eq!(
+        summary["timed_out"], false,
+        "a stop is not a timeout: {summary}"
+    );
     assert!(
         started.elapsed() < Duration::from_secs(WAIT_MAX_SECS),
         "the recipient's prompt ended the wait before its deadline"
@@ -301,6 +313,36 @@ async fn a_wait_ends_when_its_recipient_stops_during_it() {
     assert!(
         started.elapsed() < Duration::from_secs(WAIT_MAX_SECS),
         "a turn that resumed and ended between two looks ended the wait"
+    );
+    /* the worker has already stopped and the next wait starts after that stop: the deadline
+    ends it, and the idle progress must not be mistaken for a stop */
+    let captured = wait_capture(&app, &cid, 0, None).await.unwrap();
+    let summary = wait_summary(&captured, 0);
+    assert_eq!(summary["state"]["progress"]["kind"], "idle", "{summary}");
+    assert_eq!(summary["timed_out"], true, "{summary}");
+    /* a stop and the deadline meet in one check: the wait must not call it a timeout. The
+    first poll records the activity the wait began on; the lock then holds the next look back
+    until the deadline has passed */
+    let mut w = Box::pin(wait_capture(&app, &cid, 1, None));
+    assert!(
+        futures_util::future::poll_immediate(w.as_mut())
+            .await
+            .is_none(),
+        "the first poll must wait"
+    );
+    {
+        let mut hub = app.inner.lock().await;
+        let activity = hub.activity.get_mut("worker").unwrap();
+        activity.state = "wait".into();
+        activity.since = now_unix();
+        std::thread::sleep(Duration::from_millis(1200));
+    }
+    let captured = w.await.unwrap();
+    let summary = wait_summary(&captured, 0);
+    assert_eq!(summary["open"], true, "{summary}");
+    assert_eq!(
+        summary["timed_out"], false,
+        "a stop at the deadline is not a timeout: {summary}"
     );
 }
 

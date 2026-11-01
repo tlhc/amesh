@@ -369,8 +369,8 @@ async fn final_capture_clock_coherence() {
         },
     );
     let ask = question(true);
-    let before = capture_wait(&hub, &ask, None, 99);
-    let after = capture_wait(&hub, &ask, None, 100);
+    let before = capture_wait(&hub, &ask, None, 99, false);
+    let after = capture_wait(&hub, &ask, None, 100, false);
     let before = before.derived.unwrap();
     let after = after.derived.unwrap();
     assert_eq!(
@@ -415,14 +415,14 @@ async fn wait_carries_actions_and_the_resolved_sender() {
         },
     );
     let ask = question(true);
-    let idle = capture_wait(&hub, &ask, None, 100).derived.unwrap();
+    let idle = capture_wait(&hub, &ask, None, 100, false).derived.unwrap();
     assert_eq!(idle.from_peer_id.as_deref(), Some("sender-id"));
     assert_eq!(
         idle.actions,
         vec![wire::AskAction::Nudge { to: "p".into() }]
     );
     hub.peers.remove("p");
-    let gone = capture_wait(&hub, &ask, None, 100).derived.unwrap();
+    let gone = capture_wait(&hub, &ask, None, 100, false).derived.unwrap();
     assert_eq!(gone.actions, vec![wire::AskAction::CloseLeft]);
 }
 
@@ -434,7 +434,7 @@ async fn capture_survives_close_and_disconnect() {
     hub.sockets
         .insert("sender-id".into(), (1, mpsc::unbounded_channel().0));
     hub.asks.insert("a".into(), question(true));
-    let captured = capture_wait(&hub, &hub.asks["a"], Some("sender-id"), 100);
+    let captured = capture_wait(&hub, &hub.asks["a"], Some("sender-id"), 100, false);
     hub.asks.get_mut("a").unwrap().open = false;
     hub.sockets.clear();
     let summary = wait_summary(&captured, 0);
@@ -453,7 +453,7 @@ async fn closed_capture_stays_closed_after_reopen() {
     let (app, _path) = app();
     let mut hub = app.inner.lock().await;
     hub.asks.insert("a".into(), question(false));
-    let captured = capture_wait(&hub, &hub.asks["a"], None, 100);
+    let captured = capture_wait(&hub, &hub.asks["a"], None, 100, false);
     hub.asks.get_mut("a").unwrap().open = true;
     assert_eq!(
         wait_summary(&captured, 0),
@@ -651,7 +651,7 @@ async fn sized_mcp_wait(state: &str) -> String {
         },
         90,
     );
-    let captured = capture_wait(&hub, &ask, Some(&sender), 100);
+    let captured = capture_wait(&hub, &ask, Some(&sender), 100, false);
     let summary = wait_summary(&captured, 0).to_string();
     eprintln!("bounded MCP {state}: {} bytes", summary.len());
     summary
