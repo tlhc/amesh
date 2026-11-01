@@ -174,6 +174,11 @@ export default function AmeshHooks(pi) {
   let selfId = peerId;
   let dead = false;
   let inflight = false;
+  /* the batch handed to pi; message_start clears the gate only when that same text arrives
+  as a user message */
+  let inflightText = null;
+  let reminded = false;
+  let pendingSeen = false;
   let warned = false;
   let localSession;
   let inboundSessionId;
@@ -232,6 +237,10 @@ export default function AmeshHooks(pi) {
     if (localSession !== session) {
       KeepSession(session);
       localSession = session;
+      inflight = false;
+      inflightText = null;
+      reminded = false;
+      pendingSeen = false;
     }
     return session;
   }
@@ -254,6 +263,9 @@ export default function AmeshHooks(pi) {
     dead = true;
     clearTimeout(idleCheck);
     inflight = false;
+    inflightText = null;
+    reminded = false;
+    pendingSeen = false;
     warned = false;
     pending.length = 0;
     clearTimeout(retry);
@@ -316,10 +328,12 @@ export default function AmeshHooks(pi) {
 
   function Start(batch, type) {
     inflight = true;
+    inflightText = batch.map((item) => item.text).join("\n\n");
     try {
-      pi.sendUserMessage(batch.map((item) => item.text).join("\n\n"), { deliverAs: type === "broadcast" ? "followUp" : "steer" });
+      pi.sendUserMessage(inflightText, { deliverAs: type === "broadcast" ? "followUp" : "steer" });
     } catch (error) {
       inflight = false;
+      inflightText = null;
       pending.unshift(...batch);
       console.error(`[amesh] ${error.message}`);
     }
@@ -759,6 +773,10 @@ export default function AmeshHooks(pi) {
 
   pi.on("before_agent_start", async (_event, ctx) => {
     lastCtx = ctx;
+    /* a continuation re-emits agent_start but not before_agent_start, so this is the only
+    place a new chain starts: remind at most once per chain */
+    reminded = false;
+    pendingSeen = false;
     CancelIdle();
     await settling;
     /* the session can shut down while an idle report is still landing */
@@ -772,7 +790,8 @@ export default function AmeshHooks(pi) {
     }
   });
 
-  /* a queued prompt runs after the settle without a new before_agent_start */
+  /* a continuation (a queued prompt or a settle reminder) re-emits agent_start but never
+  before_agent_start, so agent_start must not reset the reminder gate */
   pi.on("agent_start", async (_event, ctx) => {
     CancelIdle();
     const use = ctx ?? lastCtx;
@@ -790,16 +809,77 @@ export default function AmeshHooks(pi) {
     }
   });
 
+  /* the steer lands as a user message once pi consumes it; seeing that message lets the
+  next batch out inside the same run. A text rewrite by another extension's input handler
+  keeps it from matching, and the batch then waits for agent_settled, as it does today */
+  pi.on("message_start", (event) => {
+    if (inflightText === null) {
+      return;
+    }
+    const message = event.message;
+    if (!message || message.role !== "user") {
+      return;
+    }
+    const text =
+      typeof message.content === "string"
+        ? message.content
+        : (message.content || [])
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("");
+    if (text !== inflightText) {
+      return;
+    }
+    inflight = false;
+    inflightText = null;
+    Flush();
+  });
+
   pi.on("agent_end", async (_event, ctx) => {
     try {
-      EnqueueInbox(await Invoke("stop", ctx));
+      const result = await Invoke("stop", ctx);
+      EnqueueInbox(result);
+      pendingSeen = Array.isArray(result.pending) && result.pending.length > 0;
     } catch (error) {
+      pendingSeen = false;
       console.error(`[amesh] ${error.message}`);
     }
   });
 
+  /* one reminder per chain: read the asks again so a late ack is not reported as pending,
+  and keep whatever inbox the read took, or a message that arrived in between is lost */
+  pi.on("agent_before_settle", async (event, ctx) => {
+    if (!pendingSeen || reminded || dead || event.outcome !== "completed") {
+      return;
+    }
+    /* the re-read awaits a process: a session switch can land in between, and the reminder
+    belongs to the session that asked for it */
+    const session = localSession;
+    let result;
+    try {
+      result = await Invoke("stop", ctx);
+    } catch (error) {
+      console.error(`[amesh] ${error.message}`);
+      return;
+    }
+    EnqueueInbox(result);
+    const asks = Array.isArray(result.pending) ? result.pending : [];
+    if (dead || session !== localSession || asks.length === 0) {
+      return;
+    }
+    reminded = true;
+    return {
+      entries: [
+        ...(event.entries ?? []),
+        { type: "custom_message", customType: "amesh-reminder", content: result.context ?? "", display: true },
+      ],
+      continue: true,
+    };
+  });
+
   pi.on("agent_settled", (_event, ctx) => {
     inflight = false;
+    inflightText = null;
     Flush();
     const use = ctx ?? lastCtx;
     if (use && !dead) {

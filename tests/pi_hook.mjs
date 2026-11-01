@@ -1188,3 +1188,237 @@ await test("a report that fails on connect is logged, never thrown", async () =>
     await instance.handlers.get("session_shutdown")({}, busy);
   }
 });
+
+await test("a consumed steer lets the next batch out inside the same run", async () => {
+  const state = InboxSession();
+  wsFailRemaining = 0;
+  const instance = InboxInstance(state);
+  const delivered = (content, role = "user") =>
+    instance.handlers.get("message_start")({ type: "message_start", message: { role, content } });
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 4000);
+    fire(instance.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+    fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-one", id: "m1-e1" });
+    assert.equal(instance.users.length, 1, "the first batch goes out at once");
+    fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-two", id: "m1-e2" });
+    assert.equal(instance.users.length, 1, "the second batch waits while the first is in flight");
+    const first = instance.users[0].content;
+    await delivered(first, "assistant");
+    assert.equal(instance.users.length, 1, "an assistant message must not open the gate");
+    await delivered("some other user text");
+    assert.equal(instance.users.length, 1, "a different user text must not open the gate");
+    await delivered([{ type: "text", text: first }]);
+    assert.equal(instance.users.length, 2, "the consumed batch opens the gate inside the run");
+    assert.match(instance.users[1].content, /m1-two/);
+    await delivered([{ type: "text", text: first }]);
+    assert.equal(instance.users.length, 2, "one batch opens the gate once");
+    fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-three", id: "m1-e3" });
+    assert.equal(instance.users.length, 2, "the new batch is in flight again");
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 3, "the settle fallback delivers what was held");
+    assert.match(instance.users[2].content, /m1-three/);
+    fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-four", id: "m1-e4" });
+    fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-five", id: "m1-e5" });
+    assert.equal(instance.users.length, 3, "both wait behind the batch the settle just delivered");
+    const other = {
+      ...state.ctx,
+      sessionManager: { ...state.ctx.sessionManager, getSessionId: () => "pi-other-session" },
+    };
+    await instance.handlers.get("before_agent_start")({}, other);
+    await delivered([{ type: "text", text: instance.users[2].content }]);
+    assert.equal(instance.users.length, 3, "a session change drops the in-flight record");
+    await instance.handlers.get("agent_settled")({}, other);
+    assert.equal(instance.users.length, 3, "a batch queued for the old session is gone");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+    wsFailRemaining = 1;
+  }
+});
+
+await test("a settle reminder fires once per chain and only for a completed run", async () => {
+  const state = InboxSession();
+  const instance = InboxInstance(state);
+  const boundary = (over = {}) => ({
+    type: "agent_before_settle",
+    outcome: "completed",
+    entries: [],
+    context: { canContinue: false },
+    ...over,
+  });
+  let ask = SendInbox(state, "ask", "m2-pending");
+  try {
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    const first = await instance.handlers.get("agent_before_settle")(boundary(), state.ctx);
+    assert.equal(first?.continue, true, "an open ask continues the run");
+    assert.equal(first.entries.length, 1, "exactly one draft is added");
+    assert.equal(first.entries[0].type, "custom_message");
+    assert.match(first.entries[0].content, new RegExp(ask.correlation_id));
+    await instance.handlers.get("agent_start")({}, state.ctx);
+    const again = await instance.handlers.get("agent_before_settle")(boundary(), state.ctx);
+    assert.equal(again, undefined, "one reminder per chain, not once per continuation");
+    const kept = await instance.handlers.get("agent_before_settle")(
+      boundary({ entries: [{ type: "custom_message", customType: "other", content: "keep", display: true }] }),
+      state.ctx,
+    );
+    assert.equal(kept, undefined, "a reminded chain adds nothing after the reminder");
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    const next = await instance.handlers.get("agent_before_settle")(
+      boundary({ entries: [{ type: "custom_message", customType: "other", content: "keep", display: true }] }),
+      state.ctx,
+    );
+    assert.equal(next?.continue, true, "a new chain reminds again");
+    assert.equal(next.entries.length, 2, "existing drafts are kept");
+    assert.equal(next.entries[0].content, "keep");
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    const aborted = await instance.handlers.get("agent_before_settle")(boundary({ outcome: "aborted" }), state.ctx);
+    assert.equal(aborted, undefined, "an aborted run is not reminded");
+    const afterAbort = await instance.handlers.get("agent_before_settle")(boundary(), state.ctx);
+    assert.equal(afterAbort?.continue, true, "the aborted check did not consume the reminder");
+    execFileSync(executable, ["peer", "ack", ask.correlation_id], { encoding: "utf8" });
+    ask = null;
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    const closed = await instance.handlers.get("agent_before_settle")(boundary(), state.ctx);
+    assert.equal(closed, undefined, "no open ask, no reminder");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+    if (ask) execFileSync(executable, ["peer", "ack", ask.correlation_id], { encoding: "utf8" });
+  }
+});
+
+await test("the reminder re-reads the asks and keeps the inbox it took", async () => {
+  const state = InboxSession();
+  wsFailRemaining = 0;
+  const instance = InboxInstance(state);
+  let stale = SendInbox(state, "ask", "m2-stale");
+  let fresh;
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 4000);
+    fire(instance.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    execFileSync(executable, ["peer", "ack", stale.correlation_id], { encoding: "utf8" });
+    stale = null;
+    fresh = SendInbox(state, "ask", "m2-fresh");
+    const reminder = await instance.handlers.get("agent_before_settle")(
+      { type: "agent_before_settle", outcome: "completed", entries: [], context: { canContinue: false } },
+      state.ctx,
+    );
+    assert.equal(reminder?.continue, true, "the fresh ask is still reminded");
+    assert.match(reminder.entries[0].content, new RegExp(fresh.correlation_id));
+    const deliveredBefore = instance.users.length;
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    SendInbox(state, "notify", "m2-inbox");
+    const late = await instance.handlers.get("agent_before_settle")(
+      { type: "agent_before_settle", outcome: "completed", entries: [], context: { canContinue: false } },
+      state.ctx,
+    );
+    assert.equal(late?.continue, true, "the still-open ask reminds again on the new chain");
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    const delivered = instance.users.slice(deliveredBefore).map((item) => item.content).join("\n");
+    assert.match(delivered, /m2-inbox/, "the inbox the second read took is still delivered");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+    wsFailRemaining = 1;
+    if (stale) execFileSync(executable, ["peer", "ack", stale.correlation_id], { encoding: "utf8" });
+    if (fresh) execFileSync(executable, ["peer", "ack", fresh.correlation_id], { encoding: "utf8" });
+  }
+});
+
+await test("a late ack drops the reminder but keeps the inbox the read took", async () => {
+  const state = InboxSession();
+  wsFailRemaining = 0;
+  const instance = InboxInstance(state);
+  let ask = SendInbox(state, "ask", "r2-late-ack");
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 4000);
+    fire(instance.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    execFileSync(executable, ["peer", "ack", ask.correlation_id], { encoding: "utf8" });
+    ask = null;
+    SendInbox(state, "notify", "r2-late-inbox");
+    const result = await instance.handlers.get("agent_before_settle")(
+      { type: "agent_before_settle", outcome: "completed", entries: [], context: { canContinue: false } },
+      state.ctx,
+    );
+    assert.equal(result, undefined, "a late ack prevents a stale reminder");
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    const delivered = instance.users.map((item) => item.content).join("\n");
+    assert.match(delivered, /r2-late-inbox/, "a now-empty pending read still delivers its inbox");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+    wsFailRemaining = 1;
+    if (ask) execFileSync(executable, ["peer", "ack", ask.correlation_id], { encoding: "utf8" });
+  }
+});
+
+await test("a session switch during the re-read keeps the reminder out", async () => {
+  const { writeFileSync, chmodSync, existsSync, rmSync } = await import("node:fs");
+  const statePath = `${cwd}/parity-stop-state.json`;
+  const fake = `${cwd}/parity-stop-amesh`;
+  const started = `${cwd}/parity-stop-started`;
+  const release = `${cwd}/parity-stop-release`;
+  rmSync(started, { force: true });
+  rmSync(release, { force: true });
+  writeFileSync(
+    fake,
+    `#!/usr/bin/env node
+const fs = require("node:fs");
+const state = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}, "utf8"));
+const verb = process.argv[3];
+if (verb === "stop" && state.gate) {
+  fs.writeFileSync(${JSON.stringify(started)}, "");
+  const end = Date.now() + 10000;
+  while (!fs.existsSync(${JSON.stringify(release)}) && Date.now() < end) {}
+  if (!fs.existsSync(${JSON.stringify(release)})) {
+    process.exit(3);
+  }
+}
+process.stdout.write(JSON.stringify(state[verb] ?? {}));
+`,
+  );
+  chmodSync(fake, 0o755);
+  const answers = {
+    stop: { peer_id: "parity-fake", context: "reminder text", pending: [{ correlation_id: "ask-fake" }], inbox: [] },
+    prompt: { peer_id: "parity-fake", context: "", inbox: [] },
+    work: {},
+    idle: {},
+  };
+  writeFileSync(statePath, JSON.stringify(answers));
+  const patched = source.split(JSON.stringify(executable)).join(JSON.stringify(fake));
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(patched).toString("base64")}`);
+  const state = InboxSession();
+  const instance = InboxInstance(state, false, hooks);
+  const boundary = { type: "agent_before_settle", outcome: "completed", entries: [], context: { canContinue: false } };
+  const other = {
+    ...state.ctx,
+    sessionManager: { ...state.ctx.sessionManager, getSessionId: () => "parity-other-session" },
+  };
+  try {
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_end")({}, state.ctx);
+    writeFileSync(statePath, JSON.stringify({ ...answers, gate: true }));
+    const pending = instance.handlers.get("agent_before_settle")(boundary, state.ctx);
+    assert.equal(
+      await waitUntil(() => existsSync(started), 10000),
+      true,
+      "the re-read is in flight before the session switch",
+    );
+    await instance.handlers.get("before_agent_start")({}, other);
+    writeFileSync(release, "");
+    const result = await pending;
+    assert.equal(result, undefined, "a session switch during the re-read drops the reminder");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+    rmSync(started, { force: true });
+    rmSync(release, { force: true });
+  }
+});
