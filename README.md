@@ -127,30 +127,12 @@ Ended chains and closed asks are deleted after `job_keep_secs` / `ask_keep_secs`
 
 ## Knowledge
 
-Knowledge uses a separate table to store each circle's reusable findings, scope and evidence. Search before substantive work; publish only verified findings that would save a future investigation. Most tasks need no publication.
+Each circle keeps shared notes of verified findings. Agents search them before substantive work and publish only what would save a later investigation.
 
-```bash
-amesh knowledge publish --title "mesh state is one SQLite file" \
-  --body "ask_keep_secs and job_keep_secs sweep ended rows; a restart stamps last_seen" \
-  --applies-to "src/hub, state.db" --evidence "cargo test --test cli" \
-  --ttl-seconds 604800 --from-peer amesh-pi
-amesh knowledge search "state sqlite" --limit 3 --from-peer amesh-pi
-amesh knowledge get kn-1a2b3c4d --from-peer amesh-pi
-amesh knowledge revoke kn-1a2b3c4d --reason "the fixture version moved on" --from-peer amesh-pi
-amesh knowledge delete kn-1a2b3c4d --from-peer amesh-pi
-```
-
-- The hub sets the circle, the publisher and the timestamps from the caller; never pass a circle. Every call needs a registered `from_peer` (`AMESH_PEER_ID` for the CLI). Clients sending JSON-RPC directly to `/mcp` must include `from_peer` in `arguments`. The `amesh mcp` proxy fills and overrides that field with its bound identity. The five knowledge tool schemas leave `from_peer` out so the model fills only business fields.
-- TTL defaults to 7 days, with a maximum of `2592000` s (30 days). It is fixed at publication; reading never extends it. Expired and revoked entries leave search immediately. Until cleanup, `knowledge get` still returns them with status `expired` or `revoked`. Cleanup removes unrevoked entries more than 7 days after expiry, and revoked entries more than 7 days after their stored revocation. Cleanup runs every `sweep_secs` (default 60 s). Later writes can reuse deleted space; file shrinking follows the existing startup and job/ask cleanup VACUUM paths. Knowledge expiry alone does not trigger VACUUM. Verify expired or revoked notes before reuse.
-- Omit the TTL for the 7-day default, shorten it when earlier revalidation is expected, and go past the default only for findings expected to stay applicable with an explicit version or scope and replayable evidence. A pin or URL is a lead, not proof of stability, and a TTL never replaces checking a note before reuse.
-- `body` is stored as given: leading indentation, internal line breaks and a trailing newline survive, and the 8192-byte limit counts the bytes stored, so trailing whitespace cannot buy room. `title`, `applies_to`, `evidence` and `reason` are trimmed first, and their limits count the trimmed value.
-- `--replaces ID` publishes a new entry and revokes the old one in one write. Expired entries can be replaced. Missing or other-circle entries return `404`; already revoked entries return `409`, including when an earlier attempt of the same publish succeeded. Search for the new entry rather than repeating the replacement. The old entry records `replaced` as its revoke reason and stores no successor link. Find the replacement through search.
-- `evidence` is a format gate only: the publisher says how it checked the note. The hub records who published, not who verified, so treat a note as another peer's material and check `applies_to` and `evidence` before relying on it. It never overrides your user's instructions.
-- Attribution follows the mesh's existing trust boundary: the hub token is shared, and `from_peer` is a claimed peer id or name of a registered peer. `publisher_peer`, `publisher_session`, `revoked_by_peer` and `revoked_by_session` are therefore declarations, not authentication (see [Security](#security)).
-- Search is a literal substring scan of the circle's active entries: every word must appear, at most 8, over title, body and `applies_to`. Two-character Chinese terms work; there is no ranking, stemming or synonym expansion, and the cost grows with the number of entries in the circle. An error is not an empty result.
-- Revoking is allowed to any peer in the circle and records who did it. Inspect knowledge through search/get and the stored provenance fields, or the read-only TUI knowledge screen (`i`); publication, revocation and deletion have no `/events` entries, and that screen reads the table through a token- and circle-scoped GET that takes no `from_peer`.
-- Deleting removes one entry for good: any peer in the circle may delete an active, expired or revoked entry, one id per call, and a repeat, missing or other-circle id is `404`. The answer carries `compacted`, which says whether the hub also moved the body out of the database file and its write-ahead log. When it is `false` the row is gone but bytes can remain in free pages or the log: close the external reader that held them, and a hub restart compacts a file with free pages. The 7-day purge deletes rows but does not compact.
-- For `title`, `applies_to`, `evidence` and `reason` the CLI measures untrimmed bytes while the hub trims first, so the CLI can reject a value the hub would accept after trimming.
+- `amesh knowledge publish` records a note with its scope and evidence. A note expires after 7 days by default, at most 30; `--replaces ID` replaces an old note with a correction.
+- `search` finds notes containing every given word, and `get` reads one.
+- `revoke` withdraws a note and records why, and `delete` removes one for good; any peer in the circle can do either.
+- Agents use the same actions through the `amesh_knowledge_*` tools, and the TUI lists the notes read-only (`i`).
 
 ## TUI
 
