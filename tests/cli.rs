@@ -387,37 +387,16 @@ fn log_holder_pids(log: &PathBuf) -> Result<Vec<u32>, String> {
         .collect())
 }
 
-fn drop_trace_path() -> PathBuf {
-    std::env::temp_dir().join("amesh-sandbox-drop.log")
-}
-
-fn drop_trace(line: &str) {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let path = drop_trace_path();
-    if let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(&path) {
-        /* every suite on the machine appends here */
-        if file.metadata().is_ok_and(|meta| meta.len() > 1_000_000) {
-            let _ = file.set_len(0);
-        }
-        let _ = writeln!(file, "{now} {line}");
-    }
-}
-
-fn holder_snapshot(root: &PathBuf) -> (Vec<u32>, bool) {
+fn holder_snapshot(root: &PathBuf) -> Vec<u32> {
     let mut pids = Vec::new();
-    let mut failed = false;
     for log in runtime_log_paths(root) {
-        match log_holder_pids(&log) {
-            Ok(found) => pids.extend(found),
-            Err(_) => failed = true,
+        if let Ok(found) = log_holder_pids(&log) {
+            pids.extend(found);
         }
     }
     pids.sort_unstable();
     pids.dedup();
-    (pids, failed)
+    pids
 }
 
 fn stop_log_holders(root: &PathBuf) {
@@ -1236,13 +1215,6 @@ impl Drop for Sandbox {
         let folder = self.root.file_name().unwrap().to_string_lossy();
         assert!(folder.starts_with("amesh-cli-"));
         let test = std::thread::current().name().unwrap_or("?").to_string();
-        let (holders, lsof_failed) = holder_snapshot(&self.root);
-        drop_trace(&format!(
-            "enter test={test} root={} bind={} holders={holders:?} lsof_failed={lsof_failed} listen={:?}",
-            self.root.display(),
-            self.bind,
-            listen_pids(&self.bind)
-        ));
         stop_sandbox_hooks(&folder, &self.tag);
         if let Some(child) = self.daemon.as_mut() {
             let _ = child.kill();
@@ -1251,10 +1223,6 @@ impl Drop for Sandbox {
         stop_log_holders(&self.root);
         kill_listen(&self.bind, &self.root);
         if let Err(error) = fs::remove_dir_all(&self.root) {
-            drop_trace(&format!(
-                "remove test={test} root={} first_err={error}",
-                self.root.display()
-            ));
             eprintln!(
                 "sandbox remove first_err test={test} root={} {error}",
                 self.root.display()
@@ -1265,22 +1233,12 @@ impl Drop for Sandbox {
                 eprintln!("sandbox cleanup {}: {error}", self.root.display());
             }
         }
-        let removed = !self.root.exists();
-        let listen = listen_pids(&self.bind);
-        let holders = if removed {
-            "unavailable".to_string()
-        } else {
-            format!("{:?}", holder_snapshot(&self.root).0)
-        };
-        drop_trace(&format!(
-            "exit test={test} root={} removed={removed} holders={holders} listen={listen:?} log={}",
-            self.root.display(),
-            drop_trace_path().display()
-        ));
-        if !removed {
+        if self.root.exists() {
             eprintln!(
-                "sandbox drop leftover test={test} root={} holders={holders} listen={listen:?}",
-                self.root.display()
+                "sandbox drop leftover test={test} root={} holders={:?} listen={:?}",
+                self.root.display(),
+                holder_snapshot(&self.root),
+                listen_pids(&self.bind)
             );
         }
     }
