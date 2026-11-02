@@ -5,6 +5,19 @@ import { test } from "node:test";
 
 const [pluginPath, directory] = process.argv.slice(2);
 const original = await readFile(pluginPath, "utf8");
+/* the fixture runs the plugin with short windows; pinning the production values keeps
+this a measurement of the shipped timeouts instead of a fixture that quietly drifts */
+const production = {
+  timeouts: 'definition.name === "amesh_wait" ? 65000 : 15000',
+  disposer: "Delay(4000, undefined, { ref: false })",
+};
+for (const expression of Object.values(production))
+  assert.equal(
+    original.split(expression).length - 1,
+    1,
+    expression + " must appear exactly once in the hook source",
+  );
+const short = { wait: 1250, tool: 750, disposer: 200 };
 class Socket extends EventTarget {
   readyState = 0;
   constructor() {
@@ -43,7 +56,7 @@ async function Until(predicate) {
   }
   assert.fail("fixture did not reach subprocess boundary");
 }
-async function Fixture(name, mode, dispose = () => {}) {
+async function Fixture(name, mode, dispose = () => {}, shipped = false) {
   const path = resolve(directory, name);
   await mkdir(path);
   const control = join(path, "mode");
@@ -73,10 +86,46 @@ let input="";process.stdin.on("data",chunk=>input+=chunk);process.stdin.on("end"
 `,
   );
   await chmod(executable, 0o755);
-  const source = original.replace(
+  /* only the cases that measure a deadline run the copy with short ones: the others
+  answer as soon as their child reports, and a short deadline would turn a slow machine
+  into a false timeout */
+  const shortTimeouts = `definition.name === "amesh_wait" ? ${short.wait} : ${short.tool}`;
+  const shortDisposer = `Delay(${short.disposer}, undefined, { ref: false })`;
+  const withExecutable = original.replace(
     /const executable = [\s\S]*?;\n/,
     `const executable = ${JSON.stringify(executable)};\n`,
   );
+  const source = shipped
+    ? withExecutable
+    : withExecutable
+        .replace(production.timeouts, shortTimeouts)
+        .replace(production.disposer, shortDisposer);
+  /* the wide wall-clock bounds cannot tell a slow machine from a fixture that never
+  substituted its deadlines, so the substitution itself is asserted */
+  if (shipped) {
+    assert(
+      source.includes(production.timeouts),
+      "a production fixture must keep the shipped timeouts",
+    );
+    assert(
+      source.includes(production.disposer),
+      "a production fixture must keep the shipped disposer deadline",
+    );
+  } else {
+    assert(
+      !source.includes(production.timeouts),
+      "fixture must replace the production timeouts",
+    );
+    assert(
+      !source.includes(production.disposer),
+      "fixture must replace the production disposer deadline",
+    );
+    assert(
+      source.includes(shortTimeouts),
+      "fixture must carry the short timeouts",
+    );
+    assert(source.includes(shortDisposer), "fixture must carry the short disposer");
+  }
   const plugin = (
     await import(
       `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`
@@ -131,7 +180,7 @@ for (const mode of ["empty", "malformed"]) {
     `registration ${mode} output fails and recovers`,
     { concurrency: true },
     async () => {
-      const fixture = await Fixture(mode, mode);
+      const fixture = await Fixture(mode, mode, undefined, true);
       try {
         await assert.rejects(
           fixture.invoke("amesh_whoami"),
@@ -152,11 +201,12 @@ test(
   "committed creation with lost response is not retried",
   { concurrency: true },
   async () => {
-    const fixture = await Fixture("lost", "lost");
+    const fixture = await Fixture("lost", "lost", undefined, true);
     try {
+      /* a timeout ends the call with the same tail, so the matcher names the lost reply */
       await assert.rejects(
         fixture.invoke("amesh_job_create"),
-        /outcome may be unknown/,
+        /returned invalid JSON; committed outcome may be unknown/,
       );
       await new Promise((done) => setTimeout(done, 100));
       assert.equal(await readFile(fixture.committed, "utf8"), "created\n");
@@ -169,10 +219,11 @@ test(
   "cleanup kills an in-flight tool subprocess",
   { concurrency: true },
   async () => {
-    const fixture = await Fixture("cleanup", "hang");
+    const fixture = await Fixture("cleanup", "hang", undefined, true);
+    /* a timeout ends the call too, so the matcher names the abort itself */
     const operation = assert.rejects(
       fixture.invoke("amesh_wait"),
-      /abort|unknown/,
+      /operation (?:was )?aborted/,
     );
     try {
       await Until(async () => {
@@ -192,8 +243,8 @@ test(
   },
 );
 for (const [name, timeout] of [
-  ["amesh_whoami", 15000],
-  ["amesh_wait", 65000],
+  ["amesh_whoami", short.tool],
+  ["amesh_wait", short.wait],
 ]) {
   test(
     `${name} timeout kills the subprocess after ${timeout}ms`,

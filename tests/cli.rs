@@ -1,4 +1,4 @@
-#[path = "support/opencode.rs"]
+#[path = "cli/opencode.rs"]
 mod opencode_tests;
 
 use serde_json::{json, Value};
@@ -11,16 +11,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-#[path = "support/mcp_identity.rs"]
+#[path = "cli/mcp_identity.rs"]
 mod mcp_identity_tests;
 
-#[path = "support/events_mcp.rs"]
+#[path = "cli/events_mcp.rs"]
 mod events_mcp_tests;
 
-#[path = "support/unbound_routing.rs"]
+#[path = "cli/unbound_routing.rs"]
 mod unbound_routing_tests;
 
-#[path = "support/knowledge_cli.rs"]
+#[path = "cli/knowledge_cli.rs"]
 mod knowledge_cli_tests;
 
 /* a claude-code hook inherits CLAUDE_CODE_MESSAGING_SOCKET from whatever launched it and
@@ -1302,12 +1302,18 @@ fn live_inbox(path: &Path) -> std::os::unix::net::UnixListener {
     listener
 }
 
-impl Drop for KillChild {
-    fn drop(&mut self) {
+impl KillChild {
+    fn stop(&mut self) {
         if let Some(mut child) = self.0.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+impl Drop for KillChild {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -1325,7 +1331,7 @@ fn drop_reaps_detached_child_holding_serve_log_before_bind() {
     let mut cmd = Command::new("python3");
     cmd.arg("-c")
         .arg(format!(
-            "import os,socket,sys,time\nos.setsid()\nsys.stdout.write('ready\\n');sys.stdout.flush()\ntime.sleep(2)\ns=socket.socket();s.bind(('127.0.0.1',{port}));s.listen(1)\ntime.sleep(30)\n"
+            "import os,socket,sys,time\nos.setsid()\nsys.stdout.write('ready\\n');sys.stdout.flush()\ntime.sleep(3)\nsys.stdout.write('bind\\n');sys.stdout.flush()\ns=socket.socket();s.bind(('127.0.0.1',{port}));s.listen(1)\ntime.sleep(30)\n"
         ))
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().unwrap()))
@@ -1346,9 +1352,13 @@ fn drop_reaps_detached_child_holding_serve_log_before_bind() {
     }
     let holders = log_holder_pids(&log_path).unwrap_or_else(|error| panic!("{error}"));
     let listening_before = listen_pids(&bind);
-    let started = Instant::now();
+    /* this descriptor survives the sandbox's remove_dir_all, so the marker can be read from
+    the log itself: no file outside the sandbox, nothing to clean up */
+    let mut reader = fs::File::open(&log_path).unwrap();
     drop(sandbox);
-    let elapsed = started.elapsed();
+    let mut after = String::new();
+    reader.read_to_string(&mut after).unwrap();
+    let reached_bind = after.contains("bind");
     let reaped = guard
         .0
         .as_mut()
@@ -1370,8 +1380,8 @@ fn drop_reaps_detached_child_holding_serve_log_before_bind() {
         "bind must still be in the future: {listening_before:?}"
     );
     assert!(
-        elapsed < Duration::from_secs(1),
-        "Drop took {elapsed:?}; waited for delayed bind instead of reaping the log holder"
+        !reached_bind,
+        "Drop let the holder reach its bind attempt before reaping it: {after:?}"
     );
     assert!(
         reaped.is_some(),
@@ -2148,6 +2158,10 @@ fn hook_exits_quietly_when_spawn_is_forbidden() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(out.stdout.is_empty());
+    assert!(
+        !sandbox.root.join("serve.log").exists(),
+        "a forbidden spawn must not open a daemon log"
+    );
     assert!(listen_pids(&sandbox.bind).is_empty());
 }
 
@@ -3112,7 +3126,10 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
         let _ = daemon.kill();
         let _ = daemon.wait();
     }
-    std::thread::sleep(Duration::from_secs(1));
+    /* a dropped connection restarts the 2 s retry window, so a correct drainer is still
+    retrying 1.5 s after the kill; one that keeps its startup deadline, long past by then,
+    exits on its first failed reconnect about a second after the kill */
+    std::thread::sleep(Duration::from_millis(1500));
     let still = child.try_wait().unwrap();
     let _ = child.kill();
     let _ = child.wait();
@@ -3457,13 +3474,15 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
         ],
         None,
     );
-    let mut child = sandbox
-        .command()
-        .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
-        .env("CODEX_HOME", &codex_home)
-        .env("CODEX_THREAD_ID", "th1")
-        .spawn()
-        .unwrap();
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEX_THREAD_ID", "th1")
+            .spawn()
+            .unwrap(),
+    ));
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut online = false;
     while Instant::now() < deadline {
@@ -3480,8 +3499,10 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
         std::thread::sleep(Duration::from_millis(50));
     }
     if !online {
-        let _ = child.kill();
-        let out = child.wait_with_output().unwrap();
+        if let Some(row) = child.0.as_mut() {
+            let _ = row.kill();
+        }
+        let out = child.0.take().unwrap().wait_with_output().unwrap();
         panic!(
             "hook ws never connected: stderr={}",
             String::from_utf8_lossy(&out.stderr)
@@ -3583,15 +3604,14 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
         std::thread::sleep(Duration::from_millis(50));
     }
     if !online {
-        let _ = child.kill();
+        child.stop();
         panic!("hook ws did not reconnect");
     }
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let got = received.lock().unwrap().clone();
         if got.len() >= 3 {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.stop();
             assert_eq!(
                 got.len(),
                 3,
@@ -3603,8 +3623,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
             return;
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            child.stop();
             panic!("inject side got {got:?}; queue must survive hub reconnect and flush once");
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -3620,7 +3639,8 @@ fn gc_defaults_to_dry_run_and_apply_deletes_cli_leftovers() {
     fs::write(&leftover, "sock\n1\n").unwrap();
     let pidfile = amesh.join("ws-ghost.pid");
     fs::write(&pidfile, "9999999\n").unwrap();
-    let keep = amesh.join("hook-ws-amesh-claude-code.inbox");
+    let keep_peer = sandbox.id("keep");
+    let keep = amesh.join(format!("hook-ws-{keep_peer}.inbox"));
     fs::write(&keep, "sock\n1\n").unwrap();
     let home = sandbox.root.to_str().unwrap();
     let listed = sandbox.json(&["gc", "--home", home], None);
@@ -3645,7 +3665,7 @@ fn gc_defaults_to_dry_run_and_apply_deletes_cli_leftovers() {
     );
 }
 
-fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
+fn hook_receipt_probe(kind: &str, inbox: &str) -> (Vec<Value>, usize) {
     use axum::{
         extract::{ws::Message, State, WebSocketUpgrade},
         routing::{get, post},
@@ -3657,6 +3677,17 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
     if inbox == "refused" {
         dead_inbox(&socket_path);
     }
+    /* "live" binds the claude inbox before the drainer starts: the claude path only writes
+    (an optional auth line and the user frame, never a read), so a queued connection is a
+    delivery attempt. The queue is drained after the drainer exits, so a slow accept cannot
+    hide a write that already happened */
+    let live_listener = if inbox == "live" {
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        Some(listener)
+    } else {
+        None
+    };
     let frame = if kind == "invalid" {
         "{invalid".to_string()
     } else {
@@ -3768,14 +3799,14 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
         let mut cmd = sandbox.command();
         /* the socket cases exercise the claude-code drainer and the rest exercise the codex
         one; the backend, not the inherited environment, now picks the transport */
-        let backend = if matches!(inbox, "refused" | "gone") {
+        let backend = if matches!(inbox, "refused" | "gone" | "live") {
             "claude-code"
         } else {
             "codex"
         };
         cmd.args(["hook", "ws", "--peer-id", worker, "--backend", backend])
             .env("CODEX_HOME", sandbox.root.join("missing-codex"));
-        if matches!(inbox, "refused" | "gone") {
+        if matches!(inbox, "refused" | "gone" | "live") {
             cmd.env("CLAUDE_CODE_MESSAGING_SOCKET", &socket_path);
         }
         if app_task.is_some() {
@@ -3783,6 +3814,14 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
         }
         let mut child = cmd.spawn().unwrap();
         let received = tokio::time::timeout(Duration::from_secs(6), rx.recv()).await;
+        if kind == "invalid" {
+            /* a bad frame is skipped, not fatal: the drainer must still be running */
+            std::thread::sleep(Duration::from_millis(500));
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "a bad frame must not end the drainer"
+            );
+        }
         let mut app_timeout = false;
         let app_result = if let Some(task) = app_task {
             let abort = task.abort_handle();
@@ -3810,41 +3849,53 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> Vec<Value> {
                 panic!("app_task: {error}");
             }
         }
-        frames
+        let delivered = match live_listener {
+            Some(listener) => {
+                let mut seen = 0;
+                while listener.accept().is_ok() {
+                    seen += 1;
+                }
+                seen
+            }
+            None => 0,
+        };
+        (frames, delivered)
     })
 }
 
 #[test]
 fn hook_ws_negotiates_receipts() {
-    assert_eq!(hook_receipt_probe("notify", "")[0]["recv"], true);
+    assert_eq!(hook_receipt_probe("notify", "").0[0]["recv"], true);
 }
 
 #[test]
 fn hook_ws_receipts_accepted_fifo() {
-    let frames = hook_receipt_probe("notify", "");
+    let frames = hook_receipt_probe("notify", "").0;
     assert_eq!(&frames[1..], &[json!({"type":"recv","id":"delivery-1"})]);
 }
 
 #[test]
 fn hook_ws_receipts_closed_ask() {
-    let frames = hook_receipt_probe("ask", "");
+    /* a closed ask is acknowledged to the hub but never written to the claude inbox */
+    let (frames, delivered) = hook_receipt_probe("ask", "live");
     assert_eq!(&frames[1..], &[json!({"type":"recv","id":"delivery-1"})]);
+    assert_eq!(delivered, 0, "a closed ask must not reach the inbox");
 }
 
 #[test]
 fn hook_ws_receipts_claude_retry_fifo() {
-    let frames = hook_receipt_probe("notify", "refused");
+    let frames = hook_receipt_probe("notify", "refused").0;
     assert_eq!(&frames[1..], &[json!({"type":"recv","id":"delivery-1"})]);
 }
 
 #[test]
 fn hook_ws_receipts_skip_gone_socket() {
-    assert_eq!(hook_receipt_probe("notify", "gone").len(), 1);
+    assert_eq!(hook_receipt_probe("notify", "gone").0.len(), 1);
 }
 
 #[test]
 fn hook_ws_receipts_skip_invalid_frame() {
-    assert_eq!(hook_receipt_probe("invalid", "").len(), 1);
+    assert_eq!(hook_receipt_probe("invalid", "").0.len(), 1);
 }
 
 #[test]
@@ -3882,6 +3933,11 @@ fn gc_reports_peer_probe_side_effect() {
         .unwrap_or_default()
         .contains("prune"));
 }
+
+type ConnState = (
+    Arc<std::sync::Mutex<std::collections::VecDeque<Vec<Value>>>>,
+    tokio::sync::mpsc::UnboundedSender<(Vec<String>, tokio::sync::oneshot::Sender<()>)>,
+);
 
 fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String>, Vec<String>) {
     use axum::{
@@ -3938,14 +3994,7 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
             .route(
                 "/ws",
                 get(
-                    |ws: WebSocketUpgrade,
-                     State((rounds, tx)): State<(
-                        Arc<Mutex<std::collections::VecDeque<Vec<Value>>>>,
-                        tokio::sync::mpsc::UnboundedSender<(
-                            Vec<String>,
-                            tokio::sync::oneshot::Sender<()>,
-                        )>,
-                    )>| async move {
+                    |ws: WebSocketUpgrade, State((rounds, tx)): State<ConnState>| async move {
                         ws.on_upgrade(move |mut socket| async move {
                             let Some(frames) = rounds.lock().unwrap().pop_front() else {
                                 return;
@@ -4092,7 +4141,7 @@ fn hook_ws_dedupe_refreshes_and_bounds_ids() {
 
 #[test]
 fn hook_ws_rpc_close_returns_to_hub_delivery() {
-    let frames = hook_receipt_probe("notify", "app-close");
+    let frames = hook_receipt_probe("notify", "app-close").0;
     assert_eq!(
         frames.len(),
         2,
@@ -4103,7 +4152,7 @@ fn hook_ws_rpc_close_returns_to_hub_delivery() {
 
 #[test]
 fn hook_ws_rpc_transport_error_returns_to_hub_delivery() {
-    let frames = hook_receipt_probe("notify", "app-eof");
+    let frames = hook_receipt_probe("notify", "app-eof").0;
     assert_eq!(
         frames.len(),
         2,
@@ -4114,7 +4163,7 @@ fn hook_ws_rpc_transport_error_returns_to_hub_delivery() {
 
 #[test]
 fn hook_ws_rpc_accepts_control_frames_before_response() {
-    let frames = hook_receipt_probe("notify", "app-ping");
+    let frames = hook_receipt_probe("notify", "app-ping").0;
     assert_eq!(frames[1], json!({"type":"recv","id":"delivery-1"}));
 }
 
@@ -6138,6 +6187,13 @@ fn claude_session_hook_without_socket_spawns_no_drainer() {
         !hook_ws_alive("ghost"),
         "no messaging socket means no background drainer to spawn"
     );
+    assert!(
+        !sandbox.root.join("hook-ws-ghost.log").exists(),
+        "no drainer means no drainer log: {:?}",
+        fs::read_dir(&sandbox.root).map(|d| d
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect::<Vec<_>>())
+    );
 }
 
 #[test]
@@ -6947,4 +7003,4 @@ fn a_codex_drainer_that_dies_inside_the_inject_leaves_the_frame_with_the_hub() {
     );
 }
 
-include!("support/peer_handoff.rs");
+include!("cli/peer_handoff.rs");

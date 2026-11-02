@@ -280,7 +280,8 @@ macro_rules! fixture_test {
         #[tokio::test]
         async fn $name() {
             check_fixture(include_str!(concat!(
-                "../../tests/fixtures/wire/",
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/wire/",
                 $file,
                 ".json"
             )))

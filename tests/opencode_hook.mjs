@@ -3,13 +3,36 @@ import childProcess, { execFileSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
+
+/* this harness drives the real amesh CLI, so it refuses to run without a sandbox state:
+a hand-started run would otherwise let the daemon's start-up path write into the
+operator's home */
+if (!process.env.AMESH_STATE) {
+  console.error(
+    "amesh harness: AMESH_STATE is unset; run this harness through cargo test",
+  );
+  process.exit(1);
+}
 const [pluginPath, executable, cwd] = process.argv.slice(2);
 const source = await readFile(pluginPath, "utf8");
 const commands = [];
 const originalExecFile = childProcess.execFile;
+/* a report is only visible in the hub after its child exits, so the barriers below wait
+for both the handled event and the children it started */
+let running = 0;
 childProcess.execFile = (...args) => {
   commands.push(args[1]);
-  return originalExecFile(...args);
+  running += 1;
+  const child = originalExecFile(...args);
+  let settled = false;
+  const settle = () => {
+    if (settled) return;
+    settled = true;
+    running -= 1;
+  };
+  child.once("close", settle);
+  child.once("error", settle);
+  return child;
 };
 syncBuiltinESMExports();
 const plugin = (
@@ -17,6 +40,13 @@ const plugin = (
     `data:text/javascript;base64,${Buffer.from(source).toString("base64")}`
   )
 ).default;
+/* the only first-retry delay the plugin can have; windows that must outlast it derive
+from this value instead of guessing */
+const retryFirstMs = 1000;
+assert(
+  source.includes("1000 * 2 ** Math.min(root.attempts++, 5)"),
+  "the retry backoff base changed, so the stopped-instance window is stale",
+);
 const logs = [];
 const originalError = console.error;
 console.error = (...values) => {
@@ -37,6 +67,10 @@ sessions.set("ses_gone_directory", {
   location: { directory: cwd + "/missing-location" },
 });
 const sockets = [];
+/* an event counts as processed once the subscription resumes for the next one, which the
+tests use instead of sleeping to let the drainer catch up */
+let processed = 0;
+const lookups = new Map();
 const NativeWebSocket = globalThis.WebSocket;
 globalThis.WebSocket = class extends NativeWebSocket {
   constructor(url) {
@@ -92,6 +126,7 @@ const ctx = {
   },
   session: {
     async get({ sessionID }) {
+      lookups.set(sessionID, (lookups.get(sessionID) ?? 0) + 1);
       const info = sessions.get(sessionID);
       if (!info)
         throw Object.assign(new Error(""), {
@@ -130,7 +165,10 @@ const ctx = {
         { once: true },
       );
       while (!ended) {
-        while (queue.length) yield queue.shift();
+        while (queue.length) {
+          yield queue.shift();
+          processed += 1;
+        }
         await new Promise((done) => {
           wake = done;
           if (ended || queue.length) done();
@@ -162,6 +200,8 @@ async function Until(predicate, message, ms = 8000) {
   }
   assert.fail(message);
 }
+const Processed = () => processed;
+const Lookups = (id) => lookups.get(id) ?? 0;
 const peers = () => Cli(["peer", "list"]);
 const Details = async () =>
   JSON.parse(Text(await Invoke("amesh_list_peers", "ses_a", { detail: true })));
@@ -253,10 +293,11 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
           (peer) => peer.peer_id === result.peerID,
         );
         assert.equal(peer.activity.state, "idle");
-        await new Promise((resolve) => setTimeout(resolve, 100));
         const reports = () =>
           commands.filter((args) => args[0] === "hook" && args[1] === "idle")
             .length;
+        /* the enrol's own activity report has to land before the refresh count is taken */
+        await Until(() => reports() >= 1, "the opening activity report must land");
         const beforeRefresh = reports();
         await handlers.join({ sessionID: "ses_open", state: "idle" });
         await handlers.join({ sessionID: "ses_open", state: "idle" });
@@ -298,17 +339,18 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
           peer_name: a,
           message: "retry-admission",
         });
-        await new Promise((done) => setTimeout(done, 6500));
-        assert.equal(admitted.length, 0);
-        const reconnects = sockets
-          .slice(socketStart)
-          .filter((socket) =>
-            socket.frames.some((frame) => frame.peer_id === a),
-          );
-        assert(
-          reconnects.length >= 2 && reconnects.length <= 3,
-          "bounded reconnections while admission fails",
+        /* two handshakes are the evidence the retry ran; waiting for them replaces a
+        fixed window */
+        const reconnected = () =>
+          sockets
+            .slice(socketStart)
+            .filter((socket) => socket.frames.some((frame) => frame.peer_id === a));
+        await Until(
+          () => reconnected().length >= 2,
+          "the drainer must retry admission",
         );
+        assert.equal(admitted.length, 0);
+        const reconnects = reconnected();
         assert(
           reconnects[1].created - reconnects[0].created >= 2800,
           "failure backoff grows across successful handshakes",
@@ -330,11 +372,17 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
     await t.test("revert defers durable admission", async () => {
       sessions.get("ses_a").revert = { messageID: "msg_boundary" };
       const count = admitted.length;
+      const looked = Lookups("ses_a");
       await Invoke("amesh_notify_peer", "ses_b", {
         peer_name: a,
         message: "after-revert",
       });
-      await new Promise((done) => setTimeout(done, 150));
+      /* the drain looks the session up once per deferral cycle, so a second cycle that
+      still admits nothing proves the first one was not merely slow */
+      await Until(
+        () => Lookups("ses_a") >= looked + 2,
+        "revert deferral cycles",
+      );
       assert.equal(admitted.length, count);
       delete sessions.get("ses_a").revert;
       await Until(
@@ -359,6 +407,8 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
     await t.test(
       "child approvals hold root in wait until all replied",
       async () => {
+        /* three events: asked, asked, replied; the baseline precedes the first one */
+        const asked = Processed();
         Emit({
           type: "permission.asked",
           location,
@@ -380,7 +430,10 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
           location,
           data: { sessionID: "ses_child", requestID: "per_1" },
         });
-        await new Promise((done) => setTimeout(done, 100));
+        await Until(
+          () => Processed() >= asked + 3 && running === 0,
+          "all three approval events must be handled and reported",
+        );
         assert.equal(
           (await Details()).find((peer) => peer.peer_id === a).activity.state,
           "wait",
@@ -400,6 +453,9 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
     );
     await t.test("foreign and missing session events are silent", async () => {
       const before = logs.length;
+      /* five events are emitted below and the plugin drops each for a different reason, so
+      the baseline is taken before the first one and the barrier waits for all five */
+      const silent = Processed();
       Emit({
         type: "session.execution.started",
         data: { sessionID: "ses_other" },
@@ -420,7 +476,10 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
         type: "session.execution.succeeded",
         data: { sessionID: "ses_child" },
       });
-      await new Promise((done) => setTimeout(done, 100));
+      await Until(
+        () => Processed() >= silent + 5 && running === 0,
+        "the silent events must be handled with no report in flight",
+      );
       assert.equal(logs.length, before);
       assert.equal(
         (await Details()).find((peer) => peer.peer_id === a).activity.state,
@@ -889,14 +948,23 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
     await t.test(
       "location shutdown cleans up only the matching instance",
       async () => {
+        /* two events: the foreign shutdown and the matching one */
+        const shutdown = Processed();
         Emit({
           type: "location.shutdown",
           location: { directory: "/tmp" },
           data: {},
         });
-        await new Promise((done) => setTimeout(done, 100));
+        await Until(
+          () => Processed() >= shutdown + 1 && running === 0,
+          "the foreign shutdown must be handled",
+        );
         assert.equal(Text(await Invoke("amesh_whoami", "ses_b")), b);
         Emit({ type: "location.shutdown", location, data: {} });
+        await Until(
+          () => Processed() >= shutdown + 2 && running === 0,
+          "both shutdown events must be handled",
+        );
         await Until(() => hooks.size === 0, "shutdown disposes registrations");
         await assert.rejects(Invoke("amesh_whoami", "ses_b"), /stopped|reload/);
       },
@@ -1025,7 +1093,20 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
           }
         }, "first instance terminates");
         const count = sockets.length;
-        await new Promise((done) => setTimeout(done, 1200));
+        const registrations = () =>
+          commands.filter(
+            (args) => args[0] === "hook" && args[1] === "session",
+          ).length;
+        const started = registrations();
+        /* a stopped instance that retries starts its registration synchronously from its
+        retry timer, which fires inside this window; the command count sees that retry
+        before a socket could appear, since the socket waits for the registration child */
+        await new Promise((done) => setTimeout(done, retryFirstMs + 200));
+        assert.equal(
+          registrations(),
+          started,
+          "a stopped instance must not register again",
+        );
         assert.equal(
           sockets.length,
           count,

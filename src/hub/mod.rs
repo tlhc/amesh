@@ -5839,24 +5839,4 @@ async fn close_connection(
 }
 
 #[cfg(test)]
-mod event_visibility_tests;
-
-#[cfg(test)]
-mod job_dag_tests;
-
-#[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-#[path = "../../tests/support/incremental_persistence.rs"]
-mod incremental_persistence_tests;
-
-#[cfg(test)]
-#[path = "../../tests/support/knowledge_api.rs"]
-mod knowledge_api_tests;
-
-#[cfg(test)]
-mod dispatch_tests;
-
-#[cfg(test)]
-mod b2_tests;

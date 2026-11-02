@@ -1,5 +1,5 @@
-use super::derive::assess_dispatch;
 use super::*;
+use crate::hub::derive::assess_dispatch;
 use crate::wire::{BlockReason, DispatchState};
 
 fn fixture() -> (Hub, tests::TempState, Job) {
@@ -66,7 +66,7 @@ fn dispatch_ready() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_ready() {
@@ -93,7 +93,7 @@ fn dispatch_offline() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_offline() {
@@ -121,7 +121,7 @@ fn dispatch_id_collision() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_id_collision() {
@@ -150,7 +150,7 @@ fn dispatch_empty_circle() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_empty_circle() {
@@ -178,7 +178,7 @@ fn dispatch_other_circle() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_other_circle() {
@@ -199,7 +199,7 @@ fn dispatch_held() {
     job.dispatch = false;
     let assessment = assess_dispatch(&hub, &job);
     assert_eq!(assessment.state, DispatchState::Held, "state");
-    assert_eq!(assessment.nudge_eligible, false, "nudge eligibility");
+    assert!(!assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_held() {
@@ -214,7 +214,7 @@ fn dispatch_held_unresolved() {
     job.assigned_peer = Some("missing".into());
     let assessment = assess_dispatch(&hub, &job);
     assert_eq!(assessment.state, DispatchState::Held, "state");
-    assert_eq!(assessment.nudge_eligible, false, "nudge eligibility");
+    assert!(!assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_held_unresolved() {
@@ -229,7 +229,7 @@ fn dispatch_unassigned() {
     job.assigned_peer = None;
     let assessment = assess_dispatch(&hub, &job);
     assert_eq!(assessment.state, DispatchState::Unassigned, "state");
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_unassigned() {
@@ -243,7 +243,7 @@ fn dispatch_empty_assignee() {
     job.assigned_peer = Some(String::new());
     let assessment = assess_dispatch(&hub, &job);
     assert_eq!(assessment.state, DispatchState::Unassigned, "state");
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_empty_assignee() {
@@ -258,7 +258,7 @@ fn dispatch_held_unassigned() {
     job.dispatch = false;
     let assessment = assess_dispatch(&hub, &job);
     assert_eq!(assessment.state, DispatchState::Unassigned, "state");
-    assert_eq!(assessment.nudge_eligible, false, "nudge eligibility");
+    assert!(!assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_held_unassigned() {
@@ -274,7 +274,7 @@ fn dispatch_held_empty() {
     job.dispatch = false;
     let assessment = assess_dispatch(&hub, &job);
     assert_eq!(assessment.state, DispatchState::Unassigned, "state");
-    assert_eq!(assessment.nudge_eligible, false, "nudge eligibility");
+    assert!(!assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_held_empty() {
@@ -295,7 +295,7 @@ fn dispatch_no_peer() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_no_peer() {
@@ -322,7 +322,7 @@ fn dispatch_done() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_done() {
@@ -350,7 +350,7 @@ fn dispatch_waiting() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, false, "nudge eligibility");
+    assert!(!assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_waiting() {
@@ -379,7 +379,7 @@ fn dispatch_waiting_held() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, false, "nudge eligibility");
+    assert!(!assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_waiting_held() {
@@ -409,7 +409,7 @@ fn dispatch_failed() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_failed() {
@@ -440,7 +440,7 @@ fn dispatch_cancelled() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_cancelled() {
@@ -471,7 +471,7 @@ fn dispatch_deleted() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_deleted() {
@@ -506,7 +506,7 @@ fn dispatch_blocked_order() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_blocked_order() {
@@ -546,7 +546,7 @@ fn dispatch_blocked_held() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, false, "nudge eligibility");
+    assert!(!assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_blocked_held() {
@@ -587,7 +587,7 @@ fn dispatch_blocked_unassigned() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_blocked_unassigned() {
@@ -628,7 +628,7 @@ fn dispatch_blocked_other_circle() {
         },
         "state"
     );
-    assert_eq!(assessment.nudge_eligible, true, "nudge eligibility");
+    assert!(assessment.nudge_eligible, "nudge eligibility");
 }
 #[test]
 fn scheduler_blocked_other_circle() {

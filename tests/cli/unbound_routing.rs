@@ -1,4 +1,9 @@
 use super::*;
+type RouteState = (
+    std::sync::Arc<std::sync::Mutex<String>>,
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    tokio::sync::mpsc::UnboundedSender<Value>,
+);
 use axum::{
     extract::{ws::Message, State, WebSocketUpgrade},
     routing::{get, post},
@@ -36,10 +41,10 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
         let hub = Router::new()
             .route("/health", get(|| async { axum::Json(json!({"ok":true,"name":"amesh"})) }))
             .route("/peers", post(move || async move { axum::Json(json!({"peer_id":worker})) })
-                .get(move |State((binding, _, _)): State<(Arc<Mutex<String>>, Arc<AtomicUsize>, tokio::sync::mpsc::UnboundedSender<Value>)>| async move {
+                .get(move |State((binding, _, _)): State<RouteState>| async move {
                     axum::Json(json!([{"peer_id":worker,"session_id":binding.lock().unwrap().clone()}]))
                 }))
-            .route("/ws", get(move |ws: WebSocketUpgrade, State((_, generation, receipts)): State<(Arc<Mutex<String>>, Arc<AtomicUsize>, tokio::sync::mpsc::UnboundedSender<Value>)>| async move {
+            .route("/ws", get(move |ws: WebSocketUpgrade, State((_, generation, receipts)): State<RouteState>| async move {
                 ws.on_upgrade(move |mut socket| async move {
                     let Some(Ok(_)) = socket.recv().await else { return; };
                     let index = generation.fetch_add(1, Ordering::SeqCst);

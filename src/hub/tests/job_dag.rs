@@ -1,12 +1,458 @@
-use super::tests::TempState;
+use super::TempState;
 use super::*;
 use axum::http::Request;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-include!("../../tests/support/event_retention.rs");
-include!("../../tests/support/data_consistency.rs");
-include!("../../tests/support/peer_details.rs");
+#[tokio::test]
+async fn day_retention_keeps_closed_asks_until_24_hours() {
+    let f = team("c", &["boss", "worker"]).await;
+    let cid = f.open_ask("boss", "worker").await;
+    f.ack(&cid, json!({"from_peer": "worker", "message": "done"}))
+        .await;
+    let closed = f.ask(&cid).await.closed_at.unwrap();
+    assert!(f.sweep(closed + 86_399).await.asks.is_empty());
+    assert_eq!(f.sweep(closed + 86_400).await.asks, [cid]);
+}
+
+#[tokio::test]
+async fn day_retention_keeps_finished_jobs_until_24_hours() {
+    let f = team("c", &["boss", "worker"]).await;
+    let id = f
+        .job(json!({"title": "test", "from_peer": "boss", "assigned_peer": "worker"}))
+        .await;
+    f.advance().await;
+    let cid = f.ask_id(&id).await;
+    f.ack(&cid, json!({"from_peer": "worker", "message": "done"}))
+        .await;
+    f.advance().await;
+    let ended = f.row(&id).await.finished_at.unwrap();
+    assert!(f.sweep(ended + 86_399).await.jobs.is_empty());
+    assert_eq!(f.sweep(ended + 86_400).await.jobs, [id]);
+}
+
+#[tokio::test]
+async fn day_retention_queries_events_within_24_hours() {
+    let f = team("c", &["boss"]).await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        let now = now_unix();
+        for (id, age) in [("within", 86_340), ("expired", 86_460)] {
+            push_event(
+                &mut hub,
+                json!({"id": id, "from_peer": "boss", "type": "notify"}),
+            );
+            hub.events.last_mut().unwrap()["at"] = json!(now - age);
+        }
+    }
+    let result = mcp_call(
+        &f.0,
+        json!({"name": "amesh_events", "arguments": {"from_peer": "boss"}}),
+    )
+    .await
+    .unwrap();
+    let rows: Value = serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["id"], "within");
+}
+#[tokio::test]
+async fn consistency_fix_legacy_delivery_records_event() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    f.0.inner
+        .lock()
+        .await
+        .sockets
+        .insert("worker".into(), (1, tx));
+    let cid = f.open_ask("boss", "worker").await;
+    assert_eq!(rx.try_recv().unwrap().event()["correlation_id"], cid);
+    assert!(f.0.inner.lock().await.asks.contains_key(&cid));
+    let events = ring_of(&f).await;
+    assert_eq!(events.len(), 1);
+}
+
+#[tokio::test]
+async fn consistency_fix_closed_ask_keeps_circle() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let cid = f.open_ask("boss", "worker").await;
+    f.ack(&cid, json!({"from_peer":"worker", "message":"done"}))
+        .await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        for peer in hub.peers.values_mut() {
+            peer.last_seen = 0;
+        }
+    }
+    let (_, peers) = f.request("GET", "/peers", json!({})).await;
+    assert!(peers.as_array().unwrap().is_empty());
+    for id in ["boss", "worker"] {
+        f.peer(id, "c2").await;
+    }
+    let (_, old) = f.request("GET", "/snapshot?circle=c1", json!({})).await;
+    let (_, new) = f.request("GET", "/snapshot?circle=c2", json!({})).await;
+    let (_, events) = f.request("GET", "/events?circle=c1", json!({})).await;
+    assert_eq!(old["asks"][0]["correlation_id"], cid);
+    assert!(new["asks"].as_array().unwrap().is_empty());
+    assert_eq!(events.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn consistency_fix_ack_keeps_original_circle() {
+    let f = team("c1", &["boss"]).await;
+    let reg = |id: &str, name: &str, circle: &str| json!({"peer_id":id,"name":name,"circle":circle,"backend":"pi"});
+    assert_eq!(
+        f.request("POST", "/peers", reg("worker-id", "alias", "c1"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let cid = f.open_ask("boss", "alias").await;
+    assert_eq!(
+        f.request("POST", "/peers", reg("worker-id", "renamed", "c1"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.request("POST", "/peers", reg("other", "alias", "c2"))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        f.ack(
+            &cid,
+            json!({"from_peer":"worker-id","message":"private-result"})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    assert_eq!(ring_of(&f).await.last().unwrap()["from_peer"], "worker-id");
+    let (_, events) = f.request("GET", "/events?circle=c2", json!({})).await;
+    assert!(events.as_array().unwrap().is_empty());
+    let (status, rows) = f.tool("amesh_events", json!({"from_peer":"other"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(rows.as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn consistency_fix_deleted_schedule_skips_dispatch() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let (status,sched)=f.request("POST","/schedules",json!({"from_peer":"boss","to_peer":"worker","text":"cancelled-message","kind":"notify","in_seconds":0})).await;
+    assert_eq!(status, StatusCode::OK);
+    let id = sched["schedule_id"].as_str().unwrap();
+    let held = f.0.inner.lock().await;
+    let mut tick = Box::pin(tick_schedules(&f.0));
+    assert!(futures_util::poll!(tick.as_mut()).is_pending());
+    let mut gate1 = Box::pin(f.0.inner.lock());
+    assert!(futures_util::poll!(gate1.as_mut()).is_pending());
+    drop(held);
+    assert!(futures_util::poll!(tick.as_mut()).is_pending());
+    let guard1 = match futures_util::poll!(gate1.as_mut()) {
+        std::task::Poll::Ready(g) => g,
+        _ => panic!("gate1"),
+    };
+    let path = format!("/schedules/{id}");
+    let mut deletion = Box::pin(f.request("DELETE", &path, json!({})));
+    assert!(futures_util::poll!(deletion.as_mut()).is_pending());
+    drop(guard1);
+    assert!(futures_util::poll!(tick.as_mut()).is_pending());
+    let result = match futures_util::poll!(deletion.as_mut()) {
+        std::task::Poll::Ready(g) => g,
+        _ => panic!("delete pending"),
+    };
+    assert_eq!(result.0, StatusCode::OK);
+    assert_eq!(result.1["ok"], true);
+    assert!(futures_util::poll!(tick.as_mut()).is_ready());
+    assert!(!f.0.inner.lock().await.schedules.contains_key(id));
+    let inbox = f.inbox("worker").await;
+    assert!(inbox.iter().all(|e| e["message"] != "cancelled-message"));
+}
+
+#[tokio::test]
+async fn consistency_fix_ask_circles_survive_restart() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let cid = f.open_ask("boss", "worker").await;
+    let reopened = Fixture::open(f.0.state_path.clone());
+    let hub = reopened.0.inner.lock().await;
+    assert_eq!(hub.asks[&cid].from_circle, "c1");
+    assert_eq!(hub.asks[&cid].to_circle, "c1");
+}
+
+#[tokio::test]
+async fn consistency_fix_legacy_ask_has_only_unscoped_visibility() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let cid = f.open_ask("boss", "worker").await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        let ask = hub.asks.get_mut(&cid).unwrap();
+        ask.from_circle.clear();
+        ask.to_circle.clear();
+    }
+    let (_, scoped) = f.request("GET", "/snapshot?circle=c1", json!({})).await;
+    assert!(scoped["asks"].as_array().unwrap().is_empty());
+    let (_, all) = f.request("GET", "/snapshot", json!({})).await;
+    assert_eq!(all["asks"][0]["correlation_id"], cid);
+}
+
+#[tokio::test]
+async fn consistency_fix_ack_uses_stored_circles_after_peer_removal() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let cid = f.open_ask("boss", "worker").await;
+    let mut hub = f.0.inner.lock().await;
+    hub.peers.clear();
+    push_event(
+        &mut hub,
+        json!({
+            "type":"ack", "correlation_id":cid,
+            "from_peer":"worker", "to_peer":"boss", "message":"done"
+        }),
+    );
+    let ack = hub.events.last().unwrap();
+    assert_eq!(ack["from_circle"], "c1");
+    assert_eq!(ack["to_circle"], "c1");
+}
+
+#[tokio::test]
+async fn consistency_fix_migration_takes_ask_circles_from_the_peers_on_disk() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let cid = f.open_ask("boss", "worker").await;
+    {
+        let hub = f.0.inner.lock().await;
+        hub.db
+            .execute_batch(
+                "ALTER TABLE asks DROP COLUMN from_circle;
+             ALTER TABLE asks DROP COLUMN to_circle;",
+            )
+            .unwrap();
+    }
+    let reopened = Fixture::open(f.0.state_path.clone());
+    let (_, scoped) = reopened
+        .request("GET", "/snapshot?circle=c1", json!({}))
+        .await;
+    assert_eq!(scoped["asks"][0]["correlation_id"], cid, "{scoped}");
+    let hub = reopened.0.inner.lock().await;
+    let ask = &hub.asks[&cid];
+    assert_eq!(
+        (ask.from_circle.as_str(), ask.to_circle.as_str()),
+        ("c1", "c1")
+    );
+    assert_eq!(ask.text, "q");
+}
+
+#[tokio::test]
+async fn consistency_fix_job_ack_carries_its_ask_circles() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let id = f
+        .job(json!({"title": "t", "from_peer": "boss", "assigned_peer": "worker"}))
+        .await;
+    f.advance().await;
+    let cid = f.ask_id(&id).await;
+    f.ack(&cid, json!({"from_peer": "worker", "message": "done"}))
+        .await;
+    let ring = ring_of(&f).await;
+    let ack = ring
+        .iter()
+        .find(|e| e["type"] == "ack" && e["correlation_id"] == cid)
+        .unwrap();
+    assert_eq!(
+        (&ack["from_circle"], &ack["to_circle"]),
+        (&json!("c1"), &json!("c1"))
+    );
+}
+
+#[tokio::test]
+async fn consistency_fix_scheduled_ask_keeps_its_creator_circle() {
+    let f = team("c1", &["boss"]).await;
+    f.peer("worker", "c2").await;
+    let (status, body) = f
+        .request(
+            "POST",
+            "/schedules",
+            json!({"from_peer": "boss", "to_peer": "worker", "text": "later", "kind": "ask", "in_seconds": 0, "cross_circle": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.0.inner.lock().await.peers.remove("boss");
+    tick_schedules(&f.0).await;
+    let hub = f.0.inner.lock().await;
+    let ask = hub.asks.values().find(|ask| ask.text == "later").unwrap();
+    assert_eq!(
+        (ask.from_circle.as_str(), ask.to_circle.as_str()),
+        ("c1", "c2")
+    );
+}
+
+#[tokio::test]
+async fn consistency_fix_handoff_gives_the_ask_its_coordinator_circle() {
+    let f = team("c1", &["boss", "worker"]).await;
+    let id = f.job(json!({"title": "t"})).await;
+    assert_eq!(
+        f.row(&id).await.circle,
+        "",
+        "no creator or assignee names a circle"
+    );
+    let path = format!("/jobs/{id}");
+    let (status, body) = f
+        .request(
+            "PATCH",
+            &path,
+            json!({"assigned_peer": "worker", "state": "queued"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    f.advance().await;
+    let cid = f.ask_id(&id).await;
+    let (status, body) = f
+        .request("PATCH", &path, json!({"coordinator": "boss"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(f.ask(&cid).await.from_circle, "c1");
+}
+#[tokio::test]
+async fn peer_details_match_snapshot_state() {
+    let f = team("c1", &["boss", "worker"]).await;
+    f.peer("outside", "c2").await;
+    let job = f
+        .job(json!({
+            "title":"review", "prompt":"check", "assigned_peer":"worker", "from_peer":"boss"
+        }))
+        .await;
+    assert!(!job.is_empty());
+    f.advance().await;
+    assert_eq!(
+        f.request(
+            "POST",
+            "/activity",
+            json!({
+                "peer_id":"worker", "state":"wait", "source":"test", "reason":"permission"
+            })
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, snapshot) = f.request("GET", "/snapshot?circle=c1", json!({})).await;
+    let (status, rows) = f
+        .tool(
+            "amesh_list_peers",
+            json!({
+                "from_peer":"boss", "detail":true
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = rows.as_array().expect("detail returns JSON peers");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["peer_id"], "boss");
+    assert_eq!(rows[1]["peer_id"], "worker");
+    let actual = &rows[1];
+    let expected = snapshot["roster"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["peer_id"] == "worker")
+        .unwrap();
+    for field in [
+        "activity",
+        "running",
+        "queued",
+        "push",
+        "acks",
+        "last_seen",
+        "liveness",
+    ] {
+        assert_eq!(actual[field], expected[field], "{field}");
+    }
+    assert_eq!(
+        actual["delivery"]["condition"],
+        expected["delivery"]["condition"]
+    );
+    assert_eq!(actual["activity"]["state"], "wait");
+    assert_eq!(actual["running"], 1);
+    assert_eq!(actual["queued"], 1);
+}
+
+#[tokio::test]
+async fn peer_details_preserve_cross_circle_rules() {
+    let f = team("c1", &["boss"]).await;
+    f.peer("other", "c2").await;
+    let (status, _) = f
+        .tool(
+            "amesh_list_peers",
+            json!({
+                "from_peer":"boss", "circle":"c2", "detail":true
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (_, scoped) = f
+        .tool(
+            "amesh_list_peers",
+            json!({
+                "from_peer":"boss", "circle":"c2", "cross_circle":true, "detail":true
+            }),
+        )
+        .await;
+    let rows = scoped.as_array().expect("detail returns JSON peers");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["peer_id"], "other");
+    let (_, all) = f
+        .tool(
+            "amesh_list_peers",
+            json!({
+                "from_peer":"boss", "cross_circle":true, "detail":true
+            }),
+        )
+        .await;
+    assert_eq!(all.as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn peer_details_unknown_activity_and_empty_roster() {
+    let f = team("c1", &["boss"]).await;
+    let (_, rows) = f
+        .tool(
+            "amesh_list_peers",
+            json!({
+                "from_peer":"boss", "detail":true
+            }),
+        )
+        .await;
+    let rows = rows.as_array().expect("detail returns JSON peers");
+    assert!(rows[0]["activity"].is_null());
+    assert_eq!(rows[0]["running"], 0);
+    assert_eq!(rows[0]["queued"], 0);
+    assert_eq!(rows[0]["push"], false);
+    assert_eq!(rows[0]["acks"], false);
+    let (_, empty) = f
+        .tool(
+            "amesh_list_peers",
+            json!({
+                "from_peer":"boss", "circle":"empty", "cross_circle":true, "detail":true
+            }),
+        )
+        .await;
+    assert_eq!(empty, json!([]));
+    let (_, compact) = f
+        .tool("amesh_list_peers", json!({"from_peer":"boss"}))
+        .await;
+    assert_eq!(compact.as_str().unwrap().split('\t').count(), 5);
+}
+
+#[test]
+fn peer_details_schema_is_exposed() {
+    let tools = mcp_tools();
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "amesh_list_peers")
+        .unwrap();
+    assert_eq!(
+        tool["inputSchema"]["properties"]["detail"]["type"],
+        "boolean"
+    );
+}
 
 /* a hub, and the directory it made for itself; one opened on a test's own path leaves that
 directory to the test */

@@ -1,6 +1,9 @@
 use super::*;
 use axum::http::Request;
 use http_body_util::BodyExt;
+use rusqlite::ffi;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tower::ServiceExt;
 
 async fn request(app: Router, path: &str, body: Value) -> (StatusCode, Value) {
@@ -818,24 +821,122 @@ fn knowledge_delete_404_leaves_the_bytes_alone() {
     assert!(holds(&path, marker), "a missing id compacted the file");
 }
 
+/* the erase budget is knowledge::ERASE_BUSY_MS, which is private to that module, so the
+child pins the value it expects to spend */
+const ERASE_BUSY_US: u64 = 500_000;
+
+static ERASE_SLEEP_US: AtomicU64 = AtomicU64::new(0);
+
+unsafe extern "C" fn record_sleep(
+    _vfs: *mut ffi::sqlite3_vfs,
+    micros: std::ffi::c_int,
+) -> std::ffi::c_int {
+    if micros > 0 {
+        ERASE_SLEEP_US.fetch_add(micros as u64, Ordering::SeqCst);
+    }
+    micros
+}
+
+/* a copy of the default VFS that accounts for the lock-wait budget the connection asks
+for instead of actually sleeping; registered as the default for the child's lifetime and
+restored by Drop on both the normal and the panicking path */
+struct SleepCountingVfs {
+    previous: *mut ffi::sqlite3_vfs,
+    copy: Box<ffi::sqlite3_vfs>,
+}
+
+impl SleepCountingVfs {
+    fn install() -> Self {
+        unsafe {
+            let previous = ffi::sqlite3_vfs_find(std::ptr::null());
+            assert!(!previous.is_null(), "no default sqlite vfs");
+            let mut copy = Box::new(std::ptr::read(previous));
+            copy.zName = c"amesh-erase-sleep".as_ptr();
+            copy.xSleep = Some(record_sleep);
+            assert_eq!(
+                ffi::sqlite3_vfs_register(copy.as_mut(), 1),
+                ffi::SQLITE_OK,
+                "the sleep-counting vfs was not registered"
+            );
+            Self { previous, copy }
+        }
+    }
+}
+
+impl Drop for SleepCountingVfs {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::sqlite3_vfs_unregister(self.copy.as_mut());
+            ffi::sqlite3_vfs_register(self.previous, 1);
+        }
+    }
+}
+
 #[test]
 fn knowledge_delete_beside_a_reader_reports_the_bytes_as_left_behind() {
+    if std::env::var_os("AMESH_ERASE_SLEEP_CHILD").is_some() {
+        erase_sleep_budget_body();
+        return;
+    }
+    let filter = format!(
+        "{}::knowledge_delete_beside_a_reader_reports_the_bytes_as_left_behind",
+        module_path!().split_once("::").unwrap().1
+    );
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &filter, "--nocapture"])
+        .env("AMESH_ERASE_SLEEP_CHILD", "1")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the erase budget case timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = String::from_utf8(child.wait_with_output().unwrap().stdout).unwrap();
+    assert!(status.success(), "the erase budget case failed: {stdout}");
+    assert!(
+        stdout.contains("test result: ok. 1 passed;"),
+        "the erase budget case did not run exactly one test: {stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("erase sleep budget {ERASE_BUSY_US}")),
+        "the erase budget case never reported its budget: {stdout}"
+    );
+}
+
+fn erase_sleep_budget_body() {
     let path = tests::TempState::new("knowledge-delete-reader");
-    let mut db = open_db(&path, now_unix()).unwrap();
     let peer = person("author", "c");
     let now = now_unix();
-    let id = store_publish(&mut db, &peer, "erase beside a reader", now, 3600);
+    let id = {
+        let mut db = open_db(&path, now).unwrap();
+        store_publish(&mut db, &peer, "erase beside a reader", now, 3600)
+    };
+    /* the guard must outlive every connection, which is why it is bound here and dropped
+    last: unregistering a vfs that a live connection still points at is a use-after-free */
+    let _vfs = SleepCountingVfs::install();
+    ERASE_SLEEP_US.store(0, Ordering::SeqCst);
+    let mut db = open_db(&path, now).unwrap();
     let reader = Connection::open(&path).unwrap();
     reader
         .execute_batch("BEGIN; SELECT count(*) FROM peers;")
         .unwrap();
-    let started = std::time::Instant::now();
     let out = knowledge::call(&mut db, "delete", json!({"id": id}), &peer, now).unwrap();
-    let took = started.elapsed();
     assert_eq!(out["compacted"], false, "{out}");
-    assert!(
-        took < Duration::from_millis(2500),
-        "the erase waited {took:?} on another connection"
+    /* a reader holding a wal snapshot makes the truncating checkpoint spend exactly the
+    erase budget the connection was given, whatever the scheduler does with real time */
+    let requested = ERASE_SLEEP_US.load(Ordering::SeqCst);
+    assert_eq!(
+        requested, ERASE_BUSY_US,
+        "the erase asked for {requested}us of lock wait"
     );
     assert_eq!(
         knowledge::call(&mut db, "get", json!({"id": id}), &peer, now)
@@ -847,6 +948,7 @@ fn knowledge_delete_beside_a_reader_reports_the_bytes_as_left_behind() {
     let busy: i64 = db
         .pragma_query_value(None, "busy_timeout", |row| row.get(0))
         .unwrap();
-    assert_eq!(busy, 5000, "the erase timeout was not restored");
+    assert_eq!(busy, BUSY_MS as i64, "the erase timeout was not restored");
     reader.execute_batch("ROLLBACK").unwrap();
+    println!("erase sleep budget {requested}");
 }

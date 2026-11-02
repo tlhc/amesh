@@ -2975,9 +2975,6 @@ async fn discover_app_thread(
     .map_err(|_| "MCP identity verification timed out")?
 }
 
-#[cfg(test)]
-mod thread_routing_tests;
-
 async fn app_inject(sink: &mut AppSink, text: &str) -> Result<()> {
     let read = app_rpc(
         &mut sink.ws,

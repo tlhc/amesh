@@ -1081,61 +1081,61 @@ fn liveness_offline() {
 fn closed_now_absent() {
     let mut a = ask();
     a.closed_at = None;
-    assert_eq!(closed_just_now(&a, 100), false, "closed_now_absent");
+    assert!(!closed_just_now(&a, 100), "closed_now_absent");
 }
 #[test]
 fn closed_now_future() {
     let mut a = ask();
     a.closed_at = Some(101);
-    assert_eq!(closed_just_now(&a, 100), false, "closed_now_future");
+    assert!(!closed_just_now(&a, 100), "closed_now_future");
 }
 #[test]
 fn closed_now_equal() {
     let mut a = ask();
     a.closed_at = Some(100);
-    assert_eq!(closed_just_now(&a, 100), true, "closed_now_equal");
+    assert!(closed_just_now(&a, 100), "closed_now_equal");
 }
 #[test]
 fn closed_now_one() {
     let mut a = ask();
     a.closed_at = Some(99);
-    assert_eq!(closed_just_now(&a, 100), true, "closed_now_one");
+    assert!(closed_just_now(&a, 100), "closed_now_one");
 }
 #[test]
 fn closed_now_two() {
     let mut a = ask();
     a.closed_at = Some(98);
-    assert_eq!(closed_just_now(&a, 100), false, "closed_now_two");
+    assert!(!closed_just_now(&a, 100), "closed_now_two");
 }
 #[test]
 fn opened_now_absent() {
     let mut a = ask();
     a.opened_at = None;
-    assert_eq!(opened_just_now(&a, 100), false, "opened_now_absent");
+    assert!(!opened_just_now(&a, 100), "opened_now_absent");
 }
 #[test]
 fn opened_now_future() {
     let mut a = ask();
     a.opened_at = Some(101);
-    assert_eq!(opened_just_now(&a, 100), false, "opened_now_future");
+    assert!(!opened_just_now(&a, 100), "opened_now_future");
 }
 #[test]
 fn opened_now_equal() {
     let mut a = ask();
     a.opened_at = Some(100);
-    assert_eq!(opened_just_now(&a, 100), true, "opened_now_equal");
+    assert!(opened_just_now(&a, 100), "opened_now_equal");
 }
 #[test]
 fn opened_now_one() {
     let mut a = ask();
     a.opened_at = Some(99);
-    assert_eq!(opened_just_now(&a, 100), true, "opened_now_one");
+    assert!(opened_just_now(&a, 100), "opened_now_one");
 }
 #[test]
 fn opened_now_two() {
     let mut a = ask();
     a.opened_at = Some(98);
-    assert_eq!(opened_just_now(&a, 100), false, "opened_now_two");
+    assert!(!opened_just_now(&a, 100), "opened_now_two");
 }
 #[test]
 fn delivery_offline() {

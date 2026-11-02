@@ -89,7 +89,7 @@ def RunCase(binary, primerBinary, root, case):
         mcp['mcpServers']['amesh']['env'] = {k: v for k, v in hubEnv.items()
             if k.startswith('AMESH_') or k in ('HOME', 'CODEX_HOME')}
         frozen = root / 'frozen.diff'
-        frozen.write_bytes(subprocess.check_output(['git', 'diff', '--', 'README.md', 'src/cli/mod.rs', 'tests/support/peer_handoff.rs'], cwd=pathlib.Path(__file__).resolve().parents[1]))
+        frozen.write_bytes(subprocess.check_output(['git', 'diff', '--', 'README.md', 'src/cli/mod.rs', 'tests/cli/peer_handoff.rs'], cwd=pathlib.Path(__file__).resolve().parents[2]))
         frozenHash = hashlib.sha256(frozen.read_bytes()).hexdigest()
         prompt = case[1].replace('/tmp/frozen.diff', str(frozen)).replace('a' * 64, frozenHash) + '\n请实际完成派发，派发后结束，不等待接收方回复。'
         if case[0] in ('self-ack', 'requeue'):

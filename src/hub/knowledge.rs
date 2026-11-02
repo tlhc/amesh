@@ -449,5 +449,4 @@ fn not_found() -> Failure {
 }
 
 #[cfg(test)]
-#[path = "../../tests/support/knowledge_store.rs"]
 mod tests;

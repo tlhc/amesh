@@ -173,6 +173,41 @@ fn opencode_plugin_contracts() {
     );
 }
 
+/* every claimed mutation must actually be caught by the hook harness; the script runs the
+real harness against a patched plugin for each case and asserts the failing subtest */
+#[test]
+fn opencode_mutations_are_detected() {
+    let sandbox = Sandbox::new();
+    let mut node = Command::new("node");
+    let result = isolate_session_env(&mut node, &sandbox.root)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/opencode_mutations.mjs"
+        ))
+        .arg(env!("CARGO_BIN_EXE_amesh"))
+        .arg(&sandbox.root)
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/opencode_hook.mjs"
+        ))
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/cli/opencode_hook.js"
+        ))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(
+        result.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        stdout.contains("PASS mutation targets"),
+        "the mutation run must report success: {stdout}"
+    );
+}
+
 #[test]
 fn opencode_config_path_precedence_and_home_isolation() {
     let mut sandbox = Sandbox::new();

@@ -3,6 +3,16 @@ import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { test as nodeTest } from "node:test";
 
+/* this harness drives the real amesh CLI, so it refuses to run without a sandbox state:
+a hand-started run would otherwise let the daemon's start-up path write into the
+operator's home */
+if (!process.env.AMESH_STATE) {
+  console.error(
+    "amesh harness: AMESH_STATE is unset; run this harness through cargo test",
+  );
+  process.exit(1);
+}
+
 /* AMESH_PI_DAEMON_ONLY keeps the session that talks to the daemon, for the run where
 session_start has to start it; the socket retry checks before it are left out and the
 subtests after it skipped, never cut off, so a failure still fails the run */
@@ -527,8 +537,7 @@ assert.match(userMsgs[userMsgs.length - 1].content, /r1-fail/);
 assert.match(userMsgs[userMsgs.length - 1].content, /r1-ok/);
 await handlers.get("agent_settled")({}, context);
 sockets[0].close();
-await new Promise((resolve) => setTimeout(resolve, 1100));
-assert.ok(sockets.length >= 2, "websocket reconnects after close");
+assert.ok(await waitUntil(() => sockets.length >= 2, 5000), "websocket reconnects after close");
 const afterRetry = sockets.length;
 await handlers.get("session_shutdown")({}, context);
 for (const sock of sockets) {
