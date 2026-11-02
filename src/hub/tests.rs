@@ -1189,9 +1189,10 @@ fn list_peers_schema_exposes_circle_and_cross_circle() {
         tool["inputSchema"]["properties"]["cross_circle"]["type"],
         "boolean"
     );
-    assert!(tool["description"].as_str().unwrap().starts_with(
-        "List peers in your circle; cross_circle without circle lists all"
-    ));
+    assert!(tool["description"]
+        .as_str()
+        .unwrap()
+        .starts_with("List peers in your circle; cross_circle without circle lists all"));
 }
 
 async fn mcp_tool(app: Router, name: &str, args: Value) -> (StatusCode, Value) {
