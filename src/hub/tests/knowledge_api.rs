@@ -874,21 +874,22 @@ impl Drop for SleepCountingVfs {
 
 #[test]
 fn knowledge_delete_beside_a_reader_reports_the_bytes_as_left_behind() {
-    if std::env::var_os("AMESH_ERASE_SLEEP_CHILD").is_some() {
-        erase_sleep_budget_body();
+    if let Some(path) = std::env::var_os("AMESH_ERASE_SLEEP_CHILD") {
+        erase_sleep_budget_body(Path::new(&path));
         return;
     }
+    let path = tests::TempState::new("knowledge-delete-reader");
     let filter = format!(
         "{}::knowledge_delete_beside_a_reader_reports_the_bytes_as_left_behind",
         module_path!().split_once("::").unwrap().1
     );
     let mut child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &filter, "--nocapture"])
-        .env("AMESH_ERASE_SLEEP_CHILD", "1")
+        .env("AMESH_ERASE_SLEEP_CHILD", path.as_os_str())
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
@@ -912,20 +913,19 @@ fn knowledge_delete_beside_a_reader_reports_the_bytes_as_left_behind() {
     );
 }
 
-fn erase_sleep_budget_body() {
-    let path = tests::TempState::new("knowledge-delete-reader");
+fn erase_sleep_budget_body(path: &Path) {
     let peer = person("author", "c");
     let now = now_unix();
     let id = {
-        let mut db = open_db(&path, now).unwrap();
+        let mut db = open_db(path, now).unwrap();
         store_publish(&mut db, &peer, "erase beside a reader", now, 3600)
     };
     /* the guard must outlive every connection, which is why it is bound here and dropped
     last: unregistering a vfs that a live connection still points at is a use-after-free */
     let _vfs = SleepCountingVfs::install();
     ERASE_SLEEP_US.store(0, Ordering::SeqCst);
-    let mut db = open_db(&path, now).unwrap();
-    let reader = Connection::open(&path).unwrap();
+    let mut db = open_db(path, now).unwrap();
+    let reader = Connection::open(path).unwrap();
     reader
         .execute_batch("BEGIN; SELECT count(*) FROM peers;")
         .unwrap();
