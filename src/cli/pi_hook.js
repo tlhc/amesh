@@ -217,6 +217,7 @@ export default function AmeshHooks(pi) {
           reject(error);
         }
       });
+      child.stdin.on("error", () => {});
       child.stdin.end(
         `${JSON.stringify({
           jsonrpc: "2.0",
@@ -255,6 +256,7 @@ export default function AmeshHooks(pi) {
         if (error) { reject(error); return; }
         try { resolve({ ...JSON.parse(stdout), session_id: session }); } catch (error) { reject(error); }
       });
+      child.stdin.on("error", () => {});
       child.stdin.end(payload);
     });
   }

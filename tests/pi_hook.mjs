@@ -1205,6 +1205,43 @@ await test("a report that fails on connect is logged, never thrown", async () =>
   }
 });
 
+await test("a hook child that exits before reading its input is logged, never thrown", async () => {
+  const state = InboxSession();
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const early = `${cwd}/early-hook-amesh`;
+  writeFileSync(early, `#!/bin/sh\n[ "$1" = hook ] && { echo hook-refused >&2; exit 1; }\nexec ${JSON.stringify(executable)} "$@"\n`);
+  chmodSync(early, 0o755);
+  const text = source.split(JSON.stringify(executable)).join(JSON.stringify(early));
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+  const instance = InboxInstance(state, false, hooks);
+  /* a cwd larger than a pipe buffer keeps the hook input unwritten until the child is gone */
+  const wide = { ...state.ctx, cwd: `${cwd}/${"x".repeat(256 * 1024)}` };
+  const from = ameshLogs.length;
+  try {
+    await instance.handlers.get("session_start")({}, wide);
+    assert.ok(
+      ameshLogs.slice(from).some((line) => line.includes("hook-refused")),
+      "the refused session report is logged",
+    );
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, wide);
+  }
+});
+
+await test("a tool child that exits before reading its input rejects, never throws", async () => {
+  const { writeFileSync, chmodSync } = await import("node:fs");
+  const early = `${cwd}/early-mcp-amesh`;
+  writeFileSync(early, `#!/bin/sh\n[ "$1" = mcp ] && { echo mcp-refused >&2; exit 3; }\nexec ${JSON.stringify(executable)} "$@"\n`);
+  chmodSync(early, 0o755);
+  const text = source.split(JSON.stringify(executable)).join(JSON.stringify(early));
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+  const registered = {};
+  hooks({ on() {}, sendMessage() {}, sendUserMessage() {}, registerTool(def) { registered[def.name] = def; } });
+  /* a request larger than a pipe buffer is still being written when the child exits */
+  const call = registered.amesh_job_create.execute("early", { title: "x".repeat(256 * 1024) });
+  await assert.rejects(call, /mcp-refused/);
+});
+
 await test("a consumed steer lets the next batch out inside the same run", async () => {
   const state = InboxSession();
   wsFailRemaining = 0;
