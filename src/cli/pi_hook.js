@@ -488,9 +488,11 @@ export default function AmeshHooks(pi) {
         assigned_peer: { type: "string" },
         depends_on: { type: "array", items: { type: "string" } },
       }, []],
-      ["job_list", "List jobs in your circle; cross_circle without circle lists all", {
+      ["job_list", "List jobs in your circle; cross_circle without circle lists all. Each job comes as a summary: job_id, title, state, assigned_peer, from_peer, ask_id, depends_on, circle, created_at, finished_at; detail=true returns whole jobs with prompt and result_summary; state (queued, running, done, failed or cancelled) lists only jobs in that state", {
         circle: { type: "string" },
         cross_circle: { type: "boolean" },
+        detail: { type: "boolean" },
+        state: { type: "string" },
       }, []],
       ["job_status", "Show a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
       ["job_update", "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.", {

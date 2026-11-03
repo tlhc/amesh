@@ -271,6 +271,11 @@ for (const field of ["title", "body", "applies_to", "evidence", "replaces", "ttl
       canonical.inputSchema.properties[field].description);
   });
 }
+await test("amesh_job_list matches MCP guidance", () => {
+  const canonical = catalog.find((entry) => entry.name === "amesh_job_list");
+  assert.equal(defs.amesh_job_list.description, canonical.description);
+  assert.deepEqual(schemas.amesh_job_list, canonical.inputSchema);
+});
 await test("amesh_job_create matches MCP guidance", () => {
   const canonical = catalog.find((entry) => entry.name === "amesh_job_create");
   assert.equal(defs.amesh_job_create.description, canonical.description);

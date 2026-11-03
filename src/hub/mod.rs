@@ -278,6 +278,8 @@ fn clean_identity(peer: &Peer, kept: [bool; 3]) -> bool {
     .all(|(value, kept)| peer_id_chars_ok(value) && (kept || value.len() <= PEER_ID_MAX))
 }
 
+const JOB_STATES: [&str; 5] = ["queued", "running", "done", "failed", "cancelled"];
+
 fn normalize_backend(raw: &str) -> Option<&'static str> {
     match raw {
         "pi" => Some("pi"),
@@ -3378,6 +3380,21 @@ fn stamp_job_circle(
     Ok(String::new())
 }
 
+fn job_summary(job: &Job) -> Value {
+    json!({
+        "job_id": job.job_id,
+        "title": job.title,
+        "state": job.state,
+        "assigned_peer": job.assigned_peer,
+        "from_peer": job.from_peer,
+        "ask_id": job.ask_id,
+        "depends_on": job.depends_on,
+        "circle": job.circle,
+        "created_at": job.created_at,
+        "finished_at": job.finished_at,
+    })
+}
+
 async fn create_job(
     State(app): State<App>,
     headers: HeaderMap,
@@ -3576,8 +3593,10 @@ async fn update_job(
         let now = now_unix();
         return hand_off(&mut hub, &id, to, now);
     }
-    let allowed = ["queued", "running", "done", "failed", "cancelled"];
-    let Some(state) = req.state.filter(|state| allowed.contains(&state.as_str())) else {
+    let Some(state) = req
+        .state
+        .filter(|state| JOB_STATES.contains(&state.as_str()))
+    else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "bad job state"})),
@@ -4928,10 +4947,12 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "List jobs in your circle; cross_circle without circle lists all",
+                "List jobs in your circle; cross_circle without circle lists all. Each job comes as a summary: job_id, title, state, assigned_peer, from_peer, ask_id, depends_on, circle, created_at, finished_at; detail=true returns whole jobs with prompt and result_summary; state (queued, running, done, failed or cancelled) lists only jobs in that state",
                 json!({
                     "circle": {"type": "string"},
-                    "cross_circle": {"type": "boolean"}
+                    "cross_circle": {"type": "boolean"},
+                    "detail": {"type": "boolean"},
+                    "state": {"type": "string"}
                 }),
                 &[],
             );
@@ -5331,14 +5352,32 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
         "amesh_job_list" => {
             let hub = app.inner.lock().await;
             let filter = mcp_scope(&hub, &args)?;
-            serde_json::to_string(
-                &hub.jobs
-                    .values()
-                    .filter(|job| filter.as_deref().is_none_or(|circle| job.circle == circle))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap_or_default()
+            let detail = args.get("detail").and_then(Value::as_bool).unwrap_or(false);
+            let state = match args.get("state") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(wanted)) if wanted.is_empty() => None,
+                Some(Value::String(wanted)) if JOB_STATES.contains(&wanted.as_str()) => {
+                    Some(wanted.as_str())
+                }
+                _ => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "bad job state"})),
+                    ))
+                }
+            };
+            let jobs: Vec<&Job> = hub
+                .jobs
+                .values()
+                .filter(|job| filter.as_deref().is_none_or(|circle| job.circle == circle))
+                .filter(|job| state.is_none_or(|wanted| job.state == wanted))
+                .collect();
+            if detail {
+                serde_json::to_string(&jobs).unwrap_or_default()
+            } else {
+                let summaries: Vec<Value> = jobs.iter().map(|job| job_summary(job)).collect();
+                serde_json::to_string(&summaries).unwrap_or_default()
+            }
         }
         "amesh_job_status" => {
             let id = args

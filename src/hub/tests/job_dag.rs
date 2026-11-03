@@ -3817,6 +3817,155 @@ async fn job_create_leaves_a_blocked_job_queued_without_an_ask() {
     assert!(row.ask_id.is_some());
 }
 
+const JOB_SUMMARY_FIELDS: [&str; 10] = [
+    "job_id",
+    "title",
+    "state",
+    "assigned_peer",
+    "from_peer",
+    "ask_id",
+    "depends_on",
+    "circle",
+    "created_at",
+    "finished_at",
+];
+
+fn summary_keys(job: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = job
+        .as_object()
+        .expect("a job entry is an object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+#[tokio::test]
+async fn mcp_job_list_defaults_to_the_summary_fields() {
+    let f = team("one", &["boss", "w1"]).await;
+    let running = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let queued = f
+        .job(json!({"title": "b", "from_peer": "boss", "prompt": "a long prompt"}))
+        .await;
+    let (status, body) = f.tool("amesh_job_list", json!({"from_peer": "boss"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let mut expected: Vec<String> = JOB_SUMMARY_FIELDS
+        .iter()
+        .map(|field| field.to_string())
+        .collect();
+    expected.sort();
+    let entries = body.as_array().expect("a list of jobs");
+    assert_eq!(entries.len(), 2, "{body}");
+    for entry in entries {
+        assert_eq!(summary_keys(entry), expected, "summary shape: {entry}");
+    }
+    let ids: Vec<&str> = entries
+        .iter()
+        .map(|entry| entry["job_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&running.as_str()) && ids.contains(&queued.as_str()));
+}
+
+#[tokio::test]
+async fn mcp_job_list_detail_returns_the_whole_job() {
+    let f = team("one", &["boss", "w1"]).await;
+    let id = f
+        .job(json!({"title": "a", "from_peer": "boss", "assigned_peer": "w1", "prompt": "full prompt"}))
+        .await;
+    let cid = f.ask_id(&id).await;
+    f.ack(&cid, json!({"from_peer": "w1", "message": "the result"}))
+        .await;
+    f.advance().await;
+    let (status, body) = f
+        .tool(
+            "amesh_job_list",
+            json!({"from_peer": "boss", "detail": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let entries = body.as_array().unwrap();
+    assert_eq!(entries.len(), 1, "one job was created: {body}");
+    assert_eq!(
+        entries[0],
+        json!(f.row(&id).await),
+        "detail is the whole row"
+    );
+}
+
+#[tokio::test]
+async fn mcp_job_list_keeps_one_exact_state() {
+    let f = team("one", &["boss", "w1"]).await;
+    let running = f
+        .job(json!({"title": "a", "assigned_peer": "w1", "from_peer": "boss"}))
+        .await;
+    let queued = f.job(json!({"title": "b", "from_peer": "boss"})).await;
+    let ids = |body: &Value| {
+        let mut out: Vec<String> = body
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["job_id"].as_str().unwrap().to_string())
+            .collect();
+        out.sort();
+        out
+    };
+    for (wanted, expected) in [("running", running.clone()), ("queued", queued.clone())] {
+        let (status, body) = f
+            .tool(
+                "amesh_job_list",
+                json!({"from_peer": "boss", "state": wanted}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(ids(&body), [expected], "only the {wanted} job: {body}");
+    }
+    let (status, body) = f
+        .tool(
+            "amesh_job_list",
+            json!({"from_peer": "boss", "state": "done"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.as_array().unwrap().is_empty(), "{body}");
+}
+
+#[tokio::test]
+async fn mcp_job_list_rejects_an_unknown_state() {
+    let f = team("one", &["boss"]).await;
+    f.job(json!({"title": "a", "from_peer": "boss"})).await;
+    for state in ["bogus", "completed", "in_progress"] {
+        let (status, body) = f
+            .tool(
+                "amesh_job_list",
+                json!({"from_peer": "boss", "state": state}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{state} -> {body}");
+        assert_eq!(body["error"], "bad job state", "{state} -> {body}");
+    }
+    let (status, body) = f
+        .tool("amesh_job_list", json!({"from_peer": "boss", "state": ""}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body.as_array().unwrap().len(),
+        1,
+        "an empty state is not a filter, so every job is listed: {body}"
+    );
+    let (status, body) = f
+        .tool("amesh_job_list", json!({"from_peer": "boss", "state": 5}))
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a state of the wrong type is rejected: {body}"
+    );
+    assert_eq!(body["error"], "bad job state", "5 -> {body}");
+}
+
 #[tokio::test]
 async fn job_create_leaves_an_unset_backend_empty() {
     let f = team("one", &["boss", "w1"]).await;
