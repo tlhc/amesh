@@ -3818,6 +3818,49 @@ async fn job_create_leaves_a_blocked_job_queued_without_an_ask() {
 }
 
 #[tokio::test]
+async fn job_create_leaves_an_unset_backend_empty() {
+    let f = team("one", &["boss", "w1"]).await;
+    for body in [
+        json!({"title": "a", "from_peer": "boss"}),
+        json!({"title": "b", "from_peer": "boss", "backend": ""}),
+    ] {
+        let (status, job) = f.request("POST", "/jobs", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body} -> {job}");
+        assert_eq!(job["backend"], "", "an unset backend stays empty: {job}");
+        let id = job["job_id"].as_str().unwrap();
+        assert_eq!(f.row(id).await.backend, "", "{body}");
+    }
+}
+
+#[tokio::test]
+async fn job_create_normalises_an_explicit_backend() {
+    let f = team("one", &["boss"]).await;
+    let (status, job) = f
+        .request(
+            "POST",
+            "/jobs",
+            json!({"title": "a", "from_peer": "boss", "backend": "claude"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{job}");
+    assert_eq!(job["backend"], "claude-code", "{job}");
+    let id = job["job_id"].as_str().unwrap();
+    assert_eq!(
+        f.row(id).await.backend,
+        "claude-code",
+        "the row kept the label"
+    );
+    let (status, bad) = f
+        .request(
+            "POST",
+            "/jobs",
+            json!({"title": "b", "from_peer": "boss", "backend": "gpt"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}");
+}
+
+#[tokio::test]
 async fn job_create_without_a_ready_assignee_stays_queued() {
     let f = team("one", &["boss"]).await;
     let (status, job) = f

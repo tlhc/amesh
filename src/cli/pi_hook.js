@@ -484,7 +484,7 @@ export default function AmeshHooks(pi) {
         title: { type: "string" },
         prompt: { type: "string" },
         path: { type: "string" },
-        backend: { type: "string" },
+        backend: { type: "string", description: "optional runtime label; empty when not given, dispatch does not use it" },
         assigned_peer: { type: "string" },
         depends_on: { type: "array", items: { type: "string" } },
       }, []],

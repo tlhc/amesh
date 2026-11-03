@@ -3385,7 +3385,7 @@ async fn create_job(
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
     let backend = match req.backend.as_deref() {
-        None | Some("") => "pi",
+        None | Some("") => "",
         Some(raw) => normalize_backend(raw).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
@@ -4917,7 +4917,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "title": {"type": "string"},
                     "prompt": {"type": "string"},
                     "path": {"type": "string"},
-                    "backend": {"type": "string"},
+                    "backend": {"type": "string", "description": "optional runtime label; empty when not given, dispatch does not use it"},
                     "assigned_peer": {"type": "string"},
                     "depends_on": {"type": "array", "items": {"type": "string"}}
                 }),
