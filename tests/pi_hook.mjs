@@ -3,12 +3,9 @@ import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
 import { test as nodeTest } from "node:test";
 
-/* this harness drives the real amesh CLI, so it refuses to run without a sandbox state:
-a hand-started run would otherwise let the daemon's start-up path write into the
-operator's home */
-if (!process.env.AMESH_STATE) {
+if (!process.env.AMESH_STATE || !process.env.AMESH_BIND) {
   console.error(
-    "amesh harness: AMESH_STATE is unset; run this harness through cargo test",
+    "amesh harness: AMESH_STATE and AMESH_BIND must both point at a sandbox, or a hand-started run writes into your home or reaches your daemon on the default bind; run this harness through cargo test",
   );
   process.exit(1);
 }
