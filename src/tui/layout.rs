@@ -571,6 +571,9 @@ pub(crate) fn stamp(t: Option<u64>) -> String {
 }
 
 #[cfg(not(test))]
+/* tm_gmtoff is a c_long, already i64 on 64-bit targets but i32 on 32-bit ones, so the cast
+stays; some Clippy versions flag it as unnecessary on 64-bit targets */
+#[allow(clippy::unnecessary_cast)]
 pub(crate) fn utc_offset(t: u64) -> i64 {
     let time = t as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
