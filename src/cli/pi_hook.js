@@ -429,18 +429,18 @@ export default function AmeshHooks(pi) {
     };
     tool(
       "whoami",
-      "Show this amesh peer identity.",
+      "Caller identity",
       {},
       [],
       () => Cli(selfId ? ["peer", "whoami", "--peer-id", selfId] : ["peer", "whoami"]),
     );
     tool(
       "ask",
-      "Open a tracked ask. Same-circle by default; set cross_circle for another circle. Close with amesh_ack.",
+      "Open a tracked ask. Same-circle by default; set cross_circle for another circle.",
       {
-        peer_name: { type: "string", description: "Target peer_id or name" },
-        query: { type: "string", description: "Ask text" },
-        cross_circle: { type: "boolean", description: "Required when target is in another circle" },
+        peer_name: { type: "string" },
+        query: { type: "string" },
+        cross_circle: { type: "boolean" },
       },
       ["peer_name", "query"],
       (params) => {
@@ -454,7 +454,7 @@ export default function AmeshHooks(pi) {
       "Close an ask. Bare: amesh_ack(corr_id). Reply: amesh_ack(corr_id, message). Set failed=true when you could not finish.",
       {
         correlation_id: { type: "string" },
-        message: { type: "string", description: "Optional reply to the asker" },
+        message: { type: "string" },
         failed: { type: "boolean" },
       },
       ["correlation_id"],
@@ -472,7 +472,7 @@ export default function AmeshHooks(pi) {
       {
         peer_name: { type: "string" },
         message: { type: "string" },
-        cross_circle: { type: "boolean", description: "Required when target is in another circle" },
+        cross_circle: { type: "boolean" },
       },
       ["peer_name", "message"],
       (params) => {
@@ -528,7 +528,7 @@ export default function AmeshHooks(pi) {
         text: { type: "string" },
         cross_circle: { type: "boolean" },
       }, ["to_peers", "text"]],
-      ["wait", "Wait for an ask ack. timeout_seconds is capped at 50. It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives. The recipient acks once.", {
+      ["wait", "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives.", {
         correlation_id: { type: "string" },
         timeout_seconds: { type: "integer" },
       }, ["correlation_id"]],
@@ -537,8 +537,8 @@ export default function AmeshHooks(pi) {
         circle: { type: "string" },
         cross_circle: { type: "boolean" },
       }, []],
-      ["events", "List recent events in your circle; cross_circle without circle lists all. In-memory ring cleared on hub restart; newest 20 by default, limit up to 50, text trimmed to 200 chars", {
-        since: { type: "string" },
+      ["events", "List events in your circle: newest 20 by default from the last 24 hours, limit up to 50, text trimmed to 200 chars; cross_circle without circle lists all. Each has a seq: pass since=<seq of the last one you saw> to page forward from it. The hub keeps about 500 events, drops an ask's or job's events when it deletes it, and clears them on restart", {
+        since: { type: "string", description: "seq of the last event you saw; returns the events after it" },
         limit: { type: "integer" },
         circle: { type: "string" },
         cross_circle: { type: "boolean" },
@@ -560,7 +560,7 @@ export default function AmeshHooks(pi) {
         body: { type: "string", description: "Answer one reusable question. The first 300 characters form the search excerpt: lead with the scoped answer. Add a short keys: line with exact identifiers and the user's search words. Distinguish measured, source-checked and inferred claims; keep inferred claims qualified and preserve conditions and exceptions. Stored as given including whitespace; at most 8192 UTF-8 bytes before trimming" },
         applies_to: { type: "string", description: "Use pin: repo@commit plus the checked working-tree state (clean or identified dirty content); watch: actual repository-relative paths; scope: modes, versions, dependencies and environment. For non-repository findings name the checked version or host. State what changes require revalidation. At most 2048 UTF-8 bytes" },
         evidence: { type: "string", description: "Map claims to source paths/functions/lines or replay commands and observed results. Use durable artifact references and hashes where available; label temporary evidence and its replay limits. At most 2048 UTF-8 bytes" },
-        ttl_seconds: { type: "integer", description: "Default 604800 (7 days), max 2592000 (30 days). Shorten it when earlier revalidation is expected; go past the default only for findings expected to stay applicable with an explicit version or scope and replayable evidence. A pin or URL is not proof of stability, and a TTL never replaces checks before reuse." },
+        ttl_seconds: { type: "integer", minimum: 1, maximum: 2592000, description: "Default 604800 (7 days), max 2592000 (30 days). Shorten it when earlier revalidation is expected; go past the default only for findings expected to stay applicable with an explicit version or scope and replayable evidence. A pin or URL is not proof of stability, and a TTL never replaces checks before reuse." },
         replaces: { type: "string", description: "Id of the entry this one supersedes; set it after search/get only for a verified correction or addition in the same scope. Keep duplicates unchanged; an entry for a different version or scope stays alongside the new entry." },
       },
       ["title", "body", "applies_to", "evidence"],
@@ -584,7 +584,7 @@ export default function AmeshHooks(pi) {
       "Search active knowledge in your circle before substantive work or a new obstacle. Literal substring keywords are ANDed over title, body and applies_to; search excludes evidence and has no wildcard syntax. Results are newest first, at most 5, with the first 300 body characters as an excerpt. Read candidates with amesh_knowledge_get and check applicability and evidence. An empty result is distinct from a tool error.",
       {
         query: { type: "string", description: "At most 256 UTF-8 bytes and 8 whitespace-separated keywords" },
-        limit: { type: "integer", description: "1..5, default 5" },
+        limit: { type: "integer", minimum: 1, maximum: 5 },
       },
       ["query"],
       (params) => {
@@ -604,10 +604,10 @@ export default function AmeshHooks(pi) {
     );
     tool(
       "knowledge_revoke",
-      "Withdraw a knowledge entry with a reason (1024 UTF-8 bytes at most). Revoking is not limited to the publisher: any registered peer in the circle may revoke, and the hub records who did.",
+      "Revoke knowledge in your circle with a reason (at most 1024 UTF-8 bytes). The hub records who revoked it. Repeated revocation is a conflict and preserves the original audit fields.",
       {
         id: { type: "string" },
-        reason: { type: "string", description: "Why it no longer holds" },
+        reason: { type: "string" },
       },
       ["id", "reason"],
       (params) => Cli(["knowledge", "revoke", params.id, `--reason=${params.reason}`, ...FromPeer()]),

@@ -254,29 +254,46 @@ const catalog = JSON.parse(execFileSync(executable, ["mcp", "--peer-id", peerId]
   input: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }) + "\n",
   encoding: "utf8",
 })).result.tools;
-for (const action of ["publish", "search", "get", "delete"]) {
-  const name = `amesh_knowledge_${action}`;
-  const canonical = catalog.find((entry) => entry.name === name);
-  await test(`${name} description matches MCP guidance`, () => {
-    assert.equal(defs[name].description, canonical.description);
-  });
-}
-for (const field of ["title", "body", "applies_to", "evidence", "replaces", "ttl_seconds"]) {
-  await test(`knowledge ${field} description matches MCP guidance`, () => {
-    const canonical = catalog.find((entry) => entry.name === "amesh_knowledge_publish");
-    assert.equal(schemas.amesh_knowledge_publish.properties[field].description,
-      canonical.inputSchema.properties[field].description);
-  });
-}
-await test("amesh_job_list matches MCP guidance", () => {
-  const canonical = catalog.find((entry) => entry.name === "amesh_job_list");
-  assert.equal(defs.amesh_job_list.description, canonical.description);
-  assert.deepEqual(schemas.amesh_job_list, canonical.inputSchema);
-});
-await test("amesh_job_create matches MCP guidance", () => {
-  const canonical = catalog.find((entry) => entry.name === "amesh_job_create");
-  assert.equal(defs.amesh_job_create.description, canonical.description);
-  assert.deepEqual(schemas.amesh_job_create, canonical.inputSchema);
+/* the extension fills from_peer itself, takes peer_name in place of to_peer, and its
+whoami answers for its own peer */
+const piOmits = { amesh_whoami: ["peer_id"] };
+await test("every pi tool copies the hub catalogue", () => {
+  const hub = new Map(catalog.map((entry) => [entry.name, entry]));
+  for (const name of hub.keys()) {
+    assert.ok(defs[name], `R1 ${name}: the hub has it, the pi copy does not`);
+  }
+  for (const name of Object.keys(defs)) {
+    assert.ok(hub.has(name), `R1 ${name}: the pi copy has it, the hub does not`);
+  }
+  for (const [name, entry] of hub) {
+    const schema = schemas[name];
+    assert.equal(
+      defs[name].description,
+      entry.description,
+      `R2 ${name}: description differs from the hub`,
+    );
+    const hubProperties = entry.inputSchema.properties ?? {};
+    const piProperties = schema.properties ?? {};
+    for (const [key, property] of Object.entries(piProperties)) {
+      assert.ok(key in hubProperties, `R3 ${name}.${key}: only the pi copy declares it`);
+      assert.deepEqual(
+        property,
+        hubProperties[key],
+        `R3 ${name}.${key}: differs from the hub`,
+      );
+    }
+    const omitted = new Set(["from_peer", "to_peer", ...(piOmits[name] ?? [])]);
+    for (const key of Object.keys(hubProperties)) {
+      if (omitted.has(key)) continue;
+      assert.ok(key in piProperties, `R4 ${name}.${key}: the hub declares it, the pi copy does not`);
+    }
+    for (const key of entry.inputSchema.required ?? []) {
+      assert.ok(
+        (schema.required ?? []).includes(key),
+        `R5 ${name}.${key}: the hub requires it, the pi copy does not`,
+      );
+    }
+  }
 });
 await test("knowledge tools round-trip against the daemon", async () => {
   const call = async (name, params) => {
