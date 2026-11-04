@@ -243,10 +243,29 @@ impl Sandbox {
                 .unwrap(),
         );
         let pid = daemon.id().to_string();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(5);
         loop {
             if let Some(status) = daemon.try_wait().unwrap() {
-                panic!("the hub exited before it listened: {status}");
+                let stderr = match daemon.stderr.take() {
+                    Some(stderr) => {
+                        let mut bytes = Vec::new();
+                        match stderr.take(8193).read_to_end(&mut bytes) {
+                            Ok(_) => {
+                                let truncated = bytes.len() > 8192;
+                                bytes.truncate(8192);
+                                format!(
+                                    "{}{}",
+                                    String::from_utf8_lossy(&bytes),
+                                    if truncated { " [truncated]" } else { "" }
+                                )
+                            }
+                            Err(error) => format!("unavailable: {error}"),
+                        }
+                    }
+                    None => "unavailable: stderr is not piped".into(),
+                };
+                panic!("the hub exited before it listened: {status}\nstderr: {stderr}");
             }
             if TcpStream::connect(&self.bind).is_ok() {
                 let holders = listen_pids(&self.bind);
@@ -257,10 +276,112 @@ impl Sandbox {
                 );
                 break;
             }
-            assert!(Instant::now() < deadline, "daemon failed to listen");
+            assert!(
+                Instant::now() < deadline,
+                "daemon failed to listen: {}",
+                hub_diagnostics(daemon, &self.bind, None, started)
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn hub_diagnostics(child: &mut Child, bind: &str, log: Option<&Path>, started: Instant) -> String {
+    let read = |path: &Path, limit: u64| {
+        let mut bytes = Vec::new();
+        match fs::File::open(path).and_then(|file| file.take(limit + 1).read_to_end(&mut bytes)) {
+            Ok(_) => {
+                if bytes.is_empty() {
+                    return "<empty>".into();
+                }
+                let truncated = bytes.len() > limit as usize;
+                bytes.truncate(limit as usize);
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&bytes),
+                    if truncated { " [truncated]" } else { "" }
+                )
+            }
+            Err(error) => format!("unavailable: {error}"),
+        }
+    };
+    let mut report = format!(
+        "elapsed={:?}, pid={}, status={:?}\nlog: {}\n",
+        started.elapsed(),
+        child.id(),
+        child.try_wait(),
+        log.map_or_else(
+            || "unavailable: no log file".into(),
+            |path| read(path, 8192)
+        )
+    );
+    let port = bind.rsplit(':').next().unwrap_or(bind);
+    let holders = (|| -> std::io::Result<String> {
+        let mut query = Command::new("lsof")
+            .args(["-nP", "-t", &format!("-iTCP:{port}"), "-sTCP:LISTEN"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            match query.try_wait() {
+                Ok(Some(status)) => {
+                    let mut bytes = Vec::new();
+                    if let Some(stdout) = query.stdout.take() {
+                        stdout.take(4096).read_to_end(&mut bytes)?;
+                    }
+                    return Ok(format!("{status}: {}", String::from_utf8_lossy(&bytes)));
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                result => {
+                    let _ = query.kill();
+                    let _ = query.wait();
+                    return Ok(format!(
+                        "unavailable: lsof deadline or wait error: {result:?}"
+                    ));
+                }
+            }
+        }
+    })();
+    let holders = holders.unwrap_or_else(|error| format!("unavailable: {error}"));
+    report.push_str(&format!("listeners on {bind}: {holders}\n"));
+    if cfg!(target_os = "linux") {
+        match fs::read_dir(format!("/proc/{}/task", child.id())) {
+            Ok(mut tasks) => {
+                for task in tasks.by_ref().take(64) {
+                    match task {
+                        Ok(task) => {
+                            let status = read(&task.path().join("status"), 4096);
+                            let fields: Vec<_> = status
+                                .lines()
+                                .filter(|line| {
+                                    line.starts_with("Name:")
+                                        || line.starts_with("State:")
+                                        || line.starts_with("unavailable:")
+                                })
+                                .collect();
+                            report.push_str(&format!(
+                                "thread {}: {}, wchan={}\n",
+                                task.file_name().to_string_lossy(),
+                                fields.join("; "),
+                                read(&task.path().join("wchan"), 128).trim()
+                            ));
+                        }
+                        Err(error) => report.push_str(&format!("thread unavailable: {error}\n")),
+                    }
+                }
+                if tasks.next().is_some() {
+                    report.push_str("threads: [truncated after 64 entries]\n");
+                }
+            }
+            Err(error) => report.push_str(&format!("threads unavailable: {error}\n")),
+        }
+    } else {
+        report.push_str("threads unavailable: Linux /proc only\n");
+    }
+    report
 }
 
 fn listen_pids(bind: &str) -> Vec<String> {
@@ -5584,7 +5705,8 @@ fn serve_warns_and_runs_when_the_state_lock_cannot_open() {
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(5);
     while health_name(&sandbox.bind).as_deref() != Some("amesh") {
         assert!(
             sandbox
@@ -5599,7 +5721,13 @@ fn serve_warns_and_runs_when_the_state_lock_cannot_open() {
         );
         assert!(
             Instant::now() < deadline,
-            "the unlocked hub must become healthy"
+            "the unlocked hub must become healthy: {}",
+            hub_diagnostics(
+                sandbox.daemon.as_mut().unwrap(),
+                &sandbox.bind,
+                Some(&log),
+                started
+            )
         );
         std::thread::sleep(Duration::from_millis(20));
     }
