@@ -4529,7 +4529,7 @@ fn pruned_while_away(
     sandbox.start();
     bind_pinprune(&sandbox, "A");
     let codex_home = sandbox.root.join("ap");
-    let injected = app_server_capture_with(&codex_home, &["A", "B"], busy);
+    let injected = app_server_capture_with(&codex_home, &["A", "B"], busy, None);
     let drainer = KillChild(Some(
         sandbox
             .command()
@@ -5844,7 +5844,7 @@ fn app_server_capture_threads(
     busy: &[&str],
 ) -> std::sync::mpsc::Receiver<String> {
     let busy = busy.iter().map(|id| id.to_string()).collect();
-    app_server_capture_with(home, loaded, Arc::new(std::sync::Mutex::new(busy)))
+    app_server_capture_with(home, loaded, Arc::new(std::sync::Mutex::new(busy)), None)
 }
 
 /* as app_server_capture_threads, with a busy set the test can change as it runs */
@@ -5852,6 +5852,7 @@ fn app_server_capture_with(
     home: &Path,
     loaded: &[&str],
     busy: Arc<std::sync::Mutex<Vec<String>>>,
+    reads: Option<Arc<AtomicUsize>>,
 ) -> std::sync::mpsc::Receiver<String> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as AppMessage;
@@ -5869,7 +5870,8 @@ fn app_server_capture_with(
             let listener = tokio::net::UnixListener::from_std(listener).unwrap();
             /* a drainer dials again each time it looks its thread up */
             while let Ok((stream, _)) = listener.accept().await {
-                let (tx, loaded, busy) = (tx.clone(), loaded.clone(), busy.clone());
+                let (tx, loaded, busy, reads) =
+                    (tx.clone(), loaded.clone(), busy.clone(), reads.clone());
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -5885,6 +5887,9 @@ fn app_server_capture_with(
                             /* select_app_thread only accepts a thread reported as loaded */
                             "thread/loaded/list" => json!({"data": loaded}),
                             "thread/read" => {
+                                if let Some(reads) = &reads {
+                                    reads.fetch_add(1, Ordering::SeqCst);
+                                }
                                 let thread = req["params"]["threadId"].as_str().unwrap_or("");
                                 let busy = busy.lock().unwrap();
                                 /* "!id" is a thread whose last turn the server failed */
@@ -6812,7 +6817,8 @@ fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
     sandbox.json(&["jobs", "create", "watch", "--from-peer", pinned], None);
     let codex_home = sandbox.root.join("ai");
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
-    let injected = app_server_capture_with(&codex_home, &["A"], busy.clone());
+    let reads = Arc::new(AtomicUsize::new(0));
+    let injected = app_server_capture_with(&codex_home, &["A"], busy.clone(), Some(reads.clone()));
     let prompt = sandbox.run(
         &["hook", "prompt", "--backend", "codex", "--peer-id", pinned],
         Some(json!({"session_id": "A", "cwd": sandbox.root})),
@@ -6827,12 +6833,40 @@ fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
             .command()
             .args(["hook", "ws", "--peer-id", pinned, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
+            .env("AMESH_WS_BEAT_SECS", "1")
             .spawn()
             .unwrap(),
     ));
     wait_for_drainer(pinned);
     let state = || activity_of(&sandbox, pinned);
-    std::thread::sleep(Duration::from_secs(12));
+    let grace = 15;
+    assert!(
+        include_str!("../src/hub/mod.rs")
+            .contains(&format!("const CHECK_GRACE_SECS: u64 = {grace};")),
+        "the activity check grace changed",
+    );
+    let observed = state()["observed_at"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        < observed + grace
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the work report must leave the check grace"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let target = reads.load(Ordering::SeqCst) + 3;
+    while reads.load(Ordering::SeqCst) < target {
+        assert!(
+            Instant::now() < deadline,
+            "the drainer must read the thread three more times"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(
         state()["state"],
         "work",
