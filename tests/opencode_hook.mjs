@@ -14,6 +14,7 @@ const [pluginPath, executable, cwd] = process.argv.slice(2);
 const source = await readFile(pluginPath, "utf8");
 const commands = [];
 const originalExecFile = childProcess.execFile;
+let onRegistration, onClose;
 /* a report is only visible in the hub after its child exits, so the barriers below wait
 for both the handled event and the children it started */
 let running = 0;
@@ -21,6 +22,13 @@ childProcess.execFile = (...args) => {
   commands.push(args[1]);
   running += 1;
   const child = originalExecFile(...args);
+  if (onRegistration && args[1][0] === "hook" && args[1][1] === "session") {
+    const end = child.stdin.end;
+    child.stdin.end = function (input, ...rest) {
+      if (typeof input === "string") onRegistration?.(JSON.parse(input).session_id);
+      return end.call(this, input, ...rest);
+    };
+  }
   let settled = false;
   const settle = () => {
     if (settled) return;
@@ -72,9 +80,9 @@ const NativeWebSocket = globalThis.WebSocket;
 globalThis.WebSocket = class extends NativeWebSocket {
   constructor(url) {
     super(url);
-    this.created = Date.now();
     this.frames = [];
     sockets.push(this);
+    this.addEventListener("close", () => onClose?.(this));
   }
   send(text) {
     const frame = JSON.parse(text);
@@ -330,40 +338,66 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
     await t.test(
       "admission failure retains notification until replay",
       async () => {
-        failAdmit = true;
-        const socketStart = sockets.length;
-        await Invoke("amesh_notify_peer", "ses_b", {
-          peer_name: a,
-          message: "retry-admission",
-        });
-        /* two handshakes are the evidence the retry ran; waiting for them replaces a
-        fixed window */
-        const reconnected = () =>
-          sockets
-            .slice(socketStart)
-            .filter((socket) => socket.frames.some((frame) => frame.peer_id === a));
-        await Until(
-          () => reconnected().length >= 2,
-          "the drainer must retry admission",
-        );
-        assert.equal(admitted.length, 0);
-        const reconnects = reconnected();
-        assert(
-          reconnects[1].created - reconnects[0].created >= 2800,
-          "failure backoff grows across successful handshakes",
-        );
-        failAdmit = false;
-        await Until(
-          () => admitted.some((item) => item.text.includes("retry-admission")),
-          "admission must retry",
-        );
-        assert.equal(admitted[0].sessionID, "ses_a");
-        assert.equal(admitted[0].delivery, "steer");
-        assert.equal(
-          admitted[0].description,
-          `amesh notify from @${b}`,
-          "collaboration message is visible in the TUI",
-        );
+        const orders = [], timers = [];
+        onClose = (socket) => {
+          if (orders.length === 2 || !socket.frames.some((frame) => frame.peer_id === a))
+            return;
+          const order = [];
+          orders.push(order);
+          /* both timers start in this close dispatch; their expiry order survives
+          a busy event loop */
+          timers.push(setTimeout(() => order.push("marker"), 1500));
+        };
+        onRegistration = (session) => {
+          if (session === "opencode:ses_a") orders.at(-1)?.push("register");
+        };
+        try {
+          failAdmit = true;
+          const socketStart = sockets.length;
+          await Invoke("amesh_notify_peer", "ses_b", {
+            peer_name: a,
+            message: "retry-admission",
+          });
+          const reconnected = () =>
+            sockets
+              .slice(socketStart)
+              .filter((socket) => socket.frames.some((frame) => frame.peer_id === a));
+          await Until(
+            () => reconnected().length >= 2,
+            "the drainer must retry admission",
+          );
+          assert.equal(admitted.length, 0);
+          await Until(
+            () => orders.length === 2 && orders.every((order) => order.length >= 2),
+            "both retry orders must be observed",
+          );
+          onClose = onRegistration = undefined;
+          failAdmit = false;
+          assert.deepEqual(
+            orders[0].slice(0, 2),
+            ["register", "marker"],
+            "the first close retries before the marker",
+          );
+          assert.deepEqual(
+            orders[1].slice(0, 2),
+            ["marker", "register"],
+            "the second close retries after the marker",
+          );
+          await Until(
+            () => admitted.some((item) => item.text.includes("retry-admission")),
+            "admission must retry",
+          );
+          assert.equal(admitted[0].sessionID, "ses_a");
+          assert.equal(admitted[0].delivery, "steer");
+          assert.equal(
+            admitted[0].description,
+            `amesh notify from @${b}`,
+            "collaboration message is visible in the TUI",
+          );
+        } finally {
+          onClose = onRegistration = undefined;
+          for (const timer of timers) clearTimeout(timer);
+        }
       },
     );
     await t.test("revert defers durable admission", async () => {
