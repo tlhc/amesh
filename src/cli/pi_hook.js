@@ -497,7 +497,7 @@ export default function AmeshHooks(pi) {
         state: { type: "string" },
       }, []],
       ["job_status", "Show a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
-      ["job_update", "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.", {
+      ["job_update", "Update job state. Except for coordinator alone, state is required: queued, running, done, failed or cancelled; other values are rejected. Changing prompt or assigned_peer requires state=queued and re-dispatches the job. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.", {
         job_id: { type: "string" },
         state: { type: "string" },
         result_summary: { type: "string" },
@@ -528,7 +528,7 @@ export default function AmeshHooks(pi) {
         text: { type: "string" },
         cross_circle: { type: "boolean" },
       }, ["to_peers", "text"]],
-      ["wait", "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives.", {
+      ["wait", "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.", {
         correlation_id: { type: "string" },
         timeout_seconds: { type: "integer" },
       }, ["correlation_id"]],

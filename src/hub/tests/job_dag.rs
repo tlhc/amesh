@@ -4268,3 +4268,48 @@ async fn job_terminal_requeue_without_a_worker_returns_null() {
     assert!(job["ask_id"].is_null(), "{job}");
     assert_eq!(f.row(&id).await.ask_id, None, "the stored row kept the id");
 }
+
+#[tokio::test]
+async fn job_update_explains_a_missing_state() {
+    let f = team("c", &["boss"]).await;
+    let id = f.job(json!({"title": "test", "from_peer": "boss"})).await;
+    let (status, body) = f.set_state(&id, json!({"prompt": "revised"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "state is required; expected one of: queued, running, done, failed, cancelled. Use state=queued to change prompt or assigned_peer; this re-dispatches the job.");
+}
+
+#[tokio::test]
+async fn job_update_tool_explains_a_missing_state() {
+    let f = team("c", &["boss"]).await;
+    let id = f.job(json!({"title": "test", "from_peer": "boss"})).await;
+    let (status, body) = f
+        .tool(
+            "amesh_job_update",
+            json!({"job_id": id, "prompt": "revised"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body["error"], "state is required; expected one of: queued, running, done, failed, cancelled. Use state=queued to change prompt or assigned_peer; this re-dispatches the job.");
+}
+
+#[tokio::test]
+async fn job_update_names_an_invalid_state_and_the_choices() {
+    let f = team("c", &["boss"]).await;
+    let id = f.job(json!({"title": "test", "from_peer": "boss"})).await;
+    let (status, body) = f.set_state(&id, json!({"state": "paused"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body["error"],
+        "bad job state \"paused\"; expected one of: queued, running, done, failed, cancelled"
+    );
+}
+
+#[tokio::test]
+async fn job_update_accepts_a_coordinator_without_state() {
+    let f = team("c", &["boss", "deputy"]).await;
+    let id = f.job(json!({"title": "test", "from_peer": "boss"})).await;
+    let (status, body) = f.set_state(&id, json!({"coordinator": "deputy"})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["from_peer"], "deputy");
+    assert_eq!(f.row(&id).await.from_peer, "deputy");
+}

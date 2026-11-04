@@ -3632,15 +3632,23 @@ async fn update_job(
         let now = now_unix();
         return hand_off(&mut hub, &id, to, now);
     }
-    let Some(state) = req
-        .state
-        .filter(|state| JOB_STATES.contains(&state.as_str()))
-    else {
+    let Some(state) = req.state else {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(json!({"error": "bad job state"})),
+            Json(json!({"error": format!(
+                "state is required; expected one of: {}. Use state=queued to change prompt or assigned_peer; this re-dispatches the job.",
+                JOB_STATES.join(", ")
+            )})),
         ));
     };
+    if !JOB_STATES.contains(&state.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error": format!("bad job state {state:?}; expected one of: {}", JOB_STATES.join(", "))}),
+            ),
+        ));
+    }
     let mut hub = app.inner.lock().await;
     let now = now_unix();
     settle_job(&mut hub, &id);
@@ -5009,7 +5017,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Update job state. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.",
+                "Update job state. Except for coordinator alone, state is required: queued, running, done, failed or cancelled; other values are rejected. Changing prompt or assigned_peer requires state=queued and re-dispatches the job. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.",
                 json!({
                     "job_id": {"type": "string"},
                     "state": {"type": "string"},
@@ -5098,7 +5106,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives.",
+                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.",
                 json!({
                     "correlation_id": {"type": "string"},
                     "timeout_seconds": {"type": "integer"}
