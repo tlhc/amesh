@@ -2976,6 +2976,77 @@ fn codex_stop_blocks_when_ask_is_open() {
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unsupported hook backend"));
 }
 
+fn assert_harness_env_guard(script: &str, state: bool, bind: bool) {
+    let sandbox = Sandbox::new();
+    let home = sandbox.root.join("home");
+    let tmp = home.join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    assert!(listen_pids(&sandbox.bind).is_empty());
+    let mut node = Command::new("node");
+    node.env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", &home)
+        .env("TMPDIR", &tmp)
+        .current_dir(&home)
+        .arg(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests")
+                .join(script),
+        );
+    if state {
+        node.env("AMESH_STATE", home.join("state.db"));
+    }
+    if bind {
+        node.env("AMESH_BIND", &sandbox.bind);
+    }
+    let output = node.output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{script}: state={state} bind={bind}: {stderr}"
+    );
+    assert!(
+        !stderr.contains("TypeError"),
+        "{script}: state={state} bind={bind}: the harness crashed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("    at "),
+        "{script}: state={state} bind={bind}: unexpected Node stack: {stderr}"
+    );
+    assert!(
+        stderr
+            .starts_with("amesh harness: AMESH_STATE and AMESH_BIND must both point at a sandbox"),
+        "{script}: state={state} bind={bind}: {stderr}"
+    );
+    assert!(
+        fs::read_dir(&home)
+            .unwrap()
+            .all(|entry| entry.unwrap().path() == tmp)
+            && fs::read_dir(&tmp).unwrap().next().is_none(),
+        "{script}: state={state} bind={bind}: the harness wrote into HOME"
+    );
+    assert!(
+        listen_pids(&sandbox.bind).is_empty(),
+        "{script}: state={state} bind={bind}: the harness left a listener"
+    );
+}
+
+#[test]
+fn pi_harness_rejects_missing_state() {
+    assert_harness_env_guard("pi_hook.mjs", false, true);
+}
+
+#[test]
+fn pi_harness_rejects_missing_bind() {
+    assert_harness_env_guard("pi_hook.mjs", true, false);
+}
+
+#[test]
+fn pi_harness_rejects_missing_both() {
+    assert_harness_env_guard("pi_hook.mjs", false, false);
+}
+
 #[test]
 fn installed_hooks_execute_against_the_daemon() {
     let mut sandbox = Sandbox::new();

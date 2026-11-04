@@ -456,3 +456,18 @@ fn opencode_setup_refuses_foreign_directory_and_symlink() {
     );
     assert!(!target.join("server.js").exists());
 }
+
+#[test]
+fn opencode_harness_rejects_missing_state() {
+    assert_harness_env_guard("opencode_hook.mjs", false, true);
+}
+
+#[test]
+fn opencode_harness_rejects_missing_bind() {
+    assert_harness_env_guard("opencode_hook.mjs", true, false);
+}
+
+#[test]
+fn opencode_harness_rejects_missing_both() {
+    assert_harness_env_guard("opencode_hook.mjs", false, false);
+}
