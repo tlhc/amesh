@@ -1053,8 +1053,8 @@ impl Hub {
     }
 }
 
-fn load_hub(path: &Path) -> Hub {
-    Hub::open(path).unwrap_or_else(|e| panic!("amesh state {path}: {e}", path = path.display()))
+fn load_hub(path: &Path) -> Result<Hub, String> {
+    Hub::open(path).map_err(|error| format!("cannot open state {}: {error}", path.display()))
 }
 
 fn persist(hub: &mut Hub) -> Result<(), String> {
@@ -1628,7 +1628,7 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let app = App {
-        inner: Arc::new(Mutex::new(load_hub(&state_path))),
+        inner: Arc::new(Mutex::new(load_hub(&state_path)?)),
         token,
         state_path,
     };

@@ -5741,6 +5741,34 @@ fn serve_warns_and_runs_when_the_state_lock_cannot_open() {
 }
 
 #[test]
+fn serve_reports_an_unopenable_state_instead_of_panicking() {
+    let sandbox = Sandbox::new();
+    let state = sandbox.root.join("state.db");
+    fs::write(&state, "not a database").unwrap();
+    let mut serve = KillChild(Some(sandbox.command().arg("serve").spawn().unwrap()));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while serve.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "an unopenable state must end serve, not keep it running"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = serve.0.take().unwrap().wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "an unopenable state exits through main, not a panic: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("cannot open state {}", state.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
 fn occupied_non_amesh_port_does_not_spawn() {
     let sandbox = Sandbox::new();
     let listener = TcpListener::bind(&sandbox.bind).unwrap();
