@@ -5481,6 +5481,138 @@ fn a_second_serve_on_a_taken_port_never_opens_its_state_file() {
 }
 
 #[test]
+fn a_second_serve_on_the_same_state_never_opens_it() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let state = sandbox.root.join("state.db");
+    assert_state_is_locked(&mut sandbox, &state, &state);
+}
+
+#[test]
+fn a_second_serve_on_a_state_symlink_never_opens_it() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let state = sandbox.root.join("state.db");
+    let alias = sandbox.root.join("alias.db");
+    std::os::unix::fs::symlink(&state, &alias).unwrap();
+    assert_state_is_locked(&mut sandbox, &state, &alias);
+}
+
+#[test]
+fn a_second_serve_on_an_initially_dangling_state_never_opens_it() {
+    let mut sandbox = Sandbox::new();
+    let state = sandbox.root.join("real.db");
+    std::os::unix::fs::symlink(&state, sandbox.root.join("state.db")).unwrap();
+    sandbox.start();
+    assert_state_is_locked(&mut sandbox, &state, &state);
+}
+
+fn assert_state_is_locked(sandbox: &mut Sandbox, state: &Path, loser_state: &Path) {
+    sandbox.json(
+        &["peer", "register", "--name", "keep", "--peer-id", "keep"],
+        None,
+    );
+    let db = rusqlite::Connection::open(state).unwrap();
+    let version = || {
+        db.query_row("PRAGMA data_version", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = version();
+    let other = Sandbox::new();
+    let mut loser = KillChild(Some(
+        other
+            .command()
+            .arg("serve")
+            .env("AMESH_STATE", loser_state)
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while loser.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "the second hub must exit while the state is locked"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let output = loser.0.take().unwrap().wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "losing the state lock is an error exit"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!(
+            "{} is in use by another hub. Try: amesh status",
+            loser_state.display()
+        )),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        version(),
+        before,
+        "the second hub must not write the state database"
+    );
+    let winner = sandbox.daemon.as_mut().unwrap();
+    assert!(
+        winner.try_wait().unwrap().is_none(),
+        "the winner keeps running"
+    );
+    assert!(
+        listen_pids(&sandbox.bind).contains(&winner.id().to_string()),
+        "the winner keeps the port"
+    );
+    let peers = sandbox.json(&["peer", "list"], None);
+    assert!(peers
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|peer| peer["peer_id"] == "keep"));
+}
+
+#[test]
+fn serve_warns_and_runs_when_the_state_lock_cannot_open() {
+    let mut sandbox = Sandbox::new();
+    let lock = sandbox.root.join("state.db.lock");
+    fs::create_dir(&lock).unwrap();
+    let log = sandbox.root.join("lock.stderr");
+    sandbox.daemon = Some(
+        sandbox
+            .command()
+            .arg("serve")
+            .stderr(fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while health_name(&sandbox.bind).as_deref() != Some("amesh") {
+        assert!(
+            sandbox
+                .daemon
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none(),
+            "the hub must start without a state lock: {}",
+            fs::read_to_string(&log).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "the unlocked hub must become healthy"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stderr = fs::read_to_string(log).unwrap();
+    assert!(
+        stderr.contains("amesh: warning:")
+            && stderr.contains(lock.to_str().unwrap())
+            && stderr.contains("a second hub on this state would not be stopped"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn occupied_non_amesh_port_does_not_spawn() {
     let sandbox = Sandbox::new();
     let listener = TcpListener::bind(&sandbox.bind).unwrap();

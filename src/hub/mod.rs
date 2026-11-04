@@ -1569,9 +1569,9 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .map_err(|error| format!("invalid AMESH_BIND: {error}"))?;
     let token = std::env::var("AMESH_TOKEN").ok().filter(|s| !s.is_empty());
-    /* the port decides who the daemon is. Take it before touching the state file, so a
-    second starter that loses the race exits without having opened, migrated or created
-    anything, and before any background task exists that could persist on its behalf */
+    /* take the port before touching state, so a starter that loses the port exits
+    without having opened or migrated the state database, and before any background
+    task exists that could persist on its behalf */
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(listener) => listener,
         Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
@@ -1588,6 +1588,45 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
     let state_path = state_path();
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut real_path = state_path.clone();
+    for _ in 0..40 {
+        let Ok(target) = fs::read_link(&real_path) else {
+            break;
+        };
+        real_path = real_path.parent().unwrap_or(Path::new("")).join(target);
+    }
+    let mut lock_path = real_path.into_os_string();
+    lock_path.push(".lock");
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .map_err(fs::TryLockError::Error)
+        .and_then(|file| {
+            file.try_lock()?;
+            Ok(file)
+        });
+    let _state_lock = match lock {
+        Ok(file) => Some(file),
+        Err(fs::TryLockError::WouldBlock) => {
+            return Err(format!(
+                "{} is in use by another hub. Try: amesh status",
+                state_path.display()
+            )
+            .into());
+        }
+        Err(fs::TryLockError::Error(error)) => {
+            eprintln!(
+                "amesh: warning: cannot lock {}: {error}; a second hub on this state would not be stopped",
+                Path::new(&lock_path).display()
+            );
+            None
+        }
+    };
     let app = App {
         inner: Arc::new(Mutex::new(load_hub(&state_path))),
         token,
