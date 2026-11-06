@@ -34,8 +34,8 @@ async fn mcp_wait_reports_the_answer_without_the_question() {
     );
     let hint = open["hint"].as_str().unwrap_or("");
     assert!(
-        hint.contains("peer-message") && hint.contains("wait again only if"),
-        "an open wait must tell a connected asker the ack is normally pushed, with waiting as the fallback: {open}"
+        hint.contains("peer-message") && hint.contains("at most once"),
+        "an open wait must tell a connected asker the ack is pushed and the wait is called once: {open}"
     );
     let mut legacy = open.clone();
     for field in [
@@ -190,7 +190,7 @@ async fn mcp_wait_defaults_to_the_codex_exec_budget() {
     let wait = tools.iter().find(|t| t["name"] == "amesh_wait").unwrap();
     let description = wait["description"].as_str().unwrap();
     assert!(
-        description.contains("50"),
+        description.contains(&WAIT_MAX_SECS.to_string()),
         "the cap must be stated: {description}"
     );
     assert!(
@@ -198,10 +198,10 @@ async fn mcp_wait_defaults_to_the_codex_exec_budget() {
         "the codex budget must be stated: {description}"
     );
     assert!(
-        description.contains("When the result carries a hint")
-            && description.contains("pushed to you as a peer-message")
-            && description.contains("wait again only if"),
-        "the push is expected only under the hint, with waiting as the fallback: {description}"
+        description.contains("at most once per ask")
+            && description.contains("when the result carries a hint")
+            && description.contains("pushed to you as a peer-message"),
+        "the push is expected under the hint and the wait is called once: {description}"
     );
 }
 

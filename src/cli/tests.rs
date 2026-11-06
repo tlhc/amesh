@@ -961,3 +961,14 @@ mod thread_routing {
         assert_eq!(requests.len(), 3);
     }
 }
+
+#[test]
+fn curl_budget_follows_the_requested_wait() {
+    let short = json!({"timeout_seconds": 7});
+    let long = json!({"timeout_seconds": 500});
+    assert_eq!(curl_max_time("/asks/ask-1/wait", Some(&short)), "17");
+    assert_eq!(curl_max_time("/asks/ask-1/wait", Some(&long)), "60");
+    assert_eq!(curl_max_time("/asks/ask-1/wait", None), "55");
+    let mcp = json!({"params": {"name": "amesh_wait", "arguments": {"timeout_seconds": 7}}});
+    assert_eq!(curl_max_time("/mcp", Some(&mcp)), "17");
+}

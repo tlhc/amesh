@@ -2785,6 +2785,190 @@ fn cli_routes_ask_many_and_wait() {
 }
 
 #[test]
+fn cli_peer_wait_chains_hub_slices_until_the_ack() {
+    use axum::{extract::State, routing::post, Json, Router};
+    let sandbox = Sandbox::new();
+    let slices = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        /* the first two slices find the ask open, the third carries the ack */
+        let app = Router::new()
+            .route(
+                "/asks/{id}/wait",
+                post(
+                    |State(slices): State<Arc<std::sync::Mutex<Vec<u64>>>>,
+                     Json(body): Json<Value>| async move {
+                        let mut slices = slices.lock().unwrap();
+                        slices.push(body["timeout_seconds"].as_u64().unwrap());
+                        let open = slices.len() < 3;
+                        Json(json!({
+                            "correlation_id": "ask-1",
+                            "open": open,
+                            "reply": (!open).then_some("pong")
+                        }))
+                    },
+                ),
+            )
+            .with_state(slices.clone());
+        let listener = tokio::net::TcpListener::bind(&sandbox.bind).await.unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    let single = sandbox.json(&["peer", "wait", "ask-1", "--timeout-seconds", "0"], None);
+    assert_eq!(
+        single["open"], true,
+        "a budget within the hub cap is one wait: {single}"
+    );
+    let chained = sandbox.json(&["peer", "wait", "ask-1", "--timeout-seconds", "120"], None);
+    assert_eq!(
+        chained["open"], false,
+        "the chain ends on the ack: {chained}"
+    );
+    assert_eq!(chained["reply"], "pong");
+    let short = sandbox.json(&["peer", "wait", "ask-1", "--timeout-seconds", "1"], None);
+    assert_eq!(short["open"], false);
+    assert_eq!(
+        *slices.lock().unwrap(),
+        vec![0, 50, 50, 1],
+        "each slice asks the hub for at most its cap, rounded up to whole seconds"
+    );
+}
+
+#[test]
+fn cli_peer_wait_rides_out_an_unreachable_hub() {
+    use axum::{extract::State, routing::post, Json, Router};
+    let sandbox = Sandbox::new();
+    let served = Arc::new(AtomicUsize::new(0));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let app = Router::new()
+            .route(
+                "/asks/{id}/wait",
+                post(|State(served): State<Arc<AtomicUsize>>| async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    Json(json!({"correlation_id": "ask-1", "open": false, "reply": "pong"}))
+                }),
+            )
+            .with_state(served.clone());
+        let listener = tokio::net::TcpListener::bind(&sandbox.bind).await.unwrap();
+        tokio::spawn(async move {
+            /* the first request is read and dropped unanswered, as a restarting hub leaves it */
+            let (first, _) = listener.accept().await.unwrap();
+            first.readable().await.unwrap();
+            let _ = first.try_read(&mut [0; 4096]);
+            drop(first);
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    let result = sandbox.json(&["peer", "wait", "ask-1", "--timeout-seconds", "120"], None);
+    assert_eq!(
+        result["open"], false,
+        "the wait resumes once the hub answers again: {result}"
+    );
+    assert_eq!(result["reply"], "pong");
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "the dropped request is sent again once"
+    );
+}
+
+#[test]
+fn cli_peer_wait_gives_up_at_the_deadline_and_on_hub_errors() {
+    use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+    let sandbox = Sandbox::new();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let served = Arc::new(AtomicUsize::new(0));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let app = Router::new()
+            .route(
+                "/asks/{id}/wait",
+                post(|State(served): State<Arc<AtomicUsize>>| async move {
+                    served.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({"error": "unknown ask"})),
+                    )
+                }),
+            )
+            .with_state(served.clone());
+        let listener = tokio::net::TcpListener::bind(&sandbox.bind).await.unwrap();
+        let dropped = dropped.clone();
+        tokio::spawn(async move {
+            /* the first request is read and dropped at once, the second is held past the budget */
+            let (first, _) = listener.accept().await.unwrap();
+            dropped.fetch_add(1, Ordering::SeqCst);
+            first.readable().await.unwrap();
+            let _ = first.try_read(&mut [0; 4096]);
+            drop(first);
+            let (second, _) = listener.accept().await.unwrap();
+            dropped.fetch_add(1, Ordering::SeqCst);
+            second.readable().await.unwrap();
+            let _ = second.try_read(&mut [0; 4096]);
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            drop(second);
+            axum::serve(listener, app).await.unwrap();
+        });
+    });
+    let unreachable = |output: &Output| {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("amesh daemon unreachable"),
+            "the original error is reported: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    let backoff = sandbox.run(&["peer", "wait", "ask-1", "--timeout-seconds", "2"], None);
+    unreachable(&backoff);
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        1,
+        "no request once the backoff reaches the deadline"
+    );
+    let held = sandbox.run(&["peer", "wait", "ask-1", "--timeout-seconds", "2"], None);
+    unreachable(&held);
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        2,
+        "no retry after a request that outlived the deadline"
+    );
+    assert_eq!(served.load(Ordering::SeqCst), 0);
+    let rejected = sandbox.run(&["peer", "wait", "ask-1", "--timeout-seconds", "10"], None);
+    assert!(
+        !rejected.status.success(),
+        "a hub error is returned: {rejected:?}"
+    );
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        1,
+        "a hub error is not retried"
+    );
+}
+
+#[test]
+fn cli_peer_wait_rejects_an_oversized_budget() {
+    let sandbox = Sandbox::new();
+    let huge = sandbox.run(
+        &[
+            "peer",
+            "wait",
+            "ask-1",
+            "--timeout-seconds",
+            "18446744073709551615",
+        ],
+        None,
+    );
+    assert!(!huge.status.success());
+    assert!(
+        String::from_utf8_lossy(&huge.stderr).contains("--timeout-seconds is too large"),
+        "an overflowing budget is an error, not a panic: {}",
+        String::from_utf8_lossy(&huge.stderr)
+    );
+}
+
+#[test]
 fn cli_routes_peer_events_and_attach() {
     let mut sandbox = Sandbox::new();
     sandbox.start();

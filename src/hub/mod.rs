@@ -2801,7 +2801,7 @@ async fn ask_many_result(
     ))
 }
 
-const WAIT_MAX_SECS: u64 = 50;
+pub(crate) const WAIT_MAX_SECS: u64 = 50;
 const WAIT_DEFAULT_SECS: u64 = 45;
 /* Codex runs MCP calls inside an exec cell; a wait that outlasts the cell's yield is
 parked, and each later poll of the cell is one more model call. The yield is a Codex
@@ -2809,9 +2809,9 @@ setting, so only the omitted default stays short and an explicit value stands */
 const CODEX_WAIT_SECS: u64 = 8;
 /* acks are pushed to the asker, so a poll loop only re-reads the context each turn. The
 hub sees its link to the drainer, not the drainer's hand-off to the model, so the hint
-states an expectation and keeps waiting as the fallback */
+states an expectation and asks for one call per ask */
 const WAIT_OPEN_HINT: &str =
-    "still open; the ack is normally pushed to you as a peer-message, so keep working or end the turn and wait again only if it never arrives";
+    "still open; the ack is pushed to you as a peer-message, so call amesh_wait at most once per ask and end the turn";
 
 fn wait_default_secs(backend: Option<&str>) -> u64 {
     if backend == Some("codex") {
@@ -5106,7 +5106,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Wait for an ask ack. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. When the result carries a hint, the ack is normally pushed to you as a peer-message: keep working or end the turn, and wait again only if it never arrives. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.",
+                "Wait for an ask ack. Call it at most once per ask: when the result carries a hint, the ack is pushed to you as a peer-message, so end the turn. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.",
                 json!({
                     "correlation_id": {"type": "string"},
                     "timeout_seconds": {"type": "integer"}

@@ -58,6 +58,8 @@ mesh
   peer broadcast TEXT [--circle CIRCLE] [--cross-circle true] [--from-peer ID]
   peer ask-many TO[,TO...] TEXT [--from-peer ID]
   peer wait CORRELATION_ID [--timeout-seconds N]
+                                   Above 50 the CLI chains hub waits until the ack or N seconds;
+                                   an unreachable hub is retried until N seconds pass
   peer ack CORRELATION_ID [--message TEXT] [--failed true] [--from-peer ID]
   peer events TEXT [--peer-id ID] [--role ROLE]
   peer attach FILE                  Upload a file using base64
@@ -251,22 +253,29 @@ impl Args {
     }
 }
 
+const HUB_WAIT_CAP_SECS: u64 = crate::hub::WAIT_MAX_SECS;
+
 fn curl_max_time(path: &str, body: Option<&Value>) -> String {
     /* activity is only shown: each report gets a one-second HTTP request budget */
     if path == "/activity" {
         return "1".into();
     }
-    if path.starts_with("/asks/") && path.ends_with("/wait") {
-        return "55".into();
-    }
-    if path == "/mcp" && body.and_then(|b| b["params"]["name"].as_str()) == Some("amesh_wait") {
-        let wait = body
-            .and_then(|b| b["params"]["arguments"]["timeout_seconds"].as_u64())
-            .unwrap_or(45)
-            .min(50);
-        return (wait + 10).to_string();
-    }
-    "5".into()
+    let wait = if path.starts_with("/asks/") && path.ends_with("/wait") {
+        body.map(|b| &b["timeout_seconds"])
+    } else if path == "/mcp"
+        && body.and_then(|b| b["params"]["name"].as_str()) == Some("amesh_wait")
+    {
+        body.map(|b| &b["params"]["arguments"]["timeout_seconds"])
+    } else {
+        return "5".into();
+    };
+    /* a wait gets ten seconds over the hub budget it asked for */
+    (wait
+        .and_then(Value::as_u64)
+        .unwrap_or(45)
+        .min(HUB_WAIT_CAP_SECS)
+        + 10)
+        .to_string()
 }
 
 pub(crate) fn request(method: &str, path: &str, body: Option<Value>) -> Result<Value> {
@@ -324,8 +333,8 @@ pub(crate) fn request(method: &str, path: &str, body: Option<Value>) -> Result<V
             String::from_utf8_lossy(&output.stderr).trim(),
             String::from_utf8_lossy(&output.stdout).trim()
         );
-        /* 6 dns, 7 refused, 28 timeout, 52 empty, 56 recv: no daemon to talk to */
-        if matches!(output.status.code(), Some(6 | 7 | 28 | 52 | 56)) {
+        /* 6 dns, 7 refused, 28 timeout, 52 empty, 55 send, 56 recv: no daemon to talk to */
+        if matches!(output.status.code(), Some(6 | 7 | 28 | 52 | 55 | 56)) {
             return Err(format!("{DAEMON_UNREACHABLE}: {detail}").into());
         }
         return Err(detail.into());
@@ -1091,11 +1100,37 @@ fn peer(raw: &[String]) -> Result<Value> {
                 .get("timeout-seconds", "45")
                 .parse()
                 .map_err(|_| "--timeout-seconds requires an unsigned integer")?;
-            request(
-                "POST",
-                &format!("/asks/{}/wait", escaped(&args.pos[0])),
-                Some(json!({"timeout_seconds": timeout})),
-            )
+            let path = format!("/asks/{}/wait", escaped(&args.pos[0]));
+            /* a budget above the hub's cap runs as a chain of capped waits, each sized from
+            the time left, so a slice the recipient's stop ended early costs only its own
+            elapsed time */
+            let deadline = Instant::now()
+                .checked_add(Duration::from_secs(timeout))
+                .ok_or("--timeout-seconds is too large")?;
+            loop {
+                let until_deadline = deadline.saturating_duration_since(Instant::now());
+                let left = until_deadline.as_secs() + u64::from(until_deadline.subsec_nanos() > 0);
+                let result = match request(
+                    "POST",
+                    &path,
+                    Some(json!({"timeout_seconds": left.min(HUB_WAIT_CAP_SECS)})),
+                ) {
+                    /* a restarting hub drops the connection while the ask survives in its
+                    state file, so the wait resumes once the hub listens again */
+                    Err(error) if error.to_string().starts_with(DAEMON_UNREACHABLE) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        std::thread::sleep(remaining.min(Duration::from_secs(2)));
+                        if Instant::now() >= deadline {
+                            break Err(error);
+                        }
+                        continue;
+                    }
+                    result => result?,
+                };
+                if result["open"].as_bool() != Some(true) || left <= HUB_WAIT_CAP_SECS {
+                    break Ok(result);
+                }
+            }
         }
         "ack" => {
             args.count(1, 1)?;
@@ -3688,6 +3723,9 @@ fn mesh_primer(peer_id: &str, backend: &str, circle: &str) -> String {
     if backend == "claude-code" {
         text.push_str(
             "\nClaude SendMessage addresses Claude's native roster. To reach amesh peers, use amesh_job_create(), amesh_ask(), amesh_ack(), amesh_notify_peer() according to the rules above.",
+        );
+        text.push_str(
+            "\nWaiting for acks: end the turn; the pushed ack starts your next turn. When the turn must stay open (an active goal, other work), run `amesh peer wait <correlation_id> --timeout-seconds 1200` with Bash run_in_background, one barrier per ask at a time, keep working, and end the turn once waiting is the only work left. Its exit arrives as a task notification and exit 0 only means the command ended, so read the JSON: open false is the result and is informational when the pushed ack already arrived; open true means the deadline passed, so re-read the ask before re-arming once; the barrier retries an unreachable hub within its budget; on an error, check the hub and re-read the ask before re-arming. Never chain amesh_wait calls.",
         );
     }
     text
