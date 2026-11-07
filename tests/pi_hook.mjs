@@ -146,6 +146,14 @@ assert.equal(schemas.amesh_schedule_create.properties.text.type, "string");
 assert.equal(schemas.amesh_schedule_create.properties.message, undefined);
 assert.equal(schemas.amesh_schedule_create.properties.cross_circle.type, "boolean");
 assert.equal(schemas.amesh_ask_many.properties.cross_circle.type, "boolean");
+for (const name of ["amesh_ask", "amesh_ask_many", "amesh_job_create", "amesh_job_update"]) {
+  assert.equal(schemas[name].properties.watch.type, "boolean", `${name} takes watch`);
+  assert.equal(
+    schemas[name].properties.deadline_seconds.type,
+    "integer",
+    `${name} takes deadline_seconds`,
+  );
+}
 assert.equal(schemas.amesh_list_peers.properties.detail?.type, "boolean", "installed Pi peer detail schema");
 assert.equal(schemas.amesh_events.properties.circle.type, "string");
 assert.equal(schemas.amesh_events.properties.cross_circle.type, "boolean");
@@ -296,6 +304,43 @@ await test("every pi tool copies the hub catalogue", () => {
       );
     }
   }
+});
+await test("the ask tool forwards watch and deadline flags", async () => {
+  const ask = JSON.parse(
+    (
+      await defs.amesh_ask.execute("ask-watch-flags", {
+        peer_name: peerId,
+        query: "watch flags",
+        watch: false,
+        deadline_seconds: 30,
+      })
+    ).content[0].text,
+  );
+  assert.equal(ask.ok, true, JSON.stringify(ask));
+  const badDeadline = await defs.amesh_ask
+    .execute("ask-watch-bad-deadline", {
+      peer_name: peerId,
+      query: "bad deadline",
+      deadline_seconds: "30x",
+    })
+    .then(() => null, (error) => error);
+  assert.match(
+    String(badDeadline),
+    /--deadline-seconds requires an unsigned integer/,
+    "a bad deadline reaches the CLI's validation",
+  );
+  const badWatch = await defs.amesh_ask
+    .execute("ask-watch-bad-watch", {
+      peer_name: peerId,
+      query: "bad watch",
+      watch: "maybe",
+    })
+    .then(() => null, (error) => error);
+  assert.match(
+    String(badWatch),
+    /--watch requires true or false/,
+    "a bad watch reaches the CLI's validation",
+  );
 });
 await test("knowledge tools round-trip against the daemon", async () => {
   const call = async (name, params) => {

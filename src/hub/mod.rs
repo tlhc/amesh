@@ -167,6 +167,10 @@ struct Job {
     /* the id of the notice the job's last handoff queued: only that notice still holds */
     #[serde(default, skip_serializing_if = "Option::is_none")]
     handoff: Option<String>,
+    #[serde(default)]
+    watch: bool,
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -347,7 +351,9 @@ CREATE TABLE IF NOT EXISTS jobs (
   nudge_at INTEGER,
   finished_at INTEGER,
   created_at INTEGER,
-  handoff TEXT
+  handoff TEXT,
+  watch INTEGER NOT NULL DEFAULT 0,
+  watch_deadline INTEGER
 );
 CREATE TABLE IF NOT EXISTS schedules (
   schedule_id TEXT PRIMARY KEY,
@@ -466,6 +472,8 @@ fn open_db(path: &Path, now: u64) -> Result<Connection, String> {
         "ALTER TABLE asks ADD COLUMN to_circle TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE jobs ADD COLUMN created_at INTEGER",
         "ALTER TABLE jobs ADD COLUMN handoff TEXT",
+        "ALTER TABLE jobs ADD COLUMN watch INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE jobs ADD COLUMN watch_deadline INTEGER",
         "ALTER TABLE asks ADD COLUMN watch_until INTEGER",
         "ALTER TABLE asks ADD COLUMN watch_sent TEXT",
     ] {
@@ -591,7 +599,7 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
     }
     for j in disk.jobs.values() {
         tx.prepare_cached(
-            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET (title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) = (excluded.title,excluded.prompt,excluded.path,excluded.backend,excluded.assigned_peer,excluded.state,excluded.result_summary,excluded.circle,excluded.depends_on,excluded.ask_id,excluded.from_peer,excluded.dispatch,excluded.nudge_at,excluded.finished_at,excluded.created_at,excluded.handoff) WHERE (title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff) IS NOT (excluded.title,excluded.prompt,excluded.path,excluded.backend,excluded.assigned_peer,excluded.state,excluded.result_summary,excluded.circle,excluded.depends_on,excluded.ask_id,excluded.from_peer,excluded.dispatch,excluded.nudge_at,excluded.finished_at,excluded.created_at,excluded.handoff)",
+            "INSERT INTO jobs(job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff,watch,watch_deadline) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET (title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff,watch,watch_deadline) = (excluded.title,excluded.prompt,excluded.path,excluded.backend,excluded.assigned_peer,excluded.state,excluded.result_summary,excluded.circle,excluded.depends_on,excluded.ask_id,excluded.from_peer,excluded.dispatch,excluded.nudge_at,excluded.finished_at,excluded.created_at,excluded.handoff,excluded.watch,excluded.watch_deadline) WHERE (title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff,watch,watch_deadline) IS NOT (excluded.title,excluded.prompt,excluded.path,excluded.backend,excluded.assigned_peer,excluded.state,excluded.result_summary,excluded.circle,excluded.depends_on,excluded.ask_id,excluded.from_peer,excluded.dispatch,excluded.nudge_at,excluded.finished_at,excluded.created_at,excluded.handoff,excluded.watch,excluded.watch_deadline)",
         ).map_err(|e| e.to_string())?.execute(params![
                 j.job_id,
                 j.title,
@@ -609,7 +617,9 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
                 j.nudge_at.map(|v| v as i64),
                 j.finished_at.map(|v| v as i64),
                 j.created_at.map(|v| v as i64),
-                j.handoff
+                j.handoff,
+                j.watch as i32,
+                j.deadline_seconds.map(|v| v as i64)
             ],
         )
         .map_err(|e| e.to_string())?;
@@ -779,7 +789,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
         disk.asks.insert(a.correlation_id.clone(), a);
     }
     let mut stmt = db
-        .prepare("SELECT job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff FROM jobs")
+        .prepare("SELECT job_id,title,prompt,path,backend,assigned_peer,state,result_summary,circle,depends_on,ask_id,from_peer,dispatch,nudge_at,finished_at,created_at,handoff,watch,watch_deadline FROM jobs")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -815,6 +825,11 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
                     .unwrap_or_default()
                     .map(|v| v.max(0) as u64),
                 handoff: r.get(16).unwrap_or_default(),
+                watch: r.get::<_, i32>(17).unwrap_or(0) != 0,
+                deadline_seconds: r
+                    .get::<_, Option<i64>>(18)
+                    .unwrap_or_default()
+                    .map(|v| v.max(0) as u64),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1506,6 +1521,10 @@ struct AskReq {
     attachments: Option<Value>,
     #[serde(default)]
     cross_circle: bool,
+    #[serde(default)]
+    watch: Option<bool>,
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1545,6 +1564,10 @@ struct JobCreateReq {
     from_peer: Option<String>,
     #[serde(default)]
     depends_on: Vec<String>,
+    #[serde(default)]
+    watch: Option<bool>,
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1560,6 +1583,10 @@ struct JobUpdateReq {
     /* hands the job's coordination to this peer; it comes alone */
     #[serde(default)]
     coordinator: Option<String>,
+    #[serde(default)]
+    watch: Option<bool>,
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2336,8 +2363,22 @@ async fn open_ask(
         req.cross_circle,
     )?;
     let to_peer_id = target.peer_id.clone();
+    /* a watch needs a registered asker to push to: an explicit request without one is refused
+    before anything is written, the default is simply left off */
+    let asker_registered = req
+        .from_peer
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .is_some_and(|name| resolve(&hub, name).is_some());
+    let explicit = req.watch == Some(true) || req.deadline_seconds.is_some();
+    if explicit && !asker_registered {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "the asker is not a registered peer"})),
+        ));
+    }
     let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    let ask = Ask {
+    let mut ask = Ask {
         correlation_id: cid.clone(),
         from_peer: sender_id(&hub, req.from_peer.as_deref()).unwrap_or_else(|| "anonymous".into()),
         to_peer: req.to_peer.clone(),
@@ -2358,6 +2399,14 @@ async fn open_ask(
         closed_by: None,
         watch: None,
     };
+    /* the watch is written with the ask: one persist, one rollback, and no gap in which a
+    fast ack could close the ask before its watch exists */
+    if (req.watch != Some(false) || req.deadline_seconds.is_some()) && asker_registered {
+        let mut watch = arm_watch(req.deadline_seconds, WATCH_ASK_DEFAULT_SECS, now);
+        watch.sent = seed_sent(&hub, &ask, now);
+        ask.watch = Some(watch);
+    }
+    let recipient = progress_label(&derive::progress(&hub, Some(&to_peer_id), Some(&ask), now));
     hub.asks.insert(cid.clone(), ask.clone());
     let mut event = json!({
         "type": "ask",
@@ -2370,7 +2419,12 @@ async fn open_ask(
         event["attachments"] = attachments;
     }
     persist_then_deliver(&mut hub, &to_peer_id, event, now)?;
-    Ok(Json(json!({"correlation_id": cid, "ok": true})))
+    Ok(Json(json!({
+        "correlation_id": cid,
+        "ok": true,
+        "watch_until": ask.watch.as_ref().map(|watch| watch.until),
+        "recipient": recipient,
+    })))
 }
 
 async fn ack_ask(
@@ -2618,6 +2672,10 @@ struct AskManyReq {
     text: String,
     #[serde(default)]
     cross_circle: bool,
+    #[serde(default)]
+    watch: Option<bool>,
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2770,6 +2828,7 @@ async fn ask_many(
         }
     }
     let mut cids = Vec::new();
+    let mut watches = serde_json::Map::new();
     for to in &req.to_peers {
         let (st, body) = {
             let res = open_ask(
@@ -2781,6 +2840,8 @@ async fn ask_many(
                     text: req.text.clone(),
                     attachments: None,
                     cross_circle: req.cross_circle,
+                    watch: req.watch,
+                    deadline_seconds: req.deadline_seconds,
                 }),
             )
             .await;
@@ -2800,16 +2861,22 @@ async fn ask_many(
                     .insert(parent.clone(), cids.clone());
                 body["parent_id"] = json!(parent);
                 body["asks"] = json!(cids);
+                body["watches"] = json!(watches);
             }
             return Err((st, Json(body)));
         }
         if let Some(cid) = body.get("correlation_id").and_then(Value::as_str) {
             cids.push(cid.to_string());
+            if let Some(until) = body.get("watch_until").and_then(Value::as_u64) {
+                watches.insert(cid.to_string(), json!(until));
+            }
         }
     }
     let mut hub = app.inner.lock().await;
     hub.batches.insert(parent.clone(), cids.clone());
-    Ok(Json(json!({"ok": true, "parent_id": parent, "asks": cids})))
+    Ok(Json(
+        json!({"ok": true, "parent_id": parent, "asks": cids, "watches": watches}),
+    ))
 }
 
 async fn ask_many_result(
@@ -2841,6 +2908,8 @@ pub(crate) const WAIT_MAX_SECS: u64 = 50;
 const WAIT_DEFAULT_SECS: u64 = 45;
 /* a watch registered without deadline_seconds ends after this long */
 const WATCH_DEFAULT_SECS: u64 = 1200;
+/* an ask armed at creation without deadline_seconds ends after this long */
+const WATCH_ASK_DEFAULT_SECS: u64 = 300;
 const WATCH_MAX_SECS: u64 = 86400;
 /* Codex runs MCP calls inside an exec cell; a wait that outlasts the cell's yield is
 parked, and each later poll of the cell is one more model call. The yield is a Codex
@@ -3021,18 +3090,20 @@ fn register_watch(
             ));
         }
     }
-    let until = now.saturating_add(
-        deadline_secs
-            .unwrap_or(WATCH_DEFAULT_SECS)
-            .min(WATCH_MAX_SECS),
-    );
+    let mut watch = arm_watch(deadline_secs, WATCH_DEFAULT_SECS, now);
     if let Some(ask) = hub.asks.get_mut(id) {
-        /* re-arming moves the deadline and keeps what was already pushed */
-        let sent = ask.watch.take().map(|watch| watch.sent).unwrap_or_default();
-        ask.watch = Some(Watch { until, sent });
+        /* re-arming a live watch moves the deadline and keeps what was already pushed; past
+        the deadline the cycle starts over, whether or not the tick has run yet */
+        watch.sent = ask
+            .watch
+            .take()
+            .filter(|old| now < old.until)
+            .map(|old| old.sent)
+            .unwrap_or_default();
+        ask.watch = Some(watch.clone());
     }
     persist_ok(hub)?;
-    Ok(json!({"ok": true, "correlation_id": id, "watch_until": until}))
+    Ok(json!({"ok": true, "correlation_id": id, "watch_until": watch.until}))
 }
 
 async fn watch_ask(
@@ -3046,11 +3117,97 @@ async fn watch_ask(
     register_watch(&mut hub, &id, req.deadline_seconds, None, now_unix()).map(Json)
 }
 
+/* the deadline counts from now; a caller that names none gets the default of its kind */
+fn arm_watch(deadline_secs: Option<u64>, default_secs: u64, now: u64) -> Watch {
+    Watch {
+        until: now.saturating_add(deadline_secs.unwrap_or(default_secs).min(WATCH_MAX_SECS)),
+        sent: String::new(),
+    }
+}
+
+/* the state of an open ask worth one push to its asker, with the text of that push */
+fn watch_state(hub: &Hub, ask: &Ask, now: u64) -> Option<(&'static str, String)> {
+    use crate::wire::{IdleWhy, Progress};
+    let to = &ask.to_peer_id;
+    match derive::progress(hub, Some(to), Some(ask), now) {
+        Progress::Idle { why, .. } => {
+            let why = match why {
+                IdleWhy::NotPickedUp => "was idle before the ask and has not picked it up",
+                IdleWhy::AskStillOpen => "went idle with the ask still open",
+                _ => "ended its turn with the ask still open",
+            };
+            Some((
+                "stalled",
+                format!("{to} {why}; nudged once, the ack can still arrive"),
+            ))
+        }
+        Progress::Offline => Some(("offline", format!("{to} is offline"))),
+        Progress::Gone => Some((
+            "gone",
+            format!("{to} left the hub; its backlog is kept for its session"),
+        )),
+        _ => None,
+    }
+}
+
+/* a watch armed with its ask counts the recipient's current state as already pushed: the
+asker gets that state in the answer and hears only about changes */
+fn seed_sent(hub: &Hub, ask: &Ask, now: u64) -> String {
+    watch_state(hub, ask, now)
+        .map(|(event, _)| event.to_string())
+        .unwrap_or_default()
+}
+
+fn progress_label(progress: &crate::wire::Progress) -> &'static str {
+    use crate::wire::Progress;
+    match progress {
+        Progress::Gone => "gone",
+        Progress::Offline => "offline",
+        Progress::Pending { .. } => "pending",
+        Progress::Wait { .. } => "wait",
+        Progress::Idle { .. } => "idle",
+        Progress::Work { .. } => "work",
+        Progress::Unknown => "unknown",
+    }
+}
+
+/* the same states read as the deadline text states them */
+fn held_state(progress: &crate::wire::Progress) -> &'static str {
+    use crate::wire::Progress;
+    match progress {
+        Progress::Gone => "has left the hub",
+        Progress::Offline => "is offline",
+        Progress::Pending { .. } => "pending",
+        Progress::Wait { .. } => "waiting",
+        Progress::Idle { .. } => "idle",
+        Progress::Work { .. } => "working",
+        Progress::Unknown => "state unknown",
+    }
+}
+
+/* seconds for a state still inside two minutes, whole minutes above */
+fn span(secs: u64) -> String {
+    if secs < 120 {
+        format!("{secs}s")
+    } else {
+        format!("{}m", secs / 60)
+    }
+}
+
+/* what the recipient was doing when the watch ran out, and for how long */
+fn deadline_state(hub: &Hub, ask: &Ask, now: u64) -> String {
+    let progress = derive::progress(hub, Some(&ask.to_peer_id), Some(ask), now);
+    match derive::progress_age(&progress, now) {
+        Some(age) => format!("{} for {}", held_state(&progress), span(age)),
+        None => held_state(&progress).to_string(),
+    }
+}
+
 /* Watched asks move here, once a second. Each actionable state of an open ask reaches its
 asker once: idle without an ack (the recipient is nudged once as well), offline, gone, and
-the deadline, which also ends the watch. A closed ask takes its watch with it. */
+the deadline, which also ends the watch and is pushed instead of them, carrying the state it
+finds so a re-armed watch starts from it. A closed ask takes its watch with it. */
 fn advance_asks(hub: &mut Hub, now: u64) {
-    use crate::wire::{IdleWhy, Progress};
     let mut ids: Vec<String> = hub
         .asks
         .values()
@@ -3080,39 +3237,24 @@ fn advance_asks(hub: &mut Hub, now: u64) {
             continue;
         }
         let (from, to) = (ask.from_peer.clone(), ask.to_peer_id.clone());
-        let state = match derive::progress(hub, Some(&to), Some(ask), now) {
-            Progress::Idle { why, .. } => {
-                let why = match why {
-                    IdleWhy::NotPickedUp => "was idle before the ask and has not picked it up",
-                    IdleWhy::AskStillOpen => "went idle with the ask still open",
-                    _ => "ended its turn with the ask still open",
-                };
-                Some((
-                    "stalled",
-                    format!("{to} {why}; nudged once, the ack can still arrive"),
-                ))
-            }
-            Progress::Offline => Some(("offline", format!("{to} is offline"))),
-            Progress::Gone => Some((
-                "gone",
-                format!("{to} left the hub; its backlog is kept for its session"),
-            )),
-            _ => None,
-        };
-        let mut sent = watch.sent.clone();
-        let mut due: Vec<(&str, String)> = state
-            .into_iter()
-            .filter(|(event, _)| !sent.split(' ').any(|name| name == *event))
-            .collect();
-        if now >= watch.until {
-            due.push((
+        let due: Vec<(&str, String)> = if now >= watch.until {
+            vec![(
                 "deadline",
-                "the deadline passed with the ask still open; the watch ended".to_string(),
-            ));
-        }
+                format!(
+                    "the deadline passed with the ask still open; the watch ended; {to} {}",
+                    deadline_state(hub, ask, now)
+                ),
+            )]
+        } else {
+            watch_state(hub, ask, now)
+                .into_iter()
+                .filter(|(event, _)| !watch.sent.split(' ').any(|name| name == *event))
+                .collect()
+        };
         if due.is_empty() {
             continue;
         }
+        let mut sent = watch.sent.clone();
         for (event, detail) in &due {
             events.push(json!({
                 "type": "notify",
@@ -3207,6 +3349,8 @@ async fn ask_blocking(
                     .get("cross_circle")
                     .and_then(Value::as_bool)
                     .unwrap_or(false),
+                watch: Some(body.get("watch").and_then(Value::as_bool).unwrap_or(false)),
+                deadline_seconds: body.get("deadline_seconds").and_then(Value::as_u64),
             }),
         )
         .await?;
@@ -3687,6 +3831,8 @@ async fn create_job(
         finished_at: None,
         created_at: Some(now_unix()),
         handoff: None,
+        watch: req.watch.unwrap_or(true) || req.deadline_seconds.is_some(),
+        deadline_seconds: req.deadline_seconds.map(|v| v.min(WATCH_MAX_SECS)),
     };
     hub.jobs.insert(job_id.clone(), job);
     let now = now_unix();
@@ -3831,12 +3977,14 @@ async fn update_job(
         let alone = req.state.is_none()
             && req.result_summary.is_none()
             && req.assigned_peer.is_none()
-            && req.prompt.is_none();
+            && req.prompt.is_none()
+            && req.watch.is_none()
+            && req.deadline_seconds.is_none();
         if !alone || to.is_empty() {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(
-                    json!({"error": "coordinator names a peer and comes alone, without state, result_summary, assigned_peer or prompt"}),
+                    json!({"error": "coordinator names a peer and comes alone, without state, result_summary, assigned_peer, prompt, watch or deadline_seconds"}),
                 ),
             ));
         }
@@ -3912,6 +4060,13 @@ async fn update_job(
     }
     if let Some(prompt) = req.prompt {
         job.prompt = prompt;
+    }
+    if let Some(watch) = req.watch {
+        job.watch = watch;
+    }
+    if let Some(seconds) = req.deadline_seconds {
+        job.deadline_seconds = Some(seconds.min(WATCH_MAX_SECS));
+        job.watch = true;
     }
     if job.state != "running" {
         job.nudge_at = None;
@@ -4057,6 +4212,8 @@ async fn cancel_job(
             assigned_peer: None,
             prompt: None,
             coordinator: None,
+            watch: None,
+            deadline_seconds: None,
         }),
     )
     .await
@@ -4626,25 +4783,28 @@ fn dispatch_job(hub: &mut Hub, id: &str, now: u64, events: &mut Vec<Value>) -> O
     let from_circle = job.circle.clone();
     let to_circle = hub.peers[&worker].circle.clone();
     let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    hub.asks.insert(
-        cid.clone(),
-        Ask {
-            correlation_id: cid.clone(),
-            from_peer: from.clone(),
-            to_peer: target.clone(),
-            to_peer_id: worker,
-            from_circle,
-            to_circle,
-            text: text.clone(),
-            open: true,
-            reply: None,
-            failed: false,
-            closed_at: None,
-            opened_at: Some(now_unix()),
-            closed_by: None,
-            watch: None,
-        },
-    );
+    let mut ask = Ask {
+        correlation_id: cid.clone(),
+        from_peer: from.clone(),
+        to_peer: target.clone(),
+        to_peer_id: worker,
+        from_circle,
+        to_circle,
+        text: text.clone(),
+        open: true,
+        reply: None,
+        failed: false,
+        closed_at: None,
+        opened_at: Some(now),
+        closed_by: None,
+        watch: None,
+    };
+    if job.watch && resolve(hub, &ask.from_peer).is_some() {
+        let mut watch = arm_watch(job.deadline_seconds, WATCH_DEFAULT_SECS, now);
+        watch.sent = seed_sent(hub, &ask, now);
+        ask.watch = Some(watch);
+    }
+    hub.asks.insert(cid.clone(), ask);
     events.push(json!({
         "type": "ask",
         "correlation_id": cid,
@@ -5118,13 +5278,15 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
     vec![
         {
             let mut t = obj(
-                "Open a tracked ask. Same-circle by default; set cross_circle for another circle.",
+                "Open a tracked ask; it arms a watch by default (deadline 300 s; set deadline_seconds to the time you expect, or watch=false to block in amesh_wait or when you need no reply). Same-circle by default; set cross_circle for another circle.",
                 json!({
                     "peer_name": {"type": "string"},
                     "to_peer": {"type": "string"},
                     "query": {"type": "string"},
                     "from_peer": {"type": "string"},
-                    "cross_circle": {"type": "boolean"}
+                    "cross_circle": {"type": "boolean"},
+                    "watch": {"type": "boolean"},
+                    "deadline_seconds": {"type": "integer"}
                 }),
                 &[],
             );
@@ -5192,14 +5354,16 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait or amesh_watch. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.",
+                "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait or amesh_watch. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary. watch (default true) and deadline_seconds (default 1200) arm a watch for the coordinator at every dispatch.",
                 json!({
                     "title": {"type": "string"},
                     "prompt": {"type": "string"},
                     "path": {"type": "string"},
                     "backend": {"type": "string", "description": "optional runtime label; empty when not given, dispatch does not use it"},
                     "assigned_peer": {"type": "string"},
-                    "depends_on": {"type": "array", "items": {"type": "string"}}
+                    "depends_on": {"type": "array", "items": {"type": "string"}},
+                    "watch": {"type": "boolean"},
+                    "deadline_seconds": {"type": "integer"}
                 }),
                 &[],
             );
@@ -5231,7 +5395,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Update job state. Except for coordinator alone, state is required: queued, running, done, failed or cancelled; other values are rejected. Changing prompt or assigned_peer requires state=queued and re-dispatches the job. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.",
+                "Update job state. Except for coordinator alone, state is required: queued, running, done, failed or cancelled; other values are rejected. Changing prompt or assigned_peer requires state=queued and re-dispatches the job. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were. watch (default true) and deadline_seconds (default 1200) arm a watch for the coordinator at every dispatch.",
                 json!({
                     "job_id": {"type": "string"},
                     "state": {"type": "string"},
@@ -5239,6 +5403,8 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "assigned_peer": {"type": "string"},
                     "prompt": {"type": "string"},
                     "coordinator": {"type": "string"},
+                    "watch": {"type": "boolean"},
+                    "deadline_seconds": {"type": "integer"},
                     "cross_circle": {"type": "boolean"}
                 }),
                 &["job_id"],
@@ -5306,12 +5472,14 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Ask many peers",
+                "Ask many peers; each ask arms a watch by default (watch and deadline_seconds as in amesh_ask).",
                 json!({
                     "to_peers": {"type": "array", "items": {"type": "string"}},
                     "text": {"type": "string"},
                     "from_peer": {"type": "string"},
-                    "cross_circle": {"type": "boolean"}
+                    "cross_circle": {"type": "boolean"},
+                    "watch": {"type": "boolean"},
+                    "deadline_seconds": {"type": "integer"}
                 }),
                 &["to_peers", "text"],
             );
@@ -5399,7 +5567,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Register pushes for an ask and return at once; only the asker can register it. The hub sends you a peer-message once each when the recipient sits idle without acking (it nudges the recipient once), goes offline, leaves the hub, or when deadline_seconds pass with the ask still open (default 1200, at most 86400; the deadline ends the watch). The ack itself is pushed anyway. Call it right after amesh_ask and end the turn; amesh_wait is the blocking alternative. Re-registering moves the deadline and never repeats an already-pushed event. An ask-many batch id is not an ask; watch its child correlation_ids.",
+                "Register pushes for an ask and return at once; only the asker can register it. The hub sends you a peer-message once each when the recipient sits idle without acking (it nudges the recipient once), goes offline, leaves the hub, or when deadline_seconds pass with the ask still open (default 1200, at most 86400; the deadline ends the watch). The ack itself is pushed anyway. amesh_ask and job_create arm it by default; call this to re-arm or to register late, then end the turn; amesh_wait is the blocking alternative. Re-registering while the watch is alive moves the deadline and never repeats an already-pushed event; after the deadline a new registration starts a fresh cycle. An ask-many batch id is not an ask; watch its child correlation_ids.",
                 json!({
                     "correlation_id": {"type": "string"},
                     "deadline_seconds": {"type": "integer"}
@@ -5491,6 +5659,8 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .get("cross_circle")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    watch: args.get("watch").and_then(Value::as_bool),
+                    deadline_seconds: args.get("deadline_seconds").and_then(Value::as_u64),
                 }),
             )
             .await?;
@@ -5607,6 +5777,8 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .get("from_peer")
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    watch: args.get("watch").and_then(Value::as_bool),
+                    deadline_seconds: args.get("deadline_seconds").and_then(Value::as_u64),
                     /* a malformed list read as empty would send the job at once */
                     depends_on: match args.get("depends_on") {
                         None | Some(Value::Null) => Vec::new(),
@@ -5804,6 +5976,8 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .get("cross_circle")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    watch: args.get("watch").and_then(Value::as_bool),
+                    deadline_seconds: args.get("deadline_seconds").and_then(Value::as_u64),
                 }),
             )
             .await?;

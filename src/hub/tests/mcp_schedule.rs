@@ -737,6 +737,8 @@ fn job_circle_survives_restart_and_old_schema() {
                 finished_at: None,
                 created_at: None,
                 handoff: None,
+                watch: false,
+                deadline_seconds: None,
             },
         );
         persist(&mut hub).unwrap();

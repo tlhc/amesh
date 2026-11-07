@@ -176,20 +176,141 @@ fn a_recipient_gone_with_a_kept_backlog_is_reported_once() {
 }
 
 #[test]
-fn a_state_event_and_the_deadline_due_together_are_pushed_once_each() {
+fn the_deadline_pushes_alone_when_a_state_event_is_due() {
     let (mut hub, _state, mut boss, mut worker, t0) = watched_hub("watch-together");
     register_watch(&mut hub, "ask-1", Some(30), None, t0).unwrap();
-    /* the first tick after a pause sees the stall and the deadline at once */
+    /* one tick a minute later owes a stall and the deadline at once; the deadline carries the
+    stall inside its own text, so nothing else goes out */
     advance_asks(&mut hub, t0 + 30);
-    let events: Vec<String> = pushed(&mut boss)
-        .into_iter()
-        .map(|event| event["event"].as_str().unwrap().to_string())
+    let due = pushed(&mut boss);
+    let events: Vec<&str> = due
+        .iter()
+        .map(|event| event["event"].as_str().unwrap())
         .collect();
-    assert_eq!(events, ["stalled", "deadline"]);
-    assert_eq!(pushed(&mut worker).len(), 1, "the nudge still goes out");
+    assert_eq!(events, ["deadline"], "{due:?}");
+    assert_eq!(
+        due[0]["message"],
+        "ask ask-1 to worker deadline: the deadline passed with the ask still open; the watch ended; worker idle for 30s",
+        "{due:?}"
+    );
+    assert!(
+        pushed(&mut worker).is_empty(),
+        "a deadline that ends the watch does not nudge the recipient"
+    );
     assert!(hub.asks["ask-1"].watch.is_none());
     advance_asks(&mut hub, t0 + 60);
     assert!(pushed(&mut boss).is_empty() && pushed(&mut worker).is_empty());
+}
+
+#[test]
+fn the_deadline_names_a_working_recipient_and_its_age() {
+    let (mut hub, _state, mut boss, mut worker, t0) = watched_hub("watch-deadline-working");
+    hub.activity.insert(
+        "worker".into(),
+        Activity {
+            state: "work".into(),
+            since: t0 - 45,
+            observed_at: t0 - 1,
+            source: "test".into(),
+            reason: None,
+        },
+    );
+    register_watch(&mut hub, "ask-1", Some(30), None, t0).unwrap();
+    advance_asks(&mut hub, t0 + 30);
+    let due = pushed(&mut boss);
+    assert_eq!(due.len(), 1, "{due:?}");
+    assert_eq!(
+        due[0]["message"],
+        "ask ask-1 to worker deadline: the deadline passed with the ask still open; the watch ended; worker working for 75s",
+        "{due:?}"
+    );
+    assert!(pushed(&mut worker).is_empty());
+}
+
+#[test]
+fn the_deadline_reads_an_age_of_minutes_from_the_ask() {
+    let (mut hub, _state, mut boss, _worker, t0) = watched_hub("watch-deadline-minutes");
+    /* no activity report: the recipient is pending since the ask opened */
+    hub.activity.remove("worker");
+    register_watch(&mut hub, "ask-1", Some(240), None, t0).unwrap();
+    advance_asks(&mut hub, t0 + 240);
+    let due = pushed(&mut boss);
+    assert_eq!(due.len(), 1, "{due:?}");
+    assert!(
+        due[0]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("; worker pending for 4m"),
+        "{due:?}"
+    );
+}
+
+#[test]
+fn the_deadline_names_an_offline_recipient() {
+    let (mut hub, _state, mut boss, mut worker, t0) = watched_hub("watch-deadline-offline");
+    hub.peers.get_mut("worker").unwrap().status = "offline".into();
+    register_watch(&mut hub, "ask-1", Some(30), None, t0).unwrap();
+    advance_asks(&mut hub, t0 + 30);
+    let due = pushed(&mut boss);
+    assert_eq!(due.len(), 1, "{due:?}");
+    assert!(
+        due[0]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("; worker is offline"),
+        "{due:?}"
+    );
+    assert!(pushed(&mut worker).is_empty());
+}
+
+#[test]
+fn the_deadline_names_a_recipient_that_left_the_hub() {
+    let (mut hub, _state, mut boss, _worker, t0) = watched_hub("watch-deadline-gone");
+    hub.peers.remove("worker");
+    hub.sockets.remove("worker");
+    hub.owed.insert(
+        "worker".into(),
+        Owed {
+            since: t0,
+            owner: "s-worker".into(),
+        },
+    );
+    register_watch(&mut hub, "ask-1", Some(30), None, t0).unwrap();
+    advance_asks(&mut hub, t0 + 30);
+    let due = pushed(&mut boss);
+    assert_eq!(due.len(), 1, "{due:?}");
+    assert!(
+        due[0]["message"]
+            .as_str()
+            .unwrap()
+            .ends_with("; worker has left the hub"),
+        "{due:?}"
+    );
+}
+
+#[test]
+fn the_catalogue_states_the_watch_default_and_the_deadline_cycle() {
+    let tools = mcp_tools();
+    let description = |name: &str| {
+        tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .and_then(|tool| tool["description"].as_str())
+            .unwrap()
+            .to_string()
+    };
+    assert!(description("amesh_ask").contains("arms a watch by default (deadline 300 s"));
+    assert!(description("amesh_ask_many").contains("each ask arms a watch by default"));
+    let watch = description("amesh_watch");
+    assert!(watch.contains("amesh_ask and job_create arm it by default"));
+    assert!(watch.contains("after the deadline a new registration starts a fresh cycle"));
+    assert!(watch.contains("call this to re-arm or to register late"));
+    for job in ["amesh_job_create", "amesh_job_update"] {
+        assert!(
+            description(job).contains("watch (default true) and deadline_seconds (default 1200)"),
+            "{job} names the dispatch watch"
+        );
+    }
 }
 
 #[test]
@@ -363,4 +484,326 @@ async fn amesh_watch_registers_over_mcp_and_http() {
         .find(|tool| tool["name"] == "amesh_watch")
         .expect("amesh_watch is in the catalogue");
     assert_eq!(tool["inputSchema"]["required"], json!(["correlation_id"]));
+}
+
+#[tokio::test]
+async fn an_ask_arms_its_watch_at_creation() {
+    let (app, inner, _state) = test_app_with_hub();
+    register(app.clone(), "boss", "pi", "one").await;
+    register(app.clone(), "worker", "pi", "one").await;
+    let before = now_unix();
+    let (st, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"from_peer": "boss", "to_peer": "worker", "text": "ping"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ask}");
+    let cid = ask["correlation_id"].as_str().unwrap().to_string();
+    let until = ask["watch_until"]
+        .as_u64()
+        .expect("an ask arms its watch by default");
+    assert!(
+        (before + WATCH_ASK_DEFAULT_SECS..=before + WATCH_ASK_DEFAULT_SECS + 1).contains(&until),
+        "{until} vs {before}"
+    );
+    assert!(
+        ask["recipient"].is_string(),
+        "the response names the recipient's state: {ask}"
+    );
+    {
+        let hub = inner.lock().await;
+        let watch = hub.asks[&cid]
+            .watch
+            .as_ref()
+            .expect("the watch is on the ask");
+        assert_eq!(watch.until, until);
+        assert_eq!(watch.sent, "", "a pending recipient seeds nothing");
+    }
+    let (_, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"from_peer": "boss", "to_peer": "worker", "text": "ping", "deadline_seconds": 7}),
+    )
+    .await;
+    let until = ask["watch_until"].as_u64().unwrap();
+    let now = now_unix();
+    assert!(
+        (now + 6..=now + 8).contains(&until),
+        "a deadline arms the watch for that long: {until} vs {now}"
+    );
+    let (_, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"from_peer": "boss", "to_peer": "worker", "text": "ping", "deadline_seconds": 10_000_000}),
+    )
+    .await;
+    let capped = ask["watch_until"].as_u64().unwrap();
+    let now = now_unix();
+    assert!(
+        (now + WATCH_MAX_SECS - 1..=now + WATCH_MAX_SECS + 1).contains(&capped),
+        "the deadline is capped: {capped} vs {now}"
+    );
+    let (st, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"from_peer": "boss", "to_peer": "worker", "text": "ping", "watch": false}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ask}");
+    assert!(
+        ask["watch_until"].is_null(),
+        "watch=false leaves the ask unwatched: {ask}"
+    );
+    let unwatched = ask["correlation_id"].as_str().unwrap().to_string();
+    assert!(inner.lock().await.asks[&unwatched].watch.is_none());
+    let (st, body) = mcp_tool(
+        app.clone(),
+        "amesh_ask",
+        json!({"from_peer": "boss", "peer_name": "worker", "query": "ping", "deadline_seconds": 9}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{body}");
+    let until = tool_json(&body)["watch_until"]
+        .as_u64()
+        .expect("the MCP tool passes deadline_seconds on");
+    let now = now_unix();
+    assert!((now + 8..=now + 10).contains(&until), "{until} vs {now}");
+    let (_, body) = mcp_tool(
+        app,
+        "amesh_ask",
+        json!({"from_peer": "boss", "peer_name": "worker", "query": "ping", "watch": false}),
+    )
+    .await;
+    assert!(
+        tool_json(&body)["watch_until"].is_null(),
+        "the MCP tool passes watch=false on: {body}"
+    );
+    for name in ["amesh_ask", "amesh_ask_many"] {
+        let tool = mcp_tools()
+            .into_iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap();
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(
+            properties.get("watch").is_some() && properties.get("deadline_seconds").is_some(),
+            "{name} declares watch and deadline_seconds: {properties}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_anonymous_ask_is_unwatched_unless_asked() {
+    let (app, inner, _state) = test_app_with_hub();
+    register(app.clone(), "worker", "pi", "one").await;
+    let (st, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"to_peer": "worker", "text": "ping"}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ask}");
+    assert!(
+        ask["watch_until"].is_null(),
+        "nobody to push to, so no watch: {ask}"
+    );
+    let cid = ask["correlation_id"].as_str().unwrap().to_string();
+    assert!(inner.lock().await.asks[&cid].watch.is_none());
+    for body in [
+        json!({"to_peer": "worker", "text": "ping", "watch": true}),
+        json!({"from_peer": "nobody", "to_peer": "worker", "text": "ping", "deadline_seconds": 5}),
+    ] {
+        let (st, refused) = json_req(app.clone(), "POST", "/ask", body).await;
+        assert_eq!(st, StatusCode::CONFLICT, "{refused}");
+        assert_eq!(refused["error"], "the asker is not a registered peer");
+    }
+    assert_eq!(
+        inner.lock().await.asks.len(),
+        1,
+        "a refused ask is not written"
+    );
+}
+
+#[tokio::test]
+async fn ask_many_arms_each_child() {
+    let (app, inner, _state) = test_app_with_hub();
+    for id in ["boss", "worker", "other"] {
+        register(app.clone(), id, "pi", "one").await;
+    }
+    let (st, batch) = json_req(
+        app.clone(),
+        "POST",
+        "/ask-many",
+        json!({"from_peer": "boss", "to_peers": ["worker", "other"], "text": "ping", "deadline_seconds": 8}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{batch}");
+    let asks: Vec<String> = batch["asks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(asks.len(), 2);
+    let watches = batch["watches"]
+        .as_object()
+        .expect("the batch lists each child's watch");
+    let now = now_unix();
+    for cid in &asks {
+        let until = watches[cid].as_u64().unwrap();
+        assert!((now + 7..=now + 9).contains(&until), "{until} vs {now}");
+        assert_eq!(
+            inner.lock().await.asks[cid].watch.as_ref().map(|w| w.until),
+            Some(until)
+        );
+    }
+    let (_, body) = mcp_tool(
+        app,
+        "amesh_ask_many",
+        json!({"from_peer": "boss", "to_peers": ["worker"], "text": "ping", "watch": false}),
+    )
+    .await;
+    let batch = tool_json(&body);
+    assert_eq!(
+        batch["watches"],
+        json!({}),
+        "watch=false arms nothing: {batch}"
+    );
+    let cid = batch["asks"][0].as_str().unwrap().to_string();
+    assert!(inner.lock().await.asks[&cid].watch.is_none());
+}
+
+#[tokio::test]
+async fn an_ask_to_an_offline_recipient_pushes_only_what_changes() {
+    let path = temp_state("watch-seeded");
+    let mut hub = Hub::open(&path).unwrap();
+    let mut boss = recv_peer(&mut hub, "boss");
+    let mut worker = recv_peer(&mut hub, "worker");
+    hub.peers.get_mut("worker").unwrap().status = "offline".into();
+    let inner = Arc::new(Mutex::new(hub));
+    let app = App {
+        inner: inner.clone(),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    let t0 = now_unix();
+    let opened = open_ask(
+        State(app.clone()),
+        auth_headers(&app),
+        Json(AskReq {
+            from_peer: Some("boss".into()),
+            to_peer: "worker".into(),
+            text: "ping".into(),
+            attachments: None,
+            cross_circle: false,
+            watch: None,
+            deadline_seconds: Some(60),
+        }),
+    )
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(opened["recipient"], "offline", "{opened}");
+    let cid = opened["correlation_id"].as_str().unwrap().to_string();
+    let mut hub = inner.lock().await;
+    assert_eq!(hub.asks[&cid].watch.as_ref().unwrap().sent, "offline");
+    pushed(&mut worker);
+    advance_asks(&mut hub, t0 + 1);
+    advance_asks(&mut hub, t0 + 11);
+    assert!(
+        pushed(&mut boss).is_empty(),
+        "the asker was told offline in the answer and is not told again"
+    );
+    /* the worker comes back and sits idle: that is a change */
+    hub.peers.get_mut("worker").unwrap().status = "online".into();
+    hub.activity.insert(
+        "worker".into(),
+        Activity {
+            state: "idle".into(),
+            since: t0 + 12,
+            observed_at: t0 + 12,
+            source: "test".into(),
+            reason: None,
+        },
+    );
+    advance_asks(&mut hub, t0 + 13);
+    let stalled = pushed(&mut boss);
+    assert_eq!(stalled.len(), 1, "{stalled:?}");
+    assert_eq!(stalled[0]["event"], "stalled");
+    assert_eq!(pushed(&mut worker).len(), 1, "the recipient is nudged once");
+}
+
+#[tokio::test]
+async fn a_deadline_arms_the_watch_even_with_watch_false() {
+    let (app, inner, _state) = test_app_with_hub();
+    for id in ["boss", "worker", "other"] {
+        register(app.clone(), id, "pi", "one").await;
+    }
+    let (st, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"from_peer": "boss", "to_peer": "worker", "text": "ping", "watch": false, "deadline_seconds": 7}),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{ask}");
+    let until = ask["watch_until"]
+        .as_u64()
+        .expect("a deadline arms the watch whatever watch says");
+    let now = now_unix();
+    assert!((now + 6..=now + 8).contains(&until), "{until} vs {now}");
+    let (_, body) = mcp_tool(
+        app.clone(),
+        "amesh_ask",
+        json!({"from_peer": "boss", "peer_name": "worker", "query": "ping", "watch": false, "deadline_seconds": 7}),
+    )
+    .await;
+    assert!(
+        tool_json(&body)["watch_until"].is_u64(),
+        "the MCP tool follows the same rule: {body}"
+    );
+    let (_, batch) = json_req(
+        app,
+        "POST",
+        "/ask-many",
+        json!({"from_peer": "boss", "to_peers": ["worker", "other"], "text": "ping", "watch": false, "deadline_seconds": 7}),
+    )
+    .await;
+    assert_eq!(
+        batch["watches"].as_object().map(|w| w.len()),
+        Some(2),
+        "every child is armed: {batch}"
+    );
+    let cid = batch["asks"][0].as_str().unwrap().to_string();
+    assert!(inner.lock().await.asks[&cid].watch.is_some());
+}
+
+#[test]
+fn a_re_arm_after_the_deadline_starts_a_fresh_cycle() {
+    let (mut hub, _state, mut boss, mut worker, t0) = watched_hub("watch-rearm-expired");
+    register_watch(&mut hub, "ask-1", Some(20), None, t0).unwrap();
+    advance_asks(&mut hub, t0 + 11);
+    assert_eq!(pushed(&mut boss).len(), 1, "the first cycle pushes stalled");
+    pushed(&mut worker);
+    /* the deadline has passed but no tick has run yet: the old watch row is still there */
+    register_watch(&mut hub, "ask-1", Some(10), None, t0 + 21).unwrap();
+    assert_eq!(
+        hub.asks["ask-1"].watch.as_ref().unwrap().sent,
+        "",
+        "a registration after the deadline inherits nothing"
+    );
+    advance_asks(&mut hub, t0 + 22);
+    let again = pushed(&mut boss);
+    assert_eq!(again.len(), 1, "{again:?}");
+    assert_eq!(again[0]["event"], "stalled");
+    assert_eq!(
+        pushed(&mut worker).len(),
+        1,
+        "the recipient is nudged again"
+    );
 }

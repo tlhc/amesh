@@ -220,6 +220,125 @@ fn mesh_primer_names_tools_and_peer_message() {
 }
 
 #[test]
+fn mesh_primer_documents_the_folded_watch() {
+    let text = mesh_primer("amesh-pi", "pi", "project-abc123def456");
+    assert!(text.contains(
+        "amesh_ask arms a watch by default (deadline 300 s; set deadline_seconds to the time you expect)"
+    ));
+    assert!(text.contains("Pass watch=false to block in amesh_wait or when you need no reply"));
+    assert!(text
+        .contains("amesh_watch re-arms a watch or registers one late, for example after a resume; without deadline_seconds it uses its own default of 1200 s"));
+    assert!(!text.contains("call amesh_watch(correlation_id) once"));
+    let claude = mesh_primer("x", "claude-code", "feat-a");
+    assert!(
+        claude.contains("Waiting for acks: end the turn; the pushed messages start your next turn")
+    );
+    assert!(!claude.contains("register the watch and end the turn"));
+}
+
+#[test]
+fn watch_flags_types_the_body_fields() {
+    let args: Vec<String> = ["--watch", "false", "--deadline-seconds", "30"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let parsed = Args::parse(&args, &["watch", "deadline-seconds"]).unwrap();
+    let mut body = json!({"to_peer": "peer"});
+    watch_flags(&parsed, &mut body).unwrap();
+    assert_eq!(body["watch"], json!(false));
+    assert_eq!(body["deadline_seconds"], json!(30));
+}
+
+#[test]
+fn watch_flags_rejects_bad_values() {
+    let bad_watch: Vec<String> = ["--watch", "maybe"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let parsed = Args::parse(&bad_watch, &["watch", "deadline-seconds"]).unwrap();
+    let mut body = json!({});
+    let error = watch_flags(&parsed, &mut body).unwrap_err().to_string();
+    assert!(error.contains("--watch requires true or false"), "{error}");
+
+    let bad_deadline: Vec<String> = ["--deadline-seconds", "12x"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let parsed = Args::parse(&bad_deadline, &["watch", "deadline-seconds"]).unwrap();
+    let mut body = json!({});
+    let error = watch_flags(&parsed, &mut body).unwrap_err().to_string();
+    assert!(
+        error.contains("--deadline-seconds requires an unsigned integer"),
+        "{error}"
+    );
+}
+
+#[test]
+fn jobs_create_forwards_the_watch_flags() {
+    let args: Vec<String> = [
+        "--watch",
+        "false",
+        "--deadline-seconds",
+        "30",
+        "--prompt",
+        "p",
+    ]
+    .iter()
+    .map(|arg| arg.to_string())
+    .collect();
+    let parsed =
+        Args::parse(&args, jobs_allowed("create").unwrap()).expect("jobs create takes the flags");
+    let mut body = json!({"title": "t"});
+    parsed.copy(&mut body);
+    body["depends_on"] = json!(Vec::<&str>::new());
+    watch_flags(&parsed, &mut body).unwrap();
+    assert_eq!(body["prompt"], json!("p"));
+    assert_eq!(body["watch"], json!(false));
+    assert_eq!(body["deadline_seconds"], json!(30));
+}
+
+#[test]
+fn jobs_update_forwards_the_watch_flags() {
+    let args: Vec<String> = ["--state", "queued", "--deadline-seconds", "30"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let parsed =
+        Args::parse(&args, jobs_allowed("update").unwrap()).expect("jobs update takes the flags");
+    let mut body = json!({});
+    parsed.copy(&mut body);
+    watch_flags(&parsed, &mut body).unwrap();
+    assert_eq!(body["state"], json!("queued"));
+    assert_eq!(body["deadline_seconds"], json!(30));
+}
+
+#[test]
+fn peer_ask_accepts_the_watch_flags() {
+    let args: Vec<String> = ["--watch", "true"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let parsed =
+        Args::parse(&args, peer_allowed("ask").unwrap()).expect("peer ask takes the flags");
+    let mut body = json!({});
+    watch_flags(&parsed, &mut body).unwrap();
+    assert_eq!(body["watch"], json!(true));
+}
+
+#[test]
+fn peer_notify_rejects_the_watch_flags() {
+    let args: Vec<String> = ["--watch", "true"]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    let error = Args::parse(&args, peer_allowed("notify").unwrap())
+        .map(|_| ())
+        .expect_err("peer notify rejects the watch flags")
+        .to_string();
+    assert!(error.contains("--watch"), "{error}");
+}
+
+#[test]
 fn enqueue_keeps_ask_and_ack_past_500() {
     let mut queued = VecDeque::new();
     let mut warned = false;

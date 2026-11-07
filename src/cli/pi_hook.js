@@ -436,16 +436,22 @@ export default function AmeshHooks(pi) {
     );
     tool(
       "ask",
-      "Open a tracked ask. Same-circle by default; set cross_circle for another circle.",
+      "Open a tracked ask; it arms a watch by default (deadline 300 s; set deadline_seconds to the time you expect, or watch=false to block in amesh_wait or when you need no reply). Same-circle by default; set cross_circle for another circle.",
       {
         peer_name: { type: "string" },
         query: { type: "string" },
         cross_circle: { type: "boolean" },
+        watch: { type: "boolean" },
+        deadline_seconds: { type: "integer" },
       },
       ["peer_name", "query"],
       (params) => {
         const args = ["peer", "ask", params.peer_name, params.query, ...FromPeer()];
         if (params.cross_circle) args.push("--cross-circle", "true");
+        if (params.watch !== undefined) args.push("--watch", String(params.watch));
+        if (params.deadline_seconds !== undefined) {
+          args.push("--deadline-seconds", String(params.deadline_seconds));
+        }
         return Cli(args);
       },
     );
@@ -482,13 +488,15 @@ export default function AmeshHooks(pi) {
       },
     );
     const extra = [
-      ["job_create", "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait or amesh_watch. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.", {
+      ["job_create", "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait or amesh_watch. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary. watch (default true) and deadline_seconds (default 1200) arm a watch for the coordinator at every dispatch.", {
         title: { type: "string" },
         prompt: { type: "string" },
         path: { type: "string" },
         backend: { type: "string", description: "optional runtime label; empty when not given, dispatch does not use it" },
         assigned_peer: { type: "string" },
         depends_on: { type: "array", items: { type: "string" } },
+        watch: { type: "boolean" },
+        deadline_seconds: { type: "integer" },
       }, []],
       ["job_list", "List jobs in your circle; cross_circle without circle lists all. Each job comes as a summary: job_id, title, state, assigned_peer, from_peer, ask_id, depends_on, circle, created_at, finished_at; detail=true returns whole jobs with prompt and result_summary; state (queued, running, done, failed or cancelled) lists only jobs in that state", {
         circle: { type: "string" },
@@ -497,7 +505,7 @@ export default function AmeshHooks(pi) {
         state: { type: "string" },
       }, []],
       ["job_status", "Show a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
-      ["job_update", "Update job state. Except for coordinator alone, state is required: queued, running, done, failed or cancelled; other values are rejected. Changing prompt or assigned_peer requires state=queued and re-dispatches the job. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were.", {
+      ["job_update", "Update job state. Except for coordinator alone, state is required: queued, running, done, failed or cancelled; other values are rejected. Changing prompt or assigned_peer requires state=queued and re-dispatches the job. state=queued re-sends the job (set assigned_peer to reassign, prompt to rewrite it), retires the old ask_id and dispatches the new attempt inside this call when its dependencies are done and an assignee in the job's circle is registered; the answer carries the new ask_id, or null until every dependency is done, when there is no assignee, or when the assignee is gone from the job's circle. Moving a running job to another state closes its open ask. coordinator alone, without state, hands the job to that peer: later acks of its open ask, its reminders and its next dispatch go there; closed results stay where they were. watch (default true) and deadline_seconds (default 1200) arm a watch for the coordinator at every dispatch.", {
         job_id: { type: "string" },
         state: { type: "string" },
         result_summary: { type: "string" },
@@ -505,6 +513,8 @@ export default function AmeshHooks(pi) {
         prompt: { type: "string" },
         coordinator: { type: "string" },
         cross_circle: { type: "boolean" },
+        watch: { type: "boolean" },
+        deadline_seconds: { type: "integer" },
       }, ["job_id"]],
       ["job_cancel", "Cancel a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
       ["job_delete", "Delete a job", { job_id: { type: "string" }, cross_circle: { type: "boolean" } }, ["job_id"]],
@@ -523,10 +533,12 @@ export default function AmeshHooks(pi) {
         cross_circle: { type: "boolean" },
       }, []],
       ["schedule_delete", "Delete a schedule", { schedule_id: { type: "string" } }, ["schedule_id"]],
-      ["ask_many", "Ask many peers", {
+      ["ask_many", "Ask many peers; each ask arms a watch by default (watch and deadline_seconds as in amesh_ask).", {
         to_peers: { type: "array", items: { type: "string" } },
         text: { type: "string" },
         cross_circle: { type: "boolean" },
+        watch: { type: "boolean" },
+        deadline_seconds: { type: "integer" },
       }, ["to_peers", "text"]],
       ["wait", "Wait for an ask ack, blocking; amesh_watch is the default and returns at once. Call amesh_wait at most once per ask: when the result carries a hint, the ack is pushed to you as a peer-message, so end the turn. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.", {
         correlation_id: { type: "string" },
@@ -621,7 +633,7 @@ export default function AmeshHooks(pi) {
     );
     tool(
       "watch",
-      "Register pushes for an ask and return at once; only the asker can register it. The hub sends you a peer-message once each when the recipient sits idle without acking (it nudges the recipient once), goes offline, leaves the hub, or when deadline_seconds pass with the ask still open (default 1200, at most 86400; the deadline ends the watch). The ack itself is pushed anyway. Call it right after amesh_ask and end the turn; amesh_wait is the blocking alternative. Re-registering moves the deadline and never repeats an already-pushed event. An ask-many batch id is not an ask; watch its child correlation_ids.",
+      "Register pushes for an ask and return at once; only the asker can register it. The hub sends you a peer-message once each when the recipient sits idle without acking (it nudges the recipient once), goes offline, leaves the hub, or when deadline_seconds pass with the ask still open (default 1200, at most 86400; the deadline ends the watch). The ack itself is pushed anyway. amesh_ask and job_create arm it by default; call this to re-arm or to register late, then end the turn; amesh_wait is the blocking alternative. Re-registering while the watch is alive moves the deadline and never repeats an already-pushed event; after the deadline a new registration starts a fresh cycle. An ask-many batch id is not an ask; watch its child correlation_ids.",
       {
         correlation_id: { type: "string" },
         deadline_seconds: { type: "integer" },

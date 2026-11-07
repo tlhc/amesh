@@ -4313,3 +4313,291 @@ async fn job_update_accepts_a_coordinator_without_state() {
     assert_eq!(body["from_peer"], "deputy");
     assert_eq!(f.row(&id).await.from_peer, "deputy");
 }
+
+#[tokio::test]
+async fn a_job_watch_is_armed_before_its_ask_is_delivered() {
+    let f = team("c", &["boss", "worker"]).await;
+    f.0.inner
+        .lock()
+        .await
+        .peers
+        .get_mut("worker")
+        .unwrap()
+        .status = "offline".into();
+    let id = f
+        .job(json!({"from_peer": "boss", "assigned_peer": "worker"}))
+        .await;
+    let cid = f.ask_id(&id).await;
+    let ask = f.ask(&cid).await;
+    let watch = ask
+        .watch
+        .expect("a dispatched job arms its watch by default");
+    assert_eq!(
+        watch.sent, "offline",
+        "the initial recipient state is seeded"
+    );
+    assert_eq!(watch.until, ask.opened_at.unwrap() + WATCH_DEFAULT_SECS);
+    let reopened = Hub::open(&f.0.state_path).unwrap();
+    assert_eq!(reopened.asks[&cid].watch.as_ref(), Some(&watch));
+    assert_eq!(f.inbox("worker").await[0]["correlation_id"], cid);
+    let (_, status) = f.request("GET", &format!("/jobs/{id}"), json!({})).await;
+    assert_eq!(status["watch"], true);
+    assert_eq!(status["deadline_seconds"], Value::Null);
+    let (_, detail) = f
+        .tool(
+            "amesh_job_list",
+            json!({"from_peer": "boss", "detail": true}),
+        )
+        .await;
+    assert_eq!(detail[0]["watch"], true);
+}
+
+#[tokio::test]
+async fn a_job_watch_uses_and_caps_its_dispatch_deadline() {
+    let f = team("c", &["boss", "worker"]).await;
+    for seconds in [17, WATCH_MAX_SECS + 1, u64::MAX] {
+        let id = f
+            .job(json!({"from_peer": "boss", "assigned_peer": "worker",
+            "watch": false, "deadline_seconds": seconds}))
+            .await;
+        let ask = f.ask(&f.ask_id(&id).await).await;
+        let watch = ask.watch.expect("a deadline enables the job watch");
+        assert_eq!(
+            watch.until,
+            ask.opened_at.unwrap() + seconds.min(WATCH_MAX_SECS)
+        );
+        let row = serde_json::to_value(f.row(&id).await).unwrap();
+        assert_eq!(row["watch"], true);
+        assert_eq!(row["deadline_seconds"], seconds.min(WATCH_MAX_SECS));
+        let (status, row) = f
+            .set_state(
+                &id,
+                json!({"state": "queued", "watch": false, "deadline_seconds": seconds}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{row}");
+        assert_eq!(row["watch"], true);
+        assert_eq!(row["deadline_seconds"], seconds.min(WATCH_MAX_SECS));
+        let reopened = Hub::open(&f.0.state_path).unwrap();
+        assert_eq!(
+            reopened.jobs[&id].deadline_seconds,
+            Some(seconds.min(WATCH_MAX_SECS))
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_job_watch_can_be_disabled_at_creation() {
+    let f = team("c", &["boss", "worker"]).await;
+    let id = f
+        .job(json!({"from_peer": "boss", "assigned_peer": "worker", "watch": false}))
+        .await;
+    assert!(f.ask(&f.ask_id(&id).await).await.watch.is_none());
+    let row = serde_json::to_value(f.row(&id).await).unwrap();
+    assert_eq!(row["watch"], false, "the disabled watch policy is retained");
+}
+
+#[tokio::test]
+async fn a_job_watch_starts_fresh_when_the_job_is_requeued() {
+    let f = team("c", &["boss", "worker"]).await;
+    let id = f
+        .job(json!({"from_peer": "boss", "assigned_peer": "worker", "deadline_seconds": 37}))
+        .await;
+    let old = f.ask_id(&id).await;
+    {
+        let mut hub = f.0.inner.lock().await;
+        register_watch(&mut hub, &old, Some(37), Some("boss"), now_unix()).unwrap();
+        hub.asks.get_mut(&old).unwrap().watch.as_mut().unwrap().sent = "stalled".into();
+        persist(&mut hub).unwrap();
+    }
+    let (status, row) = f
+        .set_state(&id, json!({"state": "queued", "prompt": "try again"}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let new = row["ask_id"].as_str().unwrap();
+    assert_ne!(new, old);
+    let ask = f.ask(new).await;
+    let watch = ask.watch.expect("the requeued job arms a fresh watch");
+    assert_eq!(watch.until, ask.opened_at.unwrap() + 37);
+    assert!(watch.sent.is_empty());
+    let mut hub = f.0.inner.lock().await;
+    advance_asks(&mut hub, now_unix());
+    assert!(!hub.asks[&old].open);
+    assert!(hub.asks[&old].watch.is_none());
+}
+
+#[tokio::test]
+async fn a_job_watch_counts_from_its_delayed_dispatch() {
+    let f = team("c", &["boss", "worker"]).await;
+    let dependency = f.job(json!({"from_peer": "boss"})).await;
+    let id = f
+        .job(json!({"from_peer": "boss", "assigned_peer": "worker",
+        "depends_on": [dependency], "deadline_seconds": 23}))
+        .await;
+    assert!(f.row(&id).await.ask_id.is_none());
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.jobs.get_mut(&id).unwrap().created_at = Some(now_unix() - 3600);
+    }
+    assert_eq!(
+        f.set_state(&dependency, json!({"state": "done"})).await.0,
+        StatusCode::OK
+    );
+    f.advance().await;
+    let ask = f.ask(&f.ask_id(&id).await).await;
+    let watch = ask
+        .watch
+        .expect("the dependency tick arms the dispatched ask");
+    assert_eq!(watch.until, ask.opened_at.unwrap() + 23);
+    assert!(watch.until > now_unix());
+}
+
+#[tokio::test]
+async fn a_job_watch_waits_for_a_registered_coordinator() {
+    let f = team("c", &["worker"]).await;
+    let id = f.job(json!({"assigned_peer": "worker"})).await;
+    assert!(f.ask(&f.ask_id(&id).await).await.watch.is_none());
+    let row = serde_json::to_value(f.row(&id).await).unwrap();
+    assert_eq!(
+        row["watch"], true,
+        "an anonymous dispatch keeps its watch policy"
+    );
+}
+
+#[tokio::test]
+async fn a_job_watch_policy_survives_reload_and_old_rows_stay_unwatched() {
+    let state = TempState::new("job-watch-migration");
+    {
+        let db = Connection::open(&state).unwrap();
+        db.execute_batch(
+            "CREATE TABLE jobs (
+            job_id TEXT PRIMARY KEY, title TEXT NOT NULL, prompt TEXT NOT NULL,
+            path TEXT NOT NULL, backend TEXT NOT NULL, assigned_peer TEXT,
+            state TEXT NOT NULL, result_summary TEXT);
+            INSERT INTO jobs VALUES ('old', 'old', '', '', '', NULL, 'queued', NULL);",
+        )
+        .unwrap();
+    }
+    let f = Fixture::open(state.to_path_buf());
+    let old = serde_json::to_value(f.row("old").await).unwrap();
+    assert_eq!(old["watch"], false, "old job rows do not acquire watches");
+    assert_eq!(old["deadline_seconds"], Value::Null);
+    f.peer("boss", "c").await;
+    let id = f
+        .job(json!({"from_peer": "boss", "deadline_seconds": 41}))
+        .await;
+    let reopened = Hub::open(&state).unwrap();
+    let row = serde_json::to_value(&reopened.jobs[&id]).unwrap();
+    assert_eq!(row["watch"], true);
+    assert_eq!(row["deadline_seconds"], 41);
+    let stored = reopened
+        .db
+        .query_row(
+            "SELECT watch, watch_deadline FROM jobs WHERE job_id = ?",
+            [&id],
+            |r| Ok((r.get::<_, i32>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (1, 41));
+}
+
+#[tokio::test]
+async fn a_job_watch_policy_is_forwarded_by_mcp() {
+    let f = team("c", &["boss", "worker"]).await;
+    let (status, row) = f
+        .tool(
+            "amesh_job_create",
+            json!({"from_peer": "boss",
+        "assigned_peer": "worker", "watch": false}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(row["watch"], false, "MCP passes the disabled watch policy");
+    assert!(f.ask(row["ask_id"].as_str().unwrap()).await.watch.is_none());
+    let (status, row) = f
+        .tool(
+            "amesh_job_create",
+            json!({"from_peer": "boss",
+        "assigned_peer": "worker", "watch": false, "deadline_seconds": 19}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let ask = f.ask(row["ask_id"].as_str().unwrap()).await;
+    assert_eq!(ask.watch.unwrap().until, ask.opened_at.unwrap() + 19);
+    let (status, row) = f
+        .tool(
+            "amesh_job_update",
+            json!({"from_peer": "boss",
+        "job_id": row["job_id"], "state": "queued", "deadline_seconds": 29}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let ask = f.ask(row["ask_id"].as_str().unwrap()).await;
+    assert_eq!(ask.watch.unwrap().until, ask.opened_at.unwrap() + 29);
+}
+
+#[tokio::test]
+async fn a_job_watch_policy_changes_without_retroactively_arming_the_ask() {
+    let f = team("c", &["boss", "worker"]).await;
+    let id = f
+        .job(json!({"from_peer": "boss", "assigned_peer": "worker", "watch": false}))
+        .await;
+    let old = f.ask_id(&id).await;
+    let (status, row) = f
+        .set_state(&id, json!({"state": "running", "deadline_seconds": 31}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(
+        row["deadline_seconds"], 31,
+        "a running update saves the next dispatch policy"
+    );
+    assert_eq!(row["watch"], true);
+    assert!(f.ask(&old).await.watch.is_none());
+    let (status, row) = f.set_state(&id, json!({"state": "queued"})).await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    let ask = f.ask(row["ask_id"].as_str().unwrap()).await;
+    assert_eq!(ask.watch.unwrap().until, ask.opened_at.unwrap() + 31);
+    let (status, row) = f
+        .set_state(&id, json!({"state": "queued", "watch": false}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{row}");
+    assert_eq!(row["deadline_seconds"], 31);
+    assert!(!row["watch"].as_bool().unwrap());
+    assert!(f.ask(row["ask_id"].as_str().unwrap()).await.watch.is_none());
+}
+
+#[tokio::test]
+async fn a_job_watch_policy_cannot_be_mixed_with_a_coordinator_handoff() {
+    let f = team("c", &["boss", "worker", "deputy"]).await;
+    let id = f
+        .job(json!({"from_peer": "boss", "assigned_peer": "worker"}))
+        .await;
+    for extra in [json!({"watch": false}), json!({"deadline_seconds": 7})] {
+        let mut body = extra;
+        body["coordinator"] = json!("deputy");
+        let (status, result) = f.set_state(&id, body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "handoff must reject a watch policy: {result}"
+        );
+        assert_eq!(f.row(&id).await.from_peer, "boss");
+    }
+}
+
+#[test]
+fn a_job_watch_policy_is_declared_by_both_tools() {
+    let tools = mcp_tools();
+    for name in ["amesh_job_create", "amesh_job_update"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap();
+        let properties = &tool["inputSchema"]["properties"];
+        assert_eq!(
+            properties["watch"]["type"], "boolean",
+            "{name} declares watch"
+        );
+        assert_eq!(
+            properties["deadline_seconds"]["type"], "integer",
+            "{name} declares deadline_seconds"
+        );
+    }
+}

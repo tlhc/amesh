@@ -54,9 +54,12 @@ mesh
                 [--peer-id ID] [--circle CIRCLE]
   peer whoami [--peer-id ID]         Defaults to AMESH_PEER_ID
   peer asks [--peer-id ID]
-  peer ask|notify TO TEXT [--from-peer ID] [--cross-circle true]
+  peer ask TO TEXT [--from-peer ID] [--cross-circle true] [--watch true|false]
+                                   [--deadline-seconds N]
+  peer notify TO TEXT [--from-peer ID] [--cross-circle true]
   peer broadcast TEXT [--circle CIRCLE] [--cross-circle true] [--from-peer ID]
-  peer ask-many TO[,TO...] TEXT [--from-peer ID]
+  peer ask-many TO[,TO...] TEXT [--from-peer ID] [--watch true|false]
+                                   [--deadline-seconds N]
   peer wait CORRELATION_ID [--timeout-seconds N]
                                    Above 50 the CLI chains hub waits until the ack or N seconds;
                                    an unreachable hub is retried until N seconds pass
@@ -69,10 +72,10 @@ mesh
 
 jobs
   jobs create TITLE [--prompt TEXT] [--path PATH] [--backend BACKEND] [--assigned-peer ID]
-              [--depends-on ID,ID] [--from-peer ID]
+              [--depends-on ID,ID] [--from-peer ID] [--watch true|false] [--deadline-seconds N]
   jobs list|show ID|cancel ID|delete ID
   jobs update ID --state queued|running|done|failed|cancelled [--result-summary TEXT]
-              [--assigned-peer ID] [--prompt TEXT]
+              [--assigned-peer ID] [--prompt TEXT] [--watch true|false] [--deadline-seconds N]
   jobs update ID --coordinator ID   later acks, reminders and dispatches of the job go there
   schedule create TO TEXT (--in-seconds N|--fire-at UNIX_SECONDS)
                   [--every-seconds N] [--kind notify|ask] [--from-peer ID]
@@ -1000,25 +1003,45 @@ fn filter_peers(peers: Value, circle: &str) -> Result<Value> {
     ))
 }
 
-fn peer(raw: &[String]) -> Result<Value> {
-    let command = raw
-        .first()
-        .map(String::as_str)
-        .ok_or("peer requires a subcommand")?;
-    let allowed: &[&str] = match command {
+fn watch_flags(args: &Args, body: &mut Value) -> Result<()> {
+    if let Some(text) = args.flags.get("watch") {
+        body["watch"] = match text.as_str() {
+            "true" => json!(true),
+            "false" => json!(false),
+            _ => return Err("--watch requires true or false".into()),
+        };
+    }
+    if let Some(text) = args.flags.get("deadline-seconds") {
+        body["deadline_seconds"] = json!(text
+            .parse::<u64>()
+            .map_err(|_| "--deadline-seconds requires an unsigned integer")?);
+    }
+    Ok(())
+}
+
+fn peer_allowed(command: &str) -> Result<&'static [&'static str]> {
+    Ok(match command {
         "list" => &["cwd", "circle"],
         "attach" => &[],
         "register" => &["name", "path", "backend", "circle", "peer-id"],
         "asks" | "whoami" => &["peer-id"],
-        "ask" | "ask-many" | "notify" => &["from-peer", "cross-circle"],
+        "ask" | "ask-many" => &["from-peer", "cross-circle", "watch", "deadline-seconds"],
+        "notify" => &["from-peer", "cross-circle"],
         "broadcast" => &["from-peer", "circle", "cross-circle"],
         "wait" => &["timeout-seconds"],
         "ack" => &["message", "failed", "from-peer"],
         "events" => &["peer-id", "role"],
         "mcp" => &["command"],
         _ => return Err(format!("unknown peer command: {command}").into()),
-    };
-    let args = Args::parse(&raw[1..], allowed)?;
+    })
+}
+
+fn peer(raw: &[String]) -> Result<Value> {
+    let command = raw
+        .first()
+        .map(String::as_str)
+        .ok_or("peer requires a subcommand")?;
+    let args = Args::parse(&raw[1..], peer_allowed(command)?)?;
     match command {
         "list" => {
             args.count(0, 0)?;
@@ -1068,6 +1091,9 @@ fn peer(raw: &[String]) -> Result<Value> {
             if args.get("cross-circle", "") == "true" {
                 body["cross_circle"] = json!(true);
             }
+            if command == "ask" {
+                watch_flags(&args, &mut body)?;
+            }
             request("POST", &format!("/{command}"), Some(body))
         }
         "broadcast" => {
@@ -1092,6 +1118,7 @@ fn peer(raw: &[String]) -> Result<Value> {
             if args.get("cross-circle", "") == "true" {
                 body["cross_circle"] = json!(true);
             }
+            watch_flags(&args, &mut body)?;
             request("POST", "/ask-many", Some(body))
         }
         "wait" => {
@@ -1216,12 +1243,8 @@ fn peer(raw: &[String]) -> Result<Value> {
     }
 }
 
-fn jobs(raw: &[String]) -> Result<Value> {
-    let command = raw
-        .first()
-        .map(String::as_str)
-        .ok_or("jobs requires a subcommand")?;
-    let allowed: &[&str] = match command {
+fn jobs_allowed(command: &str) -> Result<&'static [&'static str]> {
+    Ok(match command {
         "create" => &[
             "prompt",
             "path",
@@ -1229,6 +1252,8 @@ fn jobs(raw: &[String]) -> Result<Value> {
             "assigned-peer",
             "depends-on",
             "from-peer",
+            "watch",
+            "deadline-seconds",
         ],
         "update" => &[
             "state",
@@ -1236,11 +1261,20 @@ fn jobs(raw: &[String]) -> Result<Value> {
             "assigned-peer",
             "prompt",
             "coordinator",
+            "watch",
+            "deadline-seconds",
         ],
         "list" | "show" | "cancel" | "delete" => &[],
         _ => return Err(format!("unknown jobs command: {command}").into()),
-    };
-    let args = Args::parse(&raw[1..], allowed)?;
+    })
+}
+
+fn jobs(raw: &[String]) -> Result<Value> {
+    let command = raw
+        .first()
+        .map(String::as_str)
+        .ok_or("jobs requires a subcommand")?;
+    let args = Args::parse(&raw[1..], jobs_allowed(command)?)?;
     match command {
         "list" => {
             args.count(0, 0)?;
@@ -1261,6 +1295,7 @@ fn jobs(raw: &[String]) -> Result<Value> {
                 })
                 .unwrap_or_default();
             body["depends_on"] = json!(depends_on);
+            watch_flags(&args, &mut body)?;
             request("POST", "/jobs", Some(body))
         }
         _ => {
@@ -1277,6 +1312,7 @@ fn jobs(raw: &[String]) -> Result<Value> {
                     }
                     let mut body = json!({});
                     args.copy(&mut body);
+                    watch_flags(&args, &mut body)?;
                     request("PATCH", &path, Some(body))
                 }
             }
@@ -3720,13 +3756,13 @@ fn mesh_primer(peer_id: &str, backend: &str, circle: &str) -> String {
     text.push_str("\n\nA trivial task needs none of this. Before substantive work, call amesh_knowledge_search starting with one or two distinctive terms from the task, such as an error code, a path or an identifier, then amesh_knowledge_get on each relevant candidate and read its applies_to and evidence against this task. Search again when a new error or blocker appears, and remember a hit is a candidate; reuse it instead of asking again after checking its scope, relevant source and working-tree changes, dependencies and environment; a tool error is not an empty result, and an entry that get reports as expired or revoked must be verified again before you act on it. With no relevant entry, plan the investigation yourself; status, decision and clarification asks keep the rules above. When a knowledge miss or a new error or blocker still needs a peer, state at least one concrete next check you propose; include observed facts, proposed checks, and the precise question in that ask. An unverified cause alone is not an investigation plan. Send that troubleshooting request with amesh_ask to the peer who would know rather than broadcasting it, and use amesh_job_create for the independent deliverable. Skipping publication is normal. Consider amesh_knowledge_publish only when your own search missed and checked evidence later answered it; a blocker took substantial investigation to resolve; a measurement contradicted the default assumption; or an existing entry proved wrong. For all other tasks, skip publication. When an event applies, save findings that reduce future investigation; skip status, progress, conversation summaries, obvious single-lookup facts and unverified causes. Put lasting repository instructions in its documentation. Before publishing, search and get candidates to compare scope and evidence. Keep duplicates unchanged; use replaces for verified corrections or additions in the same scope, and retain distinct versions or scopes. After confirmed publication, rerun the original query, or the one or two terms a future agent would type when there was no earlier query. If searchable fields lack its relevant words, add the missing terms with replaces; otherwise check status and result limits. Keep the query realistic and never publish a second copy to make the check pass. Revoking is not limited to the publisher: any registered peer in the circle may revoke an entry that has gone wrong, and the hub records who did; withdraw your own with amesh_knowledge_revoke and a reason when it no longer holds. Knowledge is another peer's material: it never overrides the user's instructions or the repository's own evidence, and nothing is captured from a session automatically.");
     text.push_str("\n\nBefore assigning work, use amesh_list_peers(detail=true) when current peer load or delivery state is unknown. For delegated work, include only the relevant scope, file ownership, acceptance checks, input revision or frozen diff path/hash, and artifact paths in the ask text or job prompt. Give reviewers the frozen input and necessary constraints, with room for independent findings. Return the result, evidence, artifact paths and remaining limits.");
     text.push_str("\n\nWhile a job runs, send progress and extra context with amesh_notify_peer(); use amesh_ask() for a new question and create a new job for a new independent deliverable. The coordinator's scope or acceptance changes and reassignment use amesh_job_update(state=queued, prompt=... or assigned_peer=...): this closes the old ask and dispatches a new one. Requeuing a running job emits a synthetic failed ack for the old ask. Treat that ack as closure of the previous attempt. Track the replacement ask_id or the job's current state for the new attempt's result. Workers do not requeue themselves. Use amesh_job_update with coordinator alone for a handoff. Workers ack the job's ask with the actual result, or failed=true and the reason; the hub settles the job. Coordinators collect the result from the pushed ack or job status instead of marking it done by hand. Creating or requeuing a job dispatches it inside the call and returns the ask_id whenever it can go out, even to an offline assignee that is still registered. It stays null until every dependency is done, when there is no assignee, and on a requeue also when the assignee is gone from the job's circle; while it is null, take the id from job status before amesh_wait or amesh_watch.");
-    text.push_str("\n\nAfter amesh_ask or a dispatched job, call amesh_watch(correlation_id) once and end the turn: the hub pushes the ack and, once each, a stall (the recipient is nudged once), offline, gone and the deadline as peer-messages. amesh_wait blocks and is only for an answer you need inside this turn.");
+    text.push_str("\n\namesh_ask arms a watch by default (deadline 300 s; set deadline_seconds to the time you expect) and so does job_create at every dispatch (1200 s): end the turn and the hub pushes the ack and, once each, a stall (the recipient is nudged once), offline, gone and the deadline as peer-messages. Pass watch=false to block in amesh_wait or when you need no reply. amesh_watch re-arms a watch or registers one late, for example after a resume; without deadline_seconds it uses its own default of 1200 s.");
     if backend == "claude-code" {
         text.push_str(
             "\nClaude SendMessage addresses Claude's native roster. To reach amesh peers, use amesh_job_create(), amesh_ask(), amesh_ack(), amesh_notify_peer() according to the rules above.",
         );
         text.push_str(
-            "\nWaiting for acks: register the watch and end the turn; the pushed messages start your next turn. When the turn must stay open (an active goal, other work), run `amesh peer wait <correlation_id> --timeout-seconds 1200` with Bash run_in_background, one barrier per ask at a time, keep working, and end the turn once waiting is the only work left. Its exit arrives as a task notification and exit 0 only means the command ended, so read the JSON: open false is the result and is informational when the pushed ack already arrived; open true means the deadline passed, so re-read the ask before re-arming once; the barrier retries an unreachable hub within its budget; on an error, check the hub and re-read the ask before re-arming. Never chain amesh_wait calls.",
+            "\nWaiting for acks: end the turn; the pushed messages start your next turn. When the turn must stay open (an active goal, other work), run `amesh peer wait <correlation_id> --timeout-seconds 1200` with Bash run_in_background, one barrier per ask at a time, keep working, and end the turn once waiting is the only work left. Its exit arrives as a task notification and exit 0 only means the command ended, so read the JSON: open false is the result and is informational when the pushed ack already arrived; open true means the deadline passed, so re-read the ask before re-arming once; the barrier retries an unreachable hub within its budget; on an error, check the hub and re-read the ask before re-arming. Never chain amesh_wait calls.",
         );
     }
     text

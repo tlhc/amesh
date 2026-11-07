@@ -90,6 +90,8 @@ fn job() -> Job {
         finished_at: None,
         created_at: None,
         handoff: None,
+        watch: false,
+        deadline_seconds: None,
     }
 }
 #[test]
