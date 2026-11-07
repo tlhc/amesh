@@ -1617,6 +1617,11 @@ struct RpcReq {
 }
 
 pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+    /* taken before any startup work, so a file replaced while the hub starts is noticed */
+    #[cfg(unix)]
+    let mut binary = std::env::current_exe()
+        .ok()
+        .and_then(|path| Some((binary_identity(&path)?, path)));
     let bind: SocketAddr = std::env::var("AMESH_BIND")
         .unwrap_or_else(|_| "127.0.0.1:8378".into())
         .parse()
@@ -1693,6 +1698,13 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
             let mut hub = sched_app.inner.lock().await;
             advance_jobs(&mut hub);
             advance_asks(&mut hub, now_unix());
+            #[cfg(unix)]
+            if let Some((seen, path)) = &mut binary {
+                if let Some(now) = binary_identity(path).filter(|now| now != seen) {
+                    *seen = now;
+                    restart_on(path);
+                }
+            }
         }
     });
     let sweep_app = app.clone();
@@ -1705,6 +1717,36 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("amesh http://{bind} state {}", app.state_path.display());
     axum::serve(listener, router(app)).await?;
     Ok(())
+}
+
+/* the file at the path by device and inode: cargo install renames a new file over it and
+keeps the build's mtime, while a rewrite in place keeps the inode and goes unnoticed */
+#[cfg(unix)]
+fn binary_identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+}
+
+/* called by the tick while it holds the hub lock, so no handler is between a change and
+its persist; exec keeps the pid and closes the port and the state lock for the new image.
+A bare execv: execvp hands a file it cannot load to the shell, which then replaces the
+hub, and std's exec resets SIGPIPE for the whole process before it tries */
+#[cfg(unix)]
+fn restart_on(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    eprintln!("amesh: {} was replaced, restarting on it", path.display());
+    let error = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(program) => {
+            let args = [program.as_ptr(), c"serve".as_ptr(), std::ptr::null()];
+            unsafe { libc::execv(program.as_ptr(), args.as_ptr()) };
+            std::io::Error::last_os_error()
+        }
+        Err(error) => std::io::Error::new(std::io::ErrorKind::InvalidInput, error),
+    };
+    eprintln!(
+        "amesh: cannot restart on {}: {error}; serving on",
+        path.display()
+    );
 }
 
 fn router(app: App) -> Router {

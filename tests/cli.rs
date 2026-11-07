@@ -172,7 +172,11 @@ impl Sandbox {
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_amesh"));
+        self.command_for(Path::new(env!("CARGO_BIN_EXE_amesh")))
+    }
+
+    fn command_for(&self, program: &Path) -> Command {
+        let mut command = Command::new(program);
         isolate_session_env(&mut command, &self.root)
             .env("AMESH_BIND", &self.bind)
             .env("AMESH_TOKEN", "cli-test-token")
@@ -233,10 +237,14 @@ impl Sandbox {
         self.start_with(&[]);
     }
 
-    /* up once the port answers and this sandbox's own hub is the one listening there */
     fn start_with(&mut self, env: &[(&str, &str)]) {
+        self.start_from(Path::new(env!("CARGO_BIN_EXE_amesh")), env);
+    }
+
+    /* up once the port answers and this sandbox's own hub is the one listening there */
+    fn start_from(&mut self, program: &Path, env: &[(&str, &str)]) {
         let daemon = self.daemon.insert(
-            self.command()
+            self.command_for(program)
                 .arg("serve")
                 .envs(env.iter().copied())
                 .spawn()
@@ -3302,6 +3310,125 @@ fn installed_hooks_execute_against_the_daemon() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert!(String::from_utf8_lossy(&result.stdout).contains("passed against the daemon"));
+}
+
+/* a copy of the hub inside the sandbox, so replacing it touches no other test */
+fn sandbox_binary(sandbox: &Sandbox) -> PathBuf {
+    let binary = sandbox.root.join("bin/amesh");
+    fs::create_dir(binary.parent().unwrap()).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_amesh"), &binary).unwrap();
+    binary
+}
+
+/* renamed over the path the way cargo install does it; the new file notes its arguments,
+then runs the real hub */
+fn replace_with_noting_hub(binary: &Path, marker: &Path) {
+    let staged = binary.with_extension("new");
+    fs::write(
+        &staged,
+        format!(
+            "#!/bin/sh\necho \"$@\" > '{}'\nexec '{}' \"$@\"\n",
+            marker.display(),
+            env!("CARGO_BIN_EXE_amesh")
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    fs::rename(&staged, binary).unwrap();
+}
+
+fn wait_for_restart(sandbox: &Sandbox, marker: &Path, pid: &str) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !(marker.exists() && listen_pids(&sandbox.bind).iter().any(|held| held == pid)) {
+        assert!(
+            Instant::now() < deadline,
+            "the hub did not restart on its replaced binary: marker {}, listeners {:?}",
+            marker.exists(),
+            listen_pids(&sandbox.bind)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(fs::read_to_string(marker).unwrap().trim(), "serve");
+}
+
+#[test]
+fn hub_restarts_in_place_when_its_binary_is_replaced() {
+    let mut sandbox = Sandbox::new();
+    let binary = sandbox_binary(&sandbox);
+    sandbox.start_from(&binary, &[]);
+    let job = sandbox.json(&["jobs", "create", "kept across the restart"], None);
+    let title = |sandbox: &Sandbox| {
+        sandbox.json(&["jobs", "show", job["job_id"].as_str().unwrap()], None)["title"].clone()
+    };
+    let alive = |sandbox: &mut Sandbox| {
+        sandbox
+            .daemon
+            .as_mut()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .is_none()
+    };
+    let pid = sandbox.daemon.as_ref().unwrap().id().to_string();
+    let (lines, log) = std::sync::mpsc::channel();
+    let stderr = sandbox.daemon.as_mut().unwrap().stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            let _ = lines.send(line);
+        }
+    });
+    /* files that cannot run, renamed over the path: one the hub may not execute and one it
+    may but cannot load; each is tried once and the hub serves on */
+    for mode in [0o644, 0o755] {
+        let staged = binary.with_extension("new");
+        fs::write(&staged, "not a program\n").unwrap();
+        fs::set_permissions(&staged, std::os::unix::fs::PermissionsExt::from_mode(mode)).unwrap();
+        fs::rename(&staged, &binary).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let line = log
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|error| {
+                    panic!("mode {mode:o}: no failed restart reported: {error}")
+                });
+            if line.contains("cannot restart") {
+                break;
+            }
+        }
+        let quiet = Instant::now() + Duration::from_millis(1500);
+        while let Ok(line) = log.recv_timeout(quiet.saturating_duration_since(Instant::now())) {
+            assert!(
+                !line.contains("was replaced"),
+                "mode {mode:o}: a broken file is tried once: {line}"
+            );
+        }
+        assert!(
+            alive(&mut sandbox),
+            "mode {mode:o}: a failed restart keeps the hub serving"
+        );
+        assert_eq!(title(&sandbox), "kept across the restart");
+    }
+    let marker = sandbox.root.join("restarted-with");
+    replace_with_noting_hub(&binary, &marker);
+    wait_for_restart(&sandbox, &marker, &pid);
+    assert!(alive(&mut sandbox), "the restart keeps the process");
+    assert_eq!(title(&sandbox), "kept across the restart");
+}
+
+#[test]
+fn hub_notices_a_replacement_while_it_starts() {
+    let mut sandbox = Sandbox::new();
+    let binary = sandbox_binary(&sandbox);
+    /* an exclusive hold on the state database stalls startup once the port is bound, for
+    up to the hub's busy timeout of 5 s */
+    let db = rusqlite::Connection::open(sandbox.root.join("state.db")).unwrap();
+    db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    sandbox.start_from(&binary, &[]);
+    let pid = sandbox.daemon.as_ref().unwrap().id().to_string();
+    let marker = sandbox.root.join("restarted-with");
+    replace_with_noting_hub(&binary, &marker);
+    drop(db);
+    wait_for_restart(&sandbox, &marker, &pid);
 }
 
 #[test]
