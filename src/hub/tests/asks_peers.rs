@@ -578,6 +578,7 @@ async fn a_reply_to_a_departed_peer_leaves_no_permanent_queue() {
             closed_by: None,
             from_circle: String::new(),
             to_circle: String::new(),
+            watch: None,
         },
     );
     persist(&mut hub).unwrap();

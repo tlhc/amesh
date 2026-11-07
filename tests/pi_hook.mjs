@@ -112,6 +112,7 @@ assert.deepEqual(registrationOrder.slice(18), [
   "amesh_knowledge_get",
   "amesh_knowledge_revoke",
   "amesh_knowledge_delete",
+  "amesh_watch",
 ]);
 assert.deepEqual(tools.sort(), [
   "amesh_ack",
@@ -136,6 +137,7 @@ assert.deepEqual(tools.sort(), [
   "amesh_schedule_delete",
   "amesh_schedule_list",
   "amesh_wait",
+  "amesh_watch",
   "amesh_whoami",
 ]);
 assert.equal(schemas.amesh_ask.properties.query.type, "string");

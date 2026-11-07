@@ -1227,6 +1227,7 @@ fn abandoned_hub(path: &Path) -> Hub {
             closed_by: None,
             from_circle: String::new(),
             to_circle: String::new(),
+            watch: None,
         },
     );
     persist_then_deliver(

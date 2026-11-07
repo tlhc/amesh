@@ -22,6 +22,7 @@ mod persistence_time;
 mod read_model;
 mod state_file;
 mod sweep;
+mod watch;
 
 /* config.toml and attachments sit next to the state file, so each hub gets its own
 directory, removed with everything in it once the test lets go */

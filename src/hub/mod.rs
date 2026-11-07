@@ -122,6 +122,18 @@ struct Ask {
     Left out of JSON while unset, so an open ask handed to a runtime carries no noise */
     #[serde(default, skip_serializing_if = "Option::is_none")]
     closed_by: Option<String>,
+    /* the asker's registration: each state change is pushed once and the watch ends at until.
+    Hub bookkeeping, kept out of every JSON form of the ask */
+    #[serde(default, skip_serializing)]
+    watch: Option<Watch>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct Watch {
+    until: u64,
+    /* events already pushed, space separated */
+    #[serde(default)]
+    sent: String,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -314,7 +326,9 @@ CREATE TABLE IF NOT EXISTS asks (
   opened_at INTEGER,
   closed_by TEXT,
   from_circle TEXT NOT NULL DEFAULT '',
-  to_circle TEXT NOT NULL DEFAULT ''
+  to_circle TEXT NOT NULL DEFAULT '',
+  watch_until INTEGER,
+  watch_sent TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
   job_id TEXT PRIMARY KEY,
@@ -452,6 +466,8 @@ fn open_db(path: &Path, now: u64) -> Result<Connection, String> {
         "ALTER TABLE asks ADD COLUMN to_circle TEXT NOT NULL DEFAULT ''",
         "ALTER TABLE jobs ADD COLUMN created_at INTEGER",
         "ALTER TABLE jobs ADD COLUMN handoff TEXT",
+        "ALTER TABLE asks ADD COLUMN watch_until INTEGER",
+        "ALTER TABLE asks ADD COLUMN watch_sent TEXT",
     ] {
         let _ = db.execute(column, []);
     }
@@ -568,8 +584,8 @@ fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
     }
     for a in disk.asks.values() {
         tx.prepare_cached(
-            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(correlation_id) DO UPDATE SET (from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) = (excluded.from_peer,excluded.to_peer,excluded.to_peer_id,excluded.text,excluded.open,excluded.reply,excluded.failed,excluded.closed_at,excluded.opened_at,excluded.closed_by,excluded.from_circle,excluded.to_circle) WHERE (from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle) IS NOT (excluded.from_peer,excluded.to_peer,excluded.to_peer_id,excluded.text,excluded.open,excluded.reply,excluded.failed,excluded.closed_at,excluded.opened_at,excluded.closed_by,excluded.from_circle,excluded.to_circle)",
-        ).map_err(|e| e.to_string())?.execute(params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64), a.opened_at.map(|v| v as i64), a.closed_by, a.from_circle, a.to_circle],
+            "INSERT INTO asks(correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle,watch_until,watch_sent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(correlation_id) DO UPDATE SET (from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle,watch_until,watch_sent) = (excluded.from_peer,excluded.to_peer,excluded.to_peer_id,excluded.text,excluded.open,excluded.reply,excluded.failed,excluded.closed_at,excluded.opened_at,excluded.closed_by,excluded.from_circle,excluded.to_circle,excluded.watch_until,excluded.watch_sent) WHERE (from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle,watch_until,watch_sent) IS NOT (excluded.from_peer,excluded.to_peer,excluded.to_peer_id,excluded.text,excluded.open,excluded.reply,excluded.failed,excluded.closed_at,excluded.opened_at,excluded.closed_by,excluded.from_circle,excluded.to_circle,excluded.watch_until,excluded.watch_sent)",
+        ).map_err(|e| e.to_string())?.execute(params![a.correlation_id, a.from_peer, a.to_peer, a.to_peer_id, a.text, a.open as i32, a.reply, a.failed as i32, a.closed_at.map(|v| v as i64), a.opened_at.map(|v| v as i64), a.closed_by, a.from_circle, a.to_circle, a.watch.as_ref().map(|w| w.until as i64), a.watch.as_ref().map(|w| w.sent.as_str())],
         )
         .map_err(|e| e.to_string())?;
     }
@@ -720,7 +736,7 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
     }
     let mut stmt = db
         .prepare(
-            "SELECT correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle FROM asks",
+            "SELECT correlation_id,from_peer,to_peer,to_peer_id,text,open,reply,failed,closed_at,opened_at,closed_by,from_circle,to_circle,watch_until,watch_sent FROM asks",
         )
         .map_err(|e| e.to_string())?;
     let rows = stmt
@@ -745,6 +761,16 @@ fn read_snapshot(db: &Connection) -> Result<DiskState, String> {
                     .unwrap_or_default()
                     .map(|v| v.max(0) as u64),
                 closed_by: r.get::<_, Option<String>>(10).unwrap_or_default(),
+                watch: r
+                    .get::<_, Option<i64>>(13)
+                    .unwrap_or_default()
+                    .map(|until| Watch {
+                        until: until.max(0) as u64,
+                        sent: r
+                            .get::<_, Option<String>>(14)
+                            .unwrap_or_default()
+                            .unwrap_or_default(),
+                    }),
             })
         })
         .map_err(|e| e.to_string())?;
@@ -1637,7 +1663,9 @@ pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             tick_schedules(&sched_app).await;
-            advance_jobs(&mut *sched_app.inner.lock().await);
+            let mut hub = sched_app.inner.lock().await;
+            advance_jobs(&mut hub);
+            advance_asks(&mut hub, now_unix());
         }
     });
     let sweep_app = app.clone();
@@ -1679,6 +1707,7 @@ fn router(app: App) -> Router {
         .route("/ask-many", post(ask_many))
         .route("/ask-many/{id}", get(ask_many_result))
         .route("/asks/{id}/wait", post(wait_ask))
+        .route("/asks/{id}/watch", post(watch_ask))
         .route("/questions/ask-blocking", post(ask_blocking))
         .route("/answer", post(ack_ask))
         .route("/attachments", post(upload_attachment))
@@ -2327,6 +2356,7 @@ async fn open_ask(
         closed_at: None,
         opened_at: Some(now_unix()),
         closed_by: None,
+        watch: None,
     };
     hub.asks.insert(cid.clone(), ask.clone());
     let mut event = json!({
@@ -2597,6 +2627,12 @@ struct WaitReq {
 }
 
 #[derive(Deserialize)]
+struct WatchReq {
+    #[serde(default)]
+    deadline_seconds: Option<u64>,
+}
+
+#[derive(Deserialize)]
 struct ChatReq {
     #[serde(default)]
     peer: String,
@@ -2803,6 +2839,9 @@ async fn ask_many_result(
 
 pub(crate) const WAIT_MAX_SECS: u64 = 50;
 const WAIT_DEFAULT_SECS: u64 = 45;
+/* a watch registered without deadline_seconds ends after this long */
+const WATCH_DEFAULT_SECS: u64 = 1200;
+const WATCH_MAX_SECS: u64 = 86400;
 /* Codex runs MCP calls inside an exec cell; a wait that outlasts the cell's yield is
 parked, and each later poll of the cell is one more model call. The yield is a Codex
 setting, so only the omitted default stays short and an explicit value stands */
@@ -2811,7 +2850,7 @@ const CODEX_WAIT_SECS: u64 = 8;
 hub sees its link to the drainer, not the drainer's hand-off to the model, so the hint
 states an expectation and asks for one call per ask */
 const WAIT_OPEN_HINT: &str =
-    "still open; the ack is pushed to you as a peer-message, so call amesh_wait at most once per ask and end the turn";
+    "still open; the ack and amesh_watch events reach you as a peer-message, so call amesh_wait at most once per ask and end the turn";
 
 fn wait_default_secs(backend: Option<&str>) -> u64 {
     if backend == Some("codex") {
@@ -2945,6 +2984,179 @@ async fn wait_ask(
         ask: &captured.ask,
         derived: &captured.derived
     })))
+}
+
+fn register_watch(
+    hub: &mut Hub,
+    id: &str,
+    deadline_secs: Option<u64>,
+    caller: Option<&str>,
+    now: u64,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let ask = hub
+        .asks
+        .get(id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(json!({"error": "unknown ask"}))))?;
+    if !ask.open {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "ask is closed"})),
+        ));
+    }
+    let asker = resolve(hub, &ask.from_peer).map(|peer| peer.peer_id.clone());
+    /* a push needs a registered asker to land on; refusing here beats dropping it later */
+    if asker.is_none() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({"error": "the asker is not a registered peer"})),
+        ));
+    }
+    /* the pushes go to the asker whoever registers, so a named caller must be the asker;
+    the bare HTTP path names nobody and stays the operator's */
+    if let Some(caller) = caller.filter(|caller| !caller.is_empty()) {
+        if resolve(hub, caller).map(|peer| peer.peer_id.clone()) != asker {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "only the asker can register the watch"})),
+            ));
+        }
+    }
+    let until = now.saturating_add(
+        deadline_secs
+            .unwrap_or(WATCH_DEFAULT_SECS)
+            .min(WATCH_MAX_SECS),
+    );
+    if let Some(ask) = hub.asks.get_mut(id) {
+        /* re-arming moves the deadline and keeps what was already pushed */
+        let sent = ask.watch.take().map(|watch| watch.sent).unwrap_or_default();
+        ask.watch = Some(Watch { until, sent });
+    }
+    persist_ok(hub)?;
+    Ok(json!({"ok": true, "correlation_id": id, "watch_until": until}))
+}
+
+async fn watch_ask(
+    State(app): State<App>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<WatchReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    register_watch(&mut hub, &id, req.deadline_seconds, None, now_unix()).map(Json)
+}
+
+/* Watched asks move here, once a second. Each actionable state of an open ask reaches its
+asker once: idle without an ack (the recipient is nudged once as well), offline, gone, and
+the deadline, which also ends the watch. A closed ask takes its watch with it. */
+fn advance_asks(hub: &mut Hub, now: u64) {
+    use crate::wire::{IdleWhy, Progress};
+    let mut ids: Vec<String> = hub
+        .asks
+        .values()
+        .filter(|ask| ask.watch.is_some())
+        .map(|ask| ask.correlation_id.clone())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    ids.sort();
+    let mut events = Vec::new();
+    let mut changed = false;
+    for id in &ids {
+        let ask = &hub.asks[id];
+        let Some(watch) = ask.watch.clone() else {
+            continue;
+        };
+        if !ask.open {
+            if let Some(ask) = hub.asks.get_mut(id) {
+                ask.watch = None;
+            }
+            changed = true;
+            continue;
+        }
+        /* an asker without a row cannot be addressed: its events wait for its return */
+        if resolve(hub, &ask.from_peer).is_none() {
+            continue;
+        }
+        let (from, to) = (ask.from_peer.clone(), ask.to_peer_id.clone());
+        let state = match derive::progress(hub, Some(&to), Some(ask), now) {
+            Progress::Idle { why, .. } => {
+                let why = match why {
+                    IdleWhy::NotPickedUp => "was idle before the ask and has not picked it up",
+                    IdleWhy::AskStillOpen => "went idle with the ask still open",
+                    _ => "ended its turn with the ask still open",
+                };
+                Some((
+                    "stalled",
+                    format!("{to} {why}; nudged once, the ack can still arrive"),
+                ))
+            }
+            Progress::Offline => Some(("offline", format!("{to} is offline"))),
+            Progress::Gone => Some((
+                "gone",
+                format!("{to} left the hub; its backlog is kept for its session"),
+            )),
+            _ => None,
+        };
+        let mut sent = watch.sent.clone();
+        let mut due: Vec<(&str, String)> = state
+            .into_iter()
+            .filter(|(event, _)| !sent.split(' ').any(|name| name == *event))
+            .collect();
+        if now >= watch.until {
+            due.push((
+                "deadline",
+                "the deadline passed with the ask still open; the watch ended".to_string(),
+            ));
+        }
+        if due.is_empty() {
+            continue;
+        }
+        for (event, detail) in &due {
+            events.push(json!({
+                "type": "notify",
+                "from_peer": "amesh",
+                "to_peer": from,
+                "topic": id,
+                "correlation_id": id,
+                "event": event,
+                "message": format!("ask {id} to {to} {event}: {detail}"),
+            }));
+            if *event == "stalled" {
+                events.push(json!({
+                    "type": "notify",
+                    "from_peer": "amesh",
+                    "to_peer": to,
+                    "topic": id,
+                    "correlation_id": id,
+                    "message": format!(
+                        "ask {id} from {from} is still open: ack it with amesh_ack(correlation_id={id}) when done, or failed=true with the reason"
+                    ),
+                }));
+            }
+            if !sent.is_empty() {
+                sent.push(' ');
+            }
+            sent.push_str(event);
+        }
+        if let Some(ask) = hub.asks.get_mut(id) {
+            ask.watch = (now < watch.until).then_some(Watch {
+                until: watch.until,
+                sent,
+            });
+        }
+        changed = true;
+    }
+    if !changed {
+        return;
+    }
+    let queued = queue_replies(hub, events, now);
+    if let Err((_, Json(error))) = persist_ok(hub) {
+        eprintln!("amesh: could not persist asks: {error}");
+        return;
+    }
+    deliver_queued(hub, queued);
 }
 
 async fn ask_blocking(
@@ -4430,6 +4642,7 @@ fn dispatch_job(hub: &mut Hub, id: &str, now: u64, events: &mut Vec<Value>) -> O
             closed_at: None,
             opened_at: Some(now_unix()),
             closed_by: None,
+            watch: None,
         },
     );
     events.push(json!({
@@ -4682,6 +4895,7 @@ async fn tick_schedules(app: &App) {
                 closed_at: None,
                 opened_at: Some(now_unix()),
                 closed_by: None,
+                watch: None,
             };
             hub.asks.insert(cid.clone(), ask.clone());
             (
@@ -4978,7 +5192,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.",
+                "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait or amesh_watch. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.",
                 json!({
                     "title": {"type": "string"},
                     "prompt": {"type": "string"},
@@ -5106,7 +5320,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
         },
         {
             let mut t = obj(
-                "Wait for an ask ack. Call it at most once per ask: when the result carries a hint, the ack is pushed to you as a peer-message, so end the turn. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.",
+                "Wait for an ask ack, blocking; amesh_watch is the default and returns at once. Call amesh_wait at most once per ask: when the result carries a hint, the ack is pushed to you as a peer-message, so end the turn. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.",
                 json!({
                     "correlation_id": {"type": "string"},
                     "timeout_seconds": {"type": "integer"}
@@ -5181,6 +5395,18 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                 &["id"],
             );
             t["name"] = json!("amesh_knowledge_delete");
+            t
+        },
+        {
+            let mut t = obj(
+                "Register pushes for an ask and return at once; only the asker can register it. The hub sends you a peer-message once each when the recipient sits idle without acking (it nudges the recipient once), goes offline, leaves the hub, or when deadline_seconds pass with the ask still open (default 1200, at most 86400; the deadline ends the watch). The ack itself is pushed anyway. Call it right after amesh_ask and end the turn; amesh_wait is the blocking alternative. Re-registering moves the deadline and never repeats an already-pushed event. An ask-many batch id is not an ask; watch its child correlation_ids.",
+                json!({
+                    "correlation_id": {"type": "string"},
+                    "deadline_seconds": {"type": "integer"}
+                }),
+                &["correlation_id"],
+            );
+            t["name"] = json!("amesh_watch");
             t
         },
     ]
@@ -5610,6 +5836,22 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             )
             .await?;
             wait_summary(&captured, timeout).to_string()
+        }
+        "amesh_watch" => {
+            let id = args
+                .get("correlation_id")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let deadline = args.get("deadline_seconds").and_then(Value::as_u64);
+            let mut hub = app.inner.lock().await;
+            register_watch(
+                &mut hub,
+                id,
+                deadline,
+                args.get("from_peer").and_then(Value::as_str),
+                now_unix(),
+            )?
+            .to_string()
         }
         "amesh_events" => {
             let mut q = HashMap::new();

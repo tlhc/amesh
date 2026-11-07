@@ -68,6 +68,7 @@ fn ask() -> Ask {
         closed_by: None,
         from_circle: String::new(),
         to_circle: String::new(),
+        watch: None,
     }
 }
 fn job() -> Job {

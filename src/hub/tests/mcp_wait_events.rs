@@ -34,7 +34,7 @@ async fn mcp_wait_reports_the_answer_without_the_question() {
     );
     let hint = open["hint"].as_str().unwrap_or("");
     assert!(
-        hint.contains("peer-message") && hint.contains("at most once"),
+        hint.contains("peer-message") && hint.contains("at most once") && hint.contains("amesh_watch"),
         "an open wait must tell a connected asker the ack is pushed and the wait is called once: {open}"
     );
     let mut legacy = open.clone();
@@ -202,6 +202,10 @@ async fn mcp_wait_defaults_to_the_codex_exec_budget() {
             && description.contains("when the result carries a hint")
             && description.contains("pushed to you as a peer-message"),
         "the push is expected under the hint and the wait is called once: {description}"
+    );
+    assert!(
+        description.contains("amesh_watch"),
+        "the wait must name the registration that is the default: {description}"
     );
 }
 

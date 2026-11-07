@@ -253,6 +253,7 @@ async fn legacy_ids_with_control_characters_never_reach_a_primer() {
                     closed_by: None,
                     from_circle: String::new(),
                     to_circle: String::new(),
+                    watch: None,
                 },
             );
         }
@@ -512,6 +513,7 @@ async fn over_long_legacy_backlogs_are_kept_for_their_session() {
                 closed_by: None,
                 from_circle: String::new(),
                 to_circle: String::new(),
+                watch: None,
             },
         );
         persist(&mut hub).unwrap();

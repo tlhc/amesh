@@ -216,6 +216,7 @@ fn mesh_primer_names_tools_and_peer_message() {
     assert!(text.contains("<peer-message>"));
     assert!(!text.contains("telegram"));
     assert!(mesh_primer("x", "claude-code", "feat-a").contains("SendMessage"));
+    assert!(mesh_primer("x", "claude-code", "feat-a").contains("amesh_watch"));
 }
 
 #[test]

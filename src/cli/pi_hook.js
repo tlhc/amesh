@@ -482,7 +482,7 @@ export default function AmeshHooks(pi) {
       },
     );
     const extra = [
-      ["job_create", "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.", {
+      ["job_create", "Create a job. With assigned_peer, the hub dispatches it inside this call when every depends_on job is done and an assignee in the job's circle is registered, and returns the ask_id; ask_id stays null until every dependency is done, and while there is no assignee, so take the id from job status before amesh_wait or amesh_watch. A registered assignee is dispatched to even when it is offline. The peer's ack completes the job and the reply becomes result_summary.", {
         title: { type: "string" },
         prompt: { type: "string" },
         path: { type: "string" },
@@ -528,7 +528,7 @@ export default function AmeshHooks(pi) {
         text: { type: "string" },
         cross_circle: { type: "boolean" },
       }, ["to_peers", "text"]],
-      ["wait", "Wait for an ask ack. Call it at most once per ask: when the result carries a hint, the ack is pushed to you as a peer-message, so end the turn. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.", {
+      ["wait", "Wait for an ask ack, blocking; amesh_watch is the default and returns at once. Call amesh_wait at most once per ask: when the result carries a hint, the ack is pushed to you as a peer-message, so end the turn. timeout_seconds is capped at 50 (default 45; 8 for Codex callers, whose MCP calls run inside an exec cell). It returns early when the recipient stops at a prompt or ends its turn. timed_out=true means the wait window expired while the ask was still open; failed reports failure of the ask itself.", {
         correlation_id: { type: "string" },
         timeout_seconds: { type: "integer" },
       }, ["correlation_id"]],
@@ -618,6 +618,16 @@ export default function AmeshHooks(pi) {
       { id: { type: "string" } },
       ["id"],
       (params) => Cli(["knowledge", "delete", params.id, ...FromPeer()]),
+    );
+    tool(
+      "watch",
+      "Register pushes for an ask and return at once; only the asker can register it. The hub sends you a peer-message once each when the recipient sits idle without acking (it nudges the recipient once), goes offline, leaves the hub, or when deadline_seconds pass with the ask still open (default 1200, at most 86400; the deadline ends the watch). The ack itself is pushed anyway. Call it right after amesh_ask and end the turn; amesh_wait is the blocking alternative. Re-registering moves the deadline and never repeats an already-pushed event. An ask-many batch id is not an ask; watch its child correlation_ids.",
+      {
+        correlation_id: { type: "string" },
+        deadline_seconds: { type: "integer" },
+      },
+      ["correlation_id"],
+      (params) => Mcp("watch", params),
     );
   }
 
