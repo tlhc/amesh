@@ -524,6 +524,44 @@ async fn attachment_get_refuses_a_path_out_of_the_directory() {
 }
 
 #[tokio::test]
+async fn attachments_up_to_the_cap_fit_either_upload_route() {
+    let (app, _state) = test_app();
+    let json_body =
+        json!({"filename": "big.bin", "content_base64": "AAAA".repeat(8 * 1024 * 1024 / 3)})
+            .to_string()
+            .into_bytes();
+    let boundary = "----ameshbig";
+    let mut form = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+    )
+    .into_bytes();
+    form.extend(std::iter::repeat_n(0u8, 10 * 1024 * 1024));
+    form.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
+    let mut statuses = Vec::new();
+    for (uri, kind, body) in [
+        ("/attachments", "application/json".to_string(), json_body),
+        (
+            "/attachments/form",
+            format!("multipart/form-data; boundary={boundary}"),
+            form,
+        ),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", kind)
+            .body(Body::from(body))
+            .unwrap();
+        statuses.push(app.clone().oneshot(req).await.unwrap().status());
+    }
+    assert_eq!(
+        statuses,
+        [StatusCode::OK, StatusCode::OK],
+        "8 MiB as base64 JSON and 10 MiB in a form are both within the cap"
+    );
+}
+
+#[tokio::test]
 async fn attachment_form_upload_then_get_bytes() {
     let (app, _state) = test_app();
     let boundary = "----ameshform";

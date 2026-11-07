@@ -52,7 +52,7 @@ async fn schedule_queue_timestamp_starts_after_lock_wait() {
 }
 
 #[test]
-fn a2_reopen_preserves_queue_time() {
+fn reopen_preserves_queue_time() {
     let path = temp_state("a2-reopen");
     let mut hub = Hub::open_at(&path, 100).unwrap();
     let _rx = recv_peer(&mut hub, "w");
@@ -66,7 +66,7 @@ fn a2_reopen_preserves_queue_time() {
 }
 
 #[test]
-fn a2_negative_stamp_reads_as_zero() {
+fn negative_stamp_reads_as_zero() {
     let path = temp_state("a2-negative");
     let mut hub = Hub::open_at(&path, 100).unwrap();
     let _rx = recv_peer(&mut hub, "w");
@@ -146,7 +146,7 @@ fn zero_schedule_every_seconds_still_loads() {
 }
 
 #[test]
-fn a2_legacy_schema_backfills_once() {
+fn legacy_schema_backfills_once() {
     let path = temp_state("a2-legacy");
     let db = Connection::open(&path).unwrap();
     db.execute_batch("CREATE TABLE inbox(peer_id TEXT, seq INTEGER, payload TEXT); INSERT INTO inbox VALUES ('w', 0, '{}');").unwrap();
@@ -182,7 +182,7 @@ fn a2_legacy_schema_backfills_once() {
 }
 
 #[test]
-fn a2_payload_stays_raw_with_independent_time() {
+fn payload_stays_raw_with_independent_time() {
     let path = temp_state("a2-payload");
     let mut hub = Hub::open_at(&path, 100).unwrap();
     let _rx = recv_peer(&mut hub, "w");
@@ -205,7 +205,7 @@ fn a2_payload_stays_raw_with_independent_time() {
 }
 
 #[test]
-fn a2_json_import_stamps_import_instant() {
+fn json_import_stamps_import_instant() {
     let path = temp_state("a2-json");
     let event = json!({"event": 1, "queued_at": 5, "type": "notify"});
     fs::write(path.with_extension("json"), json!({
@@ -223,7 +223,7 @@ fn a2_json_import_stamps_import_instant() {
 }
 
 #[test]
-fn a2_failed_persist_restores_exact_queue_times() {
+fn failed_persist_restores_exact_queue_times() {
     let path = temp_state("a2-rollback");
     let mut hub = Hub::open_at(&path, 100).unwrap();
     let _rx = recv_peer(&mut hub, "w");
@@ -245,7 +245,7 @@ fn a2_failed_persist_restores_exact_queue_times() {
 }
 
 #[test]
-fn a2_migration_failure_rolls_back_column_and_rows() {
+fn migration_failure_rolls_back_column_and_rows() {
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch("CREATE TABLE inbox(peer_id TEXT, seq INTEGER, payload TEXT); INSERT INTO inbox VALUES ('w', 0, '{}'); CREATE TRIGGER fail_backfill BEFORE UPDATE ON inbox BEGIN SELECT RAISE(ABORT, 'a2 backfill failure'); END;").unwrap();
     let error = migrate_inbox_queued_at(&db, 777).unwrap_err();
@@ -273,7 +273,7 @@ fn a2_migration_failure_rolls_back_column_and_rows() {
 }
 
 #[test]
-fn a3_legacy_send_failure_first_time() {
+fn legacy_send_failure_first_time() {
     let (mut hub, _path) = undelivered_hub();
     let (tx, rx) = mpsc::unbounded_channel();
     hub.sockets.insert("worker".into(), (1, tx));
@@ -285,7 +285,7 @@ fn a3_legacy_send_failure_first_time() {
 }
 
 #[test]
-fn a3_dropped_link_return_time() {
+fn dropped_link_return_time() {
     let (mut hub, _path) = undelivered_hub();
     let record = QueuedRecord::new(json!({"type":"notify"}), 17);
     assert!(return_undelivered(
@@ -297,7 +297,7 @@ fn a3_dropped_link_return_time() {
 }
 
 #[test]
-fn a3_successor_second_failure_time() {
+fn successor_second_failure_time() {
     let (mut hub, _path) = undelivered_hub();
     let (tx, mut rx) = mpsc::unbounded_channel();
     hub.sockets.insert("worker".into(), (2, tx));
@@ -314,7 +314,7 @@ fn a3_successor_second_failure_time() {
 }
 
 #[test]
-fn a3_recv_copy_time_equals_original() {
+fn recv_copy_time_equals_original() {
     let (mut hub, _path) = undelivered_hub();
     let (tx, mut rx) = mpsc::unbounded_channel();
     hub.sockets.insert("worker".into(), (1, tx));
@@ -330,7 +330,7 @@ fn a3_recv_copy_time_equals_original() {
 }
 
 #[tokio::test]
-async fn a3_pending_failure_restores_exact_image() {
+async fn pending_failure_restores_exact_image() {
     let (mut hub, path) = undelivered_hub();
     hub.inbox.put(
         "worker",
@@ -360,7 +360,7 @@ async fn a3_pending_failure_restores_exact_image() {
 }
 
 #[tokio::test]
-async fn a3_recovery_write_failure_keeps_inflight_memory() {
+async fn recovery_write_failure_keeps_inflight_memory() {
     let (mut hub, path) = undelivered_hub();
     persist(&mut hub).unwrap();
     let (tx, rx) = mpsc::unbounded_channel();
@@ -385,7 +385,7 @@ async fn a3_recovery_write_failure_keeps_inflight_memory() {
 }
 
 #[test]
-fn a3_transfer_duplicate_keeps_earliest_time() {
+fn transfer_duplicate_keeps_earliest_time() {
     let mut inbox = Inbox::default();
     let payload = json!({"id":"same", "message":"target"});
     inbox.put(
@@ -410,7 +410,7 @@ fn a3_transfer_duplicate_keeps_earliest_time() {
 }
 
 #[tokio::test]
-async fn a3_register_copy_uses_merged_time() {
+async fn register_copy_uses_merged_time() {
     let (mut hub, path) = undelivered_hub();
     let (tx, mut rx) = mpsc::unbounded_channel();
     hub.sockets.insert("worker".into(), (1, tx));

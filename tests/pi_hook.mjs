@@ -565,6 +565,13 @@ assert.match(escaped, /&lt;\/peer-message>/);
 assert.equal((escaped.match(/<\/peer-message>/g) || []).length, 1);
 assert.match(escaped, /from="@x&quot;y"/);
 await handlers.get("agent_settled")({}, context);
+for (let i = 0; i < 2; i++) {
+  fire(sockets[0], { type: "notify", from_peer: "amesh-codex", message: "replayed record", id: "evt-replayed" });
+}
+await handlers.get("agent_settled")({}, context);
+const injected = userMsgs.map((msg) => (msg.content.match(/replayed record/g) || []).length).reduce((a, b) => a + b, 0);
+const acked = recvsOf(sockets[0]).filter((frame) => frame.id === "evt-replayed").length;
+assert.equal(`${injected},${acked}`, "1,2", "a record the hub replays after a lost recv is acknowledged again and injected once");
 const chunk = "x".repeat(200 * 1024);
 fire(sockets[0], { type: "notify", from_peer: "amesh-codex", message: "size-head" });
 fire(sockets[0], { type: "notify", from_peer: "amesh-codex", message: `${chunk}ONE` });

@@ -6169,6 +6169,56 @@ fn a_hook_does_not_wait_out_a_hub_that_cannot_start() {
 }
 
 #[test]
+fn a_session_start_says_when_the_hub_did_not_start() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.root.join("state.db"), "not a database").unwrap();
+    let shown: Vec<bool> = ["claude-code", "codex"]
+        .into_iter()
+        .map(|backend| {
+            let payload = json!({"session_id": "session-a", "cwd": sandbox.root, "hook_event_name": "SessionStart"});
+            let start = sandbox.run(&["hook", "session", "--backend", backend], Some(payload));
+            assert!(start.status.success(), "{backend}: {start:?}");
+            let out: Value = serde_json::from_slice(&start.stdout).unwrap_or(Value::Null);
+            let context = out["hookSpecificOutput"]["additionalContext"]
+                .as_str()
+                .unwrap_or_default();
+            context.contains(&sandbox.bind) && context.contains("amesh doctor")
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [true, true],
+        "claude-code and codex see why they are off the mesh"
+    );
+}
+
+#[test]
+fn status_names_the_unreachable_hub_and_the_next_step() {
+    let sandbox = Sandbox::new();
+    let status = sandbox.run(&["status"], None);
+    let stderr = String::from_utf8_lossy(&status.stderr);
+    assert!(
+        stderr.contains(&format!("unreachable at {}", sandbox.bind))
+            && stderr.contains("amesh doctor"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn a_hook_names_a_cwd_that_is_gone() {
+    let sandbox = Sandbox::new();
+    let gone = sandbox.root.join("gone");
+    let payload =
+        json!({"session_id": "session-a", "cwd": gone, "hook_event_name": "UserPromptSubmit"});
+    let prompt = sandbox.run(
+        &["hook", "prompt", "--backend", "claude-code"],
+        Some(payload),
+    );
+    let stderr = String::from_utf8_lossy(&prompt.stderr);
+    assert!(stderr.contains(&gone.display().to_string()), "{stderr}");
+}
+
+#[test]
 fn occupied_non_amesh_port_does_not_spawn() {
     let sandbox = Sandbox::new();
     let listener = TcpListener::bind(&sandbox.bind).unwrap();

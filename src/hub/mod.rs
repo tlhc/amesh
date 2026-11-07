@@ -1760,6 +1760,10 @@ fn restart_on(path: &Path) {
     );
 }
 
+/* an upload is capped at 10 MiB once decoded; base64 in a JSON body or a form's framing needs
+room past the default body limit */
+const UPLOAD_BODY_MAX: usize = 14 * 1024 * 1024;
+
 fn router(app: App) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -1790,8 +1794,14 @@ fn router(app: App) -> Router {
         .route("/asks/{id}/watch", post(watch_ask))
         .route("/questions/ask-blocking", post(ask_blocking))
         .route("/answer", post(ack_ask))
-        .route("/attachments", post(upload_attachment))
-        .route("/attachments/form", post(upload_form))
+        .route(
+            "/attachments",
+            post(upload_attachment).layer(DefaultBodyLimit::max(UPLOAD_BODY_MAX)),
+        )
+        .route(
+            "/attachments/form",
+            post(upload_form).layer(DefaultBodyLimit::max(UPLOAD_BODY_MAX)),
+        )
         .route("/attachments/{id}", get(get_attachment))
         .route("/events", get(list_events))
         .route("/events/chat", post(ingest_chat))

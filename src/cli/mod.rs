@@ -338,7 +338,9 @@ pub(crate) fn request(method: &str, path: &str, body: Option<Value>) -> Result<V
         );
         /* 6 dns, 7 refused, 28 timeout, 52 empty, 55 send, 56 recv: no daemon to talk to */
         if matches!(output.status.code(), Some(6 | 7 | 28 | 52 | 55 | 56)) {
-            return Err(format!("{DAEMON_UNREACHABLE}: {detail}").into());
+            return Err(
+                format!("{DAEMON_UNREACHABLE} at {bind}, run `amesh doctor`: {detail}").into(),
+            );
         }
         return Err(detail.into());
     }
@@ -3939,7 +3941,9 @@ fn hook(raw: &[String]) -> Result<()> {
         .as_str()
         .filter(|cwd| !cwd.is_empty())
         .ok_or("hook requires cwd")?;
-    let path = Path::new(path).canonicalize()?;
+    let path = Path::new(path)
+        .canonicalize()
+        .map_err(|error| format!("cwd {path}: {error}"))?;
     let circle = std::env::var("AMESH_CIRCLE")
         .ok()
         .filter(|v| !v.is_empty())
@@ -3980,7 +3984,26 @@ fn hook(raw: &[String]) -> Result<()> {
             );
         }
     }
-    let registered = request("POST", "/peers", Some(body))?;
+    let registered = match request("POST", "/peers", Some(body)) {
+        /* a hub this hook may start that does not answer would leave the session silent; the
+        agent reads that it may be off the mesh in the context it is handed */
+        Err(error)
+            if event == "SessionStart"
+                && backend != "pi"
+                && backend != "opencode"
+                && bind_addr().is_ok_and(local_spawn_bind)
+                && error.to_string().starts_with(DAEMON_UNREACHABLE) =>
+        {
+            let bind = bind_addr().map(|addr| addr.to_string()).unwrap_or_default();
+            let context = format!("amesh: the hub at {bind} did not answer, so this session may not be on the mesh; run `amesh doctor` to see why.");
+            println!(
+                "{}",
+                json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}})
+            );
+            return Ok(());
+        }
+        result => result?,
+    };
     let peer_id = registered["peer_id"]
         .as_str()
         .ok_or("register missing peer_id")?

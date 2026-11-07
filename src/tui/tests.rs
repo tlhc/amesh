@@ -1,7 +1,10 @@
-use super::input::{Act, Input, Mode};
-use super::layout::{self, width, Fit, Grid, Tone, View};
-use super::model::{self, Activity, Ask, Job, Numbers, Peer, Snapshot};
-use super::*;
+use crate::tui::input::{self, Act, Input, Mode, HINT_KEYS};
+use crate::tui::layout::{self, width, Fit, Grid, Tone, View};
+use crate::tui::model::{self, Activity, Ask, Job, Numbers, Peer, Snapshot};
+use crate::tui::{
+    ascii, asks, base64, decoded, draw, feed, knowledge, row_width, send_clipboard, strip, theme,
+    App, Opts, Pick, Want, PEER_HOLD,
+};
 use crate::wire::{
     BlockReason, DispatchState, IdleWhy, JobAction, JobProgress, JobRelation, Liveness, Progress,
 };
@@ -1097,7 +1100,7 @@ fn cell(row: &[(String, layout::Tone)], text: &str) -> layout::Tone {
         .1
 }
 
-fn b3c_card(job: Job, asks: Vec<Ask>) -> String {
+fn single_card(job: Job, asks: Vec<Ask>) -> String {
     let snap = Snapshot {
         captured_at: 1000,
         jobs: vec![job],
@@ -1126,7 +1129,7 @@ fn b3c_card(job: Job, asks: Vec<Ask>) -> String {
     )
 }
 
-fn b3c_job(state: &str) -> Job {
+fn single_job(state: &str) -> Job {
     Job {
         job_id: "job".into(),
         title: "title".into(),
@@ -1138,7 +1141,7 @@ fn b3c_job(state: &str) -> Job {
     }
 }
 
-fn b3c_scene(job: Job, asks: Vec<Ask>, peers: Vec<Peer>) -> (Snapshot, layout::Grid) {
+fn single_scene(job: Job, asks: Vec<Ask>, peers: Vec<Peer>) -> (Snapshot, layout::Grid) {
     let snap = Snapshot {
         captured_at: 1000,
         jobs: vec![job],
@@ -1166,11 +1169,11 @@ fn b3c_scene(job: Job, asks: Vec<Ask>, peers: Vec<Peer>) -> (Snapshot, layout::G
     (snap, grid)
 }
 
-fn b3c_text(job: Job, asks: Vec<Ask>, peers: Vec<Peer>) -> String {
-    flat(&b3c_scene(job, asks, peers).1.text())
+fn single_text(job: Job, asks: Vec<Ask>, peers: Vec<Peer>) -> String {
+    flat(&single_scene(job, asks, peers).1.text())
 }
 
-fn b3c_word_tone(grid: &layout::Grid, word: &str) -> layout::Tone {
+fn word_tone(grid: &layout::Grid, word: &str) -> layout::Tone {
     for row in grid.rows.values() {
         let cells: Vec<_> = row.values().collect();
         let text: String = cells.iter().map(|cell| cell.ch).collect();
@@ -1182,7 +1185,7 @@ fn b3c_word_tone(grid: &layout::Grid, word: &str) -> layout::Tone {
     panic!("no {word}");
 }
 
-fn b3c_ask(from: &str, to_id: &str, to_name: &str) -> Ask {
+fn single_ask(from: &str, to_id: &str, to_name: &str) -> Ask {
     Ask {
         correlation_id: "ask-1".into(),
         from_peer: from.into(),

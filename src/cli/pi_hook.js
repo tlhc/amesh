@@ -183,6 +183,7 @@ export default function AmeshHooks(pi) {
   let localSession;
   let inboundSessionId;
   const pending = [];
+  const delivered = [];
 
   function Cli(args) {
     return new Promise((resolve, reject) => {
@@ -681,11 +682,20 @@ export default function AmeshHooks(pi) {
         } catch {
           return;
         }
-        if (!Receive(body)) {
+        /* a record whose recv was lost with the socket comes back on the next connect: it is
+        acknowledged again and injected once */
+        const repeat = Boolean(body.id) && delivered.includes(body.id);
+        if (!repeat && !Receive(body)) {
           return;
         }
-        if (body.id && socket.readyState === 1) {
-          socket.send(JSON.stringify({ type: "recv", id: body.id }));
+        if (body.id) {
+          if (!repeat) {
+            delivered.push(body.id);
+            if (delivered.length > 64) delivered.shift();
+          }
+          if (socket.readyState === 1) {
+            socket.send(JSON.stringify({ type: "recv", id: body.id }));
+          }
         }
         Flush();
       } catch (error) {

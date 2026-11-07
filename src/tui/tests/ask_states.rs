@@ -1,6 +1,6 @@
 use super::*;
 
-fn b3b_snap(ask: Ask, peers: Vec<Peer>) -> Snapshot {
+fn snap(ask: Ask, peers: Vec<Peer>) -> Snapshot {
     Snapshot {
         captured_at: 1000,
         asks: vec![ask],
@@ -10,22 +10,22 @@ fn b3b_snap(ask: Ask, peers: Vec<Peer>) -> Snapshot {
     }
 }
 
-fn b3b_row(ask: Ask, fresh: bool) -> Vec<(String, layout::Tone)> {
-    let snap = b3b_snap(ask, vec![]);
+fn row(ask: Ask, fresh: bool) -> Vec<(String, layout::Tone)> {
+    let snap = snap(ask, vec![]);
     let mut frame = as_frame(&snap);
     frame.fresh = fresh;
     let order = super::asks::order(&snap);
     super::asks::rows(&frame, &order, 80).remove(0)
 }
 
-fn b3b_card(ask: Ask, peers: Vec<Peer>) -> String {
-    let snap = b3b_snap(ask, peers);
+fn card(ask: Ask, peers: Vec<Peer>) -> String {
+    let snap = snap(ask, peers);
     super::asks::card(&as_frame(&snap), &snap.asks[0], 1, 90, None, Fit::Whole).text()
 }
 
 #[test]
-fn b3b_glyph_open_is_run() {
-    let row = b3b_row(
+fn glyph_open_is_run() {
+    let row = row(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Pending { since: Some(820) },
@@ -38,8 +38,8 @@ fn b3b_glyph_open_is_run() {
 }
 
 #[test]
-fn b3b_glyph_failed_is_fail() {
-    let row = b3b_row(
+fn glyph_failed_is_fail() {
+    let row = row(
         ask_with(
             crate::wire::AskState::Closed {
                 outcome: crate::wire::AskOutcome::Hub,
@@ -53,8 +53,8 @@ fn b3b_glyph_failed_is_fail() {
 }
 
 #[test]
-fn b3b_glyph_closed_ok_is_done() {
-    let row = b3b_row(
+fn glyph_closed_ok_is_done() {
+    let row = row(
         ask_with(
             crate::wire::AskState::Closed {
                 outcome: crate::wire::AskOutcome::AckedOk,
@@ -68,8 +68,8 @@ fn b3b_glyph_closed_ok_is_done() {
 }
 
 #[test]
-fn b3b_arrow_work_is_flow() {
-    let row = b3b_row(
+fn arrow_work_is_flow() {
+    let row = row(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Work { since: 990 },
@@ -82,8 +82,8 @@ fn b3b_arrow_work_is_flow() {
 }
 
 #[test]
-fn b3b_arrow_pending_is_dim() {
-    let row = b3b_row(
+fn arrow_pending_is_dim() {
+    let row = row(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Pending { since: Some(820) },
@@ -96,7 +96,7 @@ fn b3b_arrow_pending_is_dim() {
 }
 
 #[test]
-fn b3b_arrow_stale_close_is_plain() {
+fn arrow_stale_close_is_plain() {
     let mut ask = ask_with(
         crate::wire::AskState::Closed {
             outcome: crate::wire::AskOutcome::AckedOk,
@@ -105,12 +105,12 @@ fn b3b_arrow_stale_close_is_plain() {
         Some(820),
     );
     ask.closed_just_now = Some(true);
-    let row = b3b_row(ask, false);
+    let row = row(ask, false);
     assert_eq!(cell(&row, ">"), layout::Tone::Plain);
 }
 
 #[test]
-fn b3b_arrow_just_failed_is_fail() {
+fn arrow_just_failed_is_fail() {
     let mut ask = ask_with(
         crate::wire::AskState::Closed {
             outcome: crate::wire::AskOutcome::Hub,
@@ -119,12 +119,12 @@ fn b3b_arrow_just_failed_is_fail() {
         Some(820),
     );
     ask.closed_just_now = Some(true);
-    let row = b3b_row(ask, true);
+    let row = row(ask, true);
     assert_eq!(cell(&row, "─×─"), layout::Tone::Fail);
 }
 
 #[test]
-fn b3b_arrow_just_ok_is_back() {
+fn arrow_just_ok_is_back() {
     let mut ask = ask_with(
         crate::wire::AskState::Closed {
             outcome: crate::wire::AskOutcome::AckedOk,
@@ -133,13 +133,13 @@ fn b3b_arrow_just_ok_is_back() {
         Some(820),
     );
     ask.closed_just_now = Some(true);
-    let row = b3b_row(ask, true);
+    let row = row(ask, true);
     assert_eq!(cell(&row, "─◂─"), layout::Tone::Back);
 }
 
 #[test]
-fn b3b_card_wait() {
-    let text = b3b_card(
+fn card_wait() {
+    let text = card(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Wait {
@@ -158,8 +158,8 @@ fn b3b_card_wait() {
     );
 }
 
-fn b3b_idle(why: crate::wire::IdleWhy) -> String {
-    b3b_card(
+fn idle(why: crate::wire::IdleWhy) -> String {
+    card(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Idle { since: 940, why },
@@ -171,8 +171,8 @@ fn b3b_idle(why: crate::wire::IdleWhy) -> String {
 }
 
 #[test]
-fn b3b_card_idle_not_picked_up() {
-    let text = b3b_idle(crate::wire::IdleWhy::NotPickedUp);
+fn card_idle_not_picked_up() {
+    let text = idle(crate::wire::IdleWhy::NotPickedUp);
     assert!(
         text.contains("│ why     amesh-pi: not picked up · 1m "),
         "{text}"
@@ -180,8 +180,8 @@ fn b3b_card_idle_not_picked_up() {
 }
 
 #[test]
-fn b3b_card_idle_still_open() {
-    let text = b3b_idle(crate::wire::IdleWhy::AskStillOpen);
+fn card_idle_still_open() {
+    let text = idle(crate::wire::IdleWhy::AskStillOpen);
     assert!(
         text.contains("│ why     amesh-pi: ask still open · 1m "),
         "{text}"
@@ -189,8 +189,8 @@ fn b3b_card_idle_still_open() {
 }
 
 #[test]
-fn b3b_card_idle_turn_ended() {
-    let text = b3b_idle(crate::wire::IdleWhy::TurnEnded);
+fn card_idle_turn_ended() {
+    let text = idle(crate::wire::IdleWhy::TurnEnded);
     assert!(
         text.contains("│ why     amesh-pi ended its turn 1m ago "),
         "{text}"
@@ -198,10 +198,10 @@ fn b3b_card_idle_turn_ended() {
 }
 
 #[test]
-fn b3b_card_gone() {
+fn card_gone() {
     let mut from = doing("amesh-claude-code", "work", 1, None);
     from.liveness = Some(crate::wire::Liveness::Online);
-    let text = b3b_card(
+    let text = card(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Gone,
@@ -218,8 +218,8 @@ fn b3b_card_gone() {
 }
 
 #[test]
-fn b3b_card_offline() {
-    let text = b3b_card(
+fn card_offline() {
+    let text = card(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Offline,
@@ -235,10 +235,10 @@ fn b3b_card_offline() {
     );
 }
 
-fn b3b_pending_to(kind: crate::wire::Liveness) -> String {
+fn pending_to(kind: crate::wire::Liveness) -> String {
     let mut peer = doing("amesh-pi", "idle", 1, None);
     peer.liveness = Some(kind);
-    b3b_card(
+    card(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Pending { since: Some(820) },
@@ -250,20 +250,20 @@ fn b3b_pending_to(kind: crate::wire::Liveness) -> String {
 }
 
 #[test]
-fn b3b_card_now_work() {
-    let text = b3b_pending_to(crate::wire::Liveness::Work { since: 1 });
+fn card_now_work() {
+    let text = pending_to(crate::wire::Liveness::Work { since: 1 });
     assert!(text.contains("· now WORK"), "{text}");
 }
 
 #[test]
-fn b3b_card_now_idle() {
-    let text = b3b_pending_to(crate::wire::Liveness::Idle { since: 1 });
+fn card_now_idle() {
+    let text = pending_to(crate::wire::Liveness::Idle { since: 1 });
     assert!(text.contains("· now IDLE"), "{text}");
 }
 
 #[test]
-fn b3b_card_now_wait() {
-    let text = b3b_pending_to(crate::wire::Liveness::Wait {
+fn card_now_wait() {
+    let text = pending_to(crate::wire::Liveness::Wait {
         since: 1,
         reason: None,
     });
@@ -271,20 +271,20 @@ fn b3b_card_now_wait() {
 }
 
 #[test]
-fn b3b_card_now_offline() {
-    let text = b3b_pending_to(crate::wire::Liveness::Offline);
+fn card_now_offline() {
+    let text = pending_to(crate::wire::Liveness::Offline);
     assert!(text.contains("· offline"), "{text}");
 }
 
 #[test]
-fn b3b_card_online_is_empty() {
-    let text = b3b_pending_to(crate::wire::Liveness::Online);
+fn card_online_is_empty() {
+    let text = pending_to(crate::wire::Liveness::Online);
     assert!(!text.contains("· now"), "{text}");
 }
 
 #[test]
-fn b3b_times_open() {
-    let text = b3b_card(
+fn times_open() {
+    let text = card(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Pending { since: Some(820) },
@@ -297,8 +297,8 @@ fn b3b_times_open() {
 }
 
 #[test]
-fn b3b_times_unknown() {
-    let text = b3b_card(
+fn times_unknown() {
+    let text = card(
         ask_with(
             crate::wire::AskState::Open {
                 progress: crate::wire::Progress::Pending { since: None },
@@ -311,7 +311,7 @@ fn b3b_times_unknown() {
 }
 
 #[test]
-fn b3b_times_closed() {
+fn times_closed() {
     let mut ask = ask_with(
         crate::wire::AskState::Closed {
             outcome: crate::wire::AskOutcome::AckedOk,
@@ -320,7 +320,7 @@ fn b3b_times_closed() {
         Some(820),
     );
     ask.closed_at = Some(950);
-    let text = b3b_card(ask, vec![]);
+    let text = card(ask, vec![]);
     assert!(
         text.contains("sent 00:13 · closed 00:15 · took 2m"),
         "{text}"
@@ -328,7 +328,7 @@ fn b3b_times_closed() {
 }
 
 #[test]
-fn b3b_command_nudge() {
+fn command_nudge() {
     let mut ask = ask_with(
         crate::wire::AskState::Open {
             progress: crate::wire::Progress::Idle {
@@ -341,7 +341,7 @@ fn b3b_command_nudge() {
     ask.actions = Some(vec![crate::wire::AskAction::Nudge {
         to: "amesh-pi".into(),
     }]);
-    let text = b3b_card(ask, vec![]);
+    let text = card(ask, vec![]);
     assert!(
         text.contains("amesh peer notify amesh-pi 'ask row waits for your ack'"),
         "{text}"
@@ -349,7 +349,7 @@ fn b3b_command_nudge() {
 }
 
 #[test]
-fn b3b_command_close_left() {
+fn command_close_left() {
     let mut ask = ask_with(
         crate::wire::AskState::Open {
             progress: crate::wire::Progress::Gone,
@@ -357,7 +357,7 @@ fn b3b_command_close_left() {
         Some(820),
     );
     ask.actions = Some(vec![crate::wire::AskAction::CloseLeft]);
-    let text = b3b_card(ask, vec![]);
+    let text = card(ask, vec![]);
     assert!(
         text.contains("amesh peer ack ask-row --failed true --message 'recipient left'"),
         "{text}"
@@ -365,7 +365,7 @@ fn b3b_command_close_left() {
 }
 
 #[test]
-fn b3b_header_counts_hub_as_failed() {
+fn header_counts_hub_as_failed() {
     use crate::wire::{AskOutcome, AskState};
     let snap = Snapshot {
         asks: vec![
