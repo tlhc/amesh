@@ -501,6 +501,29 @@ async fn an_upload_stays_next_to_its_own_state_file() {
 }
 
 #[tokio::test]
+async fn attachment_get_refuses_a_path_out_of_the_directory() {
+    let (app, state) = test_app();
+    fs::create_dir_all(state.with_file_name("attachments")).unwrap();
+    let canary = state.with_file_name("canary.txt");
+    fs::write(&canary, "private").unwrap();
+    let absolute = canary.to_str().unwrap().replace('/', "%2F");
+    let mut statuses = Vec::new();
+    for id in [absolute.as_str(), "..%2Fcanary.txt"] {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/attachments/{id}"))
+            .body(Body::empty())
+            .unwrap();
+        statuses.push(app.clone().oneshot(req).await.unwrap().status());
+    }
+    assert_eq!(
+        statuses,
+        [StatusCode::NOT_FOUND, StatusCode::NOT_FOUND],
+        "an absolute path and a ../ stay out of reach"
+    );
+}
+
+#[tokio::test]
 async fn attachment_form_upload_then_get_bytes() {
     let (app, _state) = test_app();
     let boundary = "----ameshform";

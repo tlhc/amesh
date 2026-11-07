@@ -6151,6 +6151,24 @@ fn serve_reports_an_unopenable_state_instead_of_panicking() {
 }
 
 #[test]
+fn a_hook_does_not_wait_out_a_hub_that_cannot_start() {
+    let sandbox = Sandbox::new();
+    fs::write(sandbox.root.join("state.db"), "not a database").unwrap();
+    let payload = json!({"session_id": "session-a", "cwd": sandbox.root, "hook_event_name": "UserPromptSubmit"});
+    let started = Instant::now();
+    let prompt = sandbox.run(
+        &["hook", "prompt", "--backend", "claude-code"],
+        Some(payload),
+    );
+    let elapsed = started.elapsed();
+    assert!(prompt.status.success(), "{prompt:?}");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "a hub that ends at startup is not waited for: {elapsed:?}"
+    );
+}
+
+#[test]
 fn occupied_non_amesh_port_does_not_spawn() {
     let sandbox = Sandbox::new();
     let listener = TcpListener::bind(&sandbox.bind).unwrap();

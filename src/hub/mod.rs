@@ -1398,7 +1398,18 @@ fn queue_replies(hub: &mut Hub, replies: Vec<Value>, now: u64) -> Vec<(String, Q
     let mut queued = Vec::new();
     for event in replies {
         let to = event["to_peer"].as_str().unwrap_or_default();
-        let Some(target) = recipient_key(hub, to, &event) else {
+        /* replies come from the hub's own records, which name peers by id: a dispatched ask
+        goes to the recipient it recorded and anything else to the id it names, at its row or
+        at the backlog kept for its session, never to a peer that took that id as its name */
+        let target = match event["type"].as_str() {
+            Some("ask") => event["correlation_id"]
+                .as_str()
+                .and_then(|id| hub.asks.get(id))
+                .map(|ask| ask.to_peer_id.clone()),
+            _ => Some(to.to_string()),
+        }
+        .filter(|id| hub.peers.contains_key(id) || hub.owed.contains_key(id));
+        let Some(target) = target else {
             eprintln!("amesh: dropping {} for unknown peer {to}", event["type"]);
             continue;
         };
@@ -3114,7 +3125,10 @@ fn register_watch(
             Json(json!({"error": "ask is closed"})),
         ));
     }
-    let asker = resolve(hub, &ask.from_peer).map(|peer| peer.peer_id.clone());
+    let asker = hub
+        .peers
+        .get(&ask.from_peer)
+        .map(|peer| peer.peer_id.clone());
     /* a push needs a registered asker to land on; refusing here beats dropping it later */
     if asker.is_none() {
         return Err((
@@ -3274,8 +3288,9 @@ fn advance_asks(hub: &mut Hub, now: u64) {
             changed = true;
             continue;
         }
-        /* an asker without a row cannot be addressed: its events wait for its return */
-        if resolve(hub, &ask.from_peer).is_none() {
+        /* an asker without a row cannot be addressed: its events wait for its return, and a
+        name lookup would find whoever took the name meanwhile */
+        if !hub.peers.contains_key(&ask.from_peer) {
             continue;
         }
         let (from, to) = (ask.from_peer.clone(), ask.to_peer_id.clone());
@@ -3612,6 +3627,11 @@ async fn get_attachment(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
+    /* ids are minted as 32 hex digits; join would follow anything else, an absolute path
+    or a ../, out of the directory */
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "missing"}))));
+    }
     let path = attachments_dir(&app).join(&id);
     if !path.is_file() {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "missing"}))));
@@ -4299,17 +4319,18 @@ async fn delete_job(
     }
     hub.jobs.remove(&id);
     drop_handoff_notices(&mut hub, |topic| topic == id);
-    let replies = queue_replies(&mut hub, replies, now);
     /* a worker that already holds the ask hears that the job is gone */
-    match job_holder(&hub, &job).filter(|_| running) {
-        Some(to) => deliver_notify(
-            &mut hub,
-            &to,
-            format!("job {} {} deleted", job.job_id, job.title),
-            now,
-        )?,
-        None => persist_ok(&mut hub)?,
+    if let Some(to) = job_holder(&hub, &job).filter(|_| running) {
+        replies.push(json!({
+            "type": "notify",
+            "id": format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]),
+            "from_peer": "amesh",
+            "to_peer": to,
+            "message": format!("job {} {} deleted", job.job_id, job.title),
+        }));
     }
+    let replies = queue_replies(&mut hub, replies, now);
+    persist_ok(&mut hub)?;
     deliver_queued(&mut hub, replies);
     match headers
         .get("x-amesh-operator")
@@ -4841,7 +4862,7 @@ fn dispatch_job(hub: &mut Hub, id: &str, now: u64, events: &mut Vec<Value>) -> O
         closed_by: None,
         watch: None,
     };
-    if job.watch && resolve(hub, &ask.from_peer).is_some() {
+    if job.watch && hub.peers.contains_key(&ask.from_peer) {
         let mut watch = arm_watch(job.deadline_seconds, WATCH_DEFAULT_SECS, now);
         watch.sent = seed_sent(hub, &ask, now);
         ask.watch = Some(watch);
@@ -5073,23 +5094,21 @@ async fn tick_schedules(app: &App) {
             continue;
         };
         let queued_at = now_unix();
-        if resolve(&hub, &sched.to_peer).is_none() {
+        /* the schedule holds the peer's id; a name lookup would hand it to whoever took the
+        name after that peer left */
+        let Some(to_circle) = hub.peers.get(&sched.to_peer).map(|p| p.circle.clone()) else {
             continue;
-        }
+        };
         let (to, event) = if sched.kind == "ask" {
             let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
-            let to_peer_id = resolve(&hub, &sched.to_peer)
-                .map(|p| p.peer_id.clone())
-                .unwrap_or_else(|| sched.to_peer.clone());
+            let to_peer_id = sched.to_peer.clone();
             let ask = Ask {
                 correlation_id: cid.clone(),
                 from_peer: sched.from_peer.clone(),
                 to_peer: sched.to_peer.clone(),
                 to_peer_id: to_peer_id.clone(),
                 from_circle: sched.circle.clone(),
-                to_circle: resolve(&hub, &sched.to_peer)
-                    .map(|p| p.circle.clone())
-                    .unwrap_or_default(),
+                to_circle,
                 text: sched.text.clone(),
                 open: true,
                 reply: None,

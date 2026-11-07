@@ -117,6 +117,30 @@ fn an_away_asker_keeps_its_events_pending() {
 }
 
 #[test]
+fn a_peer_that_takes_an_away_askers_name_gets_none_of_its_watch() {
+    let (mut hub, _state, _boss, _worker, t0) = watched_hub("watch-name-taken");
+    register_watch(&mut hub, "ask-1", None, None, t0).unwrap();
+    hub.peers.remove("boss");
+    hub.sockets.remove("boss");
+    let mut intruder = recv_peer(&mut hub, "intruder");
+    let row = hub.peers.get_mut("intruder").unwrap();
+    row.name = "boss".into();
+    row.circle = "other".into();
+    let rearmed = register_watch(&mut hub, "ask-1", None, Some("intruder"), t0 + 1).is_ok();
+    advance_asks(&mut hub, t0 + 11);
+    let taken = pushed(&mut intruder).len();
+    let mut boss = recv_peer(&mut hub, "boss");
+    hub.peers.get_mut("boss").unwrap().name = "boss-returned".into();
+    advance_asks(&mut hub, t0 + 12);
+    let returned = pushed(&mut boss).len();
+    assert_eq!(
+        (rearmed, taken, returned),
+        (false, 0, 1),
+        "the peer that took the name neither re-arms nor receives, and the asker gets its event on return"
+    );
+}
+
+#[test]
 fn an_offline_recipient_is_reported_once_without_a_nudge() {
     let (mut hub, _state, mut boss, mut worker, t0) = watched_hub("watch-offline");
     register_watch(&mut hub, "ask-1", None, None, t0).unwrap();

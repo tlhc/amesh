@@ -3568,6 +3568,103 @@ async fn an_ack_goes_back_to_the_peer_that_asked_after_its_name_moves() {
 }
 
 #[tokio::test]
+async fn a_scheduled_ask_waits_for_its_peer_instead_of_one_that_took_the_name() {
+    let f = team("c", &["boss", "victim"]).await;
+    let (status, _) = f
+        .request(
+            "POST",
+            "/schedules",
+            json!({"from_peer": "boss", "to_peer": "victim", "text": "private", "kind": "ask", "in_seconds": 0}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    f.0.inner.lock().await.peers.remove("victim");
+    let (registered, _) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"peer_id": "intruder", "name": "victim", "backend": "pi", "circle": "other"}),
+        )
+        .await;
+    assert_eq!(registered, StatusCode::OK);
+    {
+        let hub = f.0.inner.lock().await;
+        let intruder = &hub.peers["intruder"];
+        assert_eq!(
+            (intruder.name.as_str(), intruder.circle.as_str()),
+            ("victim", "other")
+        );
+    }
+    tick_schedules(&f.0).await;
+    let taken = f
+        .inbox("intruder")
+        .await
+        .iter()
+        .filter(|event| event["type"] == "ask")
+        .count();
+    let pending = f.0.inner.lock().await.schedules.len();
+    assert_eq!(
+        (taken, pending),
+        (0, 1),
+        "the peer that took the name gets nothing and the schedule waits for its own peer"
+    );
+}
+
+#[tokio::test]
+async fn job_notices_for_an_away_worker_wait_in_its_backlog_instead_of_reaching_its_name() {
+    let f = team("c", &["boss", "worker"]).await;
+    let mut ids = Vec::new();
+    for title in ["cancelled-title", "deleted-title"] {
+        let id = f
+            .job(json!({"title": title, "from_peer": "boss", "assigned_peer": "worker"}))
+            .await;
+        assert_eq!(f.row(&id).await.state, "running");
+        ids.push(id);
+    }
+    {
+        let mut hub = f.0.inner.lock().await;
+        hub.peers.remove("worker");
+        let owed = Owed {
+            since: now_unix(),
+            owner: "worker-session".into(),
+        };
+        hub.owed.insert("worker".into(), owed);
+    }
+    let (registered, _) = f
+        .request(
+            "POST",
+            "/peers",
+            json!({"peer_id": "intruder", "name": "worker", "backend": "pi", "circle": "other"}),
+        )
+        .await;
+    assert_eq!(registered, StatusCode::OK);
+    let (cancelled, _) = f.set_state(&ids[0], json!({"state": "cancelled"})).await;
+    let (deleted, _) = f
+        .request("DELETE", &format!("/jobs/{}", ids[1]), json!({}))
+        .await;
+    assert_eq!((cancelled, deleted), (StatusCode::OK, StatusCode::OK));
+    let notices = |inbox: Vec<Value>| {
+        inbox
+            .iter()
+            .filter(|event| event["type"] == "notify")
+            .filter(|event| {
+                event["message"]
+                    .as_str()
+                    .is_some_and(|m| m.contains("-title"))
+            })
+            .count()
+    };
+    assert_eq!(
+        (
+            notices(f.inbox("intruder").await),
+            notices(f.inbox("worker").await)
+        ),
+        (0, 2),
+        "the peer that took the name gets neither notice and the away worker's backlog keeps both"
+    );
+}
+
+#[tokio::test]
 async fn a_hub_close_says_failed_in_the_reply_text() {
     let f = team("c", &["sender"]).await;
     f.peer_in_session("worker", "c", "s-worker").await;

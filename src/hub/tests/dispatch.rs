@@ -21,6 +21,28 @@ fn fixture() -> (Hub, tests::TempState, Job) {
     (hub, path, job)
 }
 
+#[test]
+fn a_watched_job_arms_no_watch_for_a_coordinator_whose_name_was_taken() {
+    let (mut hub, _path, mut job) = fixture();
+    job.watch = true;
+    hub.peers.remove("creator");
+    hub.peers.insert(
+        "intruder".into(),
+        serde_json::from_value(json!({
+            "peer_id": "intruder", "name": "creator", "status": "online", "path": "",
+            "backend": "pi", "circle": "two", "description": "", "session_id": "", "last_seen": 0
+        }))
+        .unwrap(),
+    );
+    hub.jobs.insert("j".into(), job);
+    advance_jobs(&mut hub);
+    let ask = &hub.asks[hub.jobs["j"].ask_id.as_ref().unwrap()];
+    assert!(
+        ask.watch.is_none(),
+        "a coordinator that left has no watch to land on"
+    );
+}
+
 fn dependency(hub: &mut Hub, job: &mut Job, id: &str, state: &str) {
     job.depends_on.push(id.into());
     if state != "deleted" {

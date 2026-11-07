@@ -489,6 +489,10 @@ fn ensure_daemon() {
         if health_is_amesh_within(remaining(deadline)) {
             break;
         }
+        /* a hub that ended at startup is not coming, unless another one took the port */
+        if matches!(child.try_wait(), Ok(Some(_))) && !bind_occupied(addr, remaining(deadline)) {
+            break;
+        }
         std::thread::sleep(remaining(deadline).min(Duration::from_millis(50)));
     }
     std::thread::spawn(move || {
