@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { test as nodeTest } from "node:test";
+import { dirname, join } from "node:path";
+import { test as nodeTest, after } from "node:test";
 
 if (!process.env.AMESH_STATE || !process.env.AMESH_BIND) {
   console.error(
@@ -13,6 +15,10 @@ if (!process.env.AMESH_STATE || !process.env.AMESH_BIND) {
 /* AMESH_PI_DAEMON_ONLY keeps the session that talks to the daemon, for the run where
 session_start has to start it; the socket retry checks before it are left out and the
 subtests after it skipped, never cut off, so a failure still fails the run */
+const childEnv = JSON.parse(execFileSync(process.execPath, ["-e", "console.log(JSON.stringify({HOME:process.env.HOME,AMESH_BIND:process.env.AMESH_BIND,AMESH_STATE:process.env.AMESH_STATE}))"], { encoding: "utf8" }));
+assert.deepEqual(childEnv, { HOME: process.env.HOME, AMESH_BIND: process.env.AMESH_BIND, AMESH_STATE: process.env.AMESH_STATE });
+assert.notEqual(childEnv.AMESH_BIND, "127.0.0.1:8378");
+
 const daemonOnly = process.env.AMESH_PI_DAEMON_ONLY === "1";
 let test = nodeTest;
 
@@ -61,6 +67,10 @@ globalThis.WebSocket = class {
   }
 };
 const [extensionPath, executable, cwd, sessionManagerModule] = process.argv.slice(2);
+/* the accept log lives under the agent directory, so every instance in this run writes into
+the sandbox rather than the home that started the harness */
+process.env.PI_CODING_AGENT_DIR = join(cwd, `.pi-agent-${process.pid}`);
+mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 const NativeSessionManager = sessionManagerModule ? (await import(sessionManagerModule)).SessionManager : null;
 const source = await readFile(extensionPath, "utf8");
 const { default: AmeshHooks, ExecError } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
@@ -232,6 +242,8 @@ if (!daemonOnly) {
   wsFailRemaining = -1;
   wsAttempts = 0;
   const capLogsStart = ameshLogs.length;
+  /* the retry delays grow, so a five-retry run is only quick with a small base */
+  process.env.AMESH_CONNECT_BACKOFF_MS = "10";
   const capHandlers = new Map();
   AmeshHooks({
     on(event, handler) { capHandlers.set(event, handler); },
@@ -248,6 +260,7 @@ if (!daemonOnly) {
     1,
   );
   await capHandlers.get("session_shutdown")({}, context);
+  delete process.env.AMESH_CONNECT_BACKOFF_MS;
 }
 socketSink = sockets;
 wsFailRemaining = 1;
@@ -429,7 +442,9 @@ await test("a settled agent reports idle when pi still says so a second later", 
   };
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   /* a fresh instance per scenario: the earlier tests leave the shared one mid-run */
+  let idleIndex = 0;
   const instance = async (bin) => {
+    process.env.PI_CODING_AGENT_DIR = join(cwd, `pi-idle-owner-${++idleIndex}`);
     const text = source.split(JSON.stringify(executable)).join(JSON.stringify(bin));
     if (bin !== executable) {
       assert.notEqual(text, source, "the extension names its executable as a JSON string");
@@ -517,6 +532,9 @@ await test("a settled agent reports idle when pi still says so a second later", 
     await run;
     assert.ok(!existsSync(after), `${start} reports nothing after the session shut down`);
   }
+  await live("session_shutdown");
+  await counted("session_shutdown");
+  await late("session_shutdown");
 });
 execFileSync(executable, ["peer", "ack", promptAsk.correlation_id]);
 await handlers.get("agent_settled")({}, context);
@@ -714,6 +732,7 @@ function InboxSession() {
   return { ctx, id: registered.peer_id, primer: registered.context };
 }
 
+const inboxInstances = [];
 function InboxInstance(state, failPrimer = false, hooks = AmeshHooks) {
   const handlers = new Map();
   const primers = [];
@@ -743,6 +762,7 @@ function InboxInstance(state, failPrimer = false, hooks = AmeshHooks) {
     },
     registerTool() {},
   });
+  inboxInstances.push({ handlers, ctx: state.ctx });
   return { handlers, primers, users, order, sockets, failNextUser() { failUser = true; } };
 }
 
@@ -758,7 +778,7 @@ function SendInbox(state, command, message) {
   }));
 }
 
-await test("replacement drops pending messages and keeps the socket", async () => {
+await test("a replacement without a session keeps the queued messages", async () => {
   const state = InboxSession();
   const instance = InboxInstance(state);
   try {
@@ -772,9 +792,10 @@ await test("replacement drops pending messages and keeps the socket", async () =
     fire(socket, { type: "replaced", peer_id: state.id });
     fire(socket, { type: "notify", message: "new session message" });
     await instance.handlers.get("agent_settled")({}, state.ctx);
-    assert.equal(instance.users.length, 2);
+    assert.equal(instance.users.length, 2, "a replacement that names no session discards nothing");
+    assert.match(instance.users[1].content, /old queued ask/);
+    assert.match(instance.users[1].content, /old queued notify/);
     assert.match(instance.users[1].content, /new session message/);
-    assert.doesNotMatch(instance.users[1].content, /old queued/);
     assert.equal(socket.readyState, 1);
     assert.equal(instance.sockets.length, 1);
   } finally {
@@ -836,8 +857,10 @@ await test("a delayed old frame cannot enter the new local session", async () =>
 
 for (const kind of ["connected", "bound"]) {
   await test(`an unbound queue waits for ${kind} and is then delivered`, async () => {
+    process.env.PI_CODING_AGENT_DIR = join(cwd, `.pi-agent-unbound-${kind}`);
+    mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
     const state = InboxSession();
-    const instance = InboxInstance(state);
+    const instance = await PinnedInbox(state);
     try {
       await instance.handlers.get("session_start")({}, state.ctx);
       await waitCount(instance.sockets, 1, 2000);
@@ -909,7 +932,7 @@ await test("replacement keeps a new session's earlier HTTP inbox", async () => {
   }
 });
 
-await test("a local session switch does not claim the earlier unbound queue", async () => {
+await test("a local session switch leaves an unbound queue to the hub's binding", async () => {
   const a = InboxSession();
   const b = InboxSession();
   const instance = await PinnedInbox(a);
@@ -924,7 +947,9 @@ await test("a local session switch does not claim the earlier unbound queue", as
     await instance.handlers.get("session_start")({}, b.ctx);
     fire(socket, { type: "bound", session_id: b.ctx.sessionManager.getSessionId() });
     await instance.handlers.get("agent_settled")({}, b.ctx);
-    assert.equal(instance.users.length, 1, "the local switch must discard the old unbound message");
+    assert.equal(instance.users.length, 2, "the hub's binding delivers the unbound message");
+    assert.match(instance.users[1].content, /old unbound message/);
+    assert.doesNotMatch(instance.users[1].content, /A in flight/, "A's record never enters B");
   } finally {
     await instance.handlers.get("session_shutdown")({}, b.ctx);
   }
@@ -1280,7 +1305,7 @@ await test("a hook child that exits before reading its input is logged, never th
   const state = InboxSession();
   const { writeFileSync, chmodSync } = await import("node:fs");
   const early = `${cwd}/early-hook-amesh`;
-  writeFileSync(early, `#!/bin/sh\n[ "$1" = hook ] && { echo hook-refused >&2; exit 1; }\nexec ${JSON.stringify(executable)} "$@"\n`);
+  writeFileSync(early, `#!/bin/sh\n[ "$1" = hook ] && [ "$2" != hold ] && { echo hook-refused >&2; exit 1; }\nexec ${JSON.stringify(executable)} "$@"\n`);
   chmodSync(early, 0o755);
   const text = source.split(JSON.stringify(executable)).join(JSON.stringify(early));
   const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
@@ -1544,5 +1569,794 @@ process.stdout.write(JSON.stringify(state[verb] ?? {}));
     await instance.handlers.get("session_shutdown")({}, state.ctx);
     rmSync(started, { force: true });
     rmSync(release, { force: true });
+  }
+});
+
+/* the accept log must survive a crash between the socket ack and the injection, and must be
+the one place both ingresses dedupe against */
+let inboxLogIndex = 0;
+function InboxLog(cwd) {
+  const dir = join(cwd, `.pi-agent-log-${process.pid}-${++inboxLogIndex}`);
+  mkdirSync(dir, { recursive: true });
+  process.env.PI_CODING_AGENT_DIR = dir;
+  return dir;
+}
+
+function InboxLogFile(dir, peer) {
+  return join(dir, "amesh-inbox", `${peer}.jsonl`);
+}
+
+function Injected(instance, text) {
+  return instance.users.filter((message) => message.content.includes(text)).length;
+}
+
+function AskVisible(peer, correlationId) {
+  try {
+    const out = execFileSync(executable, ["peer", "asks", "--peer-id", peer], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return out.includes(correlationId);
+  } catch {
+    return false;
+  }
+}
+
+await test("a record acknowledged before the crash is replayed from the accept log exactly once", async () => {
+  InboxLog(cwd);
+  const state = InboxSession();
+  const first = await PinnedInbox(state);
+  await first.handlers.get("session_start")({}, state.ctx);
+  await waitCount(first.sockets, 1, 2000);
+  fire(first.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+  first.failNextUser();
+  fire(first.sockets[0], { type: "notify", message: "survives the crash", id: "evt-crash" });
+  assert.equal(Injected(first, "survives the crash"), 0, "the crash window: acknowledged, not injected");
+  assert.equal(
+    recvsOf(first.sockets[0]).filter((frame) => frame.id === "evt-crash").length,
+    1,
+    "the recv went out before the crash",
+  );
+  await first.handlers.get("session_shutdown")({}, state.ctx);
+  const second = await PinnedInbox(state);
+  await second.handlers.get("session_start")({}, state.ctx);
+  await waitCount(second.sockets, 1, 2000);
+  assert.equal(Injected(second, "survives the crash"), 1, "the log replays the record once");
+  await second.handlers.get("session_shutdown")({}, state.ctx);
+  const third = await PinnedInbox(state);
+  await third.handlers.get("session_start")({}, state.ctx);
+  await waitCount(third.sockets, 1, 2000);
+  await third.handlers.get("agent_settled")({}, state.ctx);
+  assert.equal(Injected(third, "survives the crash"), 0, "a completed record never replays");
+  await third.handlers.get("session_shutdown")({}, state.ctx);
+  await second.handlers.get("session_shutdown")({}, state.ctx);
+  await first.handlers.get("session_shutdown")({}, state.ctx);
+});
+
+await test("one record drained over HTTP and pushed over the socket is injected once", async () => {
+  InboxLog(cwd);
+  const state = InboxSession();
+  const instance = await PinnedInbox(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const sent = SendInbox(state, "notify", "one ingress");
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(Injected(instance, "one ingress"), 1, "the HTTP drain delivers the record");
+    fire(instance.sockets[0], { type: "notify", message: "one ingress", id: sent.id });
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(Injected(instance, "one ingress"), 1, "the socket copy of the same id must not inject twice");
+    assert.equal(
+      recvsOf(instance.sockets[0]).filter((frame) => frame.id === sent.id).length,
+      1,
+      "the socket copy is still acknowledged",
+    );
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a record for another session is held and injected when that session returns", async () => {
+  InboxLog(cwd);
+  const a = InboxSession();
+  const b = InboxSession();
+  const instance = await PinnedInbox(a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "connected", session_id: a.ctx.sessionManager.getSessionId() });
+    instance.failNextUser();
+    fire(instance.sockets[0], { type: "notify", message: "held for A", id: "held-a" });
+    assert.equal(Injected(instance, "held for A"), 0);
+    await instance.handlers.get("session_start")({}, b.ctx);
+    await instance.handlers.get("agent_settled")({}, b.ctx);
+    assert.equal(Injected(instance, "held for A"), 0, "A's record never enters B");
+    await instance.handlers.get("session_start")({}, a.ctx);
+    assert.equal(Injected(instance, "held for A"), 1, "returning to A injects the held record");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, a.ctx);
+  }
+});
+
+await test("a held ask past the retention window is closed with a failed ack", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const ask = SendInbox(state, "ask", "held ask");
+  assert.equal(
+    await waitUntil(() => AskVisible(state.id, ask.correlation_id), 4000),
+    true,
+    "the ask is open before the replay",
+  );
+  const file = InboxLogFile(dir, state.id);
+  mkdirSync(dirname(file), { recursive: true });
+  const stale = Math.floor(Date.now() / 1000) - 2 * 24 * 3600;
+  const row = {
+    t: "a",
+    id: "evt-stale",
+    at: stale,
+    session: state.ctx.sessionManager.getSessionId(),
+    type: "ask",
+    cid: ask.correlation_id,
+    text: "held ask",
+  };
+  writeFileSync(file, `${JSON.stringify(row)}\n`);
+  const instance = await PinnedInbox(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(Injected(instance, "held ask"), 0, "a record past the window is never injected");
+    assert.ok(
+      ameshLogs.some((line) => line.includes("dropped 1 held message")),
+      "one log line names the drop",
+    );
+    assert.equal(
+      await waitUntil(() => !AskVisible(state.id, ask.correlation_id), 6000),
+      true,
+      "the ask is closed",
+    );
+    const closed = JSON.parse(
+      execFileSync(executable, ["peer", "wait", ask.correlation_id, "--timeout-seconds", "1"], { encoding: "utf8" }),
+    );
+    assert.deepEqual([closed.open, closed.failed], [false, true], "the ask is closed as failed");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("connect retries back off up to a cap instead of every second", async () => {
+  InboxLog(cwd);
+  process.env.AMESH_CONNECT_BACKOFF_MS = "40";
+  process.env.AMESH_CONNECT_BACKOFF_MAX_MS = "160";
+  const stamps = [];
+  const Native = globalThis.WebSocket;
+  globalThis.WebSocket = class {
+    constructor() {
+      stamps.push(Date.now());
+      throw new Error("connect-backoff-probe");
+    }
+  };
+  const handlers = new Map();
+  try {
+    AmeshHooks({
+      on(event, handler) { handlers.set(event, handler); },
+      sendMessage() {},
+      sendUserMessage() {},
+      registerTool() {},
+    });
+    await handlers.get("session_start")({}, { ...context, cwd });
+    assert.equal(
+      await waitUntil(() => stamps.length >= 4, 5000),
+      true,
+      "the retry loop keeps trying",
+    );
+    const gaps = stamps.slice(1).map((at, i) => at - stamps[i]);
+    assert.ok(gaps[0] <= 60, `the first retry waits for the backoff base (${gaps.join(",")})`);
+    assert.ok(gaps[1] >= gaps[0] * 0.9, `the second wait grows (${gaps.join(",")})`);
+    assert.ok(gaps.length < 3 || gaps[2] >= gaps[1] * 0.9, `the third wait grows (${gaps.join(",")})`);
+    assert.ok(Math.max(...gaps) <= 200, `the wait stays capped (${gaps.join(",")})`);
+    await handlers.get("session_shutdown")({}, { ...context, cwd });
+  } finally {
+    globalThis.WebSocket = Native;
+    delete process.env.AMESH_CONNECT_BACKOFF_MS;
+    delete process.env.AMESH_CONNECT_BACKOFF_MAX_MS;
+  }
+});
+
+await test("a socket connect without an identity names it once", async () => {
+  InboxLog(cwd);
+  const handlers = new Map();
+  const missing = join(cwd, "missing-cwd-for-identity");
+  const before = ameshLogs.length;
+  AmeshHooks({
+    on(event, handler) { handlers.set(event, handler); },
+    sendMessage() {},
+    sendUserMessage() {},
+    registerTool() {},
+  });
+  await handlers.get("session_start")({}, { ...context, cwd: missing, sessionManager: { getSessionId: () => "pi-identity-probe", buildContextEntries: () => [] } });
+  assert.equal(
+    await waitUntil(() => ameshLogs.slice(before).some((line) => line.includes("no peer id")), 4000),
+    true,
+    "the missing identity is reported",
+  );
+  await handlers.get("session_shutdown")({}, context);
+  assert.equal(
+    ameshLogs.slice(before).filter((line) => line.includes("no peer id")).length,
+    1,
+    "the line is not repeated on every retry",
+  );
+});
+
+/* the extension with a writeSync that fails like a full disk on writes carrying marker,
+every time or only the first time */
+async function FailingWrite(marker, once) {
+  const text = source.replace("  writeSync,", "  writeSync as NativeWriteSync,") + `
+let failing = true;
+function writeSync(fd, text, ...rest) {
+  if (failing && typeof text === "string" && text.includes(${JSON.stringify(marker)})) {
+    failing = ${!once};
+    throw Object.assign(new Error("full log"), { code: "ENOSPC" });
+  }
+  return NativeWriteSync(fd, text, ...rest);
+}`;
+  return (await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`)).default;
+}
+
+await test("a record whose log write fails is not acknowledged", async () => {
+  InboxLog(cwd);
+  const hooks = await FailingWrite('"id":"evt-nolog"', false);
+  const state = InboxSession();
+  const instance = InboxInstance(state, false, hooks);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "notify", message: "cannot be logged", id: "evt-nolog" });
+    assert.equal(
+      recvsOf(instance.sockets[0]).filter((frame) => frame.id === "evt-nolog").length,
+      0,
+      "the recv must not go out before the record is on disk",
+    );
+    assert.equal(Injected(instance, "cannot be logged"), 0);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+/* the accept log is the only copy between the socket ack and the injection, so its own
+failure modes are part of the delivery contract */
+function InboxRows(dir, peer) {
+  const file = InboxLogFile(dir, peer);
+  const raw = existsSync(file) ? readFileSync(file, "utf8") : "";
+  return raw
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line);
+      } catch {
+        return { t: "torn" };
+      }
+    });
+}
+
+function InboxSessionAt(directory) {
+  mkdirSync(directory, { recursive: true });
+  const entries = [];
+  const sessionId = `pi-inbox-${++inboxSessionIndex}`;
+  const sessionManager = {
+    getSessionId: () => sessionId,
+    buildContextEntries: () => entries,
+    appendCustomMessageEntry(customType, content, display) {
+      entries.push({ type: "custom_message", customType, content, display });
+    },
+  };
+  const registered = JSON.parse(execFileSync(executable, ["hook", "session", "--backend=pi"], {
+    input: JSON.stringify({ cwd: directory, session_id: sessionId }),
+    encoding: "utf8",
+  }));
+  return { ctx: { cwd: directory, sessionManager }, id: registered.peer_id };
+}
+
+let inboxExecIndex = 0;
+function InboxExec(marker) {
+  const path = join(cwd, `pi-exec-${process.pid}-${++inboxExecIndex}.sh`);
+  writeFileSync(path, `#!/bin/sh\n[ "$2" = session ] && echo session >> '${marker}'\nexec '${executable}' "$@"\n`);
+  chmodSync(path, 0o755);
+  return path;
+}
+
+async function InboxWithExec(bin, state, failPrimer = false) {
+  const text = source.split(JSON.stringify(executable)).join(JSON.stringify(bin));
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+  return InboxInstance(state, failPrimer, hooks);
+}
+
+await test("a torn tail does not swallow the record accepted after it", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const file = InboxLogFile(dir, state.id);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `{"t":"a","id":"evt-torn","at":${Math.floor(Date.now() / 1000)}`);
+  const first = await PinnedInbox(state);
+  await first.handlers.get("session_start")({}, state.ctx);
+  await waitCount(first.sockets, 1, 2000);
+  first.failNextUser();
+  fire(first.sockets[0], { type: "notify", message: "after the torn tail", id: "evt-after" });
+  assert.equal(
+    recvsOf(first.sockets[0]).filter((frame) => frame.id === "evt-after").length,
+    1,
+    "the record is acknowledged before the crash",
+  );
+  await first.handlers.get("session_shutdown")({}, state.ctx);
+  const second = await PinnedInbox(state);
+  await second.handlers.get("session_start")({}, state.ctx);
+  await waitCount(second.sockets, 1, 2000);
+  assert.equal(Injected(second, "after the torn tail"), 1, "the acknowledged record replays after the torn tail");
+  await second.handlers.get("session_shutdown")({}, state.ctx);
+  await first.handlers.get("session_shutdown")({}, state.ctx);
+});
+
+await test("a new peer id writes its own log and keeps it across a restart", async () => {
+  const dir = InboxLog(cwd);
+  const a = await InboxSessionAt(join(cwd, "pi-identity-a"));
+  const b = await InboxSessionAt(join(cwd, "pi-identity-b"));
+  assert.notEqual(a.id, b.id, "two folders are two peers");
+  /* unpinned, so the hub names this session by the folder it runs in */
+  const first = await InboxWithExec(executable, a);
+  await first.handlers.get("session_start")({}, a.ctx);
+  await waitCount(first.sockets, 1, 2000);
+  await first.handlers.get("session_start")({}, b.ctx);
+  assert.equal(
+    existsSync(InboxLogFile(dir, b.id)),
+    true,
+    "the new identity has a log of its own",
+  );
+  await waitCount(first.sockets, 2, 2000);
+  first.failNextUser();
+  fire(first.sockets.at(-1), { type: "notify", message: "accepted as B", id: "evt-carried" });
+  assert.equal(
+    recvsOf(first.sockets.at(-1)).filter((frame) => frame.id === "evt-carried").length,
+    1,
+    "the record is acknowledged under the new identity",
+  );
+  assert.equal(
+    InboxRows(dir, a.id).some((row) => row.id === "evt-carried"),
+    false,
+    "the old identity's log does not take it",
+  );
+  await first.handlers.get("session_shutdown")({}, b.ctx);
+  const second = await PinnedInbox(b);
+  await second.handlers.get("session_start")({}, b.ctx);
+  await waitCount(second.sockets, 1, 2000);
+  assert.equal(Injected(second, "accepted as B"), 1, "the new identity replays its record after the restart");
+  await second.handlers.get("session_shutdown")({}, b.ctx);
+  await first.handlers.get("session_shutdown")({}, b.ctx);
+});
+
+await test("a session claimed before a crash stays that session's", async () => {
+  InboxLog(cwd);
+  const a = InboxSession();
+  const b = InboxSession();
+  const first = await PinnedInbox(a);
+  await first.handlers.get("session_start")({}, a.ctx);
+  await waitCount(first.sockets, 1, 2000);
+  fire(first.sockets[0], { type: "connected", session_id: "" });
+  fire(first.sockets[0], { type: "notify", message: "claimed once", id: "evt-claim" });
+  first.failNextUser();
+  fire(first.sockets[0], { type: "bound", session_id: a.ctx.sessionManager.getSessionId() });
+  assert.equal(Injected(first, "claimed once"), 0, "the injection failed, so the record is still held");
+  await first.handlers.get("session_shutdown")({}, a.ctx);
+  const second = await PinnedInbox(a);
+  await second.handlers.get("session_start")({}, b.ctx);
+  await waitCount(second.sockets, 1, 2000);
+  fire(second.sockets[1] ?? second.sockets[0], { type: "bound", session_id: b.ctx.sessionManager.getSessionId() });
+  await second.handlers.get("agent_settled")({}, b.ctx);
+  assert.equal(Injected(second, "claimed once"), 0, "the record belongs to the session that claimed it");
+  await second.handlers.get("session_start")({}, a.ctx);
+  assert.equal(Injected(second, "claimed once"), 1, "and it is delivered when that session returns");
+  await second.handlers.get("session_shutdown")({}, a.ctx);
+  await first.handlers.get("session_shutdown")({}, a.ctx);
+});
+
+await test("an unknown peer puts the registration back", async () => {
+  InboxLog(cwd);
+  const marker = join(cwd, `pi-exec-${process.pid}.marker`);
+  writeFileSync(marker, "");
+  const state = InboxSession();
+  const instance = await InboxWithExec(InboxExec(marker), state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const before = readFileSync(marker, "utf8").split("\n").filter(Boolean).length;
+    fire(instance.sockets[0], { error: "unknown peer", peers: [] });
+    assert.equal(
+      await waitUntil(() => readFileSync(marker, "utf8").split("\n").filter(Boolean).length > before, 4000),
+      true,
+      "the drainer must re-register without a manual hook",
+    );
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a done row alone keeps its record out", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const file = InboxLogFile(dir, state.id);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify({ t: "d", id: "evt-done-only", at: Math.floor(Date.now() / 1000) })}\n`);
+  const instance = await PinnedInbox(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "notify", message: "must not reappear", id: "evt-done-only" });
+    assert.equal(
+      recvsOf(instance.sockets[0]).filter((frame) => frame.id === "evt-done-only").length,
+      1,
+      "a tombstone still acknowledges the replay",
+    );
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(Injected(instance, "must not reappear"), 0, "a completed id is never injected again");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a stale staged file is never renamed into the log", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const file = InboxLogFile(dir, state.id);
+  mkdirSync(dirname(file), { recursive: true });
+  const stale = { t: "a", id: "evt-stale", at: Math.floor(Date.now() / 1000), type: "notify", text: "stale" };
+  writeFileSync(`${file}.tmp`, `${JSON.stringify(stale)}\n`);
+  const old = Math.floor(Date.now() / 1000) - 8 * 24 * 3600;
+  writeFileSync(file, `${" ".repeat(8 * 1024 * 1024)}\n${JSON.stringify({ t: "d", id: "evt-old", at: old })}\n`);
+  const instance = await PinnedInbox(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const rows = InboxRows(dir, state.id);
+    assert.equal(rows.some((row) => row.id === "evt-stale"), false, "the stale snapshot must not become the log");
+    assert.ok(statSync(file).size < 8 * 1024 * 1024, "the rewritten log is not the old oversized one");
+    assert.equal(Injected(instance, "stale"), 0);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a migration replaces the target by rename and keeps what it held", async () => {
+  const dir = InboxLog(cwd);
+  const a = await InboxSessionAt(join(cwd, "pi-f2-rename-a"));
+  const b = await InboxSessionAt(join(cwd, "pi-f2-rename-b"));
+  const instance = await InboxWithExec(executable, a);
+  try {
+    await instance.handlers.get("session_start")({}, a.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const target = InboxLogFile(dir, b.id);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, `${JSON.stringify({ t: "d", id: "evt-target-done", at: Math.floor(Date.now() / 1000) })}\n`);
+    const before = statSync(target).ino;
+    await instance.handlers.get("session_start")({}, b.ctx);
+    assert.notEqual(
+      statSync(target).ino,
+      before,
+      "the target is replaced by rename, never truncated in place",
+    );
+    assert.ok(
+      InboxRows(dir, b.id).some((row) => row.id === "evt-target-done"),
+      "the target's own row survives the move",
+    );
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("a rewrite never leaves more done ids than the bound", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const file = InboxLogFile(dir, state.id);
+  mkdirSync(dirname(file), { recursive: true });
+  const at = Math.floor(Date.now() / 1000);
+  const rows = [];
+  for (let i = 0; i < 600; i += 1) {
+    rows.push(JSON.stringify({ t: "d", id: `evt-done-${i}`, at }));
+  }
+  writeFileSync(file, `${rows.join("\n")}\n`);
+  const instance = await PinnedInbox(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const done = InboxRows(dir, state.id).filter((row) => row.t === "d").length;
+    assert.ok(done <= 512, `the rewritten file holds the bound, not the merge: ${done} done ids`);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a claim that cannot be written leaves the record unbound", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const hooks = await FailingWrite('"t":"s"', true);
+  const instance = InboxInstance(state, false, hooks);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    const session = state.ctx.sessionManager.getSessionId();
+    fire(instance.sockets[0], { type: "connected", session_id: "" });
+    fire(instance.sockets[0], { type: "notify", message: "owned by A", id: "evt-claim" });
+    fire(instance.sockets[0], { type: "bound", session_id: session });
+    assert.equal(Injected(instance, "owned by A"), 0, "an unwritten claim must not deliver");
+    assert.equal(
+      InboxRows(dir, state.id).some((row) => row.id === "evt-claim" && row.t === "s"),
+      false,
+      "and leaves no claim on disk",
+    );
+    fire(instance.sockets[0], { type: "bound", session_id: session });
+    assert.equal(Injected(instance, "owned by A"), 1, "the retry claims it and only then delivers it");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a re-registration connects at once instead of waiting out the backoff", async () => {
+  InboxLog(cwd);
+  process.env.AMESH_CONNECT_BACKOFF_MS = "12000";
+  process.env.AMESH_CONNECT_BACKOFF_MAX_MS = "12000";
+  const state = InboxSession();
+  const instance = await PinnedInbox(state);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { error: "unknown peer", peers: [] });
+    instance.sockets[0].close();
+    assert.equal(
+      await waitUntil(() => instance.sockets.length >= 2, 2000),
+      true,
+      "the fresh registration is used by a socket at once",
+    );
+  } finally {
+    delete process.env.AMESH_CONNECT_BACKOFF_MS;
+    delete process.env.AMESH_CONNECT_BACKOFF_MAX_MS;
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+function OwnerSleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+await test("a second log instance waits for the owner and replays after release", async () => {
+  InboxLog(cwd);
+  const state = InboxSession();
+  const one = await PinnedInbox(state);
+  let two;
+  try {
+    await one.handlers.get("session_start")({}, state.ctx);
+    await waitCount(one.sockets, 1, 2000);
+    one.failNextUser();
+    fire(one.sockets[0], { type: "notify", message: "owner owed", id: "evt-owner-owed" });
+    two = await PinnedInbox(state);
+    await two.handlers.get("session_start")({}, state.ctx);
+    await OwnerSleep(150);
+    assert.equal(two.sockets.length, 0, "a non-owner must not connect or displace the owner");
+    assert.equal(Injected(two, "owner owed"), 0, "a non-owner cannot inject the owner's record");
+    await one.handlers.get("session_shutdown")({}, state.ctx);
+    await waitCount(two.sockets, 1, 4000);
+    await two.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(Injected(two, "owner owed"), 1, "takeover loads the durable owed record exactly once");
+    fire(two.sockets[0], { type: "notify", message: "owner owed", id: "evt-owner-owed" });
+    await two.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(Injected(two, "owner owed"), 1);
+  } finally {
+    await one.handlers.get("session_shutdown")({}, state.ctx);
+    await two?.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a slow live owner keeps its log past the old stale timeout", async () => {
+  InboxLog(cwd);
+  const state = InboxSession();
+  const one = await PinnedInbox(state);
+  let two;
+  try {
+    await one.handlers.get("session_start")({}, state.ctx);
+    await waitCount(one.sockets, 1, 2000);
+    two = await PinnedInbox(state);
+    await two.handlers.get("session_start")({}, state.ctx);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10100);
+    await OwnerSleep(50);
+    assert.equal(two.sockets.length, 0, "a paused live owner is never replaced on age");
+    fire(one.sockets[0], { type: "notify", message: "still owned", id: "evt-still-owned" });
+    assert.equal(recvsOf(one.sockets[0]).filter((r) => r.id === "evt-still-owned").length, 1);
+  } finally {
+    await one.handlers.get("session_shutdown")({}, state.ctx);
+    await two?.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("an identity change waits for B ownership before writing as B", async () => {
+  const dir = InboxLog(cwd);
+  const a = InboxSessionAt(join(cwd, "pi-owner-a"));
+  const b = InboxSessionAt(join(cwd, "pi-owner-b"));
+  let one;
+  const two = await PinnedInbox(b);
+  try {
+    await two.handlers.get("session_start")({}, b.ctx);
+    await waitCount(two.sockets, 1, 2000);
+    one = await InboxWithExec(executable, a);
+    await one.handlers.get("session_start")({}, a.ctx);
+    await waitCount(one.sockets, 1, 2000);
+    one.failNextUser();
+    fire(one.sockets[0], { type: "notify", message: "A held", id: "evt-A-held" });
+    await one.handlers.get("session_start")({}, b.ctx);
+    fire(one.sockets[0], { type: "notify", message: "arrived as B", id: "evt-as-B" });
+    assert.equal(InboxRows(dir, a.id).some((r) => r.id === "evt-as-B"), false,
+      "B traffic must never enter A's log while B is owned elsewhere");
+    assert.ok(InboxRows(dir, a.id).some((r) => r.id === "evt-A-held"), "A keeps its record until migration");
+    assert.equal(Injected(one, "A held"), 0, "A's held record stays outside B's session");
+    assert.equal(Injected(two, "A held"), 0);
+    assert.equal(one.sockets[0].readyState, 3, "the switching non-owner releases its old socket");
+    await two.handlers.get("session_shutdown")({}, b.ctx);
+    assert.equal(await waitUntil(() => InboxRows(dir, b.id).some((r) => r.id === "evt-A-held"), 4000), true);
+    assert.equal(InboxRows(dir, a.id).some((r) => r.id === "evt-A-held"), false);
+  } finally {
+    await one?.handlers.get("session_shutdown")({}, b.ctx);
+    await two.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("a failed accept recovers on its own while the hub remains healthy", async () => {
+  InboxLog(cwd);
+  const state = InboxSession();
+  const hooks = await FailingWrite('"id":"evt-io-retry"', true);
+  const instance = InboxInstance(state, false, hooks);
+  const FakeSocket = globalThis.WebSocket;
+  globalThis.WebSocket = class extends FakeSocket {
+    constructor(url) {
+      super(url);
+      queueMicrotask(() => {
+        if (instance.sockets.length > 1) {
+          fire(this, { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+          fire(this, { type: "notify", message: "autonomous replay", id: "evt-io-retry" });
+        }
+      });
+    }
+  };
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    fire(instance.sockets[0], { type: "notify", message: "autonomous replay", id: "evt-io-retry" });
+    assert.equal(await waitUntil(() => Injected(instance, "autonomous replay") === 1, 4000), true,
+      "a failed durable accept must trigger replay without another manual frame");
+    assert.equal(instance.sockets.flatMap(recvsOf).filter((r) => r.id === "evt-io-retry").length, 1);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+    globalThis.WebSocket = FakeSocket;
+  }
+});
+
+await test("a standby instance cannot erase the owner's durable claim", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const one = await PinnedInbox(state);
+  let two;
+  try {
+    await one.handlers.get("session_start")({}, state.ctx);
+    await waitCount(one.sockets, 1, 2000);
+    fire(one.sockets[0], { type: "connected", session_id: "" });
+    fire(one.sockets[0], { type: "notify", message: "claimed by owner", id: "evt-owner-claim" });
+    const text = source.replace("  RegisterTools();", "  globalThis.OwnerRewrite = Rewrite;\n  RegisterTools();");
+    const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+    two = InboxInstance(state, true, hooks);
+    await two.handlers.get("session_start")({}, state.ctx);
+    one.failNextUser();
+    const session = state.ctx.sessionManager.getSessionId();
+    fire(one.sockets[0], { type: "bound", session_id: session });
+    const before = readFileSync(InboxLogFile(dir, state.id), "utf8");
+    globalThis.OwnerRewrite();
+    assert.equal(readFileSync(InboxLogFile(dir, state.id), "utf8"), before,
+      "the standby cannot compact stale memory over the owner's claim");
+    assert.ok(InboxRows(dir, state.id).some((r) => r.t === "s" && r.session === session));
+  } finally {
+    await one.handlers.get("session_shutdown")({}, state.ctx);
+    await two?.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a failed owner helper keeps the socket closed and retries", async () => {
+  InboxLog(cwd);
+  const state = InboxSession();
+  const marker = join(cwd, `pi-owner-allow-${process.pid}`);
+  const bin = join(cwd, `pi-owner-retry-${process.pid}.sh`);
+  writeFileSync(bin, `#!/bin/sh\nif [ "$2" = hold ] && [ ! -e '${marker}' ]; then exit 1; fi\nexec '${executable}' "$@"\n`);
+  chmodSync(bin, 0o755);
+  const text = source.split(JSON.stringify(executable)).join(JSON.stringify(bin))
+    .replace("  RegisterTools();", "  globalThis.OwnerChild = () => owner?.child;\n  RegisterTools();");
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+  const instance = InboxInstance(state, false, hooks);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await OwnerSleep(150);
+    assert.equal(instance.sockets.length, 0, "failed ownership cannot open a hub socket");
+    writeFileSync(marker, "go");
+    await waitCount(instance.sockets, 1, 5000);
+    fire(instance.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+    fire(instance.sockets[0], { type: "notify", message: "helper recovered", id: "evt-helper-recovered" });
+    assert.equal(recvsOf(instance.sockets[0]).filter((r) => r.id === "evt-helper-recovered").length, 1);
+    const child = globalThis.OwnerChild();
+    assert.equal(child.spawnfile, bin);
+    assert.equal(child.exitCode, null);
+    child.kill("SIGTERM");
+    await waitCount(instance.sockets, 2, 5000);
+    assert.equal(instance.sockets[0].readyState, 3, "losing the helper closes the old socket");
+    fire(instance.sockets.at(-1), { type: "notify", message: "helper recovered", id: "evt-helper-recovered" });
+    assert.equal(Injected(instance, "helper recovered"), 1, "a new holder reloads the tombstone");
+  } finally {
+    delete globalThis.OwnerChild;
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("an in-flight connect rechecks ownership after an identity change", async () => {
+  InboxLog(cwd);
+  const a = InboxSessionAt(join(cwd, "pi-connect-owner-a"));
+  const b = InboxSessionAt(join(cwd, "pi-connect-owner-b"));
+  const two = await PinnedInbox(b);
+  let one;
+  const release = [];
+  globalThis.OwnerConnectBarrier = () => new Promise((resolve) => release.push(resolve));
+  try {
+    await two.handlers.get("session_start")({}, b.ctx);
+    await waitCount(two.sockets, 1, 2000);
+    const text = source.replace("void Ensure().then(() => {", "void Ensure().then(async () => { await globalThis.OwnerConnectBarrier?.();");
+    const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+    one = InboxInstance(a, false, hooks);
+    await one.handlers.get("session_start")({}, a.ctx);
+    assert.equal(await waitUntil(() => release.length > 0, 2000), true);
+    await one.handlers.get("session_start")({}, b.ctx);
+    for (const resolve of release.splice(0)) resolve();
+    await OwnerSleep(50);
+    assert.equal(one.sockets.length, 0, "a connect resumed after switching to an unowned log must stay closed");
+  } finally {
+    delete globalThis.OwnerConnectBarrier;
+    for (const resolve of release.splice(0)) resolve();
+    await one?.handlers.get("session_shutdown")({}, b.ctx);
+    await two.handlers.get("session_shutdown")({}, b.ctx);
+  }
+});
+
+await test("a log read failure retries before the log becomes authoritative", async () => {
+  const dir = InboxLog(cwd);
+  const state = InboxSession();
+  const file = InboxLogFile(dir, state.id);
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, `${JSON.stringify({ t: "a", id: "evt-read-retry", at: Math.floor(Date.now() / 1000), session: state.ctx.sessionManager.getSessionId(), type: "notify", text: "read recovery" })}\n`);
+  globalThis.OwnerReadFailure = true;
+  const text = source.replace(/^const peerId = .*;$/m, `const peerId = ${JSON.stringify(state.id)};`)
+    .replace("  readFileSync,", "  readFileSync as NativeReadFileSync,") + `
+function readFileSync(path, ...rest) {
+  if (globalThis.OwnerReadFailure && path === ${JSON.stringify(file)}) {
+    throw Object.assign(new Error("cannot read accepted records"), { code: "EACCES" });
+  }
+  return NativeReadFileSync(path, ...rest);
+}`;
+  const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+  const instance = InboxInstance(state, false, hooks);
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    globalThis.OwnerReadFailure = false;
+    assert.equal(await waitUntil(() => Injected(instance, "read recovery") === 1, 3000), true,
+      "a failed load must retry the durable records, not initialise an empty log");
+  } finally {
+    delete globalThis.OwnerReadFailure;
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+after(async () => {
+  for (const instance of inboxInstances) {
+    await instance.handlers.get("session_shutdown")({}, instance.ctx);
   }
 });

@@ -1074,7 +1074,7 @@ async fn an_unproven_row_gets_no_replay_and_no_hook_leak_until_its_session_prove
 }
 
 #[tokio::test]
-async fn ownership_unproven_legacy_connection_keeps_reserved_messages() {
+async fn ownership_unproven_legacy_connection_must_reconnect_with_recv() {
     unproven_connection_waits_for_its_session(false).await;
 }
 
@@ -1134,13 +1134,32 @@ async fn unproven_connection_waits_for_its_session(recv: bool) {
     ))
     .await
     .unwrap();
-    assert!(r
-        .next()
+    let mut frame = r.next().await.unwrap().unwrap();
+    if !recv {
+        let error: Value = serde_json::from_str(&frame.to_string()).unwrap();
+        assert_eq!(
+            error["error"],
+            "this peer requires delivery acknowledgements; connect with recv:true"
+        );
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(3), r.next())
+                .await
+                .expect("the refused legacy connection must close"),
+            Some(Ok(WsMsg::Close(_))) | None
+        ));
+        assert!(!state.inner.lock().await.sockets.contains_key("tmp-pi"));
+        let (socket, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        (w, r) = socket.split();
+        w.send(WsMsg::Text(
+            json!({"type": "connect", "peer_id": "tmp-pi", "recv": true})
+                .to_string()
+                .into(),
+        ))
         .await
-        .unwrap()
-        .unwrap()
-        .to_string()
-        .contains("connected"));
+        .unwrap();
+        frame = r.next().await.unwrap().unwrap();
+    }
+    assert!(frame.to_string().contains("connected"));
     let nothing = tokio::time::timeout(Duration::from_millis(500), r.next()).await;
     assert!(
         nothing.is_err(),
@@ -1189,14 +1208,12 @@ async fn unproven_connection_waits_for_its_session(recv: bool) {
         let v: Value = serde_json::from_str(&frame.to_string()).unwrap();
         ids.push(v["id"].as_str().unwrap().to_string());
     }
-    if recv {
-        for id in &ids {
-            w.send(WsMsg::Text(
-                json!({"type": "recv", "id": id}).to_string().into(),
-            ))
-            .await
-            .unwrap();
-        }
+    for id in &ids {
+        w.send(WsMsg::Text(
+            json!({"type": "recv", "id": id}).to_string().into(),
+        ))
+        .await
+        .unwrap();
     }
     until(
         &state,

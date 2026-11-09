@@ -1396,6 +1396,12 @@ impl KillChild {
             let _ = child.wait();
         }
     }
+
+    fn stop_take(&mut self) -> Option<std::process::Output> {
+        let mut child = self.0.take()?;
+        let _ = child.kill();
+        child.wait_with_output().ok()
+    }
 }
 
 impl Drop for KillChild {
@@ -3240,6 +3246,103 @@ fn pi_harness_rejects_missing_both() {
 }
 
 #[test]
+fn hook_hold_keeps_a_log_owned_until_its_pipe_closes() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.join("inbox.owner");
+    let mut one_guard = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "hold"])
+            .arg(&path)
+            .spawn()
+            .unwrap(),
+    ));
+    let one = one_guard.0.as_mut().unwrap();
+    let mut first = String::new();
+    std::io::BufReader::new(one.stdout.take().unwrap())
+        .read_line(&mut first)
+        .unwrap();
+    assert_eq!(first, "owner\n", "the first holder must acquire the log");
+    let mut two_guard = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "hold"])
+            .arg(&path)
+            .spawn()
+            .unwrap(),
+    ));
+    let two = two_guard.0.as_mut().unwrap();
+    let stdout = two.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if line.unwrap() == "owner" {
+                let _ = tx.send("owner\n".to_string());
+                break;
+            }
+        }
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "the second holder must wait"
+    );
+    drop(one.stdin.take());
+    assert!(one.wait().unwrap().success());
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), "owner\n");
+    drop(two.stdin.take());
+    assert!(two.wait().unwrap().success());
+    reader.join().unwrap();
+}
+
+#[test]
+fn a_waiting_hook_holder_exits_when_its_pipe_closes() {
+    let sandbox = Sandbox::new();
+    let path = sandbox.root.join("inbox.owner");
+    let mut one_guard = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "hold"])
+            .arg(&path)
+            .spawn()
+            .unwrap(),
+    ));
+    let one = one_guard.0.as_mut().unwrap();
+    let mut line = String::new();
+    BufReader::new(one.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    assert_eq!(line, "owner\n");
+    let mut two_guard = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "hold"])
+            .arg(&path)
+            .spawn()
+            .unwrap(),
+    ));
+    let two = two_guard.0.as_mut().unwrap();
+    drop(two.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let exited = loop {
+        if let Some(status) = two.try_wait().unwrap() {
+            break status.success();
+        }
+        if Instant::now() >= deadline {
+            two.kill().unwrap();
+            two.wait().unwrap();
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(one.stdin.take());
+    one.wait().unwrap();
+    assert!(
+        exited,
+        "a cancelled waiter must exit while the owner is still alive"
+    );
+}
+
+#[test]
 fn installed_hooks_execute_against_the_daemon() {
     let mut sandbox = Sandbox::new();
     /* the pi harness compares primers taken seconds apart, rosters included: the hook peers
@@ -3689,19 +3792,7 @@ fn hook_ws_retries_failed_claude_inbox_inject_in_order() {
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
-    sandbox.json(
-        &[
-            "peer",
-            "register",
-            "--name",
-            "boss",
-            "--backend",
-            "pi",
-            "--peer-id",
-            "boss",
-        ],
-        None,
-    );
+    register_boss(&sandbox);
     let sock = sandbox.root.join("ai.s");
     dead_inbox(&sock);
     let mut child = sandbox
@@ -3830,19 +3921,7 @@ fn hook_ws_skips_closed_ask_when_draining_inbox() {
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
-    sandbox.json(
-        &[
-            "peer",
-            "register",
-            "--name",
-            "boss",
-            "--backend",
-            "pi",
-            "--peer-id",
-            "boss",
-        ],
-        None,
-    );
+    register_boss(&sandbox);
     let opened = sandbox.json(
         &["peer", "ask", worker, "already-done", "--from-peer", "boss"],
         None,
@@ -3922,19 +4001,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
         .join("app-server-control")
         .join("app-server-control.sock");
     bind_session(&sandbox, "codex", worker, "th1");
-    sandbox.json(
-        &[
-            "peer",
-            "register",
-            "--name",
-            "boss",
-            "--backend",
-            "pi",
-            "--peer-id",
-            "boss",
-        ],
-        None,
-    );
+    register_boss(&sandbox);
     let mut child = KillChild(Some(
         sandbox
             .command()
@@ -4089,6 +4156,473 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn hook_ws_retries_a_failed_claude_injection_after_a_drainer_restart() {
+    use std::io::{BufRead, BufReader};
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_drain_peer(&sandbox, "claude-code");
+    register_boss(&sandbox);
+    /* a socket file with no listener: every injection attempt fails */
+    let sock = sandbox.root.join("stale.s");
+    fs::write(&sock, b"").unwrap();
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+            .env("AMESH_WS_BEAT_SECS", "1")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(peer_is_online(&sandbox, worker), "drainer connects");
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "claude-once",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    child.stop();
+    /* the record was never injected, so a restart with a live socket must deliver it once */
+    let listener = live_inbox(&sock);
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+            .env("AMESH_WS_BEAT_SECS", "1")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        if let Ok((conn, _)) = listener.accept() {
+            let mut reader = BufReader::new(conn);
+            let _ = reader.read_line(&mut line);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    child.stop();
+    assert!(line.contains("claude-once"), "no injection arrived: {line}");
+    std::thread::sleep(Duration::from_millis(1000));
+    let mut second = 0;
+    while let Ok((conn, _)) = listener.accept() {
+        drop(conn);
+        second += 1;
+    }
+    assert_eq!(second, 0, "the record must be delivered exactly once");
+}
+
+#[test]
+fn hook_ws_retries_a_failed_codex_injection_after_a_drainer_restart() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    /* an empty CODEX_HOME: the app server never comes up, so every injection fails */
+    let codex_home = sandbox.root.join("no-app");
+    fs::create_dir_all(&codex_home).unwrap();
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEX_THREAD_ID", "th1")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(peer_is_online(&sandbox, worker), "drainer connects");
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "codex-once",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    child.stop();
+    /* the record was never injected, so a restart with a live app server must deliver it once */
+    let received = app_server_capture_threads(&codex_home, &["th1"], &[]);
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEX_THREAD_ID", "th1")
+            .spawn()
+            .unwrap(),
+    ));
+    let got = received
+        .recv_timeout(Duration::from_secs(10))
+        .expect("no injection arrived; the record was lost with the dead drainer");
+    std::thread::sleep(Duration::from_millis(1500));
+    child.stop();
+    assert!(
+        received.try_recv().is_err(),
+        "the record must be delivered exactly once"
+    );
+    assert!(turn_text(&got).contains("codex-once"), "{got}");
+}
+
+#[test]
+fn hook_ws_keeps_a_failed_injection_owed_and_replays_it_once() {
+    use std::io::{BufRead, BufReader};
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_drain_peer(&sandbox, "claude-code");
+    register_boss(&sandbox);
+    let sock = sandbox.root.join("stale2.s");
+    fs::write(&sock, b"").unwrap();
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+            .env("AMESH_WS_BEAT_SECS", "1")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    sandbox.json(
+        &["peer", "notify", worker, "owed-once", "--from-peer", "boss"],
+        None,
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    /* an injection that has not succeeded must leave the record owed: the hub still holds it */
+    let db = rusqlite::Connection::open_with_flags(
+        sandbox.root.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(3)).unwrap();
+    let owed: i64 = db
+        .query_row(
+            "SELECT count(*) FROM inbox WHERE peer_id = ?1",
+            [worker],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(db);
+    assert_eq!(
+        owed, 1,
+        "the failed record must stay owed in the hub: {owed:?}"
+    );
+    /* the hub restart replays the still-queued id; it must not enqueue a second copy */
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    sandbox.start();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let listener = live_inbox(&sock);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut lines = Vec::new();
+    while Instant::now() < deadline {
+        if let Ok((conn, _)) = listener.accept() {
+            let reader = BufReader::new(conn);
+            for line in reader.lines() {
+                lines.push(line.unwrap());
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    child.stop();
+    assert_eq!(lines.len(), 1, "exactly one injection: {lines:?}");
+    assert!(lines[0].contains("owed-once"), "{lines:?}");
+}
+
+#[test]
+fn hook_ws_backs_off_when_the_socket_closes_before_the_greeting() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async;
+    let sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    /* a hub that completes the upgrade and hangs up before naming the session */
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let greeted = Arc::new(AtomicUsize::new(0));
+    let counter = greeted.clone();
+    let server = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let listener = TcpListener::from_std(listener).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let Ok(Ok((stream, _))) =
+                    tokio::time::timeout_at(deadline, listener.accept()).await
+                else {
+                    break;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    if let Ok(stream) = accept_async(stream).await {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        drop(stream);
+                    }
+                });
+            }
+        });
+    });
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("AMESH_BIND", format!("127.0.0.1:{port}"))
+            .env("AMESH_WS_RETRY_SECS", "8")
+            .env("CODEX_HOME", sandbox.root.join("no-app-server"))
+            .spawn()
+            .unwrap(),
+    ));
+    std::thread::sleep(Duration::from_millis(8000));
+    let alive = child.0.as_mut().unwrap().try_wait().unwrap().is_none();
+    child.stop();
+    server.join().unwrap();
+    assert!(
+        alive,
+        "an ungreeted close is transient, so the drainer keeps running"
+    );
+    let attempts = greeted.load(Ordering::SeqCst);
+    assert!(
+        attempts >= 2,
+        "the drainer keeps retrying: {attempts} attempts"
+    );
+    assert!(
+        attempts <= 6,
+        "the waits grow instead of repeating every second: {attempts} attempts"
+    );
+}
+
+#[test]
+fn hook_ws_survives_a_hub_outage_past_the_old_give_up_window() {
+    use std::io::{BufRead, BufReader};
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_drain_peer(&sandbox, "claude-code");
+    register_boss(&sandbox);
+    let sock = claude_socket_path(&sandbox);
+    let listener = live_inbox(&sock);
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(peer_is_online(&sandbox, worker), "drainer connects");
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    /* three seconds is past the sandbox's two second retry window: the old drainer exited */
+    std::thread::sleep(Duration::from_secs(3));
+    let alive = child.0.as_mut().unwrap().try_wait().unwrap().is_none();
+    assert!(
+        alive,
+        "the drainer must keep retrying a transient hub outage"
+    );
+    sandbox.start();
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "after-outage",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        if let Ok((conn, _)) = listener.accept() {
+            let mut reader = BufReader::new(conn);
+            let _ = reader.read_line(&mut line);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    child.stop();
+    assert!(
+        line.contains("after-outage"),
+        "the drainer delivers after the outage: {line}"
+    );
+}
+
+#[test]
+fn bridge_reconnects_and_delivers_an_unacknowledged_frame_once() {
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::{Arc, Mutex};
+    use tokio_tungstenite::tungstenite::Message;
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("bc");
+    let sock = codex_home
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    let received = Arc::new(Mutex::new(Vec::<String>::new()));
+    let server_received = received.clone();
+    let cwd = sandbox.root.clone();
+    let server_sock = sock.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            fs::create_dir_all(server_sock.parent().unwrap()).unwrap();
+            let listener = tokio::net::UnixListener::bind(&server_sock).unwrap();
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    continue;
+                };
+                let received = server_received.clone();
+                let cwd = cwd.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
+                        return;
+                    };
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let Ok(msg) = serde_json::from_str::<Value>(&text) else {
+                            continue;
+                        };
+                        let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+                        let id = msg.get("id").cloned();
+                        let reply = match method {
+                            "initialize" => json!({"id": id, "result": {}}),
+                            "thread/loaded/list" => json!({"id": id, "result": {"data": ["th1"]}}),
+                            "thread/read" => json!({"id": id, "result": {"thread": {
+                                "cwd": cwd, "ephemeral": false, "threadSource": "user",
+                                "recencyAt": 1, "status": {"type": "idle"}}}}),
+                            "turn/start" | "turn/steer" => {
+                                if let Some(body) =
+                                    msg.pointer("/params/input/0/text").and_then(Value::as_str)
+                                {
+                                    received.lock().unwrap().push(body.to_string());
+                                }
+                                /* the reply is late, so the hub dies before the bridge can ack */
+                                tokio::time::sleep(Duration::from_millis(1200)).await;
+                                json!({"id": id, "result": {"turn": {"id": "t1"}}})
+                            }
+                            _ => continue,
+                        };
+                        let _ = ws.send(Message::Text(reply.to_string().into())).await;
+                    }
+                });
+            }
+        });
+    });
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["bridge", "--peer-id", worker, "--thread-id", "th1"])
+            .env("CODEX_HOME", &codex_home)
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(peer_is_online(&sandbox, worker), "bridge connects");
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "bridge-once",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    /* the turn/start has reached the app server but its reply, and so the ack, is pending */
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while received.lock().unwrap().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !received.lock().unwrap().is_empty(),
+        "the frame reached the app server"
+    );
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    sandbox.start();
+    /* a live bridge proves itself by taking a new frame; the first one must not repeat */
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        peer_is_online(&sandbox, worker),
+        "the bridge reconnects after the hub restart"
+    );
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "bridge-second",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while received.lock().unwrap().len() < 2 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    child.stop();
+    let got = received.lock().unwrap().clone();
+    assert_eq!(
+        got.len(),
+        2,
+        "the unacknowledged frame once, then the new one: {got:?}"
+    );
+    assert!(got[0].contains("bridge-once"), "{got:?}");
+    assert!(got[1].contains("bridge-second"), "{got:?}");
 }
 
 #[test]
@@ -4331,8 +4865,12 @@ fn hook_ws_negotiates_receipts() {
 
 #[test]
 fn hook_ws_receipts_accepted_fifo() {
-    let frames = hook_receipt_probe("notify", "").0;
+    let (frames, delivered) = hook_receipt_probe("notify", "live");
     assert_eq!(&frames[1..], &[json!({"type":"recv","id":"delivery-1"})]);
+    assert_eq!(
+        delivered, 1,
+        "the record reached the inbox before the receipt"
+    );
 }
 
 #[test]
@@ -4346,7 +4884,11 @@ fn hook_ws_receipts_closed_ask() {
 #[test]
 fn hook_ws_receipts_claude_retry_fifo() {
     let frames = hook_receipt_probe("notify", "refused").0;
-    assert_eq!(&frames[1..], &[json!({"type":"recv","id":"delivery-1"})]);
+    assert_eq!(
+        frames.len(),
+        1,
+        "a refused inbox must leave the record owed, not acknowledged"
+    );
 }
 
 #[test]
@@ -4474,19 +5016,20 @@ fn hook_dedupe_probe(rounds: Vec<Vec<Value>>, queued_first: bool) -> (Vec<String
                                     .await
                                     .unwrap();
                             }
+                            /* a dead inbox keeps every record unacknowledged, so the
+                            wait ends on the receipts or on their absence */
                             let mut ids = Vec::new();
+                            let until = tokio::time::Instant::now() + Duration::from_secs(2);
                             while ids.len() < expected {
-                                let frame =
-                                    tokio::time::timeout(Duration::from_secs(5), socket.recv())
-                                        .await
-                                        .unwrap()
-                                        .unwrap()
-                                        .unwrap();
-                                if let Message::Text(raw) = frame {
-                                    let frame: Value = serde_json::from_str(&raw).unwrap();
-                                    if frame["type"] == "recv" {
-                                        ids.push(frame["id"].as_str().unwrap().to_string());
+                                match tokio::time::timeout_at(until, socket.recv()).await {
+                                    Ok(Some(Ok(Message::Text(raw)))) => {
+                                        let frame: Value = serde_json::from_str(&raw).unwrap();
+                                        if frame["type"] == "recv" {
+                                            ids.push(frame["id"].as_str().unwrap().to_string());
+                                        }
                                     }
+                                    Ok(Some(Ok(_))) => continue,
+                                    _ => break,
                                 }
                             }
                             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
@@ -4570,7 +5113,7 @@ fn hook_ws_dedupe_keeps_one_queued_copy() {
     let tail = json!({"type":"notify","id":"tail","message":"tail"});
     let (messages, receipts) =
         hook_dedupe_probe(vec![vec![event.clone()], vec![event, tail]], true);
-    assert_eq!(receipts, ["dup", "dup", "tail"]);
+    assert_eq!(receipts, ["dup", "tail"]);
     assert_eq!(
         messages.len(),
         2,
@@ -4605,10 +5148,9 @@ fn hook_ws_rpc_close_returns_to_hub_delivery() {
     let frames = hook_receipt_probe("notify", "app-close").0;
     assert_eq!(
         frames.len(),
-        2,
-        "RPC close must return so hub delivery can be accepted"
+        1,
+        "RPC close must return the record to hub delivery, unacknowledged"
     );
-    assert_eq!(frames[1], json!({"type":"recv","id":"delivery-1"}));
 }
 
 #[test]
@@ -4616,16 +5158,19 @@ fn hook_ws_rpc_transport_error_returns_to_hub_delivery() {
     let frames = hook_receipt_probe("notify", "app-eof").0;
     assert_eq!(
         frames.len(),
-        2,
-        "RPC transport error must return so hub delivery can be accepted"
+        1,
+        "an RPC transport error must leave the record owed to the hub"
     );
-    assert_eq!(frames[1], json!({"type":"recv","id":"delivery-1"}));
 }
 
 #[test]
 fn hook_ws_rpc_accepts_control_frames_before_response() {
     let frames = hook_receipt_probe("notify", "app-ping").0;
-    assert_eq!(frames[1], json!({"type":"recv","id":"delivery-1"}));
+    assert_eq!(
+        frames.len(),
+        1,
+        "control frames must not wedge the RPC, and the un-injected record stays owed"
+    );
 }
 
 #[test]
@@ -5032,20 +5577,25 @@ fn pruned_while_away(
     sandbox.start();
     bind_pinprune(&sandbox, "A");
     let codex_home = sandbox.root.join("ap");
-    let injected = app_server_capture_with(&codex_home, &["A", "B"], busy, None);
+    let injected = app_server_capture_with(&codex_home, &["A", "B"], busy.clone(), None);
     let drainer = KillChild(Some(
         sandbox
             .command()
             .args(["hook", "ws", "--peer-id", pinprune, "--backend", "codex"])
             .env("CODEX_HOME", &codex_home)
             .env("CODEX_THREAD_ID", "B")
+            .env("AMESH_WS_BEAT_SECS", "1")
             .spawn()
             .unwrap(),
     ));
     wait_for_drainer(pinprune);
     std::thread::sleep(Duration::from_millis(1500));
     sandbox.json(&["peer", "notify", pinprune, "A-era"], None);
-    std::thread::sleep(Duration::from_millis(500));
+    /* the first beat leaves A-era queued on the busy thread; freeing A lets the next
+    beat inject it, so the record is acknowledged before the name changes hands */
+    std::thread::sleep(Duration::from_millis(600));
+    busy.lock().unwrap().clear();
+    std::thread::sleep(Duration::from_millis(1200));
     let pid = drainer.0.as_ref().unwrap().id().to_string();
     signal(&pid, "-STOP");
     if let Some(mut hub) = sandbox.daemon.take() {
@@ -5075,6 +5625,15 @@ fn codex_drainer_gives_another_owner_only_what_the_unowned_name_queued() {
     sandbox.json(&["peer", "notify", pinprune, "unowned-era"], None);
     bind_pinprune(&sandbox, "B");
     signal(&pid, "-CONT");
+    /* A-era is injected into A once A frees, so it is acknowledged and retired before
+    the name changes hands */
+    let into_a = injected
+        .recv_timeout(Duration::from_secs(10))
+        .expect("A-era lands in A once A frees");
+    assert!(
+        into_a.contains("A-era") && into_a.contains("\"threadId\":\"A\""),
+        "{into_a}"
+    );
     let first = injected
         .recv_timeout(Duration::from_secs(10))
         .expect("the first owner gets what the unowned name queued");
@@ -5132,24 +5691,24 @@ async fn fence(socket: &mut axum::extract::ws::WebSocket, frames: &[Value]) {
     for frame in frames {
         let _ = socket.send(Message::Text(frame.to_string().into())).await;
     }
-    let mut last = frames.iter().rev().find_map(|frame| frame["id"].as_str());
-    let mut beat = frames.iter().any(|frame| {
-        matches!(
-            frame["type"].as_str(),
-            Some("connected" | "bound" | "replaced")
-        )
-    });
-    while last.is_some() || beat {
-        match socket.recv().await {
-            Some(Ok(Message::Text(text))) => {
+    /* a frame the drainer cannot inject yet is never acknowledged, so the fence waits
+    for the last receipt when one is due and otherwise just for the frames to land */
+    let Some(last) = frames.iter().rev().find_map(|frame| frame["id"].as_str()) else {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        return;
+    };
+    let until = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout_at(until, socket.recv()).await {
+            Ok(Some(Ok(Message::Text(text)))) => {
                 let reply: Value = serde_json::from_str(&text).unwrap_or_default();
-                beat &= reply["type"] != "ping";
-                if reply["type"] == "recv" && reply["id"].as_str() == last {
-                    last = None;
+                if reply["type"] == "recv" && reply["id"].as_str() == Some(last) {
+                    return;
                 }
             }
-            Some(Ok(_)) => {}
-            _ => return,
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(_))) | Ok(None) => return,
+            Err(_) => return,
         }
     }
 }
@@ -5209,10 +5768,20 @@ fn fake_hub(
                                     .send(HubMessage::Text(frame.to_string().into()))
                                     .await;
                             }
-                            /* once the frame is in the drainer's queue this connection ends */
-                            while let Some(Ok(HubMessage::Text(text))) = socket.recv().await {
-                                if text.contains("recv") {
-                                    return;
+                            /* a drainer that cannot inject holds the frame without
+                            acknowledging it, so this connection ends on the receipt or,
+                            once the frame has had its time to land, on a drop */
+                            let until = tokio::time::Instant::now() + Duration::from_millis(600);
+                            loop {
+                                match tokio::time::timeout_at(until, socket.recv()).await {
+                                    Ok(Some(Ok(HubMessage::Text(text))))
+                                        if text.contains("recv") =>
+                                    {
+                                        return;
+                                    }
+                                    Ok(Some(Ok(_))) => continue,
+                                    Ok(Some(Err(_))) | Ok(None) => return,
+                                    Err(_) => return,
                                 }
                             }
                         } else {
@@ -6575,6 +7144,15 @@ fn app_server_capture(home: &Path) -> std::sync::mpsc::Receiver<String> {
     app_server_capture_threads(home, &["thread-1"], &[])
 }
 
+/* read where an app server reads it, so text sent in any other field fails the check */
+fn turn_text(raw: &str) -> String {
+    let rpc: Value = serde_json::from_str(raw).unwrap();
+    rpc.pointer("/params/input/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /* as app_server_capture, with the threads it reports loaded and those it reports busy */
 fn app_server_capture_threads(
     home: &Path,
@@ -6678,6 +7256,22 @@ fn app_server_capture_with(
 a hook registers it; without a messaging socket the hook spawns no drainer of its own */
 fn register_drain_peer(sandbox: &Sandbox, backend: &str) {
     bind_session(sandbox, backend, sandbox.id("worker"), "thread-1");
+}
+
+fn register_boss(sandbox: &Sandbox) {
+    sandbox.json(
+        &[
+            "peer",
+            "register",
+            "--name",
+            "boss",
+            "--backend",
+            "pi",
+            "--peer-id",
+            "boss",
+        ],
+        None,
+    );
 }
 
 fn peer_is_online(sandbox: &Sandbox, peer: &str) -> bool {
@@ -6996,15 +7590,14 @@ fn beat_counting_hub(
                         for sent in [greeting, frame.clone()] {
                             let _ = socket.send(HubMessage::Text(sent.to_string().into())).await;
                         }
-                        let mut received = false;
+                        /* the frame can stay unacknowledged, so any later ping counts
+                        as a beat that had the frame queued */
                         while let Some(Ok(message)) = socket.recv().await {
                             let HubMessage::Text(text) = message else {
                                 continue;
                             };
                             let reply: Value = serde_json::from_str(&text).unwrap_or_default();
-                            if reply["type"] == "recv" && reply["id"] == frame["id"] {
-                                received = true;
-                            } else if received && reply["type"] == "ping" {
+                            if reply["type"] == "ping" {
                                 let _ = beat_tx.send(());
                             }
                         }
@@ -7734,3 +8327,560 @@ fn a_codex_drainer_that_dies_inside_the_inject_leaves_the_frame_with_the_hub() {
 }
 
 include!("cli/peer_handoff.rs");
+
+#[test]
+fn bridge_keeps_its_registration_across_a_pruning_restart() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("br");
+    let injected = app_server_capture_threads(&codex_home, &["th1"], &[]);
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args([
+                "bridge",
+                "--peer-id",
+                worker,
+                "--thread-id",
+                "th1",
+                "--name",
+                "friendly",
+                "--path",
+                "/intended-project",
+            ])
+            .env("CODEX_HOME", &codex_home)
+            .env("AMESH_PEER_ONLINE_SECS", "2")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(peer_is_online(&sandbox, worker), "bridge connects");
+    let row = sandbox
+        .json(&["peer", "list"], None)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["peer_id"] == worker)
+        .cloned()
+        .unwrap();
+    assert_eq!(row["name"], "friendly", "the flag name survives");
+    assert_eq!(row["path"], "/intended-project", "the flag path survives");
+    assert_eq!(row["session_id"], "th1", "the thread stays the session");
+    /* prune the row and restart the hub: the shared loop must re-register the flags */
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    sandbox.daemon = None;
+    std::thread::sleep(Duration::from_secs(3));
+    sandbox.start();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        peer_is_online(&sandbox, worker),
+        "bridge reconnects after the prune"
+    );
+    let row = sandbox
+        .json(&["peer", "list"], None)
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["peer_id"] == worker)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        row["name"], "friendly",
+        "the name survives the pruning restart"
+    );
+    assert_eq!(
+        row["path"], "/intended-project",
+        "the path survives the pruning restart"
+    );
+    assert_eq!(
+        row["session_id"], "th1",
+        "the session survives the pruning restart"
+    );
+    /* delivery resumes into the same thread */
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "after-prune",
+            "--from-peer",
+            "boss",
+            "--cross-circle",
+            "true",
+        ],
+        None,
+    );
+    let got = injected
+        .recv_timeout(Duration::from_secs(10))
+        .expect("delivery resumes after the prune");
+    child.stop();
+    assert!(turn_text(&got).contains("after-prune"), "{got}");
+    let rpc: Value = serde_json::from_str(&got).unwrap();
+    assert_eq!(
+        rpc["params"]["threadId"], "th1",
+        "delivery resumes into the same thread: {got}"
+    );
+}
+
+#[test]
+fn hook_ws_backs_off_a_503_then_connects() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_drain_peer(&sandbox, "claude-code");
+    register_boss(&sandbox);
+    let path = claude_socket_path(&sandbox);
+    let listener = live_inbox(&path);
+    let mut daemon = sandbox.daemon.take().unwrap();
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    let stub = TcpListener::bind(&sandbox.bind).unwrap();
+    stub.set_nonblocking(true).unwrap();
+    let (hit_tx, hit_rx) = std::sync::mpsc::channel();
+    let responder = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let Ok((mut stream, _)) = stub.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut headers = Vec::new();
+            let mut byte = [0];
+            while headers.len() < 8192 && !headers.ends_with(b"\r\n\r\n") {
+                if stream.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                headers.push(byte[0]);
+            }
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            if headers.starts_with(b"GET /ws ") {
+                hit_tx
+                    .send(String::from_utf8_lossy(&headers).into_owned())
+                    .unwrap();
+                return;
+            }
+        }
+    });
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args([
+                "hook",
+                "ws",
+                "--peer-id",
+                worker,
+                "--backend",
+                "claude-code",
+            ])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &path)
+            .env("AMESH_WS_RETRY_SECS", "1")
+            .spawn()
+            .unwrap(),
+    ));
+    let handshake = hit_rx.recv_timeout(Duration::from_secs(12));
+    responder.join().unwrap();
+    assert!(
+        handshake.is_ok(),
+        "the drainer must receive the 503 on its WebSocket handshake: {handshake:?}"
+    );
+    sandbox.start();
+    sandbox.json(
+        &["peer", "notify", worker, "after-503", "--from-peer", "boss"],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut line = String::new();
+    while Instant::now() < deadline {
+        if let Ok((stream, _)) = listener.accept() {
+            stream.set_nonblocking(false).unwrap();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            break;
+        }
+        assert!(
+            child.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+            "the drainer exited on a 503 instead of backing off"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.stop();
+    assert!(
+        line.contains("after-503"),
+        "the drainer must recover from a 503: {line}"
+    );
+}
+
+#[test]
+fn hook_ws_exits_when_the_claude_target_is_gone_and_the_hub_is_down() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    register_drain_peer(&sandbox, "claude-code");
+    let sock = claude_socket_path(&sandbox);
+    let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker])
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &sock)
+            .env("AMESH_WS_RETRY_SECS", "2")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    sandbox.daemon = None;
+    fs::remove_file(&sock).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+            assert!(status.success());
+            let output = child.stop_take().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            assert!(
+                stderr.contains("target session gone"),
+                "the exit must log why: {stderr}"
+            );
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    child.stop();
+    panic!("the drainer stayed alive with a gone target and an unreachable hub");
+}
+
+#[test]
+fn hook_ws_remembering_a_batch_survives_a_reset_during_the_first_ack() {
+    use std::os::fd::AsRawFd;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let worker = sandbox.id("worker");
+    sandbox.json(
+        &[
+            "peer",
+            "register",
+            "--name",
+            worker,
+            "--peer-id",
+            worker,
+            "--backend",
+            "claude-code",
+        ],
+        None,
+    );
+    let path = claude_socket_path(&sandbox);
+    dead_inbox(&path);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let proxy = rt
+        .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    let proxy_bind = proxy.local_addr().unwrap().to_string();
+    let upstream = sandbox.bind.clone();
+    let (cut_tx, cut_rx) = tokio::sync::oneshot::channel();
+    let (reset_tx, reset_rx) = std::sync::mpsc::channel();
+    rt.spawn(async move {
+        let mut cut = Some((cut_rx, reset_tx));
+        while let Ok((mut client, _)) = proxy.accept().await {
+            let mut headers = Vec::new();
+            while headers.len() < 8192 && !headers.ends_with(b"\r\n\r\n") {
+                let Ok(byte) = client.read_u8().await else { break; };
+                headers.push(byte);
+            }
+            let reset = if headers.starts_with(b"GET /ws ") { cut.take() } else { None };
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let mut server = tokio::net::TcpStream::connect(upstream).await.unwrap();
+                server.write_all(&headers).await.unwrap();
+                if let Some((cut, reset)) = reset {
+                    tokio::select! {
+                        _ = tokio::io::copy_bidirectional(&mut client, &mut server) => {},
+                        _ = cut => {
+                            let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+                            let result = unsafe {
+                                libc::setsockopt(client.as_raw_fd(), libc::SOL_SOCKET, libc::SO_LINGER,
+                                    &linger as *const _ as *const libc::c_void,
+                                    std::mem::size_of_val(&linger) as libc::socklen_t)
+                            };
+                            assert_eq!(result, 0);
+                            drop(client);
+                            reset.send(()).unwrap();
+                        }
+                    }
+                } else {
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                }
+            });
+        }
+    });
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args([
+                "hook",
+                "ws",
+                "--peer-id",
+                worker,
+                "--backend",
+                "claude-code",
+            ])
+            .env("AMESH_BIND", proxy_bind)
+            .env("CLAUDE_CODE_MESSAGING_SOCKET", &path)
+            .env("AMESH_WS_BEAT_SECS", "1")
+            .env("AMESH_WS_RETRY_SECS", "1")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let db = rusqlite::Connection::open(sandbox.root.join("state.db")).unwrap();
+        let connected: i64 = db
+            .query_row(
+                "SELECT count(*) FROM recv_peers WHERE peer_id = ?1",
+                [worker],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if connected == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the proxy must carry an acknowledging connection"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let post = |route: &str, body: Value| {
+        let mut stream = TcpStream::connect(&sandbox.bind).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let body = body.to_string();
+        write!(stream, "POST {route} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAuthorization: Bearer cli-test-token\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", sandbox.bind, body.len()).unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    };
+    for text in ["FIRST", "SECOND"] {
+        post(
+            "/notify",
+            json!({"to_peer":worker,"message":format!("{text}{}", "x".repeat(256 * 1024))}),
+        );
+    }
+    let listener = live_inbox(&path);
+    /* bound follows both records on the ordered stream, so both queue before the flush */
+    post(
+        "/peers",
+        json!({"peer_id":worker,"name":worker,"backend":"claude-code",
+        "path":&sandbox.root,"session_id":"thread-1"}),
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut first = loop {
+        if let Ok((stream, _)) = listener.accept() {
+            break stream;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the queued batch must start flushing"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    first.set_nonblocking(false).unwrap();
+    let mut prefix = [0; 1024];
+    first.read_exact(&mut prefix).unwrap();
+    cut_tx.send(()).unwrap();
+    reset_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let mut body = prefix.to_vec();
+    first.read_to_end(&mut body).unwrap();
+    let mut delivered = vec![String::from_utf8(body).unwrap()];
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        while let Ok((mut stream, _)) = listener.accept() {
+            stream.set_nonblocking(false).unwrap();
+            let mut line = String::new();
+            stream.read_to_string(&mut line).unwrap();
+            delivered.push(line);
+        }
+        let db = rusqlite::Connection::open(sandbox.root.join("state.db")).unwrap();
+        let owed: i64 = db
+            .query_row(
+                "SELECT count(*) FROM inbox WHERE peer_id = ?1",
+                [worker],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if owed == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the replay must be acknowledged, delivered {}",
+            delivered.len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    child.stop();
+    let labels: Vec<_> = delivered
+        .iter()
+        .map(|text| {
+            if text.contains("FIRST") {
+                "FIRST"
+            } else if text.contains("SECOND") {
+                "SECOND"
+            } else {
+                "unknown"
+            }
+        })
+        .collect();
+    assert_eq!(
+        labels,
+        ["FIRST", "SECOND"],
+        "the entire injected batch must be remembered before its first recv"
+    );
+}
+
+#[test]
+fn hook_ws_retries_a_failed_codex_turn_start() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    let home = sandbox.root.join("failapp");
+    let path = home.join("app-server-control/app-server-control.sock");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let listener = rt.block_on(async { tokio::net::UnixListener::bind(path).unwrap() });
+    let retrying = Arc::new(AtomicBool::new(false));
+    let can_inject = retrying.clone();
+    let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
+    let cwd = sandbox.root.clone();
+    rt.spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let retrying = can_inject.clone();
+            let attempts = attempt_tx.clone();
+            let cwd = cwd.clone();
+            tokio::spawn(async move {
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let msg: Value = serde_json::from_str(&text).unwrap();
+                    let id = &msg["id"];
+                    let mut attempted = None;
+                    let result = match msg["method"].as_str().unwrap_or("") {
+                        "initialize" => json!({}),
+                        "thread/loaded/list" => json!({"data":["th1"]}),
+                        "thread/read" => json!({"thread":{"cwd":cwd,"ephemeral":false,
+                            "threadSource":"user","recencyAt":1,"status":{"type":"idle"}}}),
+                        "turn/start" | "turn/steer" => {
+                            let allowed = retrying.load(Ordering::SeqCst);
+                            attempted = Some((allowed, msg["params"]["input"][0]["text"].clone()));
+                            if !allowed {
+                                ws.send(Message::Text(
+                                    json!({"id":id,"error":{"code":-32603,"message":"app busy"}})
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                                attempts.send(attempted.unwrap()).unwrap();
+                                continue;
+                            }
+                            json!({"turn":{"id":"t1"}})
+                        }
+                        _ => continue,
+                    };
+                    ws.send(Message::Text(
+                        json!({"id":id,"result":result}).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+                    if let Some(attempt) = attempted {
+                        attempts.send(attempt).unwrap();
+                    }
+                }
+            });
+        }
+    });
+    let start = || {
+        KillChild(Some(
+            sandbox
+                .command()
+                .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+                .env("CODEX_HOME", &home)
+                .env("CODEX_THREAD_ID", "th1")
+                .env("AMESH_WS_BEAT_SECS", "60")
+                .spawn()
+                .unwrap(),
+        ))
+    };
+    let mut first = start();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(peer_is_online(&sandbox, worker), "drainer connects");
+    sandbox.json(&["peer", "notify", worker, "turn-once"], None);
+    let failed = attempt_rx.recv_timeout(Duration::from_secs(8)).unwrap();
+    assert!(!failed.0, "the first turn/start must fail");
+    first.stop();
+    retrying.store(true, Ordering::SeqCst);
+    let mut second = start();
+    let replay = attempt_rx.recv_timeout(Duration::from_secs(8));
+    second.stop();
+    let (succeeded, text) =
+        replay.expect("a failed turn/start must stay owed across a drainer restart");
+    assert!(succeeded);
+    assert!(text.as_str().unwrap().contains("turn-once"), "{text}");
+    assert!(
+        attempt_rx.try_iter().next().is_none(),
+        "the replay must inject once"
+    );
+}
+#[test]
+fn hook_ws_dedupes_a_replayed_id_within_one_connection() {
+    /* the same id arrives twice back to back with a dead inbox: only one copy queues */
+    let event = json!({"type":"notify","id":"dup-in","message":"dup"});
+    let tail = json!({"type":"notify","id":"tail-in","message":"tail"});
+    /* a second connection delivers one more frame, which flushes the queue: the replayed
+    id must appear once, not twice */
+    let (messages, _receipts) = hook_dedupe_probe(
+        vec![
+            vec![event.clone(), event, tail],
+            vec![json!({"type":"notify","id":"late","message":"late"})],
+        ],
+        true,
+    );
+    assert!(
+        messages.iter().filter(|m| m.contains("dup")).count() == 1,
+        "a replay within one connection must not inject twice: {messages:?}"
+    );
+    assert!(
+        messages.iter().any(|m| m.contains("tail")),
+        "the frames after the replay still arrive: {messages:?}"
+    );
+    assert!(messages[0].contains("dup"), "{messages:?}");
+    assert!(messages[1].contains("tail"), "{messages:?}");
+}

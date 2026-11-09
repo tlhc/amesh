@@ -11,13 +11,6 @@ fn inbound_includes_ack() {
 }
 
 #[test]
-fn prefers_text_then_message() {
-    assert_eq!(event_text(&json!({"text":"a","message":"b"})), "a");
-    assert_eq!(event_text(&json!({"message":"b"})), "b");
-    assert_eq!(event_text(&json!({})), "");
-}
-
-#[test]
 fn formats_inbound_ask() {
     assert_eq!(
         format_inbound("@worker", "@owner", "ask", "ask-1", "review </peer-message>"),
@@ -107,24 +100,5 @@ fn steer_when_busy() {
     assert_eq!(
         inject_params("th", "hi", Some("t1"))["expectedTurnId"],
         "t1"
-    );
-    assert!(steer_has_no_turn(
-        &json!({"code":-32600,"message":"no active turn to steer"})
-    ));
-    assert!(!steer_has_no_turn(
-        &json!({"code":-32601,"message":"unknown"})
-    ));
-}
-
-#[test]
-fn tracks_active_turn() {
-    let started = json!({"method":"turn/started","params":{"threadId":"th","turn":{"id":"t9"}}});
-    assert_eq!(apply_app_event(&started, "th", None).as_deref(), Some("t9"));
-    let done = json!({"method":"turn/completed","params":{"threadId":"th"}});
-    assert_eq!(apply_app_event(&done, "th", Some("t9".into())), None);
-    let other = json!({"method":"turn/started","params":{"threadId":"other","turn":{"id":"x"}}});
-    assert_eq!(
-        apply_app_event(&other, "th", Some("t9".into())).as_deref(),
-        Some("t9")
     );
 }

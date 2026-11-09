@@ -586,3 +586,401 @@ async fn second_connection_displaces_the_incumbent() {
         "incumbent must learn it lost the peer, got: {notice}"
     );
 }
+
+async fn socket_hub() -> (App, TempState, String) {
+    let path = temp_state("recv-regression");
+    let state = App {
+        inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    register(router(state.clone()), "worker", "pi", "default").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/ws", listener.local_addr().unwrap());
+    let app = router(state.clone());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (state, path, url)
+}
+
+type PeerSocket =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+async fn connect_worker(url: &str, recv: bool) -> PeerSocket {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    socket
+        .send(WsMsg::Text(
+            json!({"type": "connect", "peer_id": "worker", "recv": recv})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+}
+
+async fn socket_frame(socket: &mut PeerSocket) -> Value {
+    use futures_util::StreamExt;
+
+    let frame = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .expect("the expected socket frame did not arrive")
+        .unwrap()
+        .unwrap();
+    serde_json::from_str(&frame.to_string()).unwrap()
+}
+
+#[tokio::test]
+async fn a_legacy_connection_is_refused_without_losing_an_acknowledgers_backlog() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let (state, path, url) = socket_hub().await;
+    let mut socket = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    drop(socket);
+    until(
+        &state,
+        |hub| !hub.sockets.contains_key("worker"),
+        "first socket stayed attached",
+    )
+    .await;
+    {
+        let mut hub = state.inner.lock().await;
+        for i in 0..3 {
+            persist_then_deliver(
+                &mut hub,
+                "worker",
+                json!({"type": "notify", "message": format!("owed-{i}")}),
+                now_unix(),
+            )
+            .unwrap();
+        }
+        *hub = Hub::open(&path).unwrap();
+        assert!(hub.recv_known.contains("worker"));
+    }
+    let mut legacy = connect_worker(&url, false).await;
+    assert_eq!(
+        socket_frame(&mut legacy).await["error"],
+        "this peer requires delivery acknowledgements; connect with recv:true"
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), legacy.next())
+            .await
+            .expect("the refused legacy connection must close"),
+        Some(Ok(WsMsg::Close(_))) | None
+    ));
+    drop(legacy);
+    let expected = {
+        let mut hub = state.inner.lock().await;
+        assert!(!hub.sockets.contains_key("worker"));
+        for i in 3..23 {
+            persist_then_deliver(
+                &mut hub,
+                "worker",
+                json!({"type": "notify", "message": format!("owed-{i}")}),
+                now_unix(),
+            )
+            .unwrap();
+        }
+        hub.inbox
+            .records("worker")
+            .iter()
+            .map(|record| record.event().clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(expected.len(), 23);
+    assert_eq!(Hub::open(&path).unwrap().inbox.count("worker"), 23);
+    let mut socket = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    for (i, record) in expected.iter().enumerate() {
+        let replay = socket_frame(&mut socket).await;
+        assert_eq!(replay, *record, "record {i} must replay once in order");
+        assert!(replay["id"].as_str().is_some_and(|id| !id.is_empty()));
+        assert_eq!(replay["message"], format!("owed-{i}"));
+        socket
+            .send(WsMsg::Text(
+                json!({"type": "recv", "id": replay["id"]})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    until(
+        &state,
+        |hub| hub.inbox.count("worker") == 0,
+        "recv did not retire every replayed record",
+    )
+    .await;
+    assert_eq!(Hub::open(&path).unwrap().inbox.count("worker"), 0);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), socket.next())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_refused_legacy_connection_keeps_the_acknowledging_socket_attached() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let (state, _path, url) = socket_hub().await;
+    let mut socket = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    let gen = state.inner.lock().await.sockets["worker"].0;
+    let mut legacy = connect_worker(&url, false).await;
+    assert_eq!(
+        socket_frame(&mut legacy).await["error"],
+        "this peer requires delivery acknowledgements; connect with recv:true"
+    );
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(3), legacy.next())
+            .await
+            .expect("the refused legacy connection must close"),
+        Some(Ok(WsMsg::Close(_))) | None
+    ));
+    {
+        let mut hub = state.inner.lock().await;
+        assert_eq!(hub.sockets["worker"].0, gen);
+        assert!(hub.recv_live.contains("worker"));
+        persist_then_deliver(
+            &mut hub,
+            "worker",
+            json!({"type": "notify", "message": "still attached"}),
+            now_unix(),
+        )
+        .unwrap();
+    }
+    let frame = socket_frame(&mut socket).await;
+    assert_eq!(frame["message"], "still attached");
+    socket
+        .send(WsMsg::Text(
+            json!({"type": "recv", "id": frame["id"]})
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    until(
+        &state,
+        |hub| hub.inbox.count("worker") == 0,
+        "the incumbent could not acknowledge its record",
+    )
+    .await;
+}
+
+#[test]
+fn a_legacy_socket_keeps_new_public_records_owed_to_an_acknowledger() {
+    let (mut hub, path) = undelivered_hub();
+    let mut rx = recv_peer(&mut hub, "worker");
+    hub.recv_live.remove("worker");
+    persist_then_deliver(
+        &mut hub,
+        "worker",
+        json!({"type": "notify", "message": "live"}),
+        now_unix(),
+    )
+    .unwrap();
+    let copy = rx.try_recv().unwrap();
+    assert_eq!(
+        hub.inbox.count("worker"),
+        1,
+        "a legacy socket carries only a copy for a recv-promised peer"
+    );
+    assert_eq!(
+        hub.inbox.records("worker")[0].event()["id"],
+        copy.event()["id"]
+    );
+    assert!(copy.event()["id"].as_str().unwrap().starts_with("evt-"));
+    assert_eq!(Hub::open(&path).unwrap().inbox.count("worker"), 1);
+}
+
+#[test]
+fn a_legacy_socket_keeps_new_internal_records_owed_to_an_acknowledger() {
+    let (mut hub, path) = undelivered_hub();
+    let mut rx = recv_peer(&mut hub, "worker");
+    hub.recv_live.remove("worker");
+    let queued = queue_replies(
+        &mut hub,
+        vec![json!({"type": "notify", "to_peer": "worker", "message": "live"})],
+        now_unix(),
+    );
+    persist_ok(&mut hub).unwrap();
+    deliver_queued(&mut hub, queued);
+    let copy = rx.try_recv().unwrap();
+    assert_eq!(
+        hub.inbox.count("worker"),
+        1,
+        "a legacy socket must not retire an internal record without recv"
+    );
+    assert_eq!(
+        hub.inbox.records("worker")[0].event()["id"],
+        copy.event()["id"]
+    );
+    assert_eq!(Hub::open(&path).unwrap().inbox.count("worker"), 1);
+}
+
+#[tokio::test]
+async fn a_closing_legacy_connection_does_not_duplicate_its_durable_copies() {
+    let (mut hub, path) = undelivered_hub();
+    let rx = recv_peer(&mut hub, "worker");
+    let gen = hub.conn_gen;
+    persist_then_deliver(
+        &mut hub,
+        "worker",
+        json!({"type": "notify", "message": "live"}),
+        now_unix(),
+    )
+    .unwrap();
+    let mut rx = rx;
+    let copy = rx.try_recv().unwrap();
+    let state = App {
+        inner: Arc::new(Mutex::new(hub)),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    close_connection(&state, "worker", gen, false, rx, vec![copy]).await;
+    assert_eq!(
+        state.inner.lock().await.inbox.count("worker"),
+        1,
+        "a returned legacy copy is already owed"
+    );
+    assert_eq!(Hub::open(&path).unwrap().inbox.count("worker"), 1);
+}
+
+#[tokio::test]
+async fn a_failed_connect_persist_reports_an_error_and_closes() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let (state, _path, url) = socket_hub().await;
+    {
+        let mut hub = state.inner.lock().await;
+        persist_then_deliver(
+            &mut hub,
+            "worker",
+            json!({"type": "notify", "message": "older"}),
+            now_unix(),
+        )
+        .unwrap();
+        hub.db.execute_batch("CREATE TEMP TRIGGER fail_connect BEFORE INSERT ON recv_peers BEGIN SELECT RAISE(ABORT, 'forced connect failure'); END;").unwrap();
+    }
+    let mut socket = connect_worker(&url, true).await;
+    let error = socket_frame(&mut socket).await;
+    assert!(
+        error["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("forced connect failure")),
+        "failed ownership persist must be an error, not connected: {error}"
+    );
+    let closed = tokio::time::timeout(Duration::from_secs(3), socket.next())
+        .await
+        .unwrap();
+    assert!(
+        matches!(closed, Some(Ok(WsMsg::Close(_)))),
+        "failed ownership persist must close the socket: {closed:?}"
+    );
+    {
+        let mut hub = state.inner.lock().await;
+        assert!(
+            !hub.sockets.contains_key("worker"),
+            "failed connection must not own the socket"
+        );
+        assert!(!hub.recv_live.contains("worker"));
+        assert!(!hub.recv_known.contains("worker"));
+        hub.db.execute_batch("DROP TRIGGER fail_connect").unwrap();
+        persist_then_deliver(
+            &mut hub,
+            "worker",
+            json!({"type": "notify", "message": "newer"}),
+            now_unix(),
+        )
+        .unwrap();
+    }
+    let mut socket = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    let older = socket_frame(&mut socket).await;
+    let newer = socket_frame(&mut socket).await;
+    assert_eq!(older["message"], "older");
+    assert_eq!(newer["message"], "newer");
+    assert!(older["id"].is_string() && newer["id"].is_string());
+    assert_ne!(older["id"], newer["id"]);
+}
+
+#[tokio::test]
+async fn a_failed_replacement_keeps_the_incumbent_registered() {
+    let (state, _path, url) = socket_hub().await;
+    let mut incumbent = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut incumbent).await["type"], "connected");
+    let gen = {
+        let hub = state.inner.lock().await;
+        hub.db.execute_batch("CREATE TEMP TRIGGER fail_connect BEFORE INSERT ON recv_peers BEGIN SELECT RAISE(ABORT, 'forced connect failure'); END;").unwrap();
+        hub.sockets["worker"].0
+    };
+    let mut failed = connect_worker(&url, true).await;
+    let _ = socket_frame(&mut failed).await;
+    {
+        let mut hub = state.inner.lock().await;
+        assert_eq!(
+            hub.sockets.get("worker").map(|(gen, _)| *gen),
+            Some(gen),
+            "a failed replacement must leave the incumbent registered"
+        );
+        hub.db.execute_batch("DROP TRIGGER fail_connect").unwrap();
+        persist_then_deliver(
+            &mut hub,
+            "worker",
+            json!({"type": "notify", "message": "for incumbent"}),
+            now_unix(),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        socket_frame(&mut incumbent).await["message"],
+        "for incumbent"
+    );
+    let mut successor = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut successor).await["type"], "connected");
+    assert_eq!(
+        socket_frame(&mut successor).await["message"],
+        "for incumbent"
+    );
+    assert_ne!(state.inner.lock().await.sockets["worker"].0, gen);
+}
+
+#[tokio::test]
+async fn a_received_copy_is_not_requeued_when_a_legacy_connection_closes() {
+    let (mut hub, path) = undelivered_hub();
+    let mut rx = recv_peer(&mut hub, "worker");
+    let gen = hub.conn_gen;
+    persist_then_deliver(
+        &mut hub,
+        "worker",
+        json!({"type": "notify", "message": "live"}),
+        now_unix(),
+    )
+    .unwrap();
+    let copy = rx.try_recv().unwrap();
+    assert!(acknowledge_event(
+        &mut hub,
+        "worker",
+        copy.event()["id"].as_str().unwrap()
+    ));
+    persist_ok(&mut hub).unwrap();
+    let state = App {
+        inner: Arc::new(Mutex::new(hub)),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    close_connection(&state, "worker", gen, false, rx, vec![copy]).await;
+    assert_eq!(
+        state.inner.lock().await.inbox.count("worker"),
+        0,
+        "closing a legacy socket must not resurrect a received copy"
+    );
+    assert_eq!(Hub::open(&path).unwrap().inbox.count("worker"), 0);
+}

@@ -66,14 +66,19 @@ async function runA() {
   delete process.env.AMESH_SKIP_WS;
   const home = tempHome("amesh-ensure-A-");
   process.env.HOME = home;
+  process.env.PI_CODING_AGENT_DIR = join(home, "agent");
   process.env.AMESH_STATE = join(home, "state.db");
   process.env.AMESH_BIND = `127.0.0.1:${await freePort()}`;
   const handlers = new Map();
   const calls = [];
   (await loadHook("/nonexistent/amesh-ensure-probe"))(mockPi(handlers, calls));
-  await handlers.get("session_start")({}, ctx);
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  assert.equal(existsSync(join(home, "serve.log")), true, "Ensure must open serve.log before spawn");
+  try {
+    await handlers.get("session_start")({}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    assert.equal(existsSync(join(home, "serve.log")), true, "Ensure must open serve.log before spawn");
+  } finally {
+    await handlers.get("session_shutdown")({}, ctx);
+  }
   console.log("ensure-case-A ok");
 }
 
@@ -81,6 +86,7 @@ async function runB() {
   delete process.env.AMESH_SKIP_WS;
   const home = tempHome("amesh-ensure-B-");
   process.env.HOME = home;
+  process.env.PI_CODING_AGENT_DIR = join(home, "agent");
   process.env.AMESH_STATE = join(home, "state.db");
   process.env.AMESH_BIND = `127.0.0.1:${await freePort()}`;
   let attempts = 0;
@@ -99,11 +105,19 @@ async function runB() {
   const handlers = new Map();
   const calls = [];
   (await loadHook("/nonexistent/amesh-ensure-probe"))(mockPi(handlers, calls));
-  await handlers.get("session_start")({}, ctx);
-  await new Promise((resolve) => setTimeout(resolve, 3000));
-  console.error = orig;
-  assert.ok(attempts > 0, `WebSocket constructor must run, attempts=${attempts}`);
-  assert.match(logs.join("\n"), /connect-fail/, `Connect catch must log, got ${logs.join(" | ")}`);
+  try {
+    await handlers.get("session_start")({}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+    console.error = orig;
+    assert.equal(attempts, 0, "a missing owner helper must keep the hub socket closed");
+    assert.equal(
+      logs.filter((line) => /log owner: spawn \/nonexistent\/amesh-ensure-probe ENOENT/.test(line)).length,
+      1,
+      "a missing owner helper is reported once while retries back off",
+    );
+  } finally {
+    await handlers.get("session_shutdown")({}, ctx);
+  }
   console.log("ensure-case-B ok");
 }
 
@@ -111,6 +125,7 @@ async function runTry() {
   delete process.env.AMESH_SKIP_WS;
   const home = tempHome("amesh-ensure-try-");
   process.env.HOME = home;
+  process.env.PI_CODING_AGENT_DIR = join(home, "agent");
   process.env.AMESH_STATE = join(home, "state.db");
   process.env.AMESH_BIND = "127.0.0.1:8378 x";
   const logs = [];
@@ -122,14 +137,18 @@ async function runTry() {
   const handlers = new Map();
   const calls = [];
   (await loadHook("/nonexistent/amesh-ensure-probe"))(mockPi(handlers, calls));
-  await handlers.get("session_start")({}, ctx);
-  await new Promise((resolve) => setTimeout(resolve, 200));
-  console.error = orig;
-  assert.match(
-    logs.join("\n"),
-    /spawn \/nonexistent\/amesh-ensure-probe ENOENT/,
-    `Invoke must still run after Ensure reject, got ${logs.join(" | ")}`,
-  );
+  try {
+    await handlers.get("session_start")({}, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    console.error = orig;
+    assert.match(
+      logs.join("\n"),
+      /spawn \/nonexistent\/amesh-ensure-probe ENOENT/,
+      `Invoke must still run after Ensure reject, got ${logs.join(" | ")}`,
+    );
+  } finally {
+    await handlers.get("session_shutdown")({}, ctx);
+  }
   console.log("ensure-case-try ok");
 }
 

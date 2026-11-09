@@ -3125,7 +3125,7 @@ fn hook_ws(raw: &[String]) -> Result<()> {
         .filter(|value| !value.is_empty())
         .ok_or("hook ws requires --peer-id or AMESH_PEER_ID")?;
     tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(hook_ws_loop(peer_id, backend))
+        tokio::runtime::Handle::current().block_on(hook_ws_loop_with(peer_id, backend, None))
     })
 }
 
@@ -3138,14 +3138,16 @@ pub(crate) fn env_secs(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/* a queued inbound frame and the session it was received for, if the stream named one */
-type Queued = (Option<String>, String);
+/* a queued inbound frame, the session it was received for, and the record id the hub
+retires once the injection has succeeded */
+type Queued = (Option<String>, String, Option<String>);
 
 /* what was queued for another session goes, and what the unbound name queued becomes this
 session's, so a later owner of the name never gets it */
 fn keep_for_thread(queued: &mut VecDeque<Queued>, thread: &str) {
-    queued
-        .retain_mut(|(held, _)| held.get_or_insert_with(|| thread.to_string()).as_str() == thread);
+    queued.retain_mut(|(held, _, _)| {
+        held.get_or_insert_with(|| thread.to_string()).as_str() == thread
+    });
 }
 
 fn enqueue_hook_inbound<T>(queued: &mut VecDeque<T>, item: T, warned: &mut bool) {
@@ -3161,74 +3163,90 @@ fn enqueue_hook_inbound<T>(queued: &mut VecDeque<T>, item: T, warned: &mut bool)
 }
 
 /* the same order and stop as flush_app_sink, against the session the stream named: a hub
-too old to name one leaves an earlier connection's frames waiting */
+too old to name one leaves an earlier connection's frames waiting. Ids of the records whose
+injection succeeded come back, and the caller acknowledges them on the socket */
 fn flush_claude_inbox(
     socket: &str,
     token: Option<&str>,
     queued: &mut VecDeque<Queued>,
     owner: Option<&str>,
     inbox_fail: &mut u8,
-) {
+) -> Vec<String> {
+    let mut acked = Vec::new();
     if owner == Some("") {
-        return;
+        return acked;
     }
-    while let Some((session, text)) = queued.pop_front() {
+    while let Some((session, text, record)) = queued.pop_front() {
         if session.is_some() && session.as_deref() != owner {
-            queued.push_front((session, text));
-            return;
+            queued.push_front((session, text, record));
+            return acked;
         }
-        if let Err(error) = inject_claude_inbox(socket, token, &text) {
-            queued.push_front((session, text));
-            *inbox_fail = inbox_fail.saturating_add(1);
-            eprintln!("amesh hook ws: inbox inject failed ({inbox_fail}): {error}");
-            return;
+        match inject_claude_inbox(socket, token, &text) {
+            Ok(()) => {
+                *inbox_fail = 0;
+                if let Some(id) = record {
+                    acked.push(id);
+                }
+            }
+            Err(error) => {
+                queued.push_front((session, text, record));
+                *inbox_fail = inbox_fail.saturating_add(1);
+                eprintln!("amesh hook ws: inbox inject failed ({inbox_fail}): {error}");
+                return acked;
+            }
         }
-        *inbox_fail = 0;
     }
+    acked
 }
 
 /* nothing while nobody owns the name; otherwise sends in queue order up to the first frame
 queued for another session, which a sink picked from the row or CODEX_THREAD_ID for a hub
-too old to name the owner must not take. False once the sink is unusable */
+too old to name the owner must not take. False once the sink is unusable. Ids of the records
+whose injection succeeded come back, and the caller acknowledges them on the socket */
 async fn flush_app_sink(
     sink: &mut AppSink,
     queued: &mut VecDeque<Queued>,
     owner: Option<&str>,
-) -> bool {
+) -> (bool, Vec<String>) {
+    let mut acked = Vec::new();
     if owner == Some("") {
-        return true;
+        return (true, acked);
     }
     let before = queued.len();
     let mut usable = true;
-    while let Some((session, text)) = queued.pop_front() {
+    while let Some((session, text, record)) = queued.pop_front() {
         if session
             .as_deref()
             .is_some_and(|session| session != sink.thread_id)
         {
-            queued.push_front((session, text));
+            queued.push_front((session, text, record));
             break;
         }
-        if let Err(error) = app_inject(sink, &text).await {
-            queued.push_front((session, text));
-            if error.to_string() == "thread busy" {
-                eprintln!("amesh hook ws: thread busy, queued={}", queued.len());
-            } else {
-                eprintln!("amesh hook ws: App Server inject failed: {error}");
-                usable = false;
+        match app_inject(sink, &text).await {
+            Ok(()) => {
+                if let Some(id) = record {
+                    acked.push(id);
+                }
             }
-            break;
+            Err(error) => {
+                queued.push_front((session, text, record));
+                if error.to_string() == "thread busy" {
+                    eprintln!("amesh hook ws: thread busy, queued={}", queued.len());
+                } else {
+                    eprintln!("amesh hook ws: App Server inject failed: {error}");
+                    usable = false;
+                }
+                break;
+            }
         }
     }
     if queued.len() < before {
         eprintln!("amesh hook ws: flushed, queued={}", queued.len());
     }
-    usable
+    (usable, acked)
 }
 
-fn remember_hook_inbound(accepted: &mut VecDeque<String>, id: Option<&str>) {
-    let Some(id) = id else {
-        return;
-    };
+fn remember_hook_inbound(accepted: &mut VecDeque<String>, id: &str) {
     if let Some(index) = accepted.iter().position(|known| known == id) {
         accepted.remove(index);
     }
@@ -3239,10 +3257,16 @@ fn remember_hook_inbound(accepted: &mut VecDeque<String>, id: Option<&str>) {
     }
 }
 
-async fn hook_ws_loop(peer_id: String, backend: String) -> Result<()> {
+pub(crate) async fn hook_ws_loop_with(
+    peer_id: String,
+    backend: String,
+    registration: Option<Value>,
+) -> Result<()> {
     sweep_stale_runtime_files();
-    let retry = Duration::from_secs(env_secs("AMESH_WS_RETRY_SECS", 60));
-    let mut deadline = Instant::now() + retry;
+    /* a hub that is down is transient, so the wait grows to the old retry knob as its cap
+    and never gives up; only a refused handshake, a displaced name or a gone target ends it */
+    let cap = Duration::from_secs(env_secs("AMESH_WS_RETRY_SECS", 60).max(2));
+    let mut backoff = Duration::from_secs(1);
     let mut queued = VecDeque::new();
     let mut depth_warned = false;
     let mut accepted = VecDeque::new();
@@ -3253,36 +3277,84 @@ async fn hook_ws_loop(peer_id: String, backend: String) -> Result<()> {
             &mut queued,
             &mut depth_warned,
             &mut accepted,
+            registration.as_ref(),
         )
         .await
         {
-            Ok(true) => break,
-            Ok(false) => deadline = Instant::now() + retry,
-            Err(_) if Instant::now() >= deadline => break,
-            Err(_) => {}
+            Ok((true, _)) => break,
+            Ok((false, true)) => backoff = Duration::from_secs(1),
+            Ok((false, false)) => {}
+            Err(error) => {
+                if refused_handshake(error.as_ref()) {
+                    eprintln!("amesh hook ws: the hub refused the connection, stopping: {error}");
+                    break;
+                }
+                if target_gone(&backend, &peer_id) {
+                    eprintln!("amesh hook ws: target session gone, stopping");
+                    break;
+                }
+            }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.subsec_nanos());
+        tokio::time::sleep(backoff + Duration::from_millis(u64::from(nanos % 250))).await;
+        backoff = (backoff * 2).min(cap);
     }
     drop_inbox_stamp(&peer_id);
     Ok(())
+}
+
+/* the target the drainer feeds outlives the connection: a hub that cannot be reached
+leaves nobody to report it, so the outer path checks the same liveness the frame path does */
+fn target_gone(backend: &str, peer_id: &str) -> bool {
+    if backend == "claude-code" {
+        return claude_inbox_path()
+            .map(|path| !path.exists())
+            .unwrap_or(true);
+    }
+    if backend == "codex" {
+        return peer_identity(peer_id).is_ok_and(|row| {
+            row["session_id"].as_str().unwrap_or("").is_empty() && codex_thread_env().is_none()
+        });
+    }
+    false
+}
+
+/* a handshake refused as a bad request, a bad token or an unknown peer is a configuration
+the retry cannot fix; a hub that is busy or restarting answers 429 or 5xx and is waited out */
+fn refused_handshake(error: &(dyn std::error::Error + 'static)) -> bool {
+    error
+        .downcast_ref::<tokio_tungstenite::tungstenite::Error>()
+        .is_some_and(|error| match error {
+            tokio_tungstenite::tungstenite::Error::Http(response) => {
+                matches!(response.status().as_u16(), 400 | 401 | 403 | 404)
+            }
+            _ => false,
+        })
 }
 
 async fn hook_ws_recv(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
-    event: &Value,
+    accepted: &mut VecDeque<String>,
+    ids: Vec<String>,
 ) -> bool {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
-    let Some(id) = event.get("id").filter(|id| !id.is_null()) else {
-        return true;
-    };
-    ws.send(Message::Text(
-        json!({"type": "recv", "id": id}).to_string().into(),
-    ))
-    .await
-    .is_ok()
+    /* the whole batch is remembered before the first recv, so a socket lost between two
+    acknowledgements still knows the rest as injected when the hub replays them */
+    for id in &ids {
+        remember_hook_inbound(accepted, id);
+    }
+    for id in ids {
+        let frame = json!({"type": "recv", "id": id}).to_string();
+        if ws.send(Message::Text(frame.into())).await.is_err() {
+            return false;
+        }
+    }
+    true
 }
 
 async fn hook_ws_once(
@@ -3291,13 +3363,19 @@ async fn hook_ws_once(
     queued: &mut VecDeque<Queued>,
     depth_warned: &mut bool,
     accepted: &mut VecDeque<String>,
-) -> Result<bool> {
+    registration: Option<&Value>,
+) -> Result<(bool, bool)> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let mut greeted = false;
     /* sessions are bound by the MCP and the hooks; a drainer only carries the name, so one
     respawned under a thread that lost it cannot take the row back */
-    let _ = announce_runtime_peer(backend, &cwd, Some(peer_id), None);
+    if let Some(body) = registration {
+        let _ = request("POST", "/peers", Some(body.clone()));
+    } else {
+        let _ = announce_runtime_peer(backend, &cwd, Some(peer_id), None);
+    }
     let bind = std::env::var("AMESH_BIND").unwrap_or_else(|_| "127.0.0.1:8378".into());
     let url = format!("ws://{bind}/ws");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
@@ -3312,7 +3390,7 @@ async fn hook_ws_once(
         .await
         .is_err()
     {
-        return Ok(false);
+        return Ok((false, greeted));
     }
     if backend == "claude-code" {
         record_inbox_socket(peer_id);
@@ -3327,21 +3405,21 @@ async fn hook_ws_once(
     let mut owner: Option<String> = None;
     /* until connected names the session, nothing queued from an earlier connection may
     be flushed: the heartbeat's first tick is ready before any frame */
-    let mut greeted = false;
     let mut warned = false;
     let mut beat = tokio::time::interval(Duration::from_secs(env_secs("AMESH_WS_BEAT_SECS", 10)));
     loop {
         tokio::select! {
             msg = ws.next() => {
-                let Some(msg) = msg else { return Ok(false); };
-                let Ok(frame) = msg else { return Ok(false); };
+                let Some(msg) = msg else { return Ok((false, greeted)); };
+                let Ok(frame) = msg else { return Ok((false, greeted)); };
                 let Message::Text(text) = frame else { continue; };
                 let Ok(event) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
                 let kind = event.get("type").and_then(Value::as_str).unwrap_or("");
                 if kind == "displaced" {
-                    return Ok(true);
+                    eprintln!("amesh hook ws: displaced by another drainer, stopping");
+                    return Ok((true, greeted));
                 }
                 /* connected, replaced and bound name the session every later frame belongs
                 to, in the order the hub queued them. A replaced name ends everything queued
@@ -3368,10 +3446,19 @@ async fn hook_ws_once(
                     continue;
                 }
                 let id = event.get("id").and_then(Value::as_str).filter(|id| !id.is_empty());
-                if id.is_some_and(|id| accepted.iter().any(|known| known == id)) {
-                    remember_hook_inbound(accepted, id);
-                    if !hook_ws_recv(&mut ws, &event).await {
-                        return Ok(false);
+                /* a replay of a record still queued is not enqueued again and stays
+                unacknowledged, because its injection has not succeeded yet */
+                if let Some(frame_id) = id {
+                    if queued
+                        .iter()
+                        .any(|(_, _, held)| held.as_deref() == Some(frame_id))
+                    {
+                        continue;
+                    }
+                }
+                if let Some(id) = id.filter(|id| accepted.iter().any(|known| known == id)) {
+                    if !hook_ws_recv(&mut ws, accepted, vec![id.to_string()]).await {
+                        return Ok((false, greeted));
                     }
                     continue;
                 }
@@ -3392,9 +3479,9 @@ async fn hook_ws_once(
                         }
                     };
                     if stale {
-                        remember_hook_inbound(accepted, id);
-                        if !hook_ws_recv(&mut ws, &event).await {
-                            return Ok(false);
+                        let ids = id.map(str::to_string).into_iter().collect();
+                        if !hook_ws_recv(&mut ws, accepted, ids).await {
+                            return Ok((false, greeted));
                         }
                         continue;
                     }
@@ -3420,20 +3507,19 @@ async fn hook_ws_once(
                     let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok();
                     if gone {
                         eprintln!("amesh hook ws: inbox socket gone, yield");
-                        return Ok(true);
+                        return Ok((true, greeted));
                     }
                     let tag = owner.clone().filter(|id| !id.is_empty());
-                    enqueue_hook_inbound(queued, (tag, wrapped), depth_warned);
-                    flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
-                    remember_hook_inbound(accepted, id);
-                    if !hook_ws_recv(&mut ws, &event).await {
-                        return Ok(false);
+                    enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
+                    let acked =
+                        flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
+                    if !hook_ws_recv(&mut ws, accepted, acked).await {
+                        return Ok((false, greeted));
                     }
                     continue;
                 }
                 let tag = owner.clone().filter(|id| !id.is_empty());
-                enqueue_hook_inbound(queued, (tag, wrapped), depth_warned);
-                remember_hook_inbound(accepted, id);
+                enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
                 if uses_app_server && app.is_none() && Instant::now() >= next_app_try {
                     app = app_connect(peer_id, owner.as_deref()).await;
                     if app.is_none() {
@@ -3443,18 +3529,19 @@ async fn hook_ws_once(
                         app_backoff = Duration::from_secs(10);
                     }
                 }
-                /* recv follows the inject, as on the Claude path: a drainer that dies inside it
-                leaves the frame with the hub, which sends it to the next one */
+                /* recv follows the inject: a drainer that dies inside it leaves the frame
+                with the hub, which sends it to the next one */
                 if let Some(sink) = app.as_mut() {
-                    if !flush_app_sink(sink, queued, owner.as_deref()).await {
+                    let (usable, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
+                    if !hook_ws_recv(&mut ws, accepted, acked).await {
+                        return Ok((false, greeted));
+                    }
+                    if !usable {
                         app = None;
                     }
                 } else if !warned {
                     eprintln!("amesh hook ws: no verified App Server thread for inject, queued={}", queued.len());
                     warned = true;
-                }
-                if !hook_ws_recv(&mut ws, &event).await {
-                    return Ok(false);
                 }
             }
             _ = beat.tick() => {
@@ -3467,13 +3554,17 @@ async fn hook_ws_once(
                 if let Some(socket) = claude_backend_socket(backend) {
                     if claude_inbox_path().map(|path| !path.exists()).unwrap_or(true) {
                         eprintln!("amesh hook ws: inbox socket gone, yield");
-                        return Ok(true);
+                        return Ok((true, greeted));
                     }
                     let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok();
-                    flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
+                    let acked =
+                        flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
+                    if !hook_ws_recv(&mut ws, accepted, acked).await {
+                        return Ok((false, greeted));
+                    }
                 }
                 if ws.send(Message::Text(json!({"type": "ping"}).to_string().into())).await.is_err() {
-                    return Ok(false);
+                    return Ok((false, greeted));
                 }
                 if uses_app_server && app.is_none() && Instant::now() >= next_app_try {
                     app = app_connect(peer_id, owner.as_deref()).await;
@@ -3486,7 +3577,11 @@ async fn hook_ws_once(
                     }
                 }
                 if let Some(sink) = app.as_mut() {
-                    if !flush_app_sink(sink, queued, owner.as_deref()).await {
+                    let (usable, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
+                    if !hook_ws_recv(&mut ws, accepted, acked).await {
+                        return Ok((false, greeted));
+                    }
+                    if !usable {
                         app = None;
                     } else if queued.is_empty() {
                         check_turn(sink, peer_id, owner.as_deref()).await;
@@ -3862,6 +3957,44 @@ fn tell_activity_again(session: Option<&str>) {
 }
 
 fn hook(raw: &[String]) -> Result<()> {
+    if raw.first().map(String::as_str) == Some("hold") {
+        let path = raw.get(1).ok_or("hook hold requires a path")?;
+        if raw.len() != 2 {
+            return Err("hook hold requires one path".into());
+        }
+        let parent = std::os::unix::process::parent_id();
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        /* stdin is the owning process's pipe: its EOF means that process is gone, and exiting
+        here is what releases the lock, including for a waiter still blocked in lock() */
+        std::thread::spawn(|| {
+            let result = io::copy(&mut io::stdin(), &mut io::sink());
+            std::process::exit(if result.is_ok() { 0 } else { 1 });
+        });
+        match file.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                let pid = fs::read_to_string(path).unwrap_or_default();
+                println!("waiting {}", pid.trim());
+                io::stdout().flush()?;
+                file.lock()?;
+            }
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+        file.set_len(0)?;
+        writeln!(file, "{parent}")?;
+        file.sync_all()?;
+        println!("owner");
+        io::stdout().flush()?;
+        loop {
+            std::thread::park();
+        }
+    }
+
     if matches!(raw.first().map(String::as_str), Some("ws")) {
         return hook_ws(&raw[1..]);
     }

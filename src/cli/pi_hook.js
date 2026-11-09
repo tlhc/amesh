@@ -1,5 +1,17 @@
 import { execFile, spawn } from "node:child_process";
-import { closeSync, fstatSync, ftruncateSync, mkdirSync, openSync } from "node:fs";
+import {
+  closeSync,
+  fstatSync,
+  ftruncateSync,
+  fsyncSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readSync,
+  renameSync,
+  statSync,
+  writeSync,
+} from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { homedir } from "node:os";
@@ -119,6 +131,112 @@ function PortOpen() {
   });
 }
 
+/* the accept log: a record is written and flushed here before its recv leaves, so a crash
+before the injection replays it instead of losing it. the same file carries the ids already
+handed to pi, which is what turns a replay into an acknowledgement instead of a second
+message */
+const heldSeconds = 24 * 3600;
+const doneKeep = 512;
+const logLimit = 8 * 1024 * 1024;
+
+function LogDir() {
+  const agent =
+    process.env.PI_CODING_AGENT_DIR || join(process.env.HOME || homedir(), ".pi", "agent");
+  return join(agent, "amesh-inbox");
+}
+
+function LogFile(peer, directory) {
+  return join(directory, `${String(peer || "unbound").replace(/[^A-Za-z0-9._-]/g, "_")}.jsonl`);
+}
+
+function ReadLog(file) {
+  let raw;
+  try {
+    raw = readFileSync(file, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw error;
+    }
+    return [];
+  }
+  const rows = [];
+  for (const line of raw.split("\n")) {
+    if (!line) {
+      continue;
+    }
+    try {
+      const row = JSON.parse(line);
+      if (row && typeof row.id === "string") {
+        rows.push(row);
+      }
+    } catch {
+      /* a torn tail means its append never finished, so no recv ever named that id */
+    }
+  }
+  return rows;
+}
+
+function TornTail(file) {
+  let size = 0;
+  try {
+    size = statSync(file).size;
+  } catch {
+    return false;
+  }
+  if (size === 0) {
+    return false;
+  }
+  const fd = openSync(file, "r");
+  try {
+    const last = Buffer.alloc(1);
+    readSync(fd, last, 0, 1, size - 1);
+    return last[0] !== 0x0a;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function SyncDir(path) {
+  try {
+    const fd = openSync(path, "r");
+    try {
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    /* a filesystem that cannot sync a directory has nothing extra to offer */
+  }
+}
+
+/* appending onto a torn tail would weld the new row to the broken one and lose both, so the
+tail is closed first; a short write means the row is not on disk and the caller must not ack */
+function WriteLog(file, rows, truncate = false) {
+  mkdirSync(dirname(file), { recursive: true });
+  if (!truncate && TornTail(file)) {
+    const tail = openSync(file, "a");
+    try {
+      writeSync(tail, "\n");
+      fsyncSync(tail);
+    } finally {
+      closeSync(tail);
+    }
+  }
+  const text = rows.map((row) => `${JSON.stringify(row)}\n`).join("");
+  const fd = openSync(file, truncate ? "w" : "a");
+  try {
+    if (text.length > 0) {
+      const wrote = writeSync(fd, text);
+      if (wrote !== Buffer.byteLength(text)) {
+        throw new Error(`short log write: ${wrote} of ${Buffer.byteLength(text)} bytes`);
+      }
+    }
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
 async function Ensure() {
   const deadline = Date.now() + 2000;
   const left = () => Math.max(0, deadline - Date.now());
@@ -170,6 +288,7 @@ async function Ensure() {
 
 export default function AmeshHooks(pi) {
   let socket;
+  let wantsSocket = false;
   let intro = false;
   let selfId = peerId;
   let dead = false;
@@ -183,7 +302,127 @@ export default function AmeshHooks(pi) {
   let localSession;
   let inboundSessionId;
   const pending = [];
-  const delivered = [];
+  const accepted = new Map();
+  const logDirectory = LogDir();
+  let logFile = null;
+  let logLoaded = false;
+  let logStale = false;
+  let owner = null;
+  let nextOwner = null;
+  let ownerRetry = null;
+  let resumeSession = false;
+  let recoveryFile = null;
+  const ownerLogs = new Set();
+  let ownerErrorLogged = false;
+  const httpInbox = [];
+
+  function CloseSocket() {
+    const previous = socket;
+    socket = null;
+    clearTimeout(retry);
+    retry = null;
+    clearInterval(beat);
+    beat = null;
+    previous?.close();
+  }
+
+  function Release(held) {
+    if (!held) {
+      return Promise.resolve();
+    }
+    held.stopping = true;
+    if (held.closed || held.child.exitCode !== null || held.child.signalCode !== null) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+      held.child.once("close", resolve);
+      held.child.stdin.end();
+    });
+  }
+
+  function OwnerError(message) {
+    if (!ownerErrorLogged) {
+      ownerErrorLogged = true;
+      console.error(`[amesh] log owner: ${message}`);
+    }
+  }
+
+  function Acquire(file) {
+    mkdirSync(dirname(file), { recursive: true });
+    const child = spawn(executable, ["hook", "hold", `${file}.owner`], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let started;
+    const held = { file, child, ready: false, stopping: false,
+      started: new Promise((resolve) => { started = resolve; }) };
+    child.stdin.on("error", () => {});
+    let output = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (part) => {
+      output += part;
+      while (output.includes("\n")) {
+        const end = output.indexOf("\n");
+        const line = output.slice(0, end);
+        output = output.slice(end + 1);
+        if (line.startsWith("waiting ") && !ownerLogs.has(file)) {
+          ownerLogs.add(file);
+          console.error(`[amesh] delivery for ${file} is owned by pid ${line.slice(8) || "unknown"}; this window is not receiving amesh messages as its new identity while waiting`);
+        }
+        if (line !== "owner" || held.ready || held.stopping || dead) {
+          started();
+          continue;
+        }
+        held.ready = true;
+        ownerErrorLogged = false;
+        started();
+        if (EnsureLog()) {
+          if (resumeSession && lastCtx) {
+            resumeSession = false;
+            void SessionStart({}, lastCtx);
+          } else {
+            EnqueueInbox({});
+            if (wantsSocket) {
+              Connect(selfId);
+            }
+            Flush();
+          }
+        }
+      }
+    });
+    child.stderr.on("data", (part) => OwnerError(String(part).trim()));
+    child.on("error", (error) => OwnerError(error.message));
+    child.on("close", (code, signal) => {
+      held.closed = true;
+      held.ready = false;
+      started();
+      if (held.stopping || dead) {
+        return;
+      }
+      OwnerError(`${file}: holder exited (${signal || code})`);
+      CloseSocket();
+      if (owner === held) {
+        recoveryFile = held.file;
+        owner = null;
+        logLoaded = false;
+      }
+      if (nextOwner === held) {
+        nextOwner = null;
+      }
+      clearTimeout(ownerRetry);
+      ownerRetry = setTimeout(() => EnsureLog(), Backoff());
+      ownerRetry.unref?.();
+    });
+    return held;
+  }
+
+  function RetryDelivery() {
+    CloseSocket();
+    retry = setTimeout(() => {
+      EnqueueInbox({});
+      Connect(selfId);
+    }, Backoff());
+    retry.unref?.();
+  }
 
   function Cli(args) {
     return new Promise((resolve, reject) => {
@@ -237,7 +476,6 @@ export default function AmeshHooks(pi) {
   function UseSession(ctx) {
     const session = ctx.sessionManager.getSessionId();
     if (localSession !== session) {
-      KeepSession(session);
       localSession = session;
       inflight = false;
       inflightText = null;
@@ -271,14 +509,9 @@ export default function AmeshHooks(pi) {
     pendingSeen = false;
     warned = false;
     pending.length = 0;
-    clearTimeout(retry);
-    retry = null;
-    clearInterval(beat);
-    beat = null;
-    if (socket) {
-      socket.close();
-      socket = null;
-    }
+    CloseSocket();
+    clearTimeout(ownerRetry);
+    return Promise.all([Release(owner), Release(nextOwner)]);
   }
 
   function Take(items) {
@@ -297,39 +530,33 @@ export default function AmeshHooks(pi) {
     return batch;
   }
 
+  function Mine(item) {
+    return item.session == null || (item.session !== "" && item.session === localSession);
+  }
+
   function Flush() {
-    if (dead || !intro || inflight || pending.length === 0 || inboundSessionId === "") {
+    if (dead || !intro || inflight || pending.length === 0 || inboundSessionId === "" || !EnsureLog()) {
       return;
     }
-    const steers = [];
-    const follows = [];
-    const held = pending.findIndex((item) => item.session && localSession && item.session !== localSession);
-    if (held === 0) return;
-    for (const item of pending.splice(0, held < 0 ? pending.length : held)) {
-      if (item.type === "broadcast") {
-        follows.push(item);
-      } else {
-        steers.push(item);
-      }
-    }
-    if (steers.length) {
-      const batch = Take(steers);
-      pending.unshift(...follows, ...steers);
-      if (pending.length <= 200) {
-        warned = false;
-      }
-      Start(batch, "steer");
+    const ready = pending.filter(Mine);
+    if (ready.length === 0) {
       return;
     }
-    const batch = Take(follows);
-    pending.unshift(...follows);
     if (pending.length <= 200) {
       warned = false;
     }
-    Start(batch, "broadcast");
+    const steers = ready.filter((item) => item.type !== "broadcast");
+    if (steers.length) {
+      Start(Take(steers), "steer");
+      return;
+    }
+    Start(Take(ready), "broadcast");
   }
 
   function Start(batch, type) {
+    if (batch.length === 0) {
+      return;
+    }
     inflight = true;
     inflightText = batch.map((item) => item.text).join("\n\n");
     try {
@@ -337,16 +564,187 @@ export default function AmeshHooks(pi) {
     } catch (error) {
       inflight = false;
       inflightText = null;
-      pending.unshift(...batch);
       console.error(`[amesh] ${error.message}`);
+      return;
+    }
+    for (const item of batch) {
+      const at = pending.indexOf(item);
+      if (at !== -1) {
+        pending.splice(at, 1);
+      }
+    }
+    Complete(batch);
+  }
+
+  function Rows(map) {
+    return [...map].map(([id, held]) =>
+      held.done || !held.entry ? { t: "d", id, at: held.at } : { t: "a", at: held.at, ...held.entry },
+    );
+  }
+
+  /* a done row that lost its accept row in an earlier rewrite is a tombstone: its id was
+  handed to pi, so a replay of it must be acknowledged and not injected */
+  function Resolve(rows) {
+    const map = new Map();
+    for (const row of rows) {
+      if (row.t === "a") {
+        const held = map.get(row.id);
+        if (held?.done) {
+          continue;
+        }
+        const { t, at: stamp, ...entry } = row;
+        const at = Number(stamp) || 0;
+        if (held) {
+          held.entry = entry;
+          held.at = at;
+        } else {
+          map.set(row.id, { entry, done: false, at });
+        }
+      } else if (row.t === "s") {
+        const held = map.get(row.id);
+        if (held?.entry) {
+          held.entry.session = row.session;
+          held.at = Number(row.at) || held.at;
+        }
+      } else if (row.t === "d") {
+        const held = map.get(row.id);
+        const at = Number(row.at) || 0;
+        if (held) {
+          held.done = true;
+          held.at = Math.max(held.at, at);
+        } else {
+          map.set(row.id, { entry: null, done: true, at });
+        }
+      }
+    }
+    return map;
+  }
+
+  function Bound(map) {
+    const finished = [...map.keys()].filter((id) => map.get(id).done);
+    for (const id of finished.slice(0, Math.max(0, finished.length - doneKeep))) {
+      map.delete(id);
     }
   }
 
-  function Inject(text, type, session) {
-    if (dead) {
+  function Snapshot(file, map) {
+    const staged = `${file}.tmp`;
+    WriteLog(staged, Rows(map), true);
+    renameSync(staged, file);
+    SyncDir(dirname(file));
+  }
+
+  function Rewrite() {
+    if (!EnsureLog()) {
       return false;
     }
-    pending.push({ text, type, session });
+    try {
+      Bound(accepted);
+      Snapshot(logFile, accepted);
+      return true;
+    } catch (error) {
+      console.error(`[amesh] ${error.message}`);
+      return false;
+    }
+  }
+
+  function Report(entry, reason) {
+    if (entry.type !== "ask" || !entry.cid) {
+      return;
+    }
+    const args = ["peer", "ack", entry.cid, `--message=${reason}`, "--failed", "true", ...FromPeer()];
+    Cli(args).catch((error) => console.error(`[amesh] ${error.message}`));
+  }
+
+  function Expire(now) {
+    const expired = [];
+    for (const held of accepted.values()) {
+      if (held.done || held.at >= now - heldSeconds) {
+        continue;
+      }
+      if (held.entry) {
+        expired.push(held.entry);
+      }
+      held.done = true;
+      held.entry = null;
+      held.at = now;
+    }
+    if (expired.length === 0) {
+      return;
+    }
+    for (let i = pending.length - 1; i >= 0; i--) {
+      const held = pending[i].id ? accepted.get(pending[i].id) : null;
+      if (held?.done) {
+        pending.splice(i, 1);
+      }
+    }
+    for (const entry of expired) {
+      Report(entry, "the recipient session was not active on this pi; the message was not delivered");
+    }
+    console.error(`[amesh] dropped ${expired.length} held message(s) older than 24h`);
+    Rewrite();
+  }
+
+  function Trim() {
+    const finished = [...accepted.values()].filter((held) => held.done).length;
+    let size = 0;
+    try {
+      size = statSync(logFile).size;
+    } catch {
+      size = 0;
+    }
+    if (finished > doneKeep || logStale || size > logLimit) {
+      logStale = !Rewrite();
+    }
+  }
+
+  function Complete(batch) {
+    if (!EnsureLog()) {
+      return;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const rows = [];
+    for (const item of batch) {
+      if (!item.id) {
+        continue;
+      }
+      const held = accepted.get(item.id);
+      if (held) {
+        held.done = true;
+        held.at = now;
+      }
+      rows.push({ t: "d", id: item.id, at: now });
+    }
+    if (rows.length === 0) {
+      return;
+    }
+    try {
+      WriteLog(logFile, rows);
+    } catch (error) {
+      console.error(`[amesh] ${error.message}`);
+      logStale = true;
+    }
+    Trim();
+  }
+
+  function Accept(entry) {
+    if (!EnsureLog()) {
+      return false;
+    }
+    if (entry.id && accepted.has(entry.id)) {
+      return true;
+    }
+    const now = Math.floor(Date.now() / 1000);
+    if (entry.id) {
+      try {
+        WriteLog(logFile, [{ t: "a", at: now, ...entry }]);
+      } catch (error) {
+        console.error(`[amesh] ${error.message}`);
+        return false;
+      }
+      accepted.set(entry.id, { entry, done: false, at: now });
+    }
+    pending.push(entry);
     if (pending.length > 200) {
       if (!warned) {
         console.error("[amesh] inbound queue depth " + pending.length);
@@ -355,27 +753,179 @@ export default function AmeshHooks(pi) {
     } else {
       warned = false;
     }
+    Expire(now);
     return true;
   }
 
-  function KeepSession(session) {
-    for (let i = pending.length - 1; i >= 0; i--) {
-      if (!session || pending[i].session !== session) pending.splice(i, 1);
+  function Adopt(map) {
+    for (const [id, held] of map) {
+      accepted.set(id, held);
+      if (!held.done && held.entry) {
+        pending.push(held.entry);
+      }
     }
-    if (pending.length <= 200) warned = false;
+    Expire(Math.floor(Date.now() / 1000));
+    Trim();
+  }
+
+  function Migrate(held) {
+    try {
+      held.data ||= Resolve(ReadLog(held.file));
+      for (const [id, item] of accepted) {
+        if (!item.done && !held.data.has(id)) {
+          held.data.set(id, item);
+        }
+      }
+      Bound(held.data);
+      Snapshot(held.file, held.data);
+      const rest = new Map([...accepted].filter(([, item]) => item.done));
+      Snapshot(logFile, rest);
+    } catch (error) {
+      console.error(`[amesh] ${error.message}`);
+      clearTimeout(ownerRetry);
+      ownerRetry = setTimeout(() => {
+        if (EnsureLog()) {
+          void SessionStart({}, lastCtx);
+        }
+      }, Backoff());
+      ownerRetry.unref?.();
+      return false;
+    }
+    void Release(owner);
+    owner = held;
+    nextOwner = null;
+    logFile = held.file;
+    accepted.clear();
+    pending.length = 0;
+    Adopt(held.data);
+    return true;
+  }
+
+  /* the hub pruned the row this session was registered under, so the name has to be put
+  back before the next connect can carry anything again */
+  function Register() {
+    if (registering || dead || !lastCtx) {
+      return;
+    }
+    registering = true;
+    Invoke("session", lastCtx)
+      .then(
+        (result) => {
+          selfId = result.peer_id || selfId;
+          EnsureLog();
+          EnqueueInbox(result);
+          const resume = () => {
+            clearTimeout(retry);
+            retry = null;
+            Connect(selfId);
+          };
+          if (socket && socket.readyState < 2) {
+            socket.addEventListener("close", resume);
+          } else {
+            resume();
+          }
+        },
+        (error) => console.error(`[amesh] ${error.message}`),
+      )
+      .finally(() => {
+        registering = false;
+      });
+  }
+
+  function EnsureLog() {
+    if (dead) {
+      return false;
+    }
+    const name = LogFile(selfId, logDirectory);
+    try {
+      if (!owner) {
+        owner = Acquire(recoveryFile || name);
+      }
+      if (!owner.ready) {
+        return false;
+      }
+      if (!logLoaded) {
+        const records = Resolve(ReadLog(owner.file));
+        logLoaded = true;
+        recoveryFile = null;
+        logFile = owner.file;
+        accepted.clear();
+        pending.length = 0;
+        Adopt(records);
+      }
+      if (name === owner.file) {
+        return true;
+      }
+      CloseSocket();
+      if (nextOwner && nextOwner.file !== name) {
+        void Release(nextOwner);
+        nextOwner = null;
+      }
+      nextOwner ||= Acquire(name);
+      return nextOwner.ready && Migrate(nextOwner);
+    } catch (error) {
+      console.error(`[amesh] ${error.message}`);
+      clearTimeout(ownerRetry);
+      ownerRetry = setTimeout(() => {
+        if (EnsureLog() && lastCtx) {
+          void SessionStart({}, lastCtx);
+        }
+      }, Backoff());
+      ownerRetry.unref?.();
+      return false;
+    }
+  }
+
+  function Claim(ids, session) {
+    if (ids.length === 0 || !EnsureLog()) {
+      return [];
+    }
+    const now = Math.floor(Date.now() / 1000);
+    const rows = [];
+    for (const id of ids) {
+      const held = accepted.get(id);
+      if (!held) {
+        continue;
+      }
+      held.at = now;
+      rows.push({ t: "s", id, at: now, session });
+    }
+    if (rows.length === 0) {
+      return [];
+    }
+    try {
+      WriteLog(logFile, rows);
+    } catch (error) {
+      console.error(`[amesh] ${error.message}`);
+      logStale = true;
+      return [];
+    }
+    return rows.map((row) => row.id);
   }
 
   function Receive(body, session = inboundSessionId) {
     if (["connected", "replaced", "bound"].includes(body?.type)) {
       const next = typeof body.session_id === "string" ? body.session_id : undefined;
       inboundSessionId = next;
-      if (body.type === "replaced") {
-        KeepSession(next);
-      } else if (next) {
+      if (body.type === "connected") {
+        connectTries = 0;
+      }
+      if (next) {
+        const moved = [];
         for (const item of pending) {
-          if (!item.session) item.session = next;
+          if (!item.session && item.id) {
+            moved.push(item.id);
+          }
         }
-        KeepSession(next);
+        const claimed = moved.length === 0 ? null : new Set(Claim(moved, next));
+        for (const item of pending) {
+          if (item.session) {
+            continue;
+          }
+          if (!item.id || (claimed && claimed.has(item.id))) {
+            item.session = next;
+          }
+        }
       }
       Flush();
       /* the hub drops activity with the socket and forgets it on restart, so every connect
@@ -396,15 +946,31 @@ export default function AmeshHooks(pi) {
     if (!body || !["ask", "notify", "broadcast", "ack"].includes(body.type)) {
       return false;
     }
-    if (session && localSession && session !== localSession) return true;
     const text = body.text || body.message || "";
-    return Inject(FormatPeer(body.from_peer || "unknown", body.type, text, body.correlation_id), body.type, session);
+    return Accept({
+      id: body.id,
+      text: FormatPeer(body.from_peer || "unknown", body.type, text, body.correlation_id),
+      type: body.type,
+      session,
+      cid: body.correlation_id,
+    });
   }
 
   function EnqueueInbox(result) {
     selfId = result.peer_id || selfId;
     for (const body of Array.isArray(result.inbox) ? result.inbox : []) {
-      Receive(body, result.session_id);
+      httpInbox.push({ body, session: result.session_id });
+    }
+    if (!EnsureLog()) {
+      return;
+    }
+    while (httpInbox.length) {
+      const item = httpInbox[0];
+      if (!Receive(item.body, item.session)) {
+        RetryDelivery();
+        return;
+      }
+      httpInbox.shift();
     }
   }
 
@@ -648,23 +1214,44 @@ export default function AmeshHooks(pi) {
   let beat;
   let connectLogged = false;
   let connectTries = 0;
+  let sureTries = 0;
+  let registering = false;
+  let identityLogged = false;
+  function Backoff() {
+    const base = Number(process.env.AMESH_CONNECT_BACKOFF_MS) || 1000;
+    const cap = Number(process.env.AMESH_CONNECT_BACKOFF_MAX_MS) || 30000;
+    const nominal = Math.min(cap, base * 2 ** Math.min(connectTries, 16));
+    connectTries += 1;
+    return Math.round(nominal * (0.5 + Math.random() * 0.5));
+  }
   function Connect(id) {
+    wantsSocket = true;
+    id = selfId || id;
+    if (!EnsureLog()) {
+      return;
+    }
     if (dead || typeof WebSocket === "undefined" || process.env.AMESH_SKIP_WS) {
       return;
+    }
+    if (!id && !identityLogged) {
+      identityLogged = true;
+      console.error("[amesh] no peer id yet; retrying the socket with backoff");
     }
     if (socket && (socket.readyState === 0 || socket.readyState === 1)) {
       return;
     }
     clearTimeout(retry);
     void Ensure().then(() => {
-    if (dead || (socket && (socket.readyState === 0 || socket.readyState === 1))) {
+    if (dead || !EnsureLog() || (socket && (socket.readyState === 0 || socket.readyState === 1))) {
       return;
     }
+    id = selfId || id;
     const bind = process.env.AMESH_BIND || "127.0.0.1:8378";
     socket = new WebSocket(`ws://${bind}/ws`);
+    const active = socket;
     socket.addEventListener("open", () => {
       connectLogged = false;
-      connectTries = 0;
+      sureTries = 0;
       const frame = { type: "connect", peer_id: id, recv: true };
       if (process.env.AMESH_TOKEN) {
         frame.auth_token = process.env.AMESH_TOKEN;
@@ -672,7 +1259,7 @@ export default function AmeshHooks(pi) {
       socket.send(JSON.stringify(frame));
     });
     socket.addEventListener("message", (event) => {
-      if (dead) {
+      if (dead || socket !== active) {
         return;
       }
       try {
@@ -682,20 +1269,20 @@ export default function AmeshHooks(pi) {
         } catch {
           return;
         }
-        /* a record whose recv was lost with the socket comes back on the next connect: it is
-        acknowledged again and injected once */
-        const repeat = Boolean(body.id) && delivered.includes(body.id);
-        if (!repeat && !Receive(body)) {
+        if (typeof body?.error === "string") {
+          Register();
           return;
         }
-        if (body.id) {
-          if (!repeat) {
-            delivered.push(body.id);
-            if (delivered.length > 64) delivered.shift();
+        /* a record whose recv was lost with the socket comes back on the next connect: the
+        accept log holds its id, so it is acknowledged again and injected once */
+        if (!Receive(body)) {
+          if (["ask", "notify", "broadcast", "ack"].includes(body?.type)) {
+            RetryDelivery();
           }
-          if (socket.readyState === 1) {
-            socket.send(JSON.stringify({ type: "recv", id: body.id }));
-          }
+          return;
+        }
+        if (body.id && socket.readyState === 1) {
+          socket.send(JSON.stringify({ type: "recv", id: body.id }));
         }
         Flush();
       } catch (error) {
@@ -703,12 +1290,15 @@ export default function AmeshHooks(pi) {
       }
     });
     socket.addEventListener("close", () => {
+      if (socket !== active) {
+        return;
+      }
       socket = null;
       clearInterval(beat);
       if (dead) {
         return;
       }
-      retry = setTimeout(() => Connect(id), 1000);
+      retry = setTimeout(() => Connect(id), Backoff());
       retry.unref?.();
     });
     beat = setInterval(() => {
@@ -725,12 +1315,12 @@ export default function AmeshHooks(pi) {
       if (dead) {
         return;
       }
-      if (connectTries >= 5) {
+      if (sureTries >= 5) {
         console.error("[amesh] connect gave up after 5 retries; /reload to retry");
         return;
       }
-      connectTries += 1;
-      retry = setTimeout(() => Connect(id), 1000);
+      sureTries += 1;
+      retry = setTimeout(() => Connect(id), Backoff());
       retry.unref?.();
     });
   }
@@ -767,9 +1357,17 @@ export default function AmeshHooks(pi) {
     }, tries > 0 ? 1000 : 10000);
   };
 
-  pi.on("session_start", async (_event, ctx) => {
+  async function SessionStart(_event, ctx) {
     UseSession(ctx);
     lastCtx = ctx;
+    if (selfId) {
+      EnsureLog();
+      await (nextOwner || owner)?.started;
+      if (!EnsureLog()) {
+        resumeSession = true;
+        return;
+      }
+    }
     try {
       await Ensure();
     } catch (error) {
@@ -780,7 +1378,13 @@ export default function AmeshHooks(pi) {
     }
     try {
       const result = await Invoke("session", ctx);
+      selfId = result.peer_id || selfId;
       EnqueueInbox(result);
+      await (nextOwner || owner)?.started;
+      if (!EnsureLog()) {
+        resumeSession = true;
+        return;
+      }
       Connect(result.peer_id);
       if (!intro) {
         const boundary = /\n(?:Pending asks|Inbox):/;
@@ -805,7 +1409,8 @@ export default function AmeshHooks(pi) {
       }
     }
     Flush();
-  });
+  }
+  pi.on("session_start", SessionStart);
 
   pi.on("before_agent_start", async (_event, ctx) => {
     lastCtx = ctx;
@@ -925,6 +1530,6 @@ export default function AmeshHooks(pi) {
   });
 
   pi.on("session_shutdown", () => {
-    Drop();
+    return Drop();
   });
 }

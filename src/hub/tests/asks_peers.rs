@@ -833,3 +833,97 @@ async fn unknown_peer_errors_name_online_circle_mates() {
         "MCP surfaces the same candidates: {body}"
     );
 }
+
+#[tokio::test]
+async fn an_ask_rejects_an_empty_body() {
+    let (app, hub, path) = test_app_with_hub();
+    register(app.clone(), "worker", "pi", "default").await;
+    for text in ["", "  ", "\n\t\u{2003}"] {
+        let (status, body) = json_req(
+            app.clone(),
+            "POST",
+            "/ask",
+            json!({"to_peer": "worker", "text": text}),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "empty ask text must be rejected: {text:?}: {body}"
+        );
+        assert_eq!(body["error"], "ask text must not be empty");
+        assert!(hub.lock().await.asks.is_empty());
+        assert!(Hub::open(&path).unwrap().asks.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn mcp_ask_rejects_a_missing_body_without_opening_an_ask() {
+    let (app, hub, path) = test_app_with_hub();
+    register(app.clone(), "worker", "pi", "default").await;
+    let (status, body) = mcp_tool(app, "amesh_ask", json!({"peer_name": "worker"})).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a missing MCP ask body must be rejected: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|text| text.contains("ask text must not be empty")),
+        "a missing MCP ask body must return an error: {body}"
+    );
+    assert!(hub.lock().await.asks.is_empty());
+    assert!(Hub::open(&path).unwrap().asks.is_empty());
+}
+
+#[tokio::test]
+async fn mcp_ask_accepts_the_message_alias() {
+    let (app, hub, _path) = test_app_with_hub();
+    register(app.clone(), "worker", "pi", "default").await;
+    let (status, body) = mcp_tool(
+        app,
+        "amesh_ask",
+        json!({"peer_name": "worker", "message": "message alias"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(tool_json(&body)["ok"], true);
+    assert_eq!(
+        hub.lock().await.asks.values().next().unwrap().text,
+        "message alias",
+        "MCP must use the same message alias as HTTP"
+    );
+}
+
+#[test]
+fn the_ask_schema_requires_query() {
+    let tool = mcp_tools()
+        .into_iter()
+        .find(|tool| tool["name"] == "amesh_ask")
+        .unwrap();
+    assert_eq!(
+        tool["inputSchema"]["required"],
+        json!(["query"]),
+        "the ask schema must require a body"
+    );
+}
+
+#[tokio::test]
+async fn ask_many_rejects_an_empty_body() {
+    let (app, hub, _path) = test_app_with_hub();
+    register(app.clone(), "worker", "pi", "default").await;
+    let (status, body) = json_req(
+        app,
+        "POST",
+        "/ask-many",
+        json!({"to_peers": ["worker"], "text": "  "}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "ask-many must share ask text validation: {body}"
+    );
+    assert!(hub.lock().await.asks.is_empty());
+}

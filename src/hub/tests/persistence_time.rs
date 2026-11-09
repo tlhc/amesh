@@ -321,7 +321,7 @@ fn recv_copy_time_equals_original() {
     hub.recv_live.insert("worker".into());
     hub.recv_known.insert("worker".into());
     persist_then_deliver(&mut hub, "worker", json!({"type":"notify"}), 17).unwrap();
-    let Outbound::Record(copy) = rx.try_recv().unwrap() else {
+    let Outbound::Copy(copy) = rx.try_recv().unwrap() else {
         panic!("record expected")
     };
     assert_eq!(&copy, &hub.inbox.records("worker")[0]);
@@ -437,7 +437,7 @@ async fn register_copy_uses_merged_time() {
     let (status, _) = json_req(router(app.clone()), "POST", "/peers", json!({"peer_id":"worker", "name":"worker", "backend":"pi", "path":"/tmp", "session_id":"session"})).await;
     assert_eq!(status, StatusCode::OK);
     let copy = loop {
-        if let Outbound::Record(record) = rx.try_recv().unwrap() {
+        if let Outbound::Copy(record) = rx.try_recv().unwrap() {
             break record;
         }
     };

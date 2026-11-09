@@ -100,7 +100,7 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
         let mut readers = Vec::new();
         let mut spawn = || {
             let mut child = sandbox.command().args(["hook","ws","--peer-id",worker,"--backend","codex"])
-                .env("CODEX_HOME", "cx").spawn().unwrap();
+                .env("CODEX_HOME", "cx").env("AMESH_WS_BEAT_SECS", "1").spawn().unwrap();
             let stderr = child.stderr.take().unwrap();
             let tx = log_tx.clone();
             readers.push(std::thread::spawn(move || {
@@ -109,11 +109,11 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
             KillChild(Some(child))
         };
         let mut first = spawn();
-        assert_eq!(next(&mut receipts).await["id"], "q0");
-        assert_eq!(next(&mut receipts).await["id"], "q1");
-        // The initial connection attempt completes before the hook acknowledges either frame.
+        /* an unbound peer cannot inject, so q0 and q1 stay queued and unacknowledged
+        until the row names a session and the sink flushes them */
         assert_eq!(connections.load(Ordering::SeqCst), 0, "unbound peer connected to App Server");
         assert!(requests.try_recv().is_err(), "unbound peer made an App Server request");
+        assert!(receipts.try_recv().is_err(), "unbound peer acknowledged an un-injected frame");
         *binding.lock().unwrap() = "target".into();
         let mut turns = Vec::new();
         while turns.len() < 2 {
@@ -123,6 +123,8 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
             }
             if matches!(request["method"].as_str(), Some("turn/start" | "turn/steer")) { turns.push(request); }
         }
+        assert_eq!(next(&mut receipts).await["id"], "q0");
+        assert_eq!(next(&mut receipts).await["id"], "q1");
         for (turn, text) in turns.iter().zip(["q0", "q1"]) {
             assert_eq!(turn["params"]["threadId"], "target");
             assert!(turn["params"]["input"][0]["text"].as_str().unwrap().contains(&format!("\n{text}\n")), "FIFO order: {turn}");

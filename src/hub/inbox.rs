@@ -7,13 +7,14 @@ use super::{with_event_id, INBOX_MAX};
 #[derive(Clone, Debug)]
 pub(super) enum Outbound {
     Record(QueuedRecord),
+    Copy(QueuedRecord),
     Control(Value),
 }
 
 impl Outbound {
     pub(super) fn event(&self) -> &Value {
         match self {
-            Self::Record(record) => record.event(),
+            Self::Record(record) | Self::Copy(record) => record.event(),
             Self::Control(event) => event,
         }
     }

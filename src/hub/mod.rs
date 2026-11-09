@@ -1269,7 +1269,7 @@ fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Outbound>) 
         .skip(start)
         .filter_map(|event| match event {
             Outbound::Record(record) => Some(record),
-            Outbound::Control(_) => None,
+            Outbound::Copy(_) | Outbound::Control(_) => None,
         })
         .filter(|record| record.event()["type"] != DISPLACED && record.event()["type"] != "bound")
         .filter(|event| deliverable(hub, event.event()))
@@ -1331,13 +1331,10 @@ fn persist_then_deliver(
         eprintln!("amesh: dropping {} for unknown peer {to}", event["type"]);
         return persist_ok(hub);
     };
-    /* a peer that acknowledges, or one that did and is away right now, is owed a record it
-    can name by id. Only an attached client of the old kind takes the old path, since it
-    would never acknowledge and its own replay drains what it is sent. */
+    /* the recv promise outlives a socket: a legacy connection carries copies of the
+    same records until an acknowledging connection retires them */
     let unsettled = hub.owed.contains_key(&key);
-    let acknowledging = unsettled
-        || hub.recv_live.contains(&key)
-        || (hub.recv_known.contains(&key) && !hub.sockets.contains_key(&key));
+    let acknowledging = unsettled || hub.recv_live.contains(&key) || hub.recv_known.contains(&key);
     if acknowledging {
         /* the inbox is the record of what this peer is owed; what goes down the socket is a
         copy, and only the peer's recv for this id takes the record away */
@@ -1349,7 +1346,7 @@ fn persist_then_deliver(
         push_event(hub, event.clone());
         if !unsettled {
             if let Some((_, tx)) = hub.sockets.get(&key) {
-                let _ = tx.send(Outbound::Record(record));
+                let _ = tx.send(Outbound::Copy(record));
             }
         }
         return Ok(());
@@ -1435,11 +1432,17 @@ fn deliver_queued(hub: &mut Hub, records: Vec<(String, QueuedRecord)>) {
         let Some((_, tx)) = hub.sockets.get(&target) else {
             continue;
         };
-        if tx.send(Outbound::Record(record.clone())).is_err() {
+        let acknowledging = hub.recv_live.contains(&target) || hub.recv_known.contains(&target);
+        let outbound = if acknowledging {
+            Outbound::Copy(record.clone())
+        } else {
+            Outbound::Record(record.clone())
+        };
+        if tx.send(outbound).is_err() {
             hub.sockets.remove(&target);
             continue;
         }
-        if !hub.recv_live.contains(&target) {
+        if !acknowledging {
             retired |= acknowledge_event(hub, &target, event["id"].as_str().unwrap());
         }
     }
@@ -2413,6 +2416,12 @@ async fn open_ask(
     Json(req): Json<AskReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
+    if req.text.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "ask text must not be empty"})),
+        ));
+    }
     let mut hub = app.inner.lock().await;
     let now = now_unix();
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
@@ -5359,7 +5368,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "watch": {"type": "boolean"},
                     "deadline_seconds": {"type": "integer"}
                 }),
-                &[],
+                &["query"],
             );
             t["name"] = json!("amesh_ask");
             t
@@ -5713,6 +5722,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             let query = args
                 .get("query")
                 .or(args.get("text"))
+                .or(args.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
             let res = open_ask(
@@ -6242,25 +6252,28 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                 .await;
             return;
         };
+        if !recv && hub.recv_known.contains(&peer.peer_id) {
+            drop(hub);
+            let _ = socket
+                .send(Message::Text(
+                    json!({"error":"this peer requires delivery acknowledgements; connect with recv:true"})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
         hub.conn_gen += 1;
         let gen = hub.conn_gen;
         let (tx, rx) = mpsc::unbounded_channel();
-        /* tell the incumbent it lost the peer, otherwise it cannot tell displacement
-        from a dropped link and a reconnecting client would fight us for the socket */
-        if let Some((_, previous)) = hub.sockets.get(&peer.peer_id) {
-            let _ = previous.send(Outbound::Control(
-                json!({"type": DISPLACED, "peer_id": peer.peer_id}),
-            ));
-        }
-        hub.sockets.insert(peer.peer_id.clone(), (gen, tx));
         if let Some(p) = hub.peers.get_mut(&peer.peer_id) {
             p.status = "online".into();
             p.last_seen = now_unix();
         }
-        let mut drained = if recv {
+        let drained = if recv {
             /* an acknowledging client gets copies of everything it is still owed; the
             records stay until its recv for each id, so a drop mid-replay loses nothing */
-            hub.recv_live.insert(peer.peer_id.clone());
             hub.recv_known.insert(peer.peer_id.clone());
             if hub.owed.contains_key(&peer.peer_id) {
                 /* whose backlog this is has not been settled yet: the row came back without
@@ -6280,11 +6293,10 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                     .records(&peer.peer_id)
                     .iter()
                     .cloned()
-                    .map(Outbound::Record)
+                    .map(Outbound::Copy)
                     .collect::<Vec<_>>()
             }
         } else {
-            hub.recv_live.remove(&peer.peer_id);
             if hub.owed.contains_key(&peer.peer_id) {
                 Vec::new()
             } else {
@@ -6294,8 +6306,24 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                 taken.into_iter().map(Outbound::Record).collect()
             }
         };
-        if persist_ok(&mut hub).is_err() {
-            drained.clear();
+        if let Err((_, Json(error))) = persist_ok(&mut hub) {
+            drop(hub);
+            let _ = socket.send(Message::Text(error.to_string().into())).await;
+            let _ = socket.send(Message::Close(None)).await;
+            return;
+        }
+        /* tell the incumbent it lost the peer, otherwise it cannot tell displacement
+        from a dropped link and a reconnecting client would fight us for the socket */
+        if let Some((_, previous)) = hub.sockets.get(&peer.peer_id) {
+            let _ = previous.send(Outbound::Control(
+                json!({"type": DISPLACED, "peer_id": peer.peer_id}),
+            ));
+        }
+        hub.sockets.insert(peer.peer_id.clone(), (gen, tx));
+        if recv {
+            hub.recv_live.insert(peer.peer_id.clone());
+        } else {
+            hub.recv_live.remove(&peer.peer_id);
         }
         (peer.peer_id, peer.name, peer.session_id, gen, rx, drained)
     };

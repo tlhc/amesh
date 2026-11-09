@@ -1092,3 +1092,17 @@ fn curl_budget_follows_the_requested_wait() {
     let mcp = json!({"params": {"name": "amesh_wait", "arguments": {"timeout_seconds": 7}}});
     assert_eq!(curl_max_time("/mcp", Some(&mcp)), "17");
 }
+
+#[test]
+fn a_handshake_stops_the_drainer_only_on_a_configuration_error() {
+    use tokio_tungstenite::tungstenite::{http::Response, Error};
+    let stops = |status: u16| {
+        let response = Response::builder().status(status).body(None).unwrap();
+        refused_handshake(&Error::Http(response))
+    };
+    assert_eq!(
+        [400, 401, 403, 404, 429, 500, 502, 503].map(stops),
+        [true, true, true, true, false, false, false, false],
+        "4xx that name a bad request, token or peer stop; a busy or restarting hub is waited out"
+    );
+}
