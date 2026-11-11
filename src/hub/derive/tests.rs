@@ -11,6 +11,7 @@ fn hub() -> Hub {
         sockets: HashMap::new(),
         recv_live: Default::default(),
         recv_known: Default::default(),
+        builds: HashMap::new(),
         owed: HashMap::new(),
         inbox: Inbox::default(),
         conn_gen: 0,

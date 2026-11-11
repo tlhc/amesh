@@ -19,6 +19,7 @@ import { dirname, isAbsolute, join, resolve } from "node:path";
 
 const executable = __AMESH_EXECUTABLE__;
 const peerId = __AMESH_PEER_ID__;
+const build = __AMESH_BUILD__;
 
 function EscapeAttr(value) {
   return String(value)
@@ -1252,7 +1253,7 @@ export default function AmeshHooks(pi) {
     socket.addEventListener("open", () => {
       connectLogged = false;
       sureTries = 0;
-      const frame = { type: "connect", peer_id: id, recv: true };
+      const frame = { type: "connect", peer_id: id, recv: true, build };
       if (process.env.AMESH_TOKEN) {
         frame.auth_token = process.env.AMESH_TOKEN;
       }

@@ -218,6 +218,17 @@ impl<'a> ReadModel<'a> {
     }
 
     pub(super) fn peer(&self, peer: &Peer) -> PeerView {
+        let connected = self.hub.sockets.contains_key(&peer.peer_id);
+        let build = self
+            .hub
+            .builds
+            .get(&peer.peer_id)
+            .filter(|_| connected)
+            .cloned();
+        /* a live socket that names no build predates this field, so it is older too */
+        let stale = super::own_build()
+            .filter(|_| connected)
+            .map(|own| build.as_deref() != Some(own));
         PeerView {
             peer_id: peer.peer_id.clone(),
             name: peer.name.clone(),
@@ -237,11 +248,13 @@ impl<'a> ReadModel<'a> {
                     reason: activity.reason.clone(),
                 }),
             running: Some(self.running_count(&peer.peer_id)),
-            push: self.hub.sockets.contains_key(&peer.peer_id),
+            push: connected,
             acks: self.hub.recv_live.contains(&peer.peer_id),
             queued: self.hub.inbox.count(&peer.peer_id),
             liveness: Some(liveness(self.hub, peer)),
             delivery: Some(delivery(self.hub, peer, self.now)),
+            build,
+            stale,
         }
     }
 

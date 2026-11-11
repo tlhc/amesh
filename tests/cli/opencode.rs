@@ -156,7 +156,7 @@ fn opencode_plugin_contracts() {
                 .root
                 .join(".config/opencode/plugins/amesh/server.js"),
         )
-        .arg(env!("CARGO_BIN_EXE_amesh"))
+        .arg(sandbox.amesh())
         .arg(&sandbox.root)
         .env("AMESH_BIND", &sandbox.bind)
         .env("AMESH_TOKEN", "cli-test-token")
@@ -184,7 +184,7 @@ fn opencode_mutations_are_detected() {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/opencode_mutations.mjs"
         ))
-        .arg(env!("CARGO_BIN_EXE_amesh"))
+        .arg(sandbox.amesh())
         .arg(&sandbox.root)
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),

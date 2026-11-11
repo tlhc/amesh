@@ -47,6 +47,8 @@ struct Hub {
     is never evicted, not while they are away and not across a hub restart */
     recv_live: HashSet<String>,
     recv_known: HashSet<String>,
+    /* the build each live socket named when it connected; memory only, like the sockets */
+    builds: HashMap<String, String>,
     owed: HashMap<String, Owed>,
     inbox: Inbox,
     conn_gen: u64,
@@ -1078,6 +1080,7 @@ impl Hub {
             inbox: Inbox::from_map(disk.inbox),
             sockets: HashMap::new(),
             recv_live: HashSet::new(),
+            builds: HashMap::new(),
             recv_known: disk.recv_peers,
             owed: disk.owed,
             conn_gen: 0,
@@ -1632,6 +1635,7 @@ struct RpcReq {
 
 pub async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     /* taken before any startup work, so a file replaced while the hub starts is noticed */
+    own_build();
     #[cfg(unix)]
     let mut binary = std::env::current_exe()
         .ok()
@@ -1739,6 +1743,39 @@ keeps the build's mtime, while a rewrite in place keeps the inode and goes unnot
 fn binary_identity(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+}
+
+/* the file this process started from, taken on the first call and kept: once cargo install
+replaces it, a running client still names the one it runs and the hub can tell it from its
+own. It names a file, so reinstalling the same commit or touching the binary counts as
+another build, while a rewrite in place that keeps the size inside one mtime tick of a
+filesystem with coarse times reads as the same one */
+pub(crate) fn own_build() -> Option<&'static str> {
+    static BUILD: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BUILD
+        .get_or_init(|| build_of(&std::env::current_exe().ok()?))
+        .as_deref()
+}
+
+/* size and mtime join the inode the restart watches, so a rewrite in place, which keeps
+the inode, still reads as another build */
+#[cfg(unix)]
+fn build_of(path: &Path) -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).ok()?;
+    Some(format!(
+        "{}:{}:{}:{}.{:09}",
+        meta.dev(),
+        meta.ino(),
+        meta.size(),
+        meta.mtime(),
+        meta.mtime_nsec()
+    ))
+}
+
+#[cfg(not(unix))]
+fn build_of(_: &Path) -> Option<String> {
+    None
 }
 
 /* called by the tick while it holds the hub lock, so no handler is between a change and
@@ -1980,7 +2017,7 @@ async fn snapshot(
 }
 
 async fn health() -> Json<Value> {
-    Json(json!({"ok": true, "name": "amesh", "version": "0.1.0"}))
+    Json(json!({"ok": true, "name": "amesh", "version": "0.1.0", "build": own_build()}))
 }
 
 /* a folder name is at most this long inside a derived id, so backend and numeric
@@ -2410,18 +2447,23 @@ async fn list_peers(
     Ok(Json(json!(hub.peers.values().cloned().collect::<Vec<_>>())))
 }
 
+fn require_text(text: &str, what: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    if text.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("{what} must not be empty")})),
+        ));
+    }
+    Ok(())
+}
+
 async fn open_ask(
     State(app): State<App>,
     headers: HeaderMap,
     Json(req): Json<AskReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
-    if req.text.trim().is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "ask text must not be empty"})),
-        ));
-    }
+    require_text(&req.text, "ask text")?;
     let mut hub = app.inner.lock().await;
     let now = now_unix();
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
@@ -2586,6 +2628,7 @@ async fn notify(
     Json(req): Json<NotifyReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
+    require_text(&req.message, "notify message")?;
     let mut hub = app.inner.lock().await;
     let now = now_unix();
     touch_peer(&mut hub, req.from_peer.as_deref().unwrap_or_default());
@@ -2628,12 +2671,7 @@ async fn broadcast(
     Json(req): Json<BroadcastReq>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
-    if req.message.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "message required"})),
-        ));
-    }
+    require_text(&req.message, "broadcast message")?;
     let mut hub = app.inner.lock().await;
     let now = now_unix();
     let from = req
@@ -4375,6 +4413,7 @@ async fn create_schedule(
             Json(json!({"error": "kind must be notify or ask"})),
         ));
     }
+    require_text(&req.text, "schedule text")?;
     if req.every_seconds == Some(0) {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -6185,6 +6224,8 @@ struct ConnectReq {
     until then the frame stays in its inbox and comes back on the next connection */
     #[serde(default)]
     recv: bool,
+    #[serde(default)]
+    build: Option<String>,
 }
 
 async fn ws_upgrade(
@@ -6241,6 +6282,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
         return;
     };
     let recv = req.recv;
+    let build = req.build;
     let (peer_id, name, session_id, gen, mut rx, drained) = {
         let mut hub = app.inner.lock().await;
         let Some(peer) = resolve(&hub, &key).cloned() else {
@@ -6325,6 +6367,10 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
         } else {
             hub.recv_live.remove(&peer.peer_id);
         }
+        match build {
+            Some(build) => hub.builds.insert(peer.peer_id.clone(), build),
+            None => hub.builds.remove(&peer.peer_id),
+        };
         (peer.peer_id, peer.name, peer.session_id, gen, rx, drained)
     };
     let _ = socket
@@ -6418,6 +6464,7 @@ async fn close_connection(
     if hub.sockets.get(peer_id).map(|(g, _)| *g) == Some(gen) {
         hub.sockets.remove(peer_id);
         hub.recv_live.remove(peer_id);
+        hub.builds.remove(peer_id);
         if let Some(peer) = hub.peers.get_mut(peer_id) {
             peer.status = "offline".into();
         }

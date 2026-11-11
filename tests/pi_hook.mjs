@@ -424,7 +424,7 @@ await test("prompt Inbox waits for settled and pending asks are not redelivered"
   await handlers.get("agent_settled")({}, context);
   assert.equal(userMsgs.length, 1, "an open ask ledger entry is not a new event");
 });
-await test("a settled agent reports idle when pi still says so a second later", async () => {
+await test("a settled agent reports idle when pi still says so a second later", async (t) => {
   execFileSync(executable, ["jobs", "create", "pi-activity", "--from-peer", peerId]);
   const activity = async () => {
     const response = await fetch(`http://${process.env.AMESH_BIND}/snapshot`, {
@@ -441,8 +441,16 @@ await test("a settled agent reports idle when pi still says so a second later", 
     return activity();
   };
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  /* a fresh instance per scenario: the earlier tests leave the shared one mid-run */
+  /* a fresh instance per scenario: the earlier tests leave the shared one mid-run. Each holds
+  its log owner child and its idle check until session_shutdown, and either keeps node alive,
+  so every instance is shut down whether or not the scenario passes */
   let idleIndex = 0;
+  const instances = [];
+  t.after(async () => {
+    for (const call of instances) {
+      await call("session_shutdown");
+    }
+  });
   const instance = async (bin) => {
     process.env.PI_CODING_AGENT_DIR = join(cwd, `pi-idle-owner-${++idleIndex}`);
     const text = source.split(JSON.stringify(executable)).join(JSON.stringify(bin));
@@ -452,7 +460,9 @@ await test("a settled agent reports idle when pi still says so a second later", 
     const { default: Hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
     const on = new Map();
     Hooks({ on(event, handler) { on.set(event, handler); }, sendMessage() {}, sendUserMessage() {}, registerTool() {} });
-    return (event, ctx = context) => on.get(event)({}, ctx);
+    const call = (event, ctx = context) => on.get(event)({}, ctx);
+    instances.push(call);
+    return call;
   };
   /* pi's own word on whether the agent streams or has prompts waiting */
   const busy = { ...context, isIdle: () => false, hasPendingMessages: () => false };
@@ -532,9 +542,6 @@ await test("a settled agent reports idle when pi still says so a second later", 
     await run;
     assert.ok(!existsSync(after), `${start} reports nothing after the session shut down`);
   }
-  await live("session_shutdown");
-  await counted("session_shutdown");
-  await late("session_shutdown");
 });
 execFileSync(executable, ["peer", "ack", promptAsk.correlation_id]);
 await handlers.get("agent_settled")({}, context);
@@ -552,6 +559,7 @@ assert.equal(userMsgs.length, 0);
 const opened = (sockets[0].sent || []).map((raw) => JSON.parse(raw));
 assert.equal(opened[0].type, "connect");
 assert.equal(opened[0].recv, true);
+assert.match(opened[0].build, /^\d+:\d+:\d+:\d+\.\d{9}$/, "the connect frame names the build that rendered the extension");
 fire(sockets[0], { type: "notify", from_peer: "amesh-codex", message: "n1", id: "evt-n1" });
 fire(sockets[0], { type: "broadcast", from_peer: "amesh-codex", message: "b1" });
 fire(sockets[0], { type: "ask", from_peer: "amesh-codex", message: "a1", correlation_id: "ask-1" });

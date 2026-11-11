@@ -298,6 +298,7 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
           (peer) => peer.peer_id === result.peerID,
         );
         assert.equal(peer.activity.state, "idle");
+        assert.equal(peer.stale, false, "the plugin names the build the hub runs");
         const reports = () =>
           commands.filter((args) => args[0] === "hook" && args[1] === "idle")
             .length;

@@ -2078,6 +2078,10 @@ fn setup(args: &Args) -> Result<()> {
                 .replace(
                     "__AMESH_PEER_ID__",
                     &serde_json::to_string(&args.flags.get("peer-id"))?,
+                )
+                .replace(
+                    "__AMESH_BUILD__",
+                    &serde_json::to_string(&crate::hub::own_build())?,
                 );
             let pi_dir = pi_agent_dir(args, &root);
             write_atomic(&pi_dir.join("extensions/amesh.ts"), script.as_bytes())?;
@@ -2088,6 +2092,10 @@ fn setup(args: &Args) -> Result<()> {
             }
             let script = include_str!("opencode_hook.js")
                 .replace("__AMESH_EXECUTABLE__", &serde_json::to_string(&executable)?)
+                .replace(
+                    "__AMESH_BUILD__",
+                    &serde_json::to_string(&crate::hub::own_build())?,
+                )
                 .replace(
                     "__AMESH_BIND__",
                     &serde_json::to_string(
@@ -3061,6 +3069,9 @@ async fn app_inject(sink: &mut AppSink, text: &str) -> Result<()> {
     )
     .await?;
     sink.rpc_id += 1;
+    if read.pointer("/result/thread/canAcceptDirectInput") == Some(&Value::Bool(false)) {
+        return Err(NO_DIRECT_INPUT.into());
+    }
     /* a turn the server failed leaves the thread in systemError; the next message may start
     a turn there, as after an idle one */
     if crate::bridge::turn_is_over(&read) {
@@ -3097,6 +3108,11 @@ async fn app_inject(sink: &mut AppSink, text: &str) -> Result<()> {
 }
 
 fn hook_ws(raw: &[String]) -> Result<()> {
+    /* taken first, so a binary replaced before the first connect is not the one named, and a
+    parent that dies before the drainer parks is still told apart from the one that started it */
+    crate::hub::own_build();
+    #[cfg(unix)]
+    started_parent();
     let args = Args::parse(raw, &["peer-id", "backend"])?;
     args.count(0, 0)?;
     let backend = args.get("backend", "claude-code");
@@ -3207,13 +3223,13 @@ async fn flush_app_sink(
     sink: &mut AppSink,
     queued: &mut VecDeque<Queued>,
     owner: Option<&str>,
-) -> (bool, Vec<String>) {
+) -> (SinkState, Vec<String>) {
     let mut acked = Vec::new();
     if owner == Some("") {
-        return (true, acked);
+        return (SinkState::Usable, acked);
     }
     let before = queued.len();
-    let mut usable = true;
+    let mut state = SinkState::Usable;
     while let Some((session, text, record)) = queued.pop_front() {
         if session
             .as_deref()
@@ -3230,11 +3246,16 @@ async fn flush_app_sink(
             }
             Err(error) => {
                 queued.push_front((session, text, record));
-                if error.to_string() == "thread busy" {
+                let error = error.to_string();
+                if error == "thread busy" {
                     eprintln!("amesh hook ws: thread busy, queued={}", queued.len());
                 } else {
                     eprintln!("amesh hook ws: App Server inject failed: {error}");
-                    usable = false;
+                    state = if error.contains(NO_DIRECT_INPUT) {
+                        SinkState::NoDirectInput
+                    } else {
+                        SinkState::Failed
+                    };
                 }
                 break;
             }
@@ -3243,7 +3264,116 @@ async fn flush_app_sink(
     if queued.len() < before {
         eprintln!("amesh hook ws: flushed, queued={}", queued.len());
     }
-    (usable, acked)
+    (state, acked)
+}
+
+/* Codex's answer to turn input on a multi-agent v2 sub-agent, which thread/read also
+reports as canAcceptDirectInput false; no retry changes it */
+const NO_DIRECT_INPUT: &str =
+    "direct app-server input is not allowed for multi-agent v2 sub-agents";
+
+enum SinkState {
+    Usable,
+    Failed,
+    NoDirectInput,
+}
+
+const APP_RETRY_MIN: Duration = Duration::from_secs(1);
+const APP_RETRY_STEP: Duration = Duration::from_secs(2);
+const APP_RETRY_MAX: Duration = Duration::from_secs(10);
+
+/* when the App Server is tried next for one owner of the name. It is a local socket, so a
+failed connect or injection waits 1, 3, 5, 7 and 9 seconds and then ten, the default beat, and
+only an injection that lands starts the waits over. It outlives a hub reconnect and starts over
+for a new owner */
+struct AppRetry {
+    owner: Option<String>,
+    next: Instant,
+    backoff: Duration,
+}
+
+impl AppRetry {
+    fn new(owner: Option<String>, now: Instant) -> Self {
+        AppRetry {
+            owner,
+            next: now,
+            backoff: APP_RETRY_MIN,
+        }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    fn failed(&mut self, now: Instant) {
+        self.next = now + self.backoff;
+        self.backoff = (self.backoff + APP_RETRY_STEP).min(APP_RETRY_MAX);
+    }
+
+    fn landed(&mut self) {
+        self.backoff = APP_RETRY_MIN;
+    }
+
+    /* when to wake the beat for a retry still ahead. A due one is the beat's to run: a sleep
+    that is already over completes on its first poll and would win every round, resetting the
+    beat before it can tick */
+    fn wake_at(&self, now: Instant) -> Option<Instant> {
+        (self.next > now).then_some(self.next)
+    }
+
+    fn owned_by(&mut self, owner: Option<&str>, now: Instant) {
+        if self.owner.as_deref() != owner {
+            *self = AppRetry::new(owner.map(str::to_string), now);
+        }
+    }
+}
+
+const DRAINER_PARENT: &str = "AMESH_DRAINER_PARENT";
+
+/* the process that started this drainer. The spawner names itself, so one that died even
+before the drainer ran is still noticed; a drainer started by hand takes its parent as it
+starts */
+#[cfg(unix)]
+fn started_parent() -> u32 {
+    static PARENT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PARENT.get_or_init(|| {
+        std::env::var(DRAINER_PARENT)
+            .ok()
+            .and_then(|pid| pid.parse().ok())
+            .unwrap_or_else(std::os::unix::process::parent_id)
+    })
+}
+
+/* nothing reaches a thread that takes no direct input, so the drainer has let go of the hub
+socket and the hub keeps every record for the hook. It stays up because the MCP proxy restarts
+a drainer that exits, and the new one would only meet the same refusal. It ends once the hub
+binds the name to a session other than the one it served, so a new owner gets a drainer, and
+once the proxy that started it is gone. A row pruned while it waits, or left without a session,
+keeps it parked: a drainer started then would hold the name unbound, and its socket would keep
+the hook from the backlog too */
+async fn park_drainer(peer_id: &str, served: &str) {
+    eprintln!("amesh hook ws: {peer_id} takes no direct input; its messages stay with the hub");
+    let beat = Duration::from_secs(env_secs("AMESH_WS_BEAT_SECS", 10));
+    loop {
+        tokio::time::sleep(beat).await;
+        #[cfg(unix)]
+        if std::os::unix::process::parent_id() != started_parent() {
+            return;
+        }
+        let taken = request("GET", "/peers", None).is_ok_and(|peers| {
+            peers.as_array().is_some_and(|rows| {
+                rows.iter().any(|row| {
+                    row["peer_id"] == peer_id
+                        && row["session_id"]
+                            .as_str()
+                            .is_some_and(|session| !session.is_empty() && session != served)
+                })
+            })
+        });
+        if taken {
+            return;
+        }
+    }
 }
 
 fn remember_hook_inbound(accepted: &mut VecDeque<String>, id: &str) {
@@ -3270,6 +3400,7 @@ pub(crate) async fn hook_ws_loop_with(
     let mut queued = VecDeque::new();
     let mut depth_warned = false;
     let mut accepted = VecDeque::new();
+    let mut retry = AppRetry::new(None, Instant::now());
     loop {
         match hook_ws_once(
             &peer_id,
@@ -3277,6 +3408,7 @@ pub(crate) async fn hook_ws_loop_with(
             &mut queued,
             &mut depth_warned,
             &mut accepted,
+            &mut retry,
             registration.as_ref(),
         )
         .await
@@ -3363,6 +3495,7 @@ async fn hook_ws_once(
     queued: &mut VecDeque<Queued>,
     depth_warned: &mut bool,
     accepted: &mut VecDeque<String>,
+    retry: &mut AppRetry,
     registration: Option<&Value>,
 ) -> Result<(bool, bool)> {
     use futures_util::{SinkExt, StreamExt};
@@ -3379,7 +3512,7 @@ async fn hook_ws_once(
     let bind = std::env::var("AMESH_BIND").unwrap_or_else(|_| "127.0.0.1:8378".into());
     let url = format!("ws://{bind}/ws");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
-    let mut connect = json!({"type": "connect", "peer_id": peer_id, "recv": true});
+    let mut connect = json!({"type": "connect", "peer_id": peer_id, "recv": true, "build": crate::hub::own_build()});
     if let Ok(token) = std::env::var("AMESH_TOKEN") {
         if !token.is_empty() {
             connect["auth_token"] = json!(token);
@@ -3396,8 +3529,6 @@ async fn hook_ws_once(
         record_inbox_socket(peer_id);
     }
     let mut inbox_fail = 0u8;
-    let mut app_backoff = Duration::from_secs(10);
-    let mut next_app_try = Instant::now();
     let uses_app_server = app_server_backend(backend);
     /* the session the stream names owns what is queued from here on, and its thread is
     looked up on the first frame after connected rather than here */
@@ -3408,6 +3539,7 @@ async fn hook_ws_once(
     let mut warned = false;
     let mut beat = tokio::time::interval(Duration::from_secs(env_secs("AMESH_WS_BEAT_SECS", 10)));
     loop {
+        let wake = retry.wake_at(Instant::now());
         tokio::select! {
             msg = ws.next() => {
                 let Some(msg) = msg else { return Ok((false, greeted)); };
@@ -3435,7 +3567,7 @@ async fn hook_ws_once(
                     }
                     greeted = true;
                     app = None;
-                    next_app_try = Instant::now();
+                    retry.owned_by(owner.as_deref(), Instant::now());
                     beat.reset_immediately();
                     if backend == "claude-code" {
                         tell_activity_again(owner.as_deref());
@@ -3520,29 +3652,52 @@ async fn hook_ws_once(
                 }
                 let tag = owner.clone().filter(|id| !id.is_empty());
                 enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
-                if uses_app_server && app.is_none() && Instant::now() >= next_app_try {
+                if uses_app_server && app.is_none() && retry.due(Instant::now()) {
                     app = app_connect(peer_id, owner.as_deref()).await;
                     if app.is_none() {
-                        next_app_try = Instant::now() + app_backoff;
-                        app_backoff = (app_backoff * 2).min(Duration::from_secs(300));
-                    } else {
-                        app_backoff = Duration::from_secs(10);
+                        retry.failed(Instant::now());
                     }
                 }
                 /* recv follows the inject: a drainer that dies inside it leaves the frame
                 with the hub, which sends it to the next one */
                 if let Some(sink) = app.as_mut() {
-                    let (usable, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
+                    let (state, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
+                    if !acked.is_empty() {
+                        retry.landed();
+                    }
                     if !hook_ws_recv(&mut ws, accepted, acked).await {
                         return Ok((false, greeted));
                     }
-                    if !usable {
-                        app = None;
+                    match state {
+                        SinkState::Usable => {}
+                        SinkState::Failed => {
+                            app = None;
+                            retry.failed(Instant::now());
+                        }
+                        SinkState::NoDirectInput => {
+                            let served = owner
+                                .clone()
+                                .filter(|session| !session.is_empty())
+                                .unwrap_or_else(|| sink.thread_id.clone());
+                            let _ = ws.close(None).await;
+                            park_drainer(peer_id, &served).await;
+                            return Ok((true, greeted));
+                        }
                     }
                 } else if !warned {
                     eprintln!("amesh hook ws: no verified App Server thread for inject, queued={}", queued.len());
                     warned = true;
                 }
+            }
+            /* the beat runs the retry, so a wait that ends between beats ticks it at once rather
+            than leaving the retry to the next beat */
+            _ = async {
+                match wake {
+                    Some(at) => tokio::time::sleep_until(at.into()).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                beat.reset_immediately();
             }
             _ = beat.tick() => {
                 if !greeted {
@@ -3566,25 +3721,39 @@ async fn hook_ws_once(
                 if ws.send(Message::Text(json!({"type": "ping"}).to_string().into())).await.is_err() {
                     return Ok((false, greeted));
                 }
-                if uses_app_server && app.is_none() && Instant::now() >= next_app_try {
+                if uses_app_server && app.is_none() && retry.due(Instant::now()) {
                     app = app_connect(peer_id, owner.as_deref()).await;
                     warned = false;
                     if app.is_none() {
-                        next_app_try = Instant::now() + app_backoff;
-                        app_backoff = (app_backoff * 2).min(Duration::from_secs(300));
-                    } else {
-                        app_backoff = Duration::from_secs(10);
+                        retry.failed(Instant::now());
                     }
                 }
                 if let Some(sink) = app.as_mut() {
-                    let (usable, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
+                    let (state, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
+                    if !acked.is_empty() {
+                        retry.landed();
+                    }
                     if !hook_ws_recv(&mut ws, accepted, acked).await {
                         return Ok((false, greeted));
                     }
-                    if !usable {
-                        app = None;
-                    } else if queued.is_empty() {
-                        check_turn(sink, peer_id, owner.as_deref()).await;
+                    match state {
+                        SinkState::Usable if queued.is_empty() => {
+                            check_turn(sink, peer_id, owner.as_deref()).await;
+                        }
+                        SinkState::Usable => {}
+                        SinkState::Failed => {
+                            app = None;
+                            retry.failed(Instant::now());
+                        }
+                        SinkState::NoDirectInput => {
+                            let served = owner
+                                .clone()
+                                .filter(|session| !session.is_empty())
+                                .unwrap_or_else(|| sink.thread_id.clone());
+                            let _ = ws.close(None).await;
+                            park_drainer(peer_id, &served).await;
+                            return Ok((true, greeted));
+                        }
                     }
                 }
             }
@@ -3786,13 +3955,21 @@ fn spawn_peer_ws(peer_id: &str, backend: &str) -> Option<Child> {
         return None;
     }
     let executable = std::env::current_exe().ok()?;
-    Command::new(executable)
-        .args(["hook", "ws", "--peer-id", peer_id, "--backend", backend])
+    drainer_command(&executable, peer_id, backend)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(hook_ws_log(peer_id))
         .spawn()
         .ok()
+}
+
+/* the spawner names itself in the drainer's environment, where started_parent reads it */
+fn drainer_command(executable: &Path, peer_id: &str, backend: &str) -> Command {
+    let mut command = Command::new(executable);
+    command
+        .args(["hook", "ws", "--peer-id", peer_id, "--backend", backend])
+        .env(DRAINER_PARENT, std::process::id().to_string());
+    command
 }
 
 fn ensure_peer_ws(peer_id: &str, backend: &str) {

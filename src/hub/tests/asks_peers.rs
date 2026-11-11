@@ -858,6 +858,49 @@ async fn an_ask_rejects_an_empty_body() {
 }
 
 #[tokio::test]
+async fn every_message_body_rejects_blank_text() {
+    let (app, hub, _path) = test_app_with_hub();
+    register(app.clone(), "here", "pi", "default").await;
+    register(app.clone(), "worker", "pi", "default").await;
+    let mut accepted = Vec::new();
+    for text in ["", "  ", "\n\t\u{2003}"] {
+        for (uri, body, error) in [
+            (
+                "/notify",
+                json!({"from_peer": "here", "to_peer": "worker", "message": text}),
+                "notify message must not be empty",
+            ),
+            (
+                "/broadcast",
+                json!({"from_peer": "here", "message": text}),
+                "broadcast message must not be empty",
+            ),
+            (
+                "/schedules",
+                json!({"from_peer": "here", "to_peer": "worker", "text": text, "in_seconds": 60}),
+                "schedule text must not be empty",
+            ),
+        ] {
+            let (status, reply) = json_req(app.clone(), "POST", uri, body).await;
+            if status != StatusCode::BAD_REQUEST || reply["error"] != error {
+                accepted.push(format!("{uri} {text:?}: {status} {reply}"));
+            }
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "blank bodies got through: {accepted:#?}"
+    );
+    let hub = hub.lock().await;
+    assert_eq!(
+        hub.inbox.count("worker"),
+        0,
+        "nothing reached the recipient"
+    );
+    assert!(hub.schedules.is_empty(), "no schedule was created");
+}
+
+#[tokio::test]
 async fn mcp_ask_rejects_a_missing_body_without_opening_an_ask() {
     let (app, hub, path) = test_app_with_hub();
     register(app.clone(), "worker", "pi", "default").await;

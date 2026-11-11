@@ -33,7 +33,8 @@ function freePort() {
 async function loadHook(executable) {
   const src = rawSrc
     .replaceAll("__AMESH_EXECUTABLE__", JSON.stringify(executable))
-    .replaceAll("__AMESH_PEER_ID__", "null");
+    .replaceAll("__AMESH_PEER_ID__", "null")
+    .replaceAll("__AMESH_BUILD__", "null");
   const { default: AmeshHooks } = await import(
     `data:text/javascript;base64,${Buffer.from(src).toString("base64")}`
   );
@@ -165,7 +166,8 @@ if (caseName === "A") {
     stamp,
     rawSrc
       .replaceAll("__AMESH_EXECUTABLE__", JSON.stringify("/nonexistent/amesh-ensure-probe"))
-      .replaceAll("__AMESH_PEER_ID__", "null"),
+      .replaceAll("__AMESH_PEER_ID__", "null")
+      .replaceAll("__AMESH_BUILD__", "null"),
   );
   console.log(`input from-src sha256 ${srcHash} file ${stamp}`);
   for (const name of ["A", "B", "try"]) {

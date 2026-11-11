@@ -287,6 +287,8 @@ pub(crate) struct PeerView {
     pub queued: usize,
     pub liveness: Option<Liveness>,
     pub delivery: Option<Delivery>,
+    pub build: Option<String>,
+    pub stale: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

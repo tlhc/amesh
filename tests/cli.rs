@@ -105,6 +105,41 @@ fn lease_port(port: u16) -> Option<PortLease> {
     }
 }
 
+/* cargo publishes a build by removing the old file and linking the new one in its place, so
+the binary can be missing for a moment; a sandbox made in that moment waits for the new one */
+fn pin_binary(binary: &Path, pin: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match fs::hard_link(binary, pin).or_else(|_| fs::copy(binary, pin).map(drop)) {
+            Ok(()) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{} as {}: {error}", binary.display(), pin.display()),
+        }
+    }
+}
+
+#[test]
+fn a_sandbox_made_while_cargo_publishes_a_build_waits_for_the_binary() {
+    let sandbox = Sandbox::new();
+    let binary = sandbox.root.join("published");
+    let publish = {
+        let (binary, staged) = (binary.clone(), sandbox.root.join("published.new"));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            fs::write(&staged, "the new build").unwrap();
+            fs::rename(&staged, &binary).unwrap();
+        })
+    };
+    let pin = sandbox.root.join("pinned");
+    pin_binary(&binary, &pin);
+    publish.join().unwrap();
+    assert_eq!(fs::read_to_string(&pin).unwrap(), "the new build");
+}
+
 /* roots a suite killed before its sandboxes dropped left in /tmp: real directories this user
 owns, named exactly amesh-cli-p<port>-<8 hex>, whose port lease is free. Each is dropped as the
 sandbox it was, which stops what still runs for it and removes it */
@@ -155,6 +190,10 @@ impl Sandbox {
         let (port, lease) = sandbox_port();
         let root = PathBuf::from(format!("/tmp/amesh-cli-p{port}-{tag}"));
         fs::create_dir(&root).unwrap();
+        /* a hub restarts in place once its binary file is replaced, and every cargo run
+        replaces target/debug/amesh with a new file, so the sandbox runs a link to the file it
+        started with: a build beside the suite never restarts its hubs */
+        pin_binary(Path::new(env!("CARGO_BIN_EXE_amesh")), &root.join("amesh"));
         Self {
             root,
             bind: format!("127.0.0.1:{port}"),
@@ -171,8 +210,12 @@ impl Sandbox {
         Box::leak(format!("{name}-{}", self.tag).into_boxed_str())
     }
 
+    fn amesh(&self) -> PathBuf {
+        self.root.join("amesh")
+    }
+
     fn command(&self) -> Command {
-        self.command_for(Path::new(env!("CARGO_BIN_EXE_amesh")))
+        self.command_for(&self.amesh())
     }
 
     fn command_for(&self, program: &Path) -> Command {
@@ -238,7 +281,7 @@ impl Sandbox {
     }
 
     fn start_with(&mut self, env: &[(&str, &str)]) {
-        self.start_from(Path::new(env!("CARGO_BIN_EXE_amesh")), env);
+        self.start_from(&self.amesh(), env);
     }
 
     /* up once the port answers and this sandbox's own hub is the one listening there */
@@ -1543,7 +1586,7 @@ fn drop_reaps_setsid_amesh_serve_after_bind() {
         .append(true)
         .open(root.join("serve.log"))
         .unwrap();
-    let exe = env!("CARGO_BIN_EXE_amesh");
+    let exe = sandbox.amesh();
     let mut cmd = Command::new("python3");
     cmd.arg("-c")
         .arg(format!(
@@ -1749,6 +1792,23 @@ fn setup_merges_hooks_and_preserves_existing_settings() {
     assert!(config.contains("AMESH_BACKEND"));
     let extension = fs::read_to_string(sandbox.root.join(".pi/agent/extensions/amesh.ts")).unwrap();
     assert!(extension.contains("const peerId"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(sandbox.amesh()).unwrap();
+        let build = format!(
+            "const build = \"{}:{}:{}:{}.{:09}\";",
+            meta.dev(),
+            meta.ino(),
+            meta.size(),
+            meta.mtime(),
+            meta.mtime_nsec()
+        );
+        assert!(
+            extension.contains(&build),
+            "the extension names the build that rendered it"
+        );
+    }
     let doctor = sandbox.run(&["doctor", "--home", root], None);
     let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
     assert_eq!(report["runtimes"]["pi"]["hooks_installed"], true);
@@ -3394,16 +3454,15 @@ fn installed_hooks_execute_against_the_daemon() {
         );
     }
     let mut node = Command::new("node");
-    let result = isolate_session_env(&mut node, &sandbox.root)
+    isolate_session_env(&mut node, &sandbox.root)
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pi_hook.mjs"))
         .arg(sandbox.root.join(".pi/agent/extensions/amesh.ts"))
-        .arg(env!("CARGO_BIN_EXE_amesh"))
+        .arg(sandbox.amesh())
         .arg(&sandbox.root)
         .env("AMESH_BIND", &sandbox.bind)
         .env("AMESH_TOKEN", "cli-test-token")
-        .env("AMESH_STATE", sandbox.root.join("state.json"))
-        .output()
-        .unwrap();
+        .env("AMESH_STATE", sandbox.root.join("state.json"));
+    let result = harness_output(&mut node);
     /* node:test names the failing subtest on stdout; stderr only carries the faults the
     harness injects on purpose */
     assert!(
@@ -3419,20 +3478,20 @@ fn installed_hooks_execute_against_the_daemon() {
 fn sandbox_binary(sandbox: &Sandbox) -> PathBuf {
     let binary = sandbox.root.join("bin/amesh");
     fs::create_dir(binary.parent().unwrap()).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_amesh"), &binary).unwrap();
+    fs::copy(sandbox.amesh(), &binary).unwrap();
     binary
 }
 
 /* renamed over the path the way cargo install does it; the new file notes its arguments,
 then runs the real hub */
-fn replace_with_noting_hub(binary: &Path, marker: &Path) {
+fn replace_with_noting_hub(sandbox: &Sandbox, binary: &Path, marker: &Path) {
     let staged = binary.with_extension("new");
     fs::write(
         &staged,
         format!(
             "#!/bin/sh\necho \"$@\" > '{}'\nexec '{}' \"$@\"\n",
             marker.display(),
-            env!("CARGO_BIN_EXE_amesh")
+            sandbox.amesh().display()
         ),
     )
     .unwrap();
@@ -3512,7 +3571,7 @@ fn hub_restarts_in_place_when_its_binary_is_replaced() {
         assert_eq!(title(&sandbox), "kept across the restart");
     }
     let marker = sandbox.root.join("restarted-with");
-    replace_with_noting_hub(&binary, &marker);
+    replace_with_noting_hub(&sandbox, &binary, &marker);
     wait_for_restart(&sandbox, &marker, &pid);
     assert!(alive(&mut sandbox), "the restart keeps the process");
     assert_eq!(title(&sandbox), "kept across the restart");
@@ -3529,7 +3588,7 @@ fn hub_notices_a_replacement_while_it_starts() {
     sandbox.start_from(&binary, &[]);
     let pid = sandbox.daemon.as_ref().unwrap().id().to_string();
     let marker = sandbox.root.join("restarted-with");
-    replace_with_noting_hub(&binary, &marker);
+    replace_with_noting_hub(&sandbox, &binary, &marker);
     drop(db);
     wait_for_restart(&sandbox, &marker, &pid);
 }
@@ -4286,6 +4345,475 @@ fn hook_ws_retries_a_failed_codex_injection_after_a_drainer_restart() {
         "the record must be delivered exactly once"
     );
     assert!(turn_text(&got).contains("codex-once"), "{got}");
+}
+
+/* node:test keeps the Pi harness alive after a top-level assertion fails while the extension
+still holds its socket and timers, so a failure would hang the run. The harness runs in its
+own process group; past the limit the whole group goes, the hub and helpers it started
+included, and the run fails with what it printed */
+fn harness_output(command: &mut Command) -> Output {
+    use std::os::unix::process::CommandExt;
+    let child = command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let group = format!("-{}", child.id());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output().unwrap());
+    });
+    let limit = Duration::from_secs(600);
+    rx.recv_timeout(limit).unwrap_or_else(|_| {
+        let _ = Command::new("kill").args(["-KILL", "--", &group]).status();
+        let printed = rx.recv_timeout(Duration::from_secs(10)).map_or_else(
+            |_| "nothing: a process outside the group still holds its pipes".to_string(),
+            |output| {
+                format!(
+                    "{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            },
+        );
+        panic!("harness still running after {limit:?}; it printed:\n{printed}");
+    })
+}
+
+fn inbox_count(sandbox: &Sandbox, peer: &str) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(
+        sandbox.root.join("state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.busy_timeout(Duration::from_secs(3)).unwrap();
+    db.query_row(
+        "SELECT count(*) FROM inbox WHERE peer_id = ?1",
+        [peer],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn start_codex_drainer(sandbox: &Sandbox, worker: &str, codex_home: &Path) -> KillChild {
+    start_codex_drainer_beating(sandbox, worker, codex_home, "1")
+}
+
+fn start_codex_drainer_beating(
+    sandbox: &Sandbox,
+    worker: &str,
+    codex_home: &Path,
+    beat_secs: &str,
+) -> KillChild {
+    let child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("CODEX_HOME", codex_home)
+            .env("CODEX_THREAD_ID", "th1")
+            .env("AMESH_WS_BEAT_SECS", beat_secs)
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(peer_is_online(sandbox, worker), "drainer connects");
+    child
+}
+
+/* the beat is the default ten seconds, so only the retry's own wait brings the tries inside it.
+The gaps are taken where the App Server receives each turn; a try may come four seconds late on
+a busy runner, while one left to the beat comes ten seconds after the last. The hub restarts
+after the fourth try, and the first two tries the server sees after the stop come nine seconds
+or more apart: a reconnect that started the waits over would bring them a second apart, however
+long the restart takes or the test thread lags */
+#[test]
+fn hook_ws_retries_a_failing_injection_on_growing_waits_kept_across_a_hub_restart() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("codex");
+    let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let attempts = app_server_capture_with(
+        &codex_home,
+        &["th1"],
+        Arc::new(std::sync::Mutex::new(vec!["?th1".to_string()])),
+        None,
+        Some(starts.clone()),
+    );
+    let mut child = start_codex_drainer_beating(&sandbox, worker, &codex_home, "10");
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "keeps-failing",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    for _ in 0..4 {
+        attempts
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the drainer tries the injection");
+    }
+    if let Some(daemon) = sandbox.daemon.as_mut() {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+    sandbox.daemon = None;
+    /* a slow test thread can find tries from before the stop still queued */
+    let stopped = Instant::now();
+    sandbox.start();
+    let after = loop {
+        attempts
+            .recv_timeout(Duration::from_secs(40))
+            .expect("the drainer tries again after the restart");
+        let after: Vec<Instant> = starts
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|at| *at > stopped)
+            .collect();
+        if after.len() >= 2 {
+            break after;
+        }
+    };
+    child.stop();
+    let at = starts.lock().unwrap().clone();
+    let gaps: Vec<Duration> = at[..4].windows(2).map(|pair| pair[1] - pair[0]).collect();
+    for (gap, wait) in gaps.iter().zip([1, 3, 5]) {
+        let wait = Duration::from_secs(wait);
+        assert!(
+            *gap >= wait && *gap < wait + Duration::from_secs(4),
+            "each try comes its wait after the last, not on the beat: {gaps:?}"
+        );
+    }
+    let reconnected = after[1] - after[0];
+    assert!(
+        reconnected >= Duration::from_secs(9),
+        "the hub reconnect did not start the waits over: {reconnected:?} after {gaps:?}"
+    );
+    assert_eq!(
+        inbox_count(&sandbox, worker),
+        1,
+        "the hub still holds the record"
+    );
+}
+
+/* a drainer that meets a thread taking no direct input lets go of the hub socket, leaves
+the record with the hub, stays up while the name is that thread's, and steps aside once the
+name moves to another session so a drainer can start for the new owner */
+fn assert_parks(mark: &str, turns: usize) {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("codex");
+    let attempts = app_server_capture_threads(&codex_home, &["th1"], &[&format!("{mark}th1")]);
+    let mut child = start_codex_drainer(&sandbox, worker, &codex_home);
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "for-a-sub-agent",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let detached = !peer_is_online(&sandbox, worker);
+    std::thread::sleep(Duration::from_millis(1500));
+    let parked = child.0.as_mut().unwrap().try_wait().unwrap().is_none();
+    let started = attempts.try_iter().count();
+    let held = inbox_count(&sandbox, worker);
+    bind_session(&sandbox, "codex", worker, "th2");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.0.as_mut().unwrap().try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let released = child.0.as_mut().unwrap().try_wait().unwrap().is_some();
+    child.stop();
+    assert!(detached, "the drainer lets go of the socket");
+    assert_eq!(
+        started, turns,
+        "turns started on a thread that takes no direct input"
+    );
+    assert!(
+        parked,
+        "the drainer stays up so its MCP proxy does not respawn it"
+    );
+    assert_eq!(held, 1, "the hub keeps the record for the hook");
+    assert!(
+        released,
+        "the drainer steps aside once the name moves to another session"
+    );
+}
+
+#[test]
+fn hook_ws_parks_on_a_thread_reported_as_taking_no_direct_input() {
+    assert_parks("-", 0);
+}
+
+#[test]
+fn hook_ws_parks_on_a_refused_turn_without_the_capability_field() {
+    assert_parks("=", 1);
+}
+
+/* the refusal arrives after the name has already moved to th2: the drainer parks for the
+session it was serving, so it steps aside at once and does not hold the name against th2 */
+#[test]
+fn a_refusal_that_lands_after_the_name_moved_does_not_hold_the_new_owner() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("codex");
+    let marks = Arc::new(std::sync::Mutex::new(vec![
+        "=th1".to_string(),
+        "^th1".to_string(),
+    ]));
+    let attempts = app_server_capture_with(&codex_home, &["th1", "th2"], marks.clone(), None, None);
+    let mut child = start_codex_drainer(&sandbox, worker, &codex_home);
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "held-refusal",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    attempts
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the turn reaches the app server and is held there");
+    bind_session(&sandbox, "codex", worker, "th2");
+    marks.lock().unwrap().retain(|mark| mark != "^th1");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while child.0.as_mut().unwrap().try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let released = child.0.as_mut().unwrap().try_wait().unwrap().is_some();
+    child.stop();
+    assert!(
+        released,
+        "a drainer refused for th1 steps aside once th2 holds the name"
+    );
+}
+
+/* the shell stands in for the MCP proxy: it starts the drainer, names it and lives for a
+while. A parked drainer ends once that process is gone, whether it died after the drainer
+parked or before */
+fn assert_park_ends_with_parent(parent_dies_first: bool) {
+    use std::io::BufRead;
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("codex");
+    let _attempts = app_server_capture_threads(&codex_home, &["th1"], &["-th1"]);
+    let lives = if parent_dies_first { "1" } else { "8" };
+    let mut shell = sandbox
+        .command_for(Path::new("/bin/sh"))
+        .args([
+            "-c",
+            "\"$0\" hook ws --peer-id \"$1\" --backend codex >/dev/null 2>&1 & echo $!; sleep \"$2\"",
+            sandbox.amesh().to_str().unwrap(),
+            worker,
+            lives,
+        ])
+        .env("CODEX_HOME", &codex_home)
+        .env("CODEX_THREAD_ID", "th1")
+        .env("AMESH_WS_BEAT_SECS", "1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    std::io::BufReader::new(shell.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    let drainer = line.trim().to_string();
+    /* by its command line, so a pid the system reused for something else never counts */
+    let drains = format!("hook ws --peer-id {worker}");
+    let alive = |pid: &str| {
+        Command::new("ps")
+            .args(["-o", "command=", "-p", pid])
+            .output()
+            .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains(&drains))
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let park = || {
+        sandbox.json(
+            &["peer", "notify", worker, "orphaned", "--from-peer", "boss"],
+            None,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        (!peer_is_online(&sandbox, worker), alive(&drainer))
+    };
+    let before = (!parent_dies_first).then(park);
+    let _ = shell.wait();
+    let (detached, parked) = before.unwrap_or_else(park);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while alive(&drainer) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let ended = !alive(&drainer);
+    if alive(&drainer) {
+        let _ = Command::new("kill").args(["-KILL", &drainer]).status();
+    }
+    assert!(detached, "the drainer lets go of the socket");
+    if !parent_dies_first {
+        assert!(parked, "the drainer parks while its parent lives");
+    }
+    assert!(
+        ended,
+        "a parked drainer ends once the process that started it is gone"
+    );
+}
+
+#[test]
+fn a_parked_drainer_ends_with_the_process_that_started_it() {
+    assert_park_ends_with_parent(false);
+}
+
+#[test]
+fn a_drainer_whose_parent_died_ends_once_it_parks() {
+    assert_park_ends_with_parent(true);
+}
+
+/* the spawner names itself and is gone before the drainer even runs: pid 1 stands for a
+spawner that is not the drainer's parent when it parks */
+#[test]
+fn a_drainer_whose_spawner_died_before_it_ran_ends_once_it_parks() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("codex");
+    let _attempts = app_server_capture_threads(&codex_home, &["th1"], &["-th1"]);
+    let mut child = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("CODEX_HOME", &codex_home)
+            .env("CODEX_THREAD_ID", "th1")
+            .env("AMESH_WS_BEAT_SECS", "1")
+            .env("AMESH_DRAINER_PARENT", "1")
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "spawner-gone",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while child.0.as_mut().unwrap().try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let ended = child.0.as_mut().unwrap().try_wait().unwrap().is_some();
+    child.stop();
+    assert!(ended, "a drainer whose spawner is gone ends once it parks");
+}
+
+#[test]
+fn a_parked_drainer_outlives_the_pruning_of_its_row() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start_with(&[("AMESH_PEER_ONLINE_SECS", "2")]);
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("codex");
+    let _attempts = app_server_capture_threads(&codex_home, &["th1"], &["-th1"]);
+    let mut child = start_codex_drainer(&sandbox, worker, &codex_home);
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "pruned-later",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let listed = |sandbox: &Sandbox| {
+        sandbox
+            .json(&["peer", "list"], None)
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|row| row["peer_id"] == worker))
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while listed(&sandbox) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let pruned = !listed(&sandbox);
+    std::thread::sleep(Duration::from_secs(3));
+    let parked = child.0.as_mut().unwrap().try_wait().unwrap().is_none();
+    child.stop();
+    assert!(pruned, "the hub prunes the row of a peer gone offline");
+    assert!(
+        parked,
+        "a pruned row leaves the drainer parked, so no unbound drainer takes the name"
+    );
+}
+
+#[test]
+fn a_drainer_names_the_build_the_hub_runs() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    let codex_home = sandbox.root.join("codex");
+    let _attempts = app_server_capture_threads(&codex_home, &["th1"], &[]);
+    let mut child = start_codex_drainer(&sandbox, worker, &codex_home);
+    /* the binding puts the row online before the drainer's socket lands */
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut row = snapshot_row(&sandbox, worker);
+    while row["push"] != true && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+        row = snapshot_row(&sandbox, worker);
+    }
+    child.stop();
+    assert!(
+        row["build"].is_string(),
+        "the drainer names its build: {row}"
+    );
+    assert_eq!(row["stale"], false, "it runs the file the hub runs: {row}");
 }
 
 #[test]
@@ -5448,11 +5976,16 @@ fn codex_drainer_drops_the_old_sessions_queue_when_the_name_is_replaced() {
     assert!(later.is_err(), "nothing of A's reaches B: {later:?}");
 }
 
-/* registers `session` under `peer` the way the backend's SessionStart hook does */
+/* registers `session` under `peer` the way the backend's SessionStart hook does. A start the
+hub does not answer still exits 0, with a context that says so */
 fn bind_session(sandbox: &Sandbox, backend: &str, peer: &str, session: &str) {
-    sandbox.json(
+    let started = sandbox.json(
         &["hook", "session", "--backend", backend, "--peer-id", peer],
         Some(json!({"session_id": session, "cwd": sandbox.root})),
+    );
+    assert!(
+        !started.to_string().contains("did not answer"),
+        "the hub did not take {session} for {peer}: {started}"
     );
 }
 
@@ -5577,7 +6110,7 @@ fn pruned_while_away(
     sandbox.start();
     bind_pinprune(&sandbox, "A");
     let codex_home = sandbox.root.join("ap");
-    let injected = app_server_capture_with(&codex_home, &["A", "B"], busy.clone(), None);
+    let injected = app_server_capture_with(&codex_home, &["A", "B"], busy.clone(), None, None);
     let drainer = KillChild(Some(
         sandbox
             .command()
@@ -6990,17 +7523,16 @@ fn pi_session_start_registers_when_daemon_was_down() {
         String::from_utf8_lossy(&setup.stderr)
     );
     let mut node = Command::new("node");
-    let result = isolate_session_env(&mut node, &sandbox.root)
+    isolate_session_env(&mut node, &sandbox.root)
         .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pi_hook.mjs"))
         .arg(sandbox.root.join(".pi/agent/extensions/amesh.ts"))
-        .arg(env!("CARGO_BIN_EXE_amesh"))
+        .arg(sandbox.amesh())
         .arg(&sandbox.root)
         .env("AMESH_BIND", &sandbox.bind)
         .env("AMESH_TOKEN", "cli-test-token")
         .env("AMESH_STATE", sandbox.root.join("state.json"))
-        .env("AMESH_PI_DAEMON_ONLY", "1")
-        .output()
-        .unwrap();
+        .env("AMESH_PI_DAEMON_ONLY", "1");
+    let result = harness_output(&mut node);
     /* node:test names the failing subtest on stdout; stderr only carries the faults the
     harness injects on purpose */
     assert!(
@@ -7160,15 +7692,23 @@ fn app_server_capture_threads(
     busy: &[&str],
 ) -> std::sync::mpsc::Receiver<String> {
     let busy = busy.iter().map(|id| id.to_string()).collect();
-    app_server_capture_with(home, loaded, Arc::new(std::sync::Mutex::new(busy)), None)
+    app_server_capture_with(
+        home,
+        loaded,
+        Arc::new(std::sync::Mutex::new(busy)),
+        None,
+        None,
+    )
 }
 
-/* as app_server_capture_threads, with a busy set the test can change as it runs */
+/* as app_server_capture_threads, with a busy set the test can change as it runs, and when
+asked a count of thread reads and the instant each turn arrives */
 fn app_server_capture_with(
     home: &Path,
     loaded: &[&str],
     busy: Arc<std::sync::Mutex<Vec<String>>>,
     reads: Option<Arc<AtomicUsize>>,
+    starts: Option<Arc<std::sync::Mutex<Vec<Instant>>>>,
 ) -> std::sync::mpsc::Receiver<String> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as AppMessage;
@@ -7176,7 +7716,7 @@ fn app_server_capture_with(
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     /* bound here, not inside the thread: the caller starts a drainer as soon as this
-    returns, and a connect that lands before bind costs a ten second reconnect backoff */
+    returns, and a connect that lands before bind costs a retry */
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let loaded: Vec<String> = loaded.iter().map(|id| id.to_string()).collect();
@@ -7186,8 +7726,13 @@ fn app_server_capture_with(
             let listener = tokio::net::UnixListener::from_std(listener).unwrap();
             /* a drainer dials again each time it looks its thread up */
             while let Ok((stream, _)) = listener.accept().await {
-                let (tx, loaded, busy, reads) =
-                    (tx.clone(), loaded.clone(), busy.clone(), reads.clone());
+                let (tx, loaded, busy, reads, starts) = (
+                    tx.clone(),
+                    loaded.clone(),
+                    busy.clone(),
+                    reads.clone(),
+                    starts.clone(),
+                );
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -7199,6 +7744,17 @@ fn app_server_capture_with(
                         let Some(id) = req.get("id").cloned() else {
                             continue;
                         };
+                        /* "-id" is a thread that takes no direct input, as Codex reports a
+                        multi-agent v2 sub-agent; "=id" refuses the same way from a server that
+                        does not report the capability; "?id" is one whose every turn fails */
+                        let thread = req["params"]["threadId"].as_str().unwrap_or("");
+                        let marked = |mark: char| {
+                            busy.lock()
+                                .unwrap()
+                                .iter()
+                                .any(|id| id.strip_prefix(mark) == Some(thread))
+                        };
+                        let mut error = None;
                         let result = match req["method"].as_str().unwrap_or("") {
                             /* select_app_thread only accepts a thread reported as loaded */
                             "thread/loaded/list" => json!({"data": loaded}),
@@ -7217,9 +7773,17 @@ fn app_server_capture_with(
                                 } else {
                                     "idle"
                                 };
-                                json!({"thread": {"status": {"type": state}}})
+                                drop(busy);
+                                let mut read = json!({"thread": {"status": {"type": state}}});
+                                if marked('-') {
+                                    read["thread"]["canAcceptDirectInput"] = json!(false);
+                                }
+                                read
                             }
                             "turn/start" | "turn/steer" => {
+                                if let Some(starts) = &starts {
+                                    starts.lock().unwrap().push(Instant::now());
+                                }
                                 let _ = tx.send(raw.to_string());
                                 /* "~id" is a thread that takes the message and never answers */
                                 let thread = req["params"]["threadId"].as_str().unwrap_or("");
@@ -7231,14 +7795,25 @@ fn app_server_capture_with(
                                 if stall {
                                     std::future::pending::<()>().await;
                                 }
+                                /* "^id" holds the answer until the test takes the mark away */
+                                while marked('^') {
+                                    tokio::time::sleep(Duration::from_millis(20)).await;
+                                }
+                                if marked('-') || marked('=') {
+                                    error = Some(json!({"code": -32600, "message": "direct app-server input is not allowed for multi-agent v2 sub-agents"}));
+                                } else if marked('?') {
+                                    error = Some(json!({"code": -32603, "message": "turn failed"}));
+                                }
                                 json!({"turn": {"id": "turn-1"}})
                             }
                             _ => json!({}),
                         };
+                        let reply = match error {
+                            Some(error) => json!({"id": id, "error": error}),
+                            None => json!({"id": id, "result": result}),
+                        };
                         if ws
-                            .send(AppMessage::Text(
-                                json!({"id": id, "result": result}).to_string().into(),
-                            ))
+                            .send(AppMessage::Text(reply.to_string().into()))
                             .await
                             .is_err()
                         {
@@ -7672,7 +8247,7 @@ fn codex_mcp_keeps_its_drainer_despite_an_inherited_claude_socket() {
     let mut sandbox = Sandbox::new();
     sandbox.start();
     let claude = AcceptCounter::bind(claude_socket_path(&sandbox));
-    let expected = "shared-codex".to_string();
+    let expected = sandbox.id("shared-codex").to_string();
     /* both MCPs claim the same peer id on the same thread, so the second one's bind sees
     the first drainer */
     let mut first_mcp = sandbox
@@ -7836,7 +8411,7 @@ fn snapshot_row(sandbox: &Sandbox, peer: &str) -> Value {
         .output()
         .unwrap();
     let snapshot: Value = serde_json::from_slice(&output.stdout).unwrap();
-    snapshot["peers"]
+    snapshot["roster"]
         .as_array()
         .unwrap()
         .iter()
@@ -8149,7 +8724,8 @@ fn codex_drainer_reports_a_turn_that_ended_without_a_stop() {
     let codex_home = sandbox.root.join("ai");
     let busy = Arc::new(std::sync::Mutex::new(vec!["A".to_string()]));
     let reads = Arc::new(AtomicUsize::new(0));
-    let injected = app_server_capture_with(&codex_home, &["A"], busy.clone(), Some(reads.clone()));
+    let injected =
+        app_server_capture_with(&codex_home, &["A"], busy.clone(), Some(reads.clone()), None);
     let prompt = sandbox.run(
         &["hook", "prompt", "--backend", "codex", "--peer-id", pinned],
         Some(json!({"session_id": "A", "cwd": sandbox.root})),
@@ -8540,8 +9116,11 @@ fn hook_ws_exits_when_the_claude_target_is_gone_and_the_hub_is_down() {
             .spawn()
             .unwrap(),
     ));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !peer_is_online(&sandbox, worker) && Instant::now() < deadline {
+    /* push is the drainer's socket, so the hub goes down under a live one; the row is online
+    from the registration alone */
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while snapshot_row(&sandbox, worker)["push"] != true {
+        assert!(Instant::now() < deadline, "the drainer connects");
         std::thread::sleep(Duration::from_millis(50));
     }
     if let Some(daemon) = sandbox.daemon.as_mut() {
@@ -8549,7 +9128,18 @@ fn hook_ws_exits_when_the_claude_target_is_gone_and_the_hub_is_down() {
         let _ = daemon.wait();
     }
     sandbox.daemon = None;
+    /* the socket goes once the drainer knocks on the port again, which it does only after its
+    connection ended: a drainer that stalls as the hub dies still has its first beat due beside
+    the closed socket, and that beat would see the socket gone before the hub is missed */
+    let stub = TcpListener::bind(&sandbox.bind).unwrap();
+    stub.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while stub.accept().is_err() {
+        assert!(Instant::now() < deadline, "the drainer tries the hub again");
+        std::thread::sleep(Duration::from_millis(10));
+    }
     fs::remove_file(&sock).unwrap();
+    drop(stub);
     let deadline = Instant::now() + Duration::from_secs(10);
     while Instant::now() < deadline {
         if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {

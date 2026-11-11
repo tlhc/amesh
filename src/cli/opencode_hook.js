@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import { setTimeout as Delay } from "node:timers/promises";
 
 const executable = __AMESH_EXECUTABLE__;
+const build = __AMESH_BUILD__;
 const configuredBind = __AMESH_BIND__;
 const catalog = __AMESH_CATALOG__;
 
@@ -312,6 +313,7 @@ export default {
             type: "connect",
             peer_id: root.peerID,
             recv: true,
+            build,
             auth_token: env.AMESH_TOKEN,
           }),
         );

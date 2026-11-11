@@ -984,3 +984,115 @@ async fn a_received_copy_is_not_requeued_when_a_legacy_connection_closes() {
     );
     assert_eq!(Hub::open(&path).unwrap().inbox.count("worker"), 0);
 }
+
+#[tokio::test]
+async fn the_roster_names_each_socket_build_and_flags_a_stale_one() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let path = temp_state("builds");
+    let state = App {
+        inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
+        token: None,
+        state_path: path.clone(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve_app = router(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, serve_app).await.unwrap();
+    });
+    let own = crate::hub::own_build().expect("a unix binary has a build");
+    let mut sockets = Vec::new();
+    for (id, build) in [
+        ("fresh", Some(own)),
+        ("old", Some("0:0")),
+        ("legacy", None),
+        ("away", None),
+    ] {
+        let _ = json_req(
+            router(state.clone()),
+            "POST",
+            "/peers",
+            json!({"name": id, "backend": "pi", "peer_id": id}),
+        )
+        .await;
+        if id == "away" {
+            continue;
+        }
+        let (socket, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        let (mut w, mut r) = socket.split();
+        let mut connect = json!({"type": "connect", "peer_id": id, "recv": true});
+        if let Some(build) = build {
+            connect["build"] = json!(build);
+        }
+        w.send(WsMsg::Text(connect.to_string().into()))
+            .await
+            .unwrap();
+        assert!(r
+            .next()
+            .await
+            .unwrap()
+            .unwrap()
+            .to_string()
+            .contains("connected"));
+        sockets.push((w, r));
+    }
+    let (_, health) = json_req(router(state.clone()), "GET", "/health", json!({})).await;
+    assert_eq!(health["build"], own, "the hub names the build it runs");
+    let (_, snap) = json_req(router(state.clone()), "GET", "/snapshot", json!({})).await;
+    let row = |id: &str| {
+        snap["roster"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["peer_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no {id} in {snap}"))
+    };
+    assert_eq!(row("fresh")["build"], own);
+    assert_eq!(
+        row("fresh")["stale"],
+        false,
+        "a client on the hub's build is current"
+    );
+    assert_eq!(
+        row("old")["stale"],
+        true,
+        "a client on another build is stale"
+    );
+    assert_eq!(
+        row("legacy")["stale"],
+        true,
+        "a client that names no build predates the field"
+    );
+    assert!(
+        row("away")["stale"].is_null(),
+        "without a socket there is nothing to judge"
+    );
+    assert!(row("away")["build"].is_null());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_build_changes_when_its_file_is_rewritten_in_place() {
+    use std::os::unix::fs::MetadataExt;
+    let path = temp_state("build-of");
+    fs::write(&*path, b"first build").unwrap();
+    let first = crate::hub::build_of(&path).unwrap();
+    let inode = fs::metadata(&*path).unwrap().ino();
+    std::thread::sleep(Duration::from_millis(20));
+    /* the same length, so only the time tells the two apart */
+    fs::write(&*path, b"other build").unwrap();
+    assert_eq!(
+        fs::metadata(&*path).unwrap().ino(),
+        inode,
+        "precondition: a rewrite in place keeps the inode"
+    );
+    assert_ne!(
+        crate::hub::build_of(&path).unwrap(),
+        first,
+        "a rewrite in place is another build"
+    );
+}

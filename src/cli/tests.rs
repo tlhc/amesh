@@ -1106,3 +1106,80 @@ fn a_handshake_stops_the_drainer_only_on_a_configuration_error() {
         "4xx that name a bad request, token or peer stop; a busy or restarting hub is waited out"
     );
 }
+
+#[test]
+fn app_retry_grows_by_two_seconds_to_ten_and_starts_over_after_a_landed_injection() {
+    let start = Instant::now();
+    let mut retry = AppRetry::new(Some("th1".into()), start);
+    assert!(retry.due(start), "a new owner is tried at once");
+    let waits: Vec<u64> = (0..7)
+        .map(|_| {
+            retry.failed(start);
+            (retry.next - start).as_secs()
+        })
+        .collect();
+    assert_eq!(waits, [1, 3, 5, 7, 9, 10, 10]);
+    assert!(!retry.due(start + Duration::from_secs(9)));
+    retry.landed();
+    retry.failed(start);
+    assert_eq!(
+        (retry.next - start).as_secs(),
+        1,
+        "a landed injection resets the wait"
+    );
+}
+
+#[test]
+fn app_retry_keeps_its_wait_for_the_same_owner_and_drops_it_for_a_new_one() {
+    let start = Instant::now();
+    let mut retry = AppRetry::new(Some("th1".into()), start);
+    retry.failed(start);
+    retry.owned_by(Some("th1"), start);
+    assert!(
+        !retry.due(start),
+        "a reconnect for the same owner keeps the wait"
+    );
+    retry.owned_by(Some("th2"), start);
+    assert!(retry.due(start), "a new owner is tried at once");
+    retry.failed(start);
+    assert_eq!(
+        (retry.next - start).as_secs(),
+        1,
+        "and starts from the shortest wait"
+    );
+}
+
+#[test]
+fn app_retry_wakes_the_beat_only_for_a_retry_still_ahead() {
+    let start = Instant::now();
+    let mut retry = AppRetry::new(Some("th1".into()), start);
+    assert_eq!(
+        retry.wake_at(start),
+        None,
+        "a due retry is left to the beat"
+    );
+    retry.failed(start);
+    let at = start + Duration::from_secs(1);
+    assert_eq!(
+        retry.wake_at(start),
+        Some(at),
+        "a retry ahead wakes the beat"
+    );
+    assert_eq!(retry.wake_at(at), None, "and is the beat's once due");
+    assert_eq!(
+        retry.wake_at(at + Duration::from_nanos(1)),
+        None,
+        "and after"
+    );
+}
+
+#[test]
+fn a_spawned_drainer_is_told_which_process_spawned_it() {
+    let command = drainer_command(Path::new("amesh"), "worker", "codex");
+    let named = command
+        .get_envs()
+        .find(|(key, _)| *key == DRAINER_PARENT)
+        .and_then(|(_, value)| value);
+    let own = std::process::id().to_string();
+    assert_eq!(named, Some(std::ffi::OsStr::new(&own)));
+}
