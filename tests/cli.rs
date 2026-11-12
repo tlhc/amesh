@@ -7412,17 +7412,14 @@ fn a_hook_does_not_wait_out_a_hub_that_cannot_start() {
     let sandbox = Sandbox::new();
     fs::write(sandbox.root.join("state.db"), "not a database").unwrap();
     let payload = json!({"session_id": "session-a", "cwd": sandbox.root, "hook_event_name": "UserPromptSubmit"});
-    let started = Instant::now();
-    let prompt = sandbox.run(
+    /* a start budget far past the run backstop: a hook that waited it out instead of noticing
+    the hub had ended would never exit, so finishing at all is the check */
+    let prompt = sandbox.run_text(
         &["hook", "prompt", "--backend", "claude-code"],
-        Some(payload),
+        &payload.to_string(),
+        &[("AMESH_HUB_START_SECS", "3600")],
     );
-    let elapsed = started.elapsed();
     assert!(prompt.status.success(), "{prompt:?}");
-    assert!(
-        elapsed < Duration::from_millis(1500),
-        "a hub that ends at startup is not waited for: {elapsed:?}"
-    );
 }
 
 #[test]

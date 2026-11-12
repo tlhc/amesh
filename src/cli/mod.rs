@@ -477,7 +477,7 @@ fn remaining(deadline: Instant) -> Duration {
 }
 
 fn ensure_daemon() {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(env_secs("AMESH_HUB_START_SECS", 2));
     if health_is_amesh_within(remaining(deadline)) {
         return;
     }
