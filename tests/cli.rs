@@ -249,7 +249,10 @@ impl Sandbox {
             .unwrap()
             .write_all(input.as_bytes())
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(8);
+        /* only a backstop for a CLI that stopped making progress: the CLI bounds its own waits
+        (ensure_daemon 2 s, curl --max-time 5 per hub request, three requests in a hook), so a
+        slow but healthy run must finish well inside it; tests assert the outcome, not the time */
+        let deadline = Instant::now() + Duration::from_secs(30);
         while child.try_wait().unwrap().is_none() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -7632,23 +7635,26 @@ fn concurrent_lazy_spawn_keeps_existing_ask() {
     }
     sandbox.daemon = None;
     kill_listen(&sandbox.bind, &sandbox.root);
-    let payload = json!({"session_id": "c", "cwd": sandbox.root}).to_string();
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            sandbox.run_text(
+    let payload = json!({"session_id": "c", "cwd": sandbox.root});
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| {
+            sandbox.json(
                 &["hook", "session", "--backend", "pi", "--peer-id", "a"],
-                &payload,
-                &[],
+                Some(payload.clone()),
             )
         });
-        scope.spawn(|| {
-            sandbox.run_text(
+        let b = scope.spawn(|| {
+            sandbox.json(
                 &["hook", "session", "--backend", "pi", "--peer-id", "b"],
-                &payload,
-                &[],
+                Some(payload.clone()),
             )
         });
+        (a.join().unwrap(), b.join().unwrap())
     });
+    /* a hook that cannot reach the hub still exits 0, with nothing on stdout, so each one must
+    name the peer it registered */
+    assert_eq!(a["peer_id"], "a");
+    assert_eq!(b["peer_id"], "b");
     assert_eq!(listen_pids(&sandbox.bind).len(), 1);
     let peers = sandbox.json(&["peer", "list"], None);
     let old_peer = peers
