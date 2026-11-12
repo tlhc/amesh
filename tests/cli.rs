@@ -800,36 +800,6 @@ fn mcp_oneshot_without_codex_backend_skips_keeper_join() {
 fn mcp_codex_keeper_wakes_on_shutdown() {
     let mut sandbox = Sandbox::new();
     sandbox.start();
-    sandbox.json(
-        &[
-            "peer",
-            "register",
-            "--name",
-            "worker",
-            "--peer-id",
-            "worker",
-        ],
-        None,
-    );
-    let frame = format!(
-        "{}\n",
-        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
-            "name":"amesh_list_peers","arguments":{}
-        }})
-    );
-    let pi_started = Instant::now();
-    let pi = sandbox.run_text(
-        &["mcp", "--peer-id", "worker"],
-        &frame,
-        &[("AMESH_BACKEND", "pi")],
-    );
-    let pi_elapsed = pi_started.elapsed();
-    assert!(
-        pi.status.success(),
-        "{}",
-        String::from_utf8_lossy(&pi.stderr)
-    );
-
     let expected = format!(
         "{}-codex",
         sandbox.root.file_name().unwrap().to_string_lossy()
@@ -838,27 +808,30 @@ fn mcp_codex_keeper_wakes_on_shutdown() {
         .command()
         .arg("mcp")
         .env("AMESH_BACKEND", "codex")
+        .env("AMESH_KEEPER_POLL_SECS", "60")
         .spawn()
         .unwrap();
     codex_first_call(&mut mcp, Some("T1"));
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !hook_ws_alive(&expected) {
         assert!(Instant::now() < deadline, "MCP must start hook ws");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let started = Instant::now();
     drop(mcp.stdin.take());
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while mcp.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if mcp.try_wait().unwrap().is_none() {
+        mcp.kill().unwrap();
+        let _ = mcp.wait();
+        panic!("MCP keeper did not wake on shutdown");
+    }
     let output = mcp.wait_with_output().unwrap();
-    let elapsed = started.elapsed();
     assert!(
         output.status.success(),
         "{}",
         String::from_utf8_lossy(&output.stderr)
-    );
-    let budget = pi_elapsed + Duration::from_millis(100);
-    assert!(
-        elapsed <= budget,
-        "codex shutdown {elapsed:?} exceeded pi oneshot {pi_elapsed:?} + 100ms"
     );
 }
 

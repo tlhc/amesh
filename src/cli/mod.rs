@@ -616,6 +616,7 @@ fn keep_drainer(
     stop: &AtomicBool,
     wake_rx: &mpsc::Receiver<()>,
 ) {
+    let poll_secs = env_secs("AMESH_KEEPER_POLL_SECS", 0);
     while !stop.load(Ordering::Relaxed) {
         let vacant = ws_child
             .lock()
@@ -647,7 +648,9 @@ fn keep_drainer(
                 }
             }
         }
-        let idle = if vacant || need {
+        let idle = if poll_secs > 0 {
+            Duration::from_secs(poll_secs)
+        } else if vacant || need {
             Duration::from_secs(1)
         } else {
             Duration::from_millis(200)
