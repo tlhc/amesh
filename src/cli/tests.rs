@@ -1094,6 +1094,12 @@ fn curl_budget_follows_the_requested_wait() {
 }
 
 #[test]
+fn an_activity_report_gets_a_one_second_budget() {
+    assert_eq!(curl_max_time("/activity", None), "1");
+    assert_eq!(curl_max_time("/peers", None), "5");
+}
+
+#[test]
 fn a_handshake_stops_the_drainer_only_on_a_configuration_error() {
     use tokio_tungstenite::tungstenite::{http::Response, Error};
     let stops = |status: u16| {

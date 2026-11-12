@@ -312,21 +312,21 @@ fn opencode_doctor_bounds_version_probe() {
     let mut sandbox = Sandbox::new();
     sandbox.start();
     let binary = sandbox.root.join("opencode");
-    fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+    /* longer than the CLI's deadman, so a probe without a bound fails the test by hanging
+    instead of being measured against a stopwatch */
+    fs::write(&binary, "#!/bin/sh\nexec /bin/sleep 120\n").unwrap();
     fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).unwrap();
     let path = format!(
         "{}:{}",
         sandbox.root.display(),
         std::env::var("PATH").unwrap()
     );
-    let started = Instant::now();
     let output = sandbox.run_text(
         &["doctor", "--home", sandbox.root.to_str().unwrap()],
         "",
         &[("PATH", &path)],
     );
     assert!(output.status.success());
-    assert!(started.elapsed() < Duration::from_secs(4));
     let report: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(report["runtimes"]["opencode"]["available"], true);
     assert_eq!(report["runtimes"]["opencode"]["version"], Value::Null);

@@ -8998,18 +8998,16 @@ fn an_activity_report_gives_up_on_a_hub_that_does_not_answer() {
             held.push(stream);
         }
     });
-    let started = Instant::now();
+    /* the report is best effort: it answers and does not fail the turn. A report without a
+    budget would never exit and trip the run backstop; the one-second budget itself is pinned
+    by the curl_max_time unit test */
     let output = sandbox.run_text(
         &["hook", "idle", "--backend=pi"],
         r#"{"session_id": "s1"}"#,
         &[("AMESH_BIND", &bind)],
     );
-    let took = started.elapsed();
+    assert!(output.status.success(), "the report must not fail the turn");
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "{}");
-    assert!(
-        took < Duration::from_millis(2500),
-        "the report took {took:?}"
-    );
 }
 
 /* the App Server takes the message and never answers, so the drainer dies inside the inject;
