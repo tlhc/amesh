@@ -2245,6 +2245,44 @@ await test("a failed accept recovers on its own while the hub remains healthy", 
   }
 });
 
+/* the hub's count of what it still holds for the peer, leased or not */
+async function HubQueued(peer) {
+  const response = await fetch(`http://${process.env.AMESH_BIND}/snapshot`, {
+    headers: { authorization: `Bearer ${process.env.AMESH_TOKEN}` },
+  });
+  return (await response.json()).roster.find((row) => row.peer_id === peer)?.queued;
+}
+
+await test("an HTTP inbox record leaves the hub only once its accept is on disk", async () => {
+  InboxLog(cwd);
+  const state = InboxSession();
+  const hooks = await FailingWrite("held until accepted", true);
+  const instance = InboxInstance(state, false, hooks);
+  /* the retry after the failed accept waits at least half of this */
+  process.env.AMESH_CONNECT_BACKOFF_MS = "4000";
+  try {
+    await instance.handlers.get("session_start")({}, state.ctx);
+    await waitCount(instance.sockets, 1, 2000);
+    SendInbox(state, "notify", "held until accepted");
+    assert.equal(await HubQueued(state.id), 1, "the hub holds the record before the read");
+    await instance.handlers.get("before_agent_start")({}, state.ctx);
+    assert.equal(Injected(instance, "held until accepted"), 0);
+    await OwnerSleep(1000);
+    assert.equal(await HubQueued(state.id), 1, "a failed accept settles nothing, so the record comes back");
+    let left = 1;
+    for (const deadline = Date.now() + 8000; left !== 0 && Date.now() < deadline; ) {
+      await OwnerSleep(50);
+      left = await HubQueued(state.id);
+    }
+    assert.equal(left, 0, "the retried accept settles the batch");
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(Injected(instance, "held until accepted"), 1);
+  } finally {
+    delete process.env.AMESH_CONNECT_BACKOFF_MS;
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
 await test("a standby instance cannot erase the owner's durable claim", async () => {
   const dir = InboxLog(cwd);
   const state = InboxSession();

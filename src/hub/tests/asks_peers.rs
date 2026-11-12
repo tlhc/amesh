@@ -471,38 +471,6 @@ fn a_restart_gives_persisted_peers_a_reconnect_window() {
 }
 
 #[test]
-fn a_full_inbox_drops_chatter_before_an_ask() {
-    let path = temp_state("inbox");
-    let mut hub = Hub::open(&path).unwrap();
-    queue_inbox(
-        &mut hub,
-        "w",
-        [json!({"type": "ask", "id": "keep-me"})],
-        now_unix(),
-    );
-    let chatter = (0..INBOX_MAX * 2).map(|n| json!({"type": "broadcast", "id": n}));
-    queue_inbox(&mut hub, "w", chatter, now_unix());
-    let queue = &hub.inbox.records("w");
-    assert_eq!(queue.len(), INBOX_MAX);
-    assert!(
-        queue.iter().any(|held| held.event()["id"] == "keep-me"),
-        "chatter must be evicted before the ask someone is waiting on"
-    );
-    assert_eq!(
-        queue.last().unwrap().event()["id"],
-        json!(INBOX_MAX * 2 - 1)
-    );
-    let asks = (0..INBOX_MAX * 2).map(|n| json!({"type": "ask", "id": n}));
-    queue_inbox(&mut hub, "x", asks, now_unix());
-    assert_eq!(
-        hub.inbox.records("x").len(),
-        INBOX_MAX * 2,
-        "a queue of nothing but asks grows past the cap instead of stranding an asker"
-    );
-    let _ = fs::remove_file(&path);
-}
-
-#[test]
 fn a_restart_ignores_inbox_keys_without_a_peer() {
     let path = temp_state("orphan-load");
     let mut hub = Hub::open(&path).unwrap();

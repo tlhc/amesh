@@ -56,8 +56,253 @@ async fn the_hook_does_not_take_what_an_attached_acknowledger_is_still_owed() {
         Some(1),
         "with nobody attached the hook is the delivery"
     );
+    let (status, _) = json_req(
+        router(state.clone()),
+        "POST",
+        "/asks/pending/settle",
+        json!({"peer_id": "w", "lease": body["lease"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     assert!(state.inner.lock().await.inbox.count("w") == 0);
     let _ = fs::remove_file(&path);
+}
+
+async fn notify_worker(app: &Router, message: &str) {
+    let (status, body) = json_req(
+        app.clone(),
+        "POST",
+        "/notify",
+        json!({"from_peer": "boss", "to_peer": "w", "message": message}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn read_pending(app: &Router) -> Value {
+    let (status, body) = json_req(app.clone(), "GET", "/asks/pending?peer_id=w", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    body
+}
+
+fn messages(read: &Value) -> Vec<&str> {
+    read["inbox"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["message"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_pending_read_leases_what_it_hands_out_until_the_reader_settles() {
+    let (app, hub, path) = test_app_with_hub();
+    register(app.clone(), "w", "codex", "default").await;
+    notify_worker(&app, "first").await;
+    notify_worker(&app, "second").await;
+    let read = read_pending(&app).await;
+    assert_eq!(messages(&read), ["first", "second"]);
+    assert!(
+        read["inbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["id"].as_str().is_some_and(|id| !id.is_empty())),
+        "every record handed out carries its id: {read}"
+    );
+    let lease = read["lease"]
+        .as_str()
+        .expect("a read that hands records out names its lease");
+    let again = read_pending(&app).await;
+    assert!(
+        messages(&again).is_empty(),
+        "a second read inside the lease shows none of it: {again}"
+    );
+    assert!(again["lease"].is_null(), "{again}");
+    notify_worker(&app, "third").await;
+    let later = read_pending(&app).await;
+    assert_eq!(
+        messages(&later),
+        ["third"],
+        "a live lease holds back only its own records"
+    );
+    let (status, settled) = json_req(
+        app.clone(),
+        "POST",
+        "/asks/pending/settle",
+        json!({"peer_id": "w", "lease": lease}),
+    )
+    .await;
+    assert_eq!((status, settled), (StatusCode::OK, json!({"ok": true})));
+    assert_eq!(hub.lock().await.inbox.count("w"), 1, "only third is left");
+    let (status, _) = json_req(
+        app,
+        "POST",
+        "/asks/pending/settle",
+        json!({"peer_id": "w", "lease": lease}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "settling twice is a no-op");
+    let reopened = Hub::open(&path).unwrap();
+    assert_eq!(
+        reopened.inbox.records("w").len(),
+        1,
+        "the settled records are gone from the state file too"
+    );
+}
+
+#[tokio::test]
+async fn a_pending_read_drops_an_ask_closed_since_it_was_queued() {
+    let (app, hub, _path) = test_app_with_hub();
+    register(app.clone(), "w", "codex", "default").await;
+    let (status, ask) = json_req(
+        app.clone(),
+        "POST",
+        "/ask",
+        json!({"from_peer": "boss", "to_peer": "w", "text": "still needed?"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{ask}");
+    let (status, closed) = json_req(
+        app.clone(),
+        "POST",
+        "/ack",
+        json!({"correlation_id": ask["correlation_id"], "message": "answered elsewhere"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{closed}");
+    assert_eq!(
+        hub.lock().await.inbox.count("w"),
+        1,
+        "the ask is still queued"
+    );
+    let read = read_pending(&app).await;
+    assert!(
+        read["inbox"].as_array().unwrap().is_empty(),
+        "a closed ask is not handed out: {read}"
+    );
+    assert_eq!(
+        hub.lock().await.inbox.count("w"),
+        0,
+        "a closed ask leaves the queue instead of counting against it"
+    );
+}
+
+#[tokio::test]
+async fn a_hub_restart_hands_an_unsettled_lease_out_again() {
+    let path = temp_state("lease-restart");
+    let open = || {
+        router(App {
+            inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
+            token: None,
+            state_path: path.to_path_buf(),
+        })
+    };
+    let first = {
+        let app = open();
+        register(app.clone(), "w", "codex", "default").await;
+        notify_worker(&app, "kept").await;
+        let read = read_pending(&app).await;
+        assert!(read["lease"].is_string(), "{read}");
+        read["inbox"].clone()
+    };
+    let read = read_pending(&open()).await;
+    assert_eq!(messages(&read), ["kept"], "{read}");
+    assert_eq!(
+        read["inbox"], first,
+        "a restart forgets the lease and hands out the same records, ids included"
+    );
+}
+
+async fn settle_w(app: &Router, lease: &Value) -> StatusCode {
+    let body = json!({"peer_id": "w", "lease": lease});
+    json_req(app.clone(), "POST", "/asks/pending/settle", body)
+        .await
+        .0
+}
+
+#[tokio::test]
+async fn a_failed_write_elsewhere_keeps_a_pending_read_lease() {
+    let (app, hub, _path) = test_app_with_hub();
+    register(app.clone(), "w", "codex", "default").await;
+    notify_worker(&app, "held").await;
+    let lease = read_pending(&app).await["lease"].clone();
+    hub.lock().await.db.execute_batch("CREATE TEMP TRIGGER fail_write BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+    let refused = json!({"from_peer": "boss", "to_peer": "w", "message": "refused"});
+    let (status, _) = json_req(app.clone(), "POST", "/notify", refused).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    hub.lock()
+        .await
+        .db
+        .execute_batch("DROP TRIGGER fail_write")
+        .unwrap();
+    let read = read_pending(&app).await;
+    assert!(
+        messages(&read).is_empty(),
+        "the lease still holds what it handed out: {read}"
+    );
+    assert_eq!(settle_w(&app, &lease).await, StatusCode::OK);
+    assert_eq!(
+        hub.lock().await.inbox.count("w"),
+        0,
+        "and its settle takes it"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_settle_keeps_its_lease_for_the_retry() {
+    let (app, hub, _path) = test_app_with_hub();
+    register(app.clone(), "w", "codex", "default").await;
+    notify_worker(&app, "held").await;
+    let lease = read_pending(&app).await["lease"].clone();
+    hub.lock().await.db.execute_batch("CREATE TEMP TRIGGER fail_write BEFORE DELETE ON inbox BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+    assert_eq!(
+        settle_w(&app, &lease).await,
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+    hub.lock()
+        .await
+        .db
+        .execute_batch("DROP TRIGGER fail_write")
+        .unwrap();
+    let read = read_pending(&app).await;
+    assert!(
+        messages(&read).is_empty(),
+        "the records are back and still held for the reader: {read}"
+    );
+    assert_eq!(settle_w(&app, &lease).await, StatusCode::OK);
+    assert_eq!(
+        hub.lock().await.inbox.count("w"),
+        0,
+        "the retry settles them"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_pending_read_holds_nothing_back() {
+    let (app, hub, _path) = test_app_with_hub();
+    register(app.clone(), "w", "codex", "default").await;
+    {
+        let mut hub = hub.lock().await;
+        let kept = json!({"type": "notify", "id": "kept", "message": "kept"});
+        let closed = json!({"type": "ask", "id": "stale", "correlation_id": "closed"});
+        queue_inbox(&mut hub, "w", [kept, closed], now_unix());
+        persist_ok(&mut hub).unwrap();
+        hub.db.execute_batch("CREATE TEMP TRIGGER fail_write BEFORE DELETE ON inbox BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+    }
+    let (status, _) = json_req(app.clone(), "GET", "/asks/pending?peer_id=w", json!({})).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    hub.lock()
+        .await
+        .db
+        .execute_batch("DROP TRIGGER fail_write")
+        .unwrap();
+    let read = read_pending(&app).await;
+    assert_eq!(
+        messages(&read),
+        ["kept"],
+        "a read that failed handed nothing out, so it holds nothing back: {read}"
+    );
 }
 
 #[tokio::test]
@@ -294,12 +539,6 @@ fn what_an_acknowledging_peer_is_owed_is_never_evicted() {
         INBOX_MAX + 20,
         "no cap after a restart either"
     );
-    /* a peer that never promised recv keeps the old cap */
-    reopened
-        .peers
-        .insert("x".into(), reopened.peers["w"].clone());
-    queue_inbox(&mut reopened, "x", chatter(INBOX_MAX + 10), now_unix());
-    assert_eq!(reopened.inbox.records("x").len(), INBOX_MAX);
     let _ = fs::remove_file(&path);
 }
 
@@ -588,6 +827,10 @@ async fn second_connection_displaces_the_incumbent() {
 }
 
 async fn socket_hub() -> (App, TempState, String) {
+    socket_hub_on(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap()).await
+}
+
+async fn socket_hub_on(listener: tokio::net::TcpListener) -> (App, TempState, String) {
     let path = temp_state("recv-regression");
     let state = App {
         inner: Arc::new(Mutex::new(Hub::open(&path).unwrap())),
@@ -595,7 +838,6 @@ async fn socket_hub() -> (App, TempState, String) {
         state_path: path.to_path_buf(),
     };
     register(router(state.clone()), "worker", "pi", "default").await;
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/ws", listener.local_addr().unwrap());
     let app = router(state.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -606,10 +848,14 @@ type PeerSocket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 async fn connect_worker(url: &str, recv: bool) -> PeerSocket {
+    let (socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    send_connect(socket, recv).await
+}
+
+async fn send_connect(mut socket: PeerSocket, recv: bool) -> PeerSocket {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-    let (mut socket, _) = tokio_tungstenite::connect_async(url).await.unwrap();
     socket
         .send(WsMsg::Text(
             json!({"type": "connect", "peer_id": "worker", "recv": recv})
@@ -630,6 +876,329 @@ async fn socket_frame(socket: &mut PeerSocket) -> Value {
         .unwrap()
         .unwrap();
     serde_json::from_str(&frame.to_string()).unwrap()
+}
+
+/* AMESH_WS_WRITE_SECS is process-wide and the unit tests share one process, so a case that
+shortens the write deadline runs in a child; the parent only checks that the child ran and
+passed */
+fn ran_in_child(test: &str, deadline_secs: &str) -> bool {
+    if std::env::var_os("AMESH_WRITE_DEADLINE_CHILD").is_some() {
+        return false;
+    }
+    let filter = format!("{}::{test}", module_path!().split_once("::").unwrap().1);
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &filter, "--nocapture"])
+        .env("AMESH_WRITE_DEADLINE_CHILD", "1")
+        .env("AMESH_WS_WRITE_SECS", deadline_secs)
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && text.contains("test result: ok. 1 passed;"),
+        "{test} must run and pass with a {deadline_secs} s write deadline:\n{text}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    true
+}
+
+/* a tuned loopback absorbs tens of MiB from a peer that stops reading; with small buffers at
+both ends the hub's writes block after a few frames */
+const TIGHT_BUFFER: u32 = 64 * 1024;
+
+async fn tight_socket_hub() -> (App, TempState, String) {
+    let listener = tokio::net::TcpSocket::new_v4().unwrap();
+    /* an accepted socket takes the listener's send buffer */
+    listener.set_send_buffer_size(TIGHT_BUFFER).unwrap();
+    listener.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    socket_hub_on(listener.listen(16).unwrap()).await
+}
+
+/* connects with a tight receive buffer and reads nothing */
+async fn connect_tight(url: &str, recv: bool) -> PeerSocket {
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(TIGHT_BUFFER).unwrap();
+    let addr = url.trim_start_matches("ws://").trim_end_matches("/ws");
+    let stream = socket.connect(addr.parse().unwrap()).await.unwrap();
+    let (socket, _) =
+        tokio_tungstenite::client_async(url, tokio_tungstenite::MaybeTlsStream::Plain(stream))
+            .await
+            .unwrap();
+    send_connect(socket, recv).await
+}
+
+/* takes the connected frame and nothing after it */
+async fn connect_stalled_worker(url: &str, recv: bool) -> PeerSocket {
+    let mut socket = connect_tight(url, recv).await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    socket
+}
+
+/* far more than the tight buffers hold, and fewer than the INBOX_MAX a legacy inbox keeps,
+so nothing handed back is evicted */
+async fn flood(state: &App) -> Vec<Value> {
+    let mut hub = state.inner.lock().await;
+    (0..40)
+        .map(|seq| {
+            let event = json!({"type": "notify", "seq": seq, "message": "x".repeat(128 * 1024)});
+            persist_then_deliver(&mut hub, "worker", event.clone(), now_unix()).unwrap();
+            event
+        })
+        .collect()
+}
+
+/* the child's one second deadline ends the connection well inside this bound */
+async fn cut_off(state: &App, failure: &str) {
+    let closed = tokio::time::timeout(
+        Duration::from_secs(10),
+        until(
+            state,
+            |hub| {
+                !hub.sockets.contains_key("worker")
+                    && hub
+                        .peers
+                        .get("worker")
+                        .is_some_and(|peer| peer.status == "offline")
+            },
+            failure,
+        ),
+    )
+    .await;
+    assert!(closed.is_ok(), "{failure}");
+}
+
+fn events_of(records: &[QueuedRecord]) -> Vec<Value> {
+    records
+        .iter()
+        .map(|record| record.event().clone())
+        .collect()
+}
+
+async fn owed_events(state: &App) -> Vec<Value> {
+    events_of(state.inner.lock().await.inbox.records("worker"))
+}
+
+fn disk_events(hub: &Hub) -> Vec<Value> {
+    let disk = read_snapshot(&hub.db).unwrap();
+    events_of(disk.inbox.get("worker").map_or(&[], Vec::as_slice))
+}
+
+/* the payloads are large, so a mismatch names the records by seq */
+fn seqs(events: &[Value]) -> Vec<Option<u64>> {
+    events.iter().map(|event| event["seq"].as_u64()).collect()
+}
+
+#[tokio::test]
+async fn an_acknowledger_that_stops_reading_is_cut_off_and_replayed_on_reconnect() {
+    if ran_in_child(
+        "an_acknowledger_that_stops_reading_is_cut_off_and_replayed_on_reconnect",
+        "1",
+    ) {
+        return;
+    }
+    let (state, _path, url) = tight_socket_hub().await;
+    let stalled = connect_stalled_worker(&url, true).await;
+    let sent = flood(&state).await;
+    let owed = owed_events(&state).await;
+    assert_eq!(seqs(&owed), seqs(&sent));
+    cut_off(&state, "the hub kept a connection that stopped reading").await;
+    let left = owed_events(&state).await;
+    assert!(
+        left == owed,
+        "copies the peer never took stay owed: {:?}",
+        seqs(&left)
+    );
+    drop(stalled);
+    let stalled = connect_stalled_worker(&url, true).await;
+    cut_off(
+        &state,
+        "the hub kept replaying to a connection that stopped reading",
+    )
+    .await;
+    let left = owed_events(&state).await;
+    assert!(
+        left == owed,
+        "an unread replay stays owed: {:?}",
+        seqs(&left)
+    );
+    drop(stalled);
+    let mut socket = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    for (seq, record) in owed.iter().enumerate() {
+        let replay = socket_frame(&mut socket).await;
+        assert!(
+            replay == *record,
+            "record {seq} must replay in order, got seq {}",
+            replay["seq"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_legacy_peer_that_stops_reading_gets_its_unwritten_frames_back() {
+    use futures_util::StreamExt;
+
+    if ran_in_child(
+        "a_legacy_peer_that_stops_reading_gets_its_unwritten_frames_back",
+        "1",
+    ) {
+        return;
+    }
+    let (state, _path, url) = tight_socket_hub().await;
+    let mut stalled = connect_stalled_worker(&url, false).await;
+    let sent = flood(&state).await;
+    cut_off(&state, "the hub kept a connection that stopped reading").await;
+    let returned = owed_events(&state).await;
+    assert!(
+        !returned.is_empty(),
+        "the frames the hub could not write come back to the inbox"
+    );
+    /* what the hub did write is still in the socket buffers: the peer takes those frames, then
+    the end of the connection */
+    let mut taken = Vec::new();
+    while let Ok(Some(Ok(frame))) =
+        tokio::time::timeout(Duration::from_secs(3), stalled.next()).await
+    {
+        taken.push(serde_json::from_str::<Value>(&frame.to_string()).unwrap());
+    }
+    taken.extend(returned);
+    assert!(
+        taken == sent,
+        "every frame is either written or handed back, once and in order: {:?}",
+        seqs(&taken)
+    );
+}
+
+/* the acknowledging link that takes the name over is handed what the legacy link had not
+written; those records were never in the inbox, so they must land there before the new link
+can lose them by stalling too. The longer deadline lets the takeover happen while the legacy
+link is still stuck */
+#[tokio::test]
+async fn a_legacy_link_taken_over_by_an_acknowledger_that_stops_reading_loses_nothing() {
+    use futures_util::StreamExt;
+
+    if ran_in_child(
+        "a_legacy_link_taken_over_by_an_acknowledger_that_stops_reading_loses_nothing",
+        "3",
+    ) {
+        return;
+    }
+    let (state, _path, url) = tight_socket_hub().await;
+    let mut legacy = connect_stalled_worker(&url, false).await;
+    let sent = flood(&state).await;
+    let taker = connect_stalled_worker(&url, true).await;
+    /* the handover is written down while the acknowledging link still holds the name: that
+    link's own cut persists the hub again and would hide a handover that skipped its write */
+    let (held, on_disk, taker_live) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            {
+                let hub = state.inner.lock().await;
+                if !hub.inbox.records("worker").is_empty() {
+                    return (
+                        events_of(hub.inbox.records("worker")),
+                        disk_events(&hub),
+                        hub.sockets.contains_key("worker"),
+                    );
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the frames the legacy link could not write never reached the inbox");
+    assert!(
+        taker_live,
+        "the acknowledging link was cut before the handover could be checked"
+    );
+    assert!(
+        held == on_disk,
+        "the handover is on disk: memory {:?}, disk {:?}",
+        seqs(&held),
+        seqs(&on_disk)
+    );
+    cut_off(
+        &state,
+        "the hub kept the acknowledging link that stopped reading",
+    )
+    .await;
+    drop(taker);
+    let mut taken = Vec::new();
+    while let Ok(Some(Ok(frame))) =
+        tokio::time::timeout(Duration::from_secs(3), legacy.next()).await
+    {
+        let event = serde_json::from_str::<Value>(&frame.to_string()).unwrap();
+        if event.get("seq").is_some() {
+            taken.push(event);
+        }
+    }
+    let mut socket = connect_worker(&url, true).await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    while taken.len() < sent.len() {
+        /* the inbox names a record by an id so the peer can acknowledge it */
+        let mut replay = socket_frame(&mut socket).await;
+        replay.as_object_mut().unwrap().remove("id");
+        taken.push(replay);
+    }
+    assert!(
+        taken == sent,
+        "every accepted record reaches the peer once and in order: {:?}",
+        seqs(&taken)
+    );
+}
+
+/* the greeting carries the session id, so a long one is a frame the tight buffers cannot
+take */
+#[tokio::test]
+async fn a_peer_whose_greeting_cannot_be_written_is_cut_off() {
+    if ran_in_child("a_peer_whose_greeting_cannot_be_written_is_cut_off", "1") {
+        return;
+    }
+    let (state, _path, url) = tight_socket_hub().await;
+    if let Some(peer) = state.inner.lock().await.peers.get_mut("worker") {
+        peer.session_id = "s".repeat(1024 * 1024);
+    }
+    let silent = connect_tight(&url, true).await;
+    cut_off(
+        &state,
+        "the hub kept a connection whose greeting it could not write",
+    )
+    .await;
+    drop(silent);
+}
+
+/* a legacy link takes its backlog out of the inbox when it connects, so a greeting it cannot
+write must hand that backlog back */
+#[tokio::test]
+async fn a_legacy_peer_whose_greeting_cannot_be_written_keeps_its_backlog() {
+    if ran_in_child(
+        "a_legacy_peer_whose_greeting_cannot_be_written_keeps_its_backlog",
+        "1",
+    ) {
+        return;
+    }
+    let (state, _path, url) = tight_socket_hub().await;
+    let waiting = json!({"type": "notify", "seq": 0, "message": "waiting"});
+    {
+        let mut hub = state.inner.lock().await;
+        persist_then_deliver(&mut hub, "worker", waiting.clone(), now_unix()).unwrap();
+        if let Some(peer) = hub.peers.get_mut("worker") {
+            peer.session_id = "s".repeat(1024 * 1024);
+        }
+    }
+    let silent = connect_tight(&url, false).await;
+    cut_off(
+        &state,
+        "the hub kept a connection whose greeting it could not write",
+    )
+    .await;
+    drop(silent);
+    let hub = state.inner.lock().await;
+    let backlog = vec![waiting];
+    assert_eq!(events_of(hub.inbox.records("worker")), backlog);
+    assert_eq!(
+        disk_events(&hub),
+        backlog,
+        "the returned backlog is on disk"
+    );
 }
 
 #[tokio::test]
@@ -986,6 +1555,57 @@ async fn a_received_copy_is_not_requeued_when_a_legacy_connection_closes() {
 }
 
 #[tokio::test]
+async fn a_failed_request_does_not_undo_what_a_dropped_link_handed_back() {
+    const FAIL: &str = "CREATE TEMP TRIGGER fail_write BEFORE INSERT ON inbox BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;";
+    let ids = |hub: &Hub| -> Vec<String> {
+        hub.inbox
+            .records("worker")
+            .iter()
+            .filter_map(|record| record.event()["id"].as_str().map(str::to_string))
+            .collect()
+    };
+    let (mut hub, path) = undelivered_hub();
+    persist_ok(&mut hub).unwrap();
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.sockets.insert("worker".into(), (1, tx));
+    hub.db.execute_batch(FAIL).unwrap();
+    let state = App {
+        inner: Arc::new(Mutex::new(hub)),
+        token: None,
+        state_path: path.to_path_buf(),
+    };
+    let on_the_link = vec![test_outbound(json!({"type": "notify", "id": "on-link"}))];
+    close_connection(&state, "worker", 1, false, rx, on_the_link).await;
+    let mut hub = state.inner.lock().await;
+    for id in ["refused", "refused-again"] {
+        let refused = json!({"type": "notify", "id": id});
+        assert!(persist_then_deliver(&mut hub, "worker", refused, now_unix()).is_err());
+        assert_eq!(
+            ids(&hub),
+            ["on-link"],
+            "each failed request is undone and what the link handed back stays"
+        );
+    }
+    assert_eq!(
+        hub.peers["worker"].status, "offline",
+        "the link stays dropped"
+    );
+    hub.db.execute_batch("DROP TRIGGER fail_write").unwrap();
+    let landed = json!({"type": "notify", "id": "landed"});
+    persist_then_deliver(&mut hub, "worker", landed, now_unix()).unwrap();
+    hub.db.execute_batch(FAIL).unwrap();
+    let refused = json!({"type": "notify", "id": "refused-after"});
+    assert!(persist_then_deliver(&mut hub, "worker", refused, now_unix()).is_err());
+    assert_eq!(
+        ids(&hub),
+        ["on-link", "landed"],
+        "a failure after a write that landed goes back to that write"
+    );
+    drop(hub);
+    assert_eq!(ids(&Hub::open(&path).unwrap()), ["on-link", "landed"]);
+}
+
+#[tokio::test]
 async fn the_roster_names_each_socket_build_and_flags_a_stale_one() {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::connect_async;
@@ -1094,5 +1714,154 @@ fn a_build_changes_when_its_file_is_rewritten_in_place() {
         crate::hub::build_of(&path).unwrap(),
         first,
         "a rewrite in place is another build"
+    );
+}
+
+/* how many waiters the hub's change signal has: a connection a lease holds back is one */
+async fn watchers_reach(state: &App, count: usize, failure: &str) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.inner.lock().await.changes.receiver_count() != count {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(failure);
+}
+
+async fn notify_socket_worker(app: &Router, message: &str) {
+    let (status, body) = json_req(
+        app.clone(),
+        "POST",
+        "/notify",
+        json!({"from_peer": "boss", "to_peer": "worker", "message": message}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+async fn settle_worker(app: &Router, lease: &str) {
+    let (status, body) = json_req(
+        app.clone(),
+        "POST",
+        "/asks/pending/settle",
+        json!({"peer_id": "worker", "lease": lease}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/* worker's one record, "held", went out to a pending read under the returned lease */
+async fn leased_socket_hub() -> (App, TempState, String, Router, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, path, url) = socket_hub_on(listener).await;
+    let app = router(state.clone());
+    notify_socket_worker(&app, "held").await;
+    let (status, read) = json_req(
+        app.clone(),
+        "GET",
+        "/asks/pending?peer_id=worker",
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{read}");
+    let lease = read["lease"]
+        .as_str()
+        .expect("the read leases what it hands out")
+        .to_string();
+    (state, path, url, app, lease)
+}
+
+/* a hook reads the backlog over HTTP and settles once it has shown it; a drainer that connects
+in between must not get the same records replayed, so its connection waits out the lease */
+#[tokio::test]
+async fn a_connection_waits_out_a_pending_read_lease_instead_of_replaying_it() {
+    let (state, _path, url, app, lease) = leased_socket_hub().await;
+    let watchers = state.inner.lock().await.changes.receiver_count();
+    let mut socket = connect_worker(&url, true).await;
+    watchers_reach(
+        &state,
+        watchers + 1,
+        "the connection attached while a pending read held the backlog",
+    )
+    .await;
+    settle_worker(&app, &lease).await;
+    notify_socket_worker(&app, "after").await;
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    assert_eq!(
+        socket_frame(&mut socket).await["message"],
+        "after",
+        "the record the hook showed and settled is not replayed"
+    );
+}
+
+/* a reader that never settles sends the hub nothing more, so the lease running out is what
+lets the connection attach, and the connection gets the record again. Pi pings every 10 s,
+also before it is greeted, and a ping read while the connection waits keeps it waiting */
+#[tokio::test]
+async fn a_connection_held_by_an_unsettled_lease_attaches_when_it_runs_out() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (state, _path, url) = socket_hub_on(listener).await;
+    notify_socket_worker(&router(state.clone()), "held").await;
+    let watchers = {
+        let mut hub = state.inner.lock().await;
+        hub.inbox.ensure_ids("worker");
+        let id = hub.inbox.records("worker")[0].event()["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let end = Instant::now() + Duration::from_secs(1);
+        hub.inbox.lease("worker", "lease-short", vec![id], end);
+        hub.changes.receiver_count()
+    };
+    let mut socket = connect_worker(&url, true).await;
+    watchers_reach(
+        &state,
+        watchers + 1,
+        "the connection attached while the lease was live",
+    )
+    .await;
+    socket
+        .send(WsMsg::Text(json!({"type": "ping"}).to_string().into()))
+        .await
+        .unwrap();
+    assert_eq!(socket_frame(&mut socket).await["type"], "connected");
+    assert_eq!(
+        socket_frame(&mut socket).await["message"],
+        "held",
+        "the record comes back once the lease runs out"
+    );
+}
+
+/* a client that gives up while its connection waits must not take the name later from one
+that is still there */
+#[tokio::test]
+async fn a_connection_closed_while_it_waits_leaves_the_name_to_the_one_still_waiting() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMsg;
+
+    let (state, _path, url, app, lease) = leased_socket_hub().await;
+    let watchers = state.inner.lock().await.changes.receiver_count();
+    let mut kept = connect_worker(&url, true).await;
+    watchers_reach(&state, watchers + 1, "the first connection attached early").await;
+    let mut gone = connect_worker(&url, true).await;
+    watchers_reach(&state, watchers + 2, "the second connection attached early").await;
+    gone.send(WsMsg::Close(None)).await.unwrap();
+    drop(gone);
+    watchers_reach(
+        &state,
+        watchers + 1,
+        "the hub kept waiting for a connection that closed",
+    )
+    .await;
+    settle_worker(&app, &lease).await;
+    notify_socket_worker(&app, "after").await;
+    assert_eq!(socket_frame(&mut kept).await["type"], "connected");
+    assert_eq!(
+        socket_frame(&mut kept).await["message"],
+        "after",
+        "the connection still there keeps the name"
     );
 }

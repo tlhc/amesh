@@ -1378,7 +1378,7 @@ async fn a_moved_backlog_is_deduplicated_by_id_and_only_the_new_part_is_pushed()
     )
     .unwrap();
     let _ = rx.try_recv().unwrap();
-    hub.inbox.enqueue("tmp-pi-2", [duplicate.clone()], true);
+    hub.inbox.enqueue("tmp-pi-2", [duplicate.clone()]);
     let state = App {
         inner: Arc::new(Mutex::new(hub)),
         token: None,

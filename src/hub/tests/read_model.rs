@@ -129,7 +129,6 @@ fn fixture_hub(hub: &mut Hub, fixture: &Value) {
             hub.inbox.enqueue(
                 &peer.peer_id,
                 (0..count).map(|i| QueuedRecord::new(json!({"fixture_record":i}), queued_at)),
-                true,
             );
         }
         hub.peers.insert(peer.peer_id.clone(), peer);

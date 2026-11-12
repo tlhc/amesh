@@ -493,11 +493,12 @@ async fn a_handoff_notice_outlives_the_inbox_cap() {
     assert_eq!(
         handoffs(&hub, "deputy", &jid).len(),
         1,
-        "chatter gives way to the notice, as to an ask"
+        "the notice is queued past the cap"
     );
-    assert!(
-        hub.inbox.records("deputy").len() <= INBOX_MAX,
-        "the cap still holds"
+    assert_eq!(
+        hub.inbox.records("deputy").len(),
+        INBOX_MAX * 2 + 1,
+        "nothing is evicted to make room"
     );
 }
 

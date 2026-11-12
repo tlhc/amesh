@@ -54,6 +54,7 @@ mesh
                 [--peer-id ID] [--circle CIRCLE]
   peer whoami [--peer-id ID]         Defaults to AMESH_PEER_ID
   peer asks [--peer-id ID]
+  peer settle LEASE [--peer-id ID]   Drop what a pending read leased; peer asks does it after printing
   peer ask TO TEXT [--from-peer ID] [--cross-circle true] [--watch true|false]
                                    [--deadline-seconds N]
   peer notify TO TEXT [--from-peer ID] [--cross-circle true]
@@ -148,6 +149,9 @@ fn dispatch(args: &[String]) -> Result<()> {
         )?)?,
         "setup" => return setup(&Args::parse(&args[1..], &["home", "peer-id"])?),
         "uninstall" => uninstall(&Args::parse(&args[1..], &["home", "apply"])?)?,
+        "peer" if args.get(1).is_some_and(|command| command == "asks") => {
+            return peer_asks(&args[2..])
+        }
         "peer" => peer(&args[1..])?,
         "jobs" => jobs(&args[1..])?,
         "schedule" => schedule(&args[1..])?,
@@ -1030,7 +1034,7 @@ fn peer_allowed(command: &str) -> Result<&'static [&'static str]> {
         "list" => &["cwd", "circle"],
         "attach" => &[],
         "register" => &["name", "path", "backend", "circle", "peer-id"],
-        "asks" | "whoami" => &["peer-id"],
+        "asks" | "whoami" | "settle" => &["peer-id"],
         "ask" | "ask-many" => &["from-peer", "cross-circle", "watch", "deadline-seconds"],
         "notify" => &["from-peer", "cross-circle"],
         "broadcast" => &["from-peer", "circle", "cross-circle"],
@@ -1069,13 +1073,10 @@ fn peer(raw: &[String]) -> Result<Value> {
             args.copy(&mut body);
             request("POST", "/peers", Some(body))
         }
-        "asks" => {
-            args.count(0, 0)?;
-            request(
-                "GET",
-                &format!("/asks/pending?peer_id={}", escaped(&caller(&args, true)?)),
-                None,
-            )
+        "settle" => {
+            args.count(1, 1)?;
+            let body = json!({"peer_id": caller(&args, true)?, "lease": args.pos[0]});
+            request("POST", "/asks/pending/settle", Some(body))
         }
         "whoami" => {
             args.count(0, 0)?;
@@ -1246,6 +1247,33 @@ fn peer(raw: &[String]) -> Result<Value> {
             }
         }
         _ => unreachable!(),
+    }
+}
+
+fn peer_asks(raw: &[String]) -> Result<()> {
+    let args = Args::parse(raw, peer_allowed("asks")?)?;
+    args.count(0, 0)?;
+    let peer_id = caller(&args, true)?;
+    let pending = request(
+        "GET",
+        &format!("/asks/pending?peer_id={}", escaped(&peer_id)),
+        None,
+    )?;
+    println!("{}", serde_json::to_string_pretty(&pending)?);
+    io::stdout().flush()?;
+    settle_lease(&peer_id, &pending);
+    Ok(())
+}
+
+/* the inbox records of a pending read leave the hub once the reader has written them out; a
+settle that fails is only logged, as the lease runs out and the hub hands them out again */
+fn settle_lease(peer_id: &str, pending: &Value) {
+    let Some(lease) = pending["lease"].as_str() else {
+        return;
+    };
+    let body = json!({"peer_id": peer_id, "lease": lease});
+    if let Err(error) = request("POST", "/asks/pending/settle", Some(body)) {
+        eprintln!("amesh: settle {lease}: {error}");
     }
 }
 
@@ -4366,7 +4394,7 @@ fn hook(raw: &[String]) -> Result<()> {
     if backend == "pi" {
         println!(
             "{}",
-            json!({"peer_id": peer_id, "context": context, "pending": asks, "inbox": inbox.cloned().unwrap_or_else(Vec::new)})
+            json!({"peer_id": peer_id, "context": context, "pending": asks, "inbox": inbox.cloned().unwrap_or_else(Vec::new), "lease": pending["lease"]})
         );
     } else if event == "Stop" {
         if !asks.is_empty() || inbox.map(|v| !v.is_empty()).unwrap_or(false) {
@@ -4386,6 +4414,11 @@ fn hook(raw: &[String]) -> Result<()> {
             "{}",
             json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}})
         );
+    }
+    /* pi settles in the extension, once its accept log holds every record of the batch */
+    if backend != "pi" {
+        io::stdout().flush()?;
+        settle_lease(&peer_id, &pending);
     }
     Ok(())
 }

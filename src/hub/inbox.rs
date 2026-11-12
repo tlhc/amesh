@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use serde_json::Value;
 
-use super::{with_event_id, INBOX_MAX};
+use super::with_event_id;
 
 #[derive(Clone, Debug)]
 pub(super) enum Outbound {
@@ -45,9 +46,19 @@ impl QueuedRecord {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+struct Lease {
+    peer: String,
+    until: Instant,
+    ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(super) struct Inbox {
     queues: HashMap<String, Vec<QueuedRecord>>,
+    /* records a pending read handed out, by lease id: kept out of the next read until the
+    reader settles the lease or it runs out. Memory only, so a restart hands them out again */
+    leases: HashMap<String, Lease>,
 }
 
 impl Inbox {
@@ -69,10 +80,7 @@ impl Inbox {
         &mut self,
         peer_id: &str,
         events: impl IntoIterator<Item = QueuedRecord>,
-        owed: bool,
     ) {
-        /* what an acknowledging peer is owed is never evicted: the cap would silently take back
-        the at-least-once promise, and pruning the peer is the only bound on that queue */
         let queue = self.queues.entry(peer_id.to_string()).or_default();
         for event in events {
             /* a newer handoff notice for a job replaces the one the queue holds: a link that
@@ -82,18 +90,6 @@ impl Inbox {
                 queue.retain(|held| {
                     held.event()["handoff"] != true || held.event()["topic"] != topic
                 });
-            }
-            /* only an ask leaves someone blocked on an answer, so chatter gives way to it and a
-            queue of nothing but asks is allowed past the cap rather than strand an asker; a
-            handoff notice is kept the same way, since it is the new coordinator's only signal
-            and a retry of the handoff sends none */
-            while !owed && queue.len() >= INBOX_MAX {
-                let Some(chatter) = queue.iter().position(|held| {
-                    held.event()["type"] != "ask" && held.event()["handoff"] != true
-                }) else {
-                    break;
-                };
-                queue.remove(chatter);
             }
             queue.push(event);
         }
@@ -150,6 +146,71 @@ impl Inbox {
         }
     }
 
+    /* the ids a live lease holds for this peer */
+    pub(super) fn leased(&mut self, peer: &str, now: Instant) -> HashSet<String> {
+        self.prune_leases(now);
+        self.leases
+            .values()
+            .filter(|lease| lease.peer == peer)
+            .flat_map(|lease| lease.ids.iter().cloned())
+            .collect()
+    }
+
+    /* when the last live lease on this peer's records runs out */
+    pub(super) fn lease_end(&mut self, peer: &str, now: Instant) -> Option<Instant> {
+        self.prune_leases(now);
+        self.leases
+            .values()
+            .filter(|lease| lease.peer == peer)
+            .map(|lease| lease.until)
+            .max()
+    }
+
+    pub(super) fn lease(&mut self, peer: &str, id: &str, ids: Vec<String>, until: Instant) {
+        let peer = peer.to_string();
+        self.leases
+            .insert(id.to_string(), Lease { peer, until, ids });
+    }
+
+    /* the reader holds what the lease handed it, so those records go; the lease stays until
+    release. An unknown or run-out lease, or another peer's, changes nothing */
+    pub(super) fn settle(&mut self, peer: &str, id: &str, now: Instant) -> bool {
+        self.prune_leases(now);
+        let Some(lease) = self.leases.get(id).filter(|lease| lease.peer == peer) else {
+            return false;
+        };
+        let ids = lease.ids.clone();
+        let before = self.count(peer);
+        self.retain(peer, |held| {
+            !ids.iter().any(|id| held.event()["id"] == id.as_str())
+        });
+        before != self.count(peer)
+    }
+
+    pub(super) fn release(&mut self, peer: &str, id: &str) {
+        self.leases
+            .retain(|key, lease| key != id || lease.peer != peer);
+    }
+
+    /* a rollback puts the queues back. Leases are memory only and change once a write lands,
+    so they stay as they are */
+    pub(super) fn restore(&mut self, queues: HashMap<String, Vec<QueuedRecord>>) {
+        self.queues = Self::from_map(queues).queues;
+    }
+
+    /* a lease ends when it runs out, or once none of its records is queued, whichever path
+    took them */
+    fn prune_leases(&mut self, now: Instant) {
+        let queues = &self.queues;
+        self.leases.retain(|_, lease| {
+            let queued = queues.get(&lease.peer).into_iter().flatten();
+            lease.until > now
+                && queued
+                    .filter_map(|held| held.event()["id"].as_str())
+                    .any(|id| lease.ids.iter().any(|leased| leased == id))
+        });
+    }
+
     pub(super) fn transfer_owed(&mut self, from: &str, to: &str) {
         let moved = self.take(from);
         let mut target = self.take(to);
@@ -187,7 +248,10 @@ impl Inbox {
 
     pub(super) fn from_map(mut queues: HashMap<String, Vec<QueuedRecord>>) -> Self {
         queues.retain(|_, records| !records.is_empty());
-        Self { queues }
+        Self {
+            queues,
+            leases: HashMap::new(),
+        }
     }
 
     pub(super) fn to_map(&self) -> HashMap<String, Vec<QueuedRecord>> {

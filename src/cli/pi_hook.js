@@ -959,8 +959,15 @@ export default function AmeshHooks(pi) {
 
   function EnqueueInbox(result) {
     selfId = result.peer_id || selfId;
-    for (const body of Array.isArray(result.inbox) ? result.inbox : []) {
+    const inbox = Array.isArray(result.inbox) ? result.inbox : [];
+    for (const body of inbox) {
       httpInbox.push({ body, session: result.session_id });
+    }
+    /* the queue drains in order, so once the batch's last record is accepted all of it is on
+    disk and the hub may let it go; a lease never settled runs out and the hub hands the batch
+    out again, which the accept log answers without a second injection */
+    if (inbox.length && result.lease) {
+      httpInbox.at(-1).settle = ["peer", "settle", result.lease, "--peer-id", selfId];
     }
     if (!EnsureLog()) {
       return;
@@ -972,6 +979,9 @@ export default function AmeshHooks(pi) {
         return;
       }
       httpInbox.shift();
+      if (item.settle) {
+        Cli(item.settle).catch((error) => console.error(`[amesh] ${error.message}`));
+      }
     }
   }
 

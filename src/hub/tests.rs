@@ -12,6 +12,7 @@ mod event_visibility;
 mod events_ring;
 mod handoff;
 mod ids;
+mod inbox_cap;
 mod incremental_persistence;
 mod job_dag;
 mod knowledge_api;

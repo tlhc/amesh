@@ -132,37 +132,6 @@ async fn jobs_persist_and_pending_is_id_only() {
 }
 
 #[tokio::test]
-async fn inbox_caps_at_50() {
-    let (app, _state) = test_app();
-    let (_, reg) = json_req(
-        app.clone(),
-        "POST",
-        "/peers",
-        json!({"name": "sink", "backend": "pi", "circle": "default"}),
-    )
-    .await;
-    let peer_id = reg["peer_id"].as_str().unwrap().to_string();
-    for i in 0..51 {
-        let (st, _) = json_req(
-            app.clone(),
-            "POST",
-            "/notify",
-            json!({"from_peer": "boss", "to_peer": "sink", "message": format!("m{i}")}),
-        )
-        .await;
-        assert_eq!(st, StatusCode::OK);
-    }
-    let (_, pending) = json_req(
-        app,
-        "GET",
-        &format!("/asks/pending?peer_id={peer_id}"),
-        json!({}),
-    )
-    .await;
-    assert_eq!(pending["inbox"].as_array().unwrap().len(), 50);
-}
-
-#[tokio::test]
 async fn job_assigned_peer_and_chat_go_to_inbox() {
     let (app, hub, _state) = test_app_with_hub();
     let _ = json_req(

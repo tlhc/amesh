@@ -5,12 +5,12 @@ mod knowledge;
 use inbox::{Inbox, Outbound, QueuedRecord};
 
 use rusqlite::{params, Connection};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{
     ws::{Message, WebSocket, WebSocketUpgrade},
@@ -36,6 +36,10 @@ struct App {
 
 struct Hub {
     db: Connection,
+    /* the state a failed write left only in memory, for changes no request can take back: a
+    link that dropped and the frames it handed back. A failed request rolls back to it
+    instead of to the disk; the next write that lands clears it */
+    unwritten: Option<DiskState>,
     peers: HashMap<String, Peer>,
     asks: HashMap<String, Ask>,
     jobs: HashMap<String, Job>,
@@ -43,8 +47,8 @@ struct Hub {
     sockets: HashMap<String, (u64, mpsc::UnboundedSender<Outbound>)>,
     /* recv_live: peers whose current connection acknowledges every frame with a recv, so
     the inbox is the record of what they are owed and a send is only a copy of it.
-    recv_known: every peer that ever made that promise; persisted, so what they are owed
-    is never evicted, not while they are away and not across a hub restart */
+    recv_known: every peer that ever made that promise; persisted, so a send to them is
+    never refused for a full queue, not while they are away and not across a hub restart */
     recv_live: HashSet<String>,
     recv_known: HashSet<String>,
     /* the build each live socket named when it connected; memory only, like the sockets */
@@ -188,7 +192,7 @@ struct Schedule {
     circle: String,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct DiskState {
     peers: HashMap<String, Peer>,
     asks: HashMap<String, Ask>,
@@ -1004,7 +1008,7 @@ fn apply_disk(hub: &mut Hub, disk: DiskState) {
     hub.asks = disk.asks;
     hub.jobs = disk.jobs;
     hub.schedules = disk.schedules;
-    hub.inbox = Inbox::from_map(disk.inbox);
+    hub.inbox.restore(disk.inbox);
     hub.mcp_servers = disk.mcp_servers;
     hub.owed = disk.owed;
     hub.recv_known = disk.recv_peers;
@@ -1073,6 +1077,7 @@ impl Hub {
         }
         Ok(Hub {
             db,
+            unwritten: None,
             peers,
             asks: disk.asks,
             jobs: disk.jobs,
@@ -1101,8 +1106,8 @@ fn load_hub(path: &Path) -> Result<Hub, String> {
     Hub::open(path).map_err(|error| format!("cannot open state {}: {error}", path.display()))
 }
 
-fn persist(hub: &mut Hub) -> Result<(), String> {
-    let disk = DiskState {
+fn disk_state(hub: &Hub) -> DiskState {
+    DiskState {
         peers: hub.peers.clone(),
         asks: hub.asks.clone(),
         jobs: hub.jobs.clone(),
@@ -1111,16 +1116,27 @@ fn persist(hub: &mut Hub) -> Result<(), String> {
         mcp_servers: hub.mcp_servers.clone(),
         recv_peers: hub.recv_known.clone(),
         owed: hub.owed.clone(),
-    };
+    }
+}
+
+fn persist(hub: &mut Hub) -> Result<(), String> {
+    let disk = disk_state(hub);
     write_snapshot(&mut hub.db, &disk)?;
+    hub.unwritten = None;
     hub.changes.send_modify(|count| *count += 1);
     Ok(())
 }
 
+/* a request whose write fails is undone: the hub goes back to what it held before the
+request, the disk unless a failed write left a change only in memory */
 fn persist_ok(hub: &mut Hub) -> Result<(), (StatusCode, Json<Value>)> {
     if let Err(e) = persist(hub) {
-        if let Ok(disk) = read_snapshot(&hub.db) {
-            apply_disk(hub, disk);
+        let before = match hub.unwritten.clone() {
+            Some(state) => Ok(state),
+            None => read_snapshot(&hub.db),
+        };
+        if let Ok(before) = before {
+            apply_disk(hub, before);
         }
         return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))));
     }
@@ -1191,6 +1207,38 @@ const DISPLACED: &str = "displaced";
 const REPLACED: &str = "replaced";
 const PEER_HINTS: usize = 8;
 
+/* a peer that does not acknowledge holds at most INBOX_MAX records from senders: a send that
+would queue past that is refused before anything is minted, so the sender learns it, and a
+target named twice counts twice. What the hub queues by its own doing, an ack reply, a watch
+event, a job ask or reminder, a handoff notice, a schedule fire or what a dropped link hands
+back, is never refused and can take a queue past the cap */
+fn admit<'a>(
+    hub: &Hub,
+    targets: impl IntoIterator<Item = &'a str>,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let mut adding: BTreeMap<&str, usize> = BTreeMap::new();
+    for to in targets {
+        if let Some(peer) = resolve(hub, to) {
+            *adding.entry(peer.peer_id.as_str()).or_default() += 1;
+        }
+    }
+    let full: Vec<String> = adding
+        .into_iter()
+        .filter(|(id, n)| !hub.recv_known.contains(*id) && hub.inbox.count(id) + n > INBOX_MAX)
+        .map(|(id, _)| format!("{id} holds {} undelivered records", hub.inbox.count(id)))
+        .collect();
+    if full.is_empty() {
+        return Ok(());
+    }
+    Err((
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({
+            "error": format!("inbox full: {}", full.join(", ")),
+            "hint": "nothing was sent; retry once the peer has read its queue"
+        })),
+    ))
+}
+
 /* a mistyped target should correct itself: the caller's online circle mates are the
 names it meant, so the error carries them instead of costing a list_peers round trip.
 Without a resolvable caller there is no circle to scope by, and offering every peer would
@@ -1235,7 +1283,6 @@ fn queue_inbox(hub: &mut Hub, peer_id: &str, events: impl IntoIterator<Item = Va
         events
             .into_iter()
             .map(|event| QueuedRecord::new(event, now)),
-        hub.recv_known.contains(peer_id),
     );
 }
 
@@ -1281,18 +1328,31 @@ fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Outbound>) 
         return false;
     }
     if hub.owed.contains_key(peer_id) {
-        hub.inbox
-            .enqueue(peer_id, owed, hub.recv_known.contains(peer_id));
+        hub.inbox.enqueue(peer_id, owed);
         return true;
     }
     if !hub.peers.contains_key(peer_id) {
         return false;
     }
     let Some(successor) = hub.sockets.get(peer_id).map(|(_, tx)| tx.clone()) else {
-        hub.inbox
-            .enqueue(peer_id, owed, hub.recv_known.contains(peer_id));
+        hub.inbox.enqueue(peer_id, owed);
         return true;
     };
+    /* an acknowledging successor holds nothing until its recv, so the inbox keeps these and
+    the successor gets copies, as with any delivery to it */
+    if hub.recv_live.contains(peer_id) {
+        let owed: Vec<QueuedRecord> = owed
+            .into_iter()
+            .map(|record| {
+                QueuedRecord::new(with_event_id(record.event().clone()), record.queued_at())
+            })
+            .collect();
+        hub.inbox.enqueue(peer_id, owed.clone());
+        for record in owed {
+            let _ = successor.send(Outbound::Copy(record));
+        }
+        return true;
+    }
     let mut owed = owed.into_iter();
     for event in owed.by_ref() {
         if let Err(rejected) = successor.send(Outbound::Record(event)) {
@@ -1301,8 +1361,7 @@ fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Outbound>) 
                 unreachable!()
             };
             let stranded = std::iter::once(record).chain(owed);
-            hub.inbox
-                .enqueue(peer_id, stranded, hub.recv_known.contains(peer_id));
+            hub.inbox.enqueue(peer_id, stranded);
             hub.sockets.remove(peer_id);
             return true;
         }
@@ -1343,8 +1402,7 @@ fn persist_then_deliver(
         copy, and only the peer's recv for this id takes the record away */
         let event = with_event_id(event);
         let record = QueuedRecord::new(event.clone(), now);
-        hub.inbox
-            .enqueue(&key, [record.clone()], hub.recv_known.contains(&key));
+        hub.inbox.enqueue(&key, [record.clone()]);
         persist_ok(hub)?;
         push_event(hub, event.clone());
         if !unsettled {
@@ -1364,8 +1422,7 @@ fn persist_then_deliver(
         }
         hub.sockets.remove(&key);
     }
-    hub.inbox
-        .enqueue(&key, [record], hub.recv_known.contains(&key));
+    hub.inbox.enqueue(&key, [record]);
     persist_ok(hub)?;
     push_event(hub, event);
     Ok(())
@@ -1415,8 +1472,7 @@ fn queue_replies(hub: &mut Hub, replies: Vec<Value>, now: u64) -> Vec<(String, Q
         };
         let event = with_event_id(event);
         let record = QueuedRecord::new(event, now);
-        hub.inbox
-            .enqueue(&target, [record.clone()], hub.recv_known.contains(&target));
+        hub.inbox.enqueue(&target, [record.clone()]);
         queued.push((target, record));
     }
     queued
@@ -1814,6 +1870,7 @@ fn router(app: App) -> Router {
         .route("/notify", post(notify))
         .route("/broadcast", post(broadcast))
         .route("/asks/pending", get(pending_asks))
+        .route("/asks/pending/settle", post(settle_pending))
         .route("/jobs", get(list_jobs).post(create_job))
         .route(
             "/jobs/{id}",
@@ -2491,6 +2548,7 @@ async fn open_ask(
             Json(json!({"error": "the asker is not a registered peer"})),
         ));
     }
+    admit(&hub, [to_peer_id.as_str()])?;
     let cid = format!("ask-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let mut ask = Ask {
         correlation_id: cid.clone(),
@@ -2641,6 +2699,7 @@ async fn notify(
         &req.to_peer,
         req.cross_circle,
     )?;
+    admit(&hub, [req.to_peer.as_str()])?;
     let id = format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let event = json!({
         "type": "notify",
@@ -2716,7 +2775,9 @@ async fn broadcast(
             "to_peer": to,
             "message": req.message,
         });
-        match persist_then_deliver(&mut hub, &to, event, now) {
+        let sent = admit(&hub, [to.as_str()])
+            .and_then(|()| persist_then_deliver(&mut hub, &to, event, now));
+        match sent {
             Ok(()) => sent_to.push(to),
             Err((_, Json(err))) => failed.push(json!({"peer": to, "error": err})),
         }
@@ -2730,6 +2791,10 @@ async fn broadcast(
 struct PendingQuery {
     peer_id: Option<String>,
 }
+
+/* how long a pending read keeps what it handed out from the next read; a reader that never
+settles gets the records back after it, so a lost answer or a lost settle loses nothing */
+const LEASE_SECS: u64 = 60;
 
 async fn pending_asks(
     State(app): State<App>,
@@ -2756,21 +2821,74 @@ async fn pending_asks(
     /* an unsettled backlog is held the same way: the hook must not leak it to whoever holds
     the name before a session has proved it is the owner */
     let attached = hub.recv_live.contains(&peer_id) || hub.owed.contains_key(&peer_id);
-    let inbox = if attached {
+    let mut lease = None;
+    let inbox: Vec<Value> = if attached {
         Vec::new()
     } else {
+        let now = Instant::now();
+        /* a record that can no longer be delivered, an ask closed since it was queued or a
+        notice a newer one replaced, goes here, so it neither reaches the reader nor counts
+        against the queue */
         let queue = hub.inbox.take(&peer_id);
-        queue
+        let kept = queue
             .into_iter()
             .filter(|record| deliverable(&hub, record.event()))
-            .collect()
+            .collect();
+        hub.inbox.put(&peer_id, kept);
+        /* records queued for a peer that never acknowledged carry no id; a lease names
+        records by one */
+        hub.inbox.ensure_ids(&peer_id);
+        let leased = hub.inbox.leased(&peer_id, now);
+        let inbox: Vec<Value> = hub
+            .inbox
+            .records(&peer_id)
+            .iter()
+            .map(QueuedRecord::event)
+            .filter(|event| !leased.contains(event["id"].as_str().unwrap_or_default()))
+            .cloned()
+            .collect();
+        if !inbox.is_empty() {
+            let id = format!("lease-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let ids = inbox
+                .iter()
+                .filter_map(|event| event["id"].as_str().map(str::to_string))
+                .collect();
+            let secs = crate::cli::env_secs("AMESH_LEASE_SECS", LEASE_SECS);
+            lease = Some((id, ids, now + Duration::from_secs(secs)));
+        }
+        inbox
     };
     persist_ok(&mut hub)?;
-    let inbox: Vec<Value> = inbox
-        .into_iter()
-        .map(|record| record.event().clone())
-        .collect();
-    Ok(Json(json!({"asks": open, "inbox": inbox})))
+    /* held back only once the read is written: a read that fails hands nothing out */
+    let lease = lease.map(|(id, ids, until)| {
+        hub.inbox.lease(&peer_id, &id, ids, until);
+        id
+    });
+    Ok(Json(json!({"asks": open, "inbox": inbox, "lease": lease})))
+}
+
+#[derive(Deserialize)]
+struct SettleReq {
+    peer_id: String,
+    lease: String,
+}
+
+/* the reader has written out what a pending read handed it, so the hub lets those records go.
+An unknown or run-out lease is a no-op: its records were or will be handed out again */
+async fn settle_pending(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<SettleReq>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    check_auth(&app, &headers)?;
+    let mut hub = app.inner.lock().await;
+    if hub.inbox.settle(&req.peer_id, &req.lease, Instant::now()) {
+        persist_ok(&mut hub)?;
+    }
+    /* only once the removal is written: after a failed write the records are back and still
+    held for this reader's retry */
+    hub.inbox.release(&req.peer_id, &req.lease);
+    Ok(Json(json!({"ok": true})))
 }
 
 #[derive(Deserialize)]
@@ -2927,7 +3045,8 @@ async fn ask_many(
         ));
     }
     let parent = format!("batch-{}", &Uuid::new_v4().simple().to_string()[..8]);
-    /* every recipient is checked before any ask is opened, so a refused fan-out opens none */
+    /* every recipient is checked before any ask is opened, so a fan-out this check refuses
+    opens none */
     {
         let hub = app.inner.lock().await;
         for to in &req.to_peers {
@@ -2936,6 +3055,7 @@ async fn ask_many(
             }
             require_cross_circle(&hub, req.from_peer.as_deref(), to, req.cross_circle)?;
         }
+        admit(&hub, req.to_peers.iter().map(String::as_str))?;
     }
     let mut cids = Vec::new();
     let mut watches = serde_json::Map::new();
@@ -2972,6 +3092,7 @@ async fn ask_many(
                 body["parent_id"] = json!(parent);
                 body["asks"] = json!(cids);
                 body["watches"] = json!(watches);
+                body["hint"] = json!("the asks listed were opened; check them before retrying");
             }
             return Err((st, Json(body)));
         }
@@ -3536,6 +3657,7 @@ async fn ingest_chat(
     check_auth(&app, &headers)?;
     let mut hub = app.inner.lock().await;
     let now = now_unix();
+    admit(&hub, [req.peer.as_str()])?;
     let id = format!("evt-{}", &Uuid::new_v4().simple().to_string()[..8]);
     push_event(
         &mut hub,
@@ -6283,7 +6405,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
     };
     let recv = req.recv;
     let build = req.build;
-    let (peer_id, name, session_id, gen, mut rx, drained) = {
+    let (peer_id, name, session_id, gen, mut rx, drained) = loop {
         let mut hub = app.inner.lock().await;
         let Some(peer) = resolve(&hub, &key).cloned() else {
             drop(hub);
@@ -6305,6 +6427,25 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                 .await;
             let _ = socket.send(Message::Close(None)).await;
             return;
+        }
+        /* a pending read handed the backlog to a reader that has not settled it yet; a replay
+        here would deliver it twice, so the connection attaches once the lease ends: settled,
+        run out, or its records gone another way */
+        if let Some(end) = hub.inbox.lease_end(&peer.peer_id, Instant::now()) {
+            let mut changes = hub.changes.subscribe();
+            drop(hub);
+            let end = tokio::time::Instant::from_std(end);
+            /* a client that leaves while it waits must not take the name later from one that
+            is still there */
+            tokio::select! {
+                _ = tokio::time::timeout_at(end, changes.changed()) => {}
+                incoming = socket.recv() => {
+                    if matches!(incoming, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) {
+                        return;
+                    }
+                }
+            }
+            continue;
         }
         hub.conn_gen += 1;
         let gen = hub.conn_gen;
@@ -6371,22 +6512,30 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
             Some(build) => hub.builds.insert(peer.peer_id.clone(), build),
             None => hub.builds.remove(&peer.peer_id),
         };
-        (peer.peer_id, peer.name, peer.session_id, gen, rx, drained)
+        break (peer.peer_id, peer.name, peer.session_id, gen, rx, drained);
     };
-    let _ = socket
-        .send(Message::Text(
-            json!({"type":"connected","peer_id":peer_id,"name":name,"session_id":session_id})
-                .to_string()
-                .into(),
-        ))
-        .await;
+    /* a peer that stops reading leaves a send pending forever while everything delivered to it
+    piles up in the channel; a frame not written within the deadline counts as a failed send.
+    The deadline is per frame, so a reader too slow to take one frame within it is cut and gets
+    that frame again on its next connection */
+    let write = Duration::from_secs(crate::cli::env_secs("AMESH_WS_WRITE_SECS", 30));
+    let greeting = Message::Text(
+        json!({"type":"connected","peer_id":peer_id,"name":name,"session_id":session_id})
+            .to_string()
+            .into(),
+    );
+    if !matches!(
+        tokio::time::timeout(write, socket.send(greeting)).await,
+        Ok(Ok(()))
+    ) {
+        close_connection(&app, &peer_id, gen, recv, rx, drained).await;
+        return;
+    }
     let mut remain = 0;
     while remain < drained.len() {
-        if socket
-            .send(Message::Text(drained[remain].event().to_string().into()))
-            .await
-            .is_err()
-        {
+        let frame = Message::Text(drained[remain].event().to_string().into());
+        let sent = tokio::time::timeout(write, socket.send(frame)).await;
+        if !matches!(sent, Ok(Ok(()))) {
             close_connection(&app, &peer_id, gen, recv, rx, drained[remain..].to_vec()).await;
             return;
         }
@@ -6406,8 +6555,8 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                         let frame: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
                         if recv && frame["type"] == "recv" {
                             if let Some(id) = frame["id"].as_str() {
-                                /* persist_ok reloads the disk copy when the write fails, so a
-                                   recv that could not be recorded leaves the record owed */
+                                /* persist_ok rolls back when the write fails, so a recv that
+                                   could not be recorded leaves the record owed */
                                 if acknowledge_event(&mut hub, &peer_id, id) {
                                     if let Err((_, Json(err))) = persist_ok(&mut hub) {
                                         eprintln!("amesh persist: {err}");
@@ -6428,7 +6577,9 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
             event = rx.recv() => {
                 match event {
                     Some(v) => {
-                        if socket.send(Message::Text(v.event().to_string().into())).await.is_err() {
+                        let frame = Message::Text(v.event().to_string().into());
+                        let sent = tokio::time::timeout(write, socket.send(frame)).await;
+                        if !matches!(sent, Ok(Ok(()))) {
                             undelivered.push(v);
                             break;
                         }
@@ -6482,6 +6633,7 @@ async fn close_connection(
     if dirty {
         if let Err(e) = persist(&mut hub) {
             eprintln!("amesh persist: {e}");
+            hub.unwritten = Some(disk_state(&hub));
         }
     }
 }

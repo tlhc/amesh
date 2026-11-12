@@ -4,6 +4,7 @@ use serde_json::json;
 fn hub() -> Hub {
     Hub {
         db: rusqlite::Connection::open_in_memory().unwrap(),
+        unwritten: None,
         peers: HashMap::new(),
         asks: HashMap::new(),
         jobs: HashMap::new(),
@@ -1179,8 +1180,7 @@ fn delivery_no_push() {
 fn delivery_stuck_young() {
     let mut h = hub();
     peer(&mut h, "p", "alias", "online", "", 0);
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 99)], true);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 99)]);
     assert_eq!(
         delivery(&h, &h.peers["p"], 100).stuck,
         None,
@@ -1191,8 +1191,7 @@ fn delivery_stuck_young() {
 fn delivery_stuck_boundary() {
     let mut h = hub();
     peer(&mut h, "p", "alias", "online", "", 0);
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 98)], true);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 98)]);
     assert_eq!(
         delivery(&h, &h.peers["p"], 100).stuck,
         Some(Stuck {
@@ -1206,10 +1205,8 @@ fn delivery_stuck_boundary() {
 fn delivery_stuck_oldest_last() {
     let mut h = hub();
     peer(&mut h, "p", "alias", "online", "", 0);
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 99)], true);
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 90)], true);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 99)]);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 90)]);
     assert_eq!(
         delivery(&h, &h.peers["p"], 100).stuck,
         Some(Stuck {
@@ -1223,8 +1220,7 @@ fn delivery_stuck_oldest_last() {
 fn delivery_stuck_offline() {
     let mut h = hub();
     peer(&mut h, "p", "alias", "offline", "", 0);
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 90)], true);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 90)]);
     assert_eq!(
         delivery(&h, &h.peers["p"], 100).stuck,
         Some(Stuck {
@@ -1238,8 +1234,7 @@ fn delivery_stuck_offline() {
 fn delivery_stuck_future() {
     let mut h = hub();
     peer(&mut h, "p", "alias", "online", "", 0);
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 101)], true);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 101)]);
     assert_eq!(
         delivery(&h, &h.peers["p"], 100).stuck,
         None,
@@ -1260,11 +1255,9 @@ fn delivery_stuck_empty() {
 fn delivery_stuck_turnover() {
     let mut h = hub();
     peer(&mut h, "p", "alias", "online", "", 0);
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 90)], true);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 90)]);
     h.inbox.take("p");
-    h.inbox
-        .enqueue("p", [QueuedRecord::new(json!({}), 99)], true);
+    h.inbox.enqueue("p", [QueuedRecord::new(json!({}), 99)]);
     assert_eq!(
         delivery(&h, &h.peers["p"], 100).stuck,
         None,

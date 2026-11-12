@@ -46,30 +46,11 @@ fn stuck_future_timestamp_saturates() {
 }
 
 #[test]
-fn enqueue_protects_asks_and_evicts_oldest_chatter() {
-    let mut inbox = Inbox::default();
-    inbox.enqueue(
-        "p",
-        [QueuedRecord::new(json!({"type": "ask", "id": "ask"}), 0)],
-        false,
-    );
-    inbox.enqueue(
-        "p",
-        (0..super::super::INBOX_MAX).map(|i| QueuedRecord::new(json!({"id": i}), 0)),
-        false,
-    );
-    assert_eq!(inbox.count("p"), super::super::INBOX_MAX);
-    assert_eq!(inbox.records("p")[0].event()["id"], "ask");
-    assert_eq!(inbox.records("p")[1].event()["id"], 1);
-}
-
-#[test]
-fn owed_ignores_cap() {
+fn enqueue_never_drops_a_record() {
     let mut inbox = Inbox::default();
     inbox.enqueue(
         "p",
         (0..super::super::INBOX_MAX + 2).map(|i| QueuedRecord::new(json!({"id": i}), 0)),
-        true,
     );
     assert_eq!(inbox.count("p"), super::super::INBOX_MAX + 2);
     assert_eq!(inbox.records("p")[0].event()["id"], 0);
@@ -85,7 +66,6 @@ fn new_handoff_supersedes_same_topic() {
             QueuedRecord::new(json!({"handoff": true, "topic": "b", "id": "other"}), 0),
             QueuedRecord::new(json!({"handoff": true, "topic": "a", "id": "new"}), 0),
         ],
-        false,
     );
     assert_eq!(
         inbox.records("p"),
@@ -105,7 +85,6 @@ fn acknowledge_matches_id_and_cleans_empty_queue() {
             QueuedRecord::new(json!({"id": "a"}), 0),
             QueuedRecord::new(json!({"id": "b"}), 0),
         ],
-        false,
     );
     assert!(!inbox.acknowledge("p", "unknown"));
     assert!(inbox.acknowledge("p", "a"));
@@ -165,5 +144,27 @@ fn retain_all_cleans_empty_queues() {
     assert_eq!(
         inbox.records("keep"),
         &[QueuedRecord::new(json!({"keep": true}), 100)]
+    );
+}
+
+#[test]
+fn a_lease_ends_once_none_of_its_records_is_queued() {
+    let mut inbox = Inbox::default();
+    let now = Instant::now();
+    let until = now + std::time::Duration::from_secs(60);
+    let records = ["a", "b", "c"].map(|id| QueuedRecord::new(json!({"id": id}), 100));
+    inbox.put("p", records.to_vec());
+    inbox.lease("p", "lease", vec!["a".into(), "b".into()], until);
+    assert!(inbox.acknowledge("p", "a"));
+    assert_eq!(
+        inbox.lease_end("p", now),
+        Some(until),
+        "a lease holds while one of its records is queued"
+    );
+    assert!(inbox.acknowledge("p", "b"));
+    assert_eq!(
+        inbox.lease_end("p", now),
+        None,
+        "with its records gone another way it holds nothing back, whatever else is queued"
     );
 }

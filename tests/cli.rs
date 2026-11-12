@@ -3234,6 +3234,158 @@ fn codex_stop_blocks_when_ask_is_open() {
     assert!(String::from_utf8_lossy(&bad.stderr).contains("unsupported hook backend"));
 }
 
+/* the pending read alone, never settled: what a reader whose answer or settle was lost
+leaves behind */
+fn pending_read(sandbox: &Sandbox, peer: &str) -> Value {
+    let output = Command::new("curl")
+        .args([
+            "--silent",
+            "--noproxy",
+            "*",
+            "--header",
+            "Authorization: Bearer cli-test-token",
+            &format!("http://{}/asks/pending?peer_id={peer}", sandbox.bind),
+        ])
+        .output()
+        .unwrap();
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/* a peer with no socket, so what it is sent waits in the hub's inbox */
+fn notify_unattached_worker(sandbox: &Sandbox, message: &str) {
+    let register = [
+        "peer",
+        "register",
+        "--peer-id",
+        "worker",
+        "--backend",
+        "codex",
+    ];
+    sandbox.json(&register, None);
+    sandbox.json(&["peer", "notify", "worker", message], None);
+}
+
+#[test]
+fn an_unsettled_pending_read_hands_the_same_records_out_again() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_with(&[("AMESH_LEASE_SECS", "1")]);
+    notify_unattached_worker(&sandbox, "kept");
+    let first = pending_read(&sandbox, "worker");
+    assert_eq!(first["inbox"][0]["message"], "kept", "{first}");
+    assert!(first["lease"].is_string(), "{first}");
+    std::thread::sleep(Duration::from_millis(1500));
+    let again = pending_read(&sandbox, "worker");
+    assert_eq!(
+        again["inbox"], first["inbox"],
+        "a lease nobody settled runs out and the same records come back"
+    );
+    assert!(again["lease"].is_string(), "{again}");
+}
+
+#[test]
+fn peer_asks_settles_what_it_printed() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    notify_unattached_worker(&sandbox, "listed-once");
+    let listed = sandbox.json(&["peer", "asks", "--peer-id", "worker"], None);
+    assert_eq!(listed["inbox"][0]["message"], "listed-once", "{listed}");
+    assert_eq!(
+        inbox_count(&sandbox, "worker"),
+        0,
+        "peer asks settles what it printed"
+    );
+}
+
+fn codex_hook_peer(sandbox: &Sandbox, payload: &Value) -> String {
+    sandbox.json(
+        &["hook", "session", "--backend", "codex"],
+        Some(payload.clone()),
+    );
+    sandbox.json(&["peer", "list"], None)[0]["peer_id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn hook_shows(output: &Output, text: &str) {
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap_or_default();
+    assert!(
+        value["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .is_some_and(|context| context.contains(text)),
+        "{text} missing: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_hook_settles_the_inbox_it_showed() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let payload = json!({"session_id": "lease-shown", "cwd": sandbox.root});
+    let peer_id = codex_hook_peer(&sandbox, &payload);
+    sandbox.json(&["peer", "notify", &peer_id, "shown-once"], None);
+    let shown = sandbox.run(
+        &["hook", "prompt", "--backend", "codex"],
+        Some(payload.clone()),
+    );
+    hook_shows(&shown, "shown-once");
+    assert_eq!(
+        inbox_count(&sandbox, &peer_id),
+        0,
+        "the hook settles what it printed"
+    );
+    let next = sandbox.run(&["hook", "prompt", "--backend", "codex"], Some(payload));
+    assert!(next.status.success());
+    assert!(
+        next.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&next.stdout)
+    );
+}
+
+#[test]
+fn a_hook_whose_settle_cannot_reach_the_hub_leaves_the_inbox_to_come_back() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start_with(&[("AMESH_LEASE_SECS", "1")]);
+    let payload = json!({"session_id": "lease-lost", "cwd": sandbox.root});
+    let peer_id = codex_hook_peer(&sandbox, &payload);
+    sandbox.json(&["peer", "notify", &peer_id, "comes-back"], None);
+    /* a curl that reaches the hub for everything but the settle, which it sends to a socket
+    nobody listens on */
+    let bin = sandbox.root.join("lost-settle");
+    fs::create_dir(&bin).unwrap();
+    let curl = bin.join("curl");
+    fs::write(
+        &curl,
+        "#!/bin/sh\ncase \"$*\" in *asks/pending/settle*) set -- --unix-socket \"$0.sock\" \"$@\" ;; esac\nPATH=${PATH#*:} exec curl \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&curl, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let lost = sandbox.run_text(
+        &["hook", "prompt", "--backend", "codex"],
+        &payload.to_string(),
+        &[("PATH", &path)],
+    );
+    let stderr = String::from_utf8_lossy(&lost.stderr);
+    assert!(lost.status.success(), "{stderr}");
+    hook_shows(&lost, "comes-back");
+    assert!(
+        stderr.contains("settle lease-"),
+        "a lost settle is logged: {stderr}"
+    );
+    assert_eq!(
+        inbox_count(&sandbox, &peer_id),
+        1,
+        "the hub keeps what it never heard settled"
+    );
+    std::thread::sleep(Duration::from_millis(1500));
+    let again = sandbox.run(&["hook", "prompt", "--backend", "codex"], Some(payload));
+    hook_shows(&again, "comes-back");
+}
+
 fn assert_harness_env_guard(script: &str, state: bool, bind: bool) {
     let sandbox = Sandbox::new();
     let home = sandbox.root.join("home");

@@ -211,8 +211,10 @@ async fn mcp_wait_defaults_to_the_codex_exec_budget() {
 
 #[tokio::test]
 async fn mcp_events_returns_the_newest_trimmed_entries() {
-    let (app, _state) = test_app();
+    let (app, hub, _state) = test_app_with_hub();
     register(app.clone(), "here", "pi", "one").await;
+    /* an acknowledging peer's queue has no cap, so all 60 lines are accepted */
+    hub.lock().await.recv_known.insert("here".into());
     for i in 0..60 {
         let (st, _) = json_req(
             app.clone(),

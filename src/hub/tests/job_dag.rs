@@ -1958,7 +1958,6 @@ async fn closed_or_swept_asks_are_not_delivered() {
             json!({"type": "ask", "text": "no id"}),
             now_unix(),
         )],
-        true,
     );
     let (_, pending) = f
         .request("GET", "/asks/pending?peer_id=w1", json!({}))
