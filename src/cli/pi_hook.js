@@ -239,8 +239,8 @@ function WriteLog(file, rows, truncate = false) {
 }
 
 async function Ensure() {
-  const deadline = Date.now() + 2000;
-  const left = () => Math.max(0, deadline - Date.now());
+  const deadline = performance.now() + 2000;
+  const left = () => Math.max(0, deadline - performance.now());
   if (await ProbeHealth(left())) {
     return;
   }

@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import { test as nodeTest, after } from "node:test";
+import { test as nodeTest } from "node:test";
 
 if (!process.env.AMESH_STATE || !process.env.AMESH_BIND) {
   console.error(
@@ -73,7 +73,33 @@ process.env.PI_CODING_AGENT_DIR = join(cwd, `.pi-agent-${process.pid}`);
 mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 const NativeSessionManager = sessionManagerModule ? (await import(sessionManagerModule)).SessionManager : null;
 const source = await readFile(extensionPath, "utf8");
-const { default: AmeshHooks, ExecError } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+const { default: ExtensionFactory, ExecError } = await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+/* every instance keeps timers, a socket and a hold child alive, and node waits on them after
+a failure that skipped the instance's own shutdown. node:test cannot clean up for us: run as
+a plain script it ends its root at the first idle moment between subtests, so a root after
+hook registered early runs mid-run and one registered late never runs. The rest of the run
+therefore sits in one try whose finally shuts every instance down, whether the run reaches
+its end or stops at a failure outside a subtest. Its body is left unindented so the scripts
+it writes from template literals keep their exact text */
+const shutdowns = [];
+async function ShutdownAll() {
+  for (const shutdown of shutdowns.splice(0)) {
+    await shutdown();
+  }
+}
+function Tracked(factory) {
+  return (pi) => factory({
+    ...pi,
+    on(event, handler) {
+      if (event === "session_shutdown") {
+        shutdowns.push(() => handler({}, {}));
+      }
+      pi.on(event, handler);
+    },
+  });
+}
+const AmeshHooks = Tracked(ExtensionFactory);
+try {
 const handlers = new Map();
 const messages = [];
 const userMsgs = [];
@@ -198,14 +224,14 @@ const context = {
   },
 };
 async function waitCount(list, n, ms) {
-  const deadline = Date.now() + ms;
-  while (list.length < n && Date.now() < deadline) {
+  const deadline = performance.now() + ms;
+  while (list.length < n && performance.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
 async function waitUntil(pred, ms) {
-  const deadline = Date.now() + ms;
-  while (!pred() && Date.now() < deadline) {
+  const deadline = performance.now() + ms;
+  while (!pred() && performance.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   return pred();
@@ -457,7 +483,7 @@ await test("a settled agent reports idle when pi still says so a second later", 
     if (bin !== executable) {
       assert.notEqual(text, source, "the extension names its executable as a JSON string");
     }
-    const { default: Hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
+    const Hooks = Tracked((await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`)).default);
     const on = new Map();
     Hooks({ on(event, handler) { on.set(event, handler); }, sendMessage() {}, sendUserMessage() {}, registerTool() {} });
     const call = (event, ctx = context) => on.get(event)({}, ctx);
@@ -740,8 +766,7 @@ function InboxSession() {
   return { ctx, id: registered.peer_id, primer: registered.context };
 }
 
-const inboxInstances = [];
-function InboxInstance(state, failPrimer = false, hooks = AmeshHooks) {
+function InboxInstance(state, failPrimer = false, hooks = ExtensionFactory) {
   const handlers = new Map();
   const primers = [];
   const users = [];
@@ -749,7 +774,7 @@ function InboxInstance(state, failPrimer = false, hooks = AmeshHooks) {
   const sockets = [];
   let failUser = false;
   socketSink = sockets;
-  hooks({
+  Tracked(hooks)({
     on(event, handler) { handlers.set(event, handler); },
     sendMessage(message) {
       if (failPrimer) {
@@ -770,7 +795,6 @@ function InboxInstance(state, failPrimer = false, hooks = AmeshHooks) {
     },
     registerTool() {},
   });
-  inboxInstances.push({ handlers, ctx: state.ctx });
   return { handlers, primers, users, order, sockets, failNextUser() { failUser = true; } };
 }
 
@@ -1340,7 +1364,7 @@ await test("a tool child that exits before reading its input rejects, never thro
   const text = source.split(JSON.stringify(executable)).join(JSON.stringify(early));
   const { default: hooks } = await import(`data:text/javascript;base64,${Buffer.from(text).toString("base64")}`);
   const registered = {};
-  hooks({ on() {}, sendMessage() {}, sendUserMessage() {}, registerTool(def) { registered[def.name] = def; } });
+  Tracked(hooks)({ on() {}, sendMessage() {}, sendUserMessage() {}, registerTool(def) { registered[def.name] = def; } });
   /* a request larger than a pipe buffer is still being written when the child exits */
   const call = registered.amesh_job_create.execute("early", { title: "x".repeat(256 * 1024) });
   await assert.rejects(call, /mcp-refused/);
@@ -1533,8 +1557,8 @@ const state = JSON.parse(fs.readFileSync(${JSON.stringify(statePath)}, "utf8"));
 const verb = process.argv[3];
 if (verb === "stop" && state.gate) {
   fs.writeFileSync(${JSON.stringify(started)}, "");
-  const end = Date.now() + 10000;
-  while (!fs.existsSync(${JSON.stringify(release)}) && Date.now() < end) {}
+  const end = performance.now() + 10000;
+  while (!fs.existsSync(${JSON.stringify(release)}) && performance.now() < end) {}
   if (!fs.existsSync(${JSON.stringify(release)})) {
     process.exit(3);
   }
@@ -1741,7 +1765,7 @@ await test("connect retries back off up to a cap instead of every second", async
   const Native = globalThis.WebSocket;
   globalThis.WebSocket = class {
     constructor() {
-      stamps.push(Date.now());
+      stamps.push(performance.now());
       throw new Error("connect-backoff-probe");
     }
   };
@@ -2270,7 +2294,7 @@ await test("an HTTP inbox record leaves the hub only once its accept is on disk"
     await OwnerSleep(1000);
     assert.equal(await HubQueued(state.id), 1, "a failed accept settles nothing, so the record comes back");
     let left = 1;
-    for (const deadline = Date.now() + 8000; left !== 0 && Date.now() < deadline; ) {
+    for (const deadline = performance.now() + 8000; left !== 0 && performance.now() < deadline; ) {
       await OwnerSleep(50);
       left = await HubQueued(state.id);
     }
@@ -2400,9 +2424,6 @@ function readFileSync(path, ...rest) {
     await instance.handlers.get("session_shutdown")({}, state.ctx);
   }
 });
-
-after(async () => {
-  for (const instance of inboxInstances) {
-    await instance.handlers.get("session_shutdown")({}, instance.ctx);
-  }
-});
+} finally {
+  await ShutdownAll();
+}

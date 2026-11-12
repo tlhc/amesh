@@ -198,8 +198,8 @@ const Invoke = async (name, sessionID, args = {}) =>
 const Text = (result) =>
   typeof result.content === "string" ? result.content : result.content[0].text;
 async function Until(predicate, message, ms = 8000) {
-  const end = Date.now() + ms;
-  while (Date.now() < end) {
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
     if (await predicate()) return;
     await new Promise((done) => setTimeout(done, 25));
   }
@@ -1056,7 +1056,7 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
         },
       });
       await Until(() => entered, "event read started");
-      const started = Date.now();
+      const started = performance.now();
       try {
         await Promise.race([
           stopCleanup(),
@@ -1064,7 +1064,7 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
             setTimeout(() => reject(new Error("cleanup exceeded 3s")), 3000),
           ),
         ]);
-        assert(Date.now() - started < 3000);
+        assert(performance.now() - started < 3000);
       } finally {
         release();
       }

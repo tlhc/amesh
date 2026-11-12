@@ -186,6 +186,33 @@ test("RPC failure backs off and cleanup cancels the request and observer", async
   }
 });
 
+test("a failed join retries after its backoff even when the wall clock steps back", async () => {
+  const originalNow = performance.now;
+  const originalDateNow = Date.now;
+  let now = performance.now();
+  performance.now = () => now;
+  const f = Fixture({ type: "home" });
+  try {
+    f.perform(async () => {
+      throw new Error("unavailable");
+    });
+    f.route({ type: "session", sessionID: "root-a" });
+    await f.tick();
+    await f.tick();
+    assert.equal(f.calls.length, 1);
+    const wall = originalDateNow();
+    Date.now = () => wall - 3600 * 1000;
+    now += 1001;
+    await f.tick();
+    await f.tick();
+    assert.equal(f.calls.length, 2, "the first backoff is 1 s of monotonic time");
+  } finally {
+    f.dispose();
+    performance.now = originalNow;
+    Date.now = originalDateNow;
+  }
+});
+
 test("opening reports running and child approval states", async () => {
   const f = Fixture({ type: "home" });
   try {
@@ -228,9 +255,9 @@ test("terminal join failure shows reload once and stops retrying", async () => {
 });
 
 test("foreground join refreshes after server-only plugin replacement", async () => {
-  const originalNow = Date.now;
-  let now = originalNow();
-  Date.now = () => now;
+  const originalNow = performance.now;
+  let now = performance.now();
+  performance.now = () => now;
   const f = Fixture();
   try {
     await Flush();
@@ -243,7 +270,7 @@ test("foreground join refreshes after server-only plugin replacement", async () 
     assert.equal(f.calls[1].input.input.sessionID, "root-a");
   } finally {
     f.dispose();
-    Date.now = originalNow;
+    performance.now = originalNow;
   }
 });
 

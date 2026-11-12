@@ -16,13 +16,13 @@ export default {
       const sessionID = ctx.data.session.root(route.sessionID);
       const info = ctx.data.session.get(sessionID);
       if (!info || info.parentID) return;
-      if (Date.now() < (joined.get(sessionID)?.until ?? 0)) return;
+      if (performance.now() < (joined.get(sessionID)?.until ?? 0)) return;
       if (previous !== sessionID) {
         previous = sessionID;
         attempts = 0;
         retryAt = 0;
       }
-      if (Date.now() < retryAt) return;
+      if (performance.now() < retryAt) return;
       pending = true;
       const currentGeneration = generation;
       try {
@@ -48,7 +48,7 @@ export default {
         if (!stop.signal.aborted && generation === currentGeneration)
           joined.set(sessionID, {
             directory: info.location.directory,
-            until: Date.now() + 30000,
+            until: performance.now() + 30000,
           });
         attempts = 0;
       } catch (error) {
@@ -71,7 +71,7 @@ export default {
             return;
           }
           retryAt =
-            Date.now() + Math.min(30000, 1000 * 2 ** Math.min(attempts++, 5));
+            performance.now() + Math.min(30000, 1000 * 2 ** Math.min(attempts++, 5));
         }
       } finally {
         pending = false;

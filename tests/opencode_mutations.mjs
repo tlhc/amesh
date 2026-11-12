@@ -274,13 +274,13 @@ async function RunCase([name, from, to, expected]) {
     delete env[key];
   const hub = spawn(executable, ["serve"], { cwd: dir, env, stdio: "ignore" });
   try {
-    const deadline = Date.now() + 5000;
+    const deadline = performance.now() + 5000;
     while (true) {
       try {
         const res = await fetch(`http://${bind}/health`);
         if (res.ok) break;
       } catch {}
-      assert(Date.now() < deadline, "hub ready");
+      assert(performance.now() < deadline, "hub ready");
       await new Promise((done) => setTimeout(done, 20));
     }
     const setup = await Run(executable, ["setup", "opencode"], { cwd: dir, env });

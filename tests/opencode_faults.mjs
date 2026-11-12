@@ -49,8 +49,8 @@ class Socket extends EventTarget {
 }
 globalThis.WebSocket = Socket;
 async function Until(predicate) {
-  const deadline = Date.now() + 3000;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + 3000;
+  while (performance.now() < deadline) {
     if (await predicate()) return;
     await new Promise((done) => setTimeout(done, 20));
   }
@@ -252,12 +252,12 @@ for (const [name, timeout] of [
     async () => {
       const fixture = await Fixture(name, "hang");
       try {
-        const before = Date.now();
+        const before = performance.now();
         await assert.rejects(
           fixture.invoke(name),
           new RegExp(`timeout ${timeout}ms.*outcome may be unknown`),
         );
-        const elapsed = Date.now() - before;
+        const elapsed = performance.now() - before;
         assert(elapsed >= timeout && elapsed < timeout + 5000);
         const pid = Number(await readFile(fixture.started, "utf8"));
         assert.throws(() => process.kill(pid, 0), { code: "ESRCH" });
@@ -277,7 +277,7 @@ test(
       "ok",
       () => new Promise(() => {}),
     );
-    const before = Date.now();
+    const before = performance.now();
     let timer;
     try {
       await Promise.race([
@@ -289,7 +289,7 @@ test(
           );
         }),
       ]);
-      assert(Date.now() - before < 5000);
+      assert(performance.now() - before < 5000);
     } finally {
       clearTimeout(timer);
     }
