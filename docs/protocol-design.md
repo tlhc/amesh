@@ -10,7 +10,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - If `AMESH_TOKEN` is set at `serve` start, HTTP needs `Authorization: Bearer <token>` (`check_auth`):
   - a mismatch is 401
   - an empty token means no check
-- `GET /health` is always open: `{"ok":true,"name":"amesh","version":"0.1.0"}`.
+- `GET /health` is always open: `{"ok":true,"name":"amesh","version":"0.1.0","build":"…"}`. `build` identifies the running hub binary (`dev:ino:size:mtime` on Unix), or is null when unavailable.
 
 ## Roster
 
@@ -26,6 +26,8 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `POST /ask-many` checks every recipient and the cross-circle rule before it opens any ask; one that still fails after others went out returns its error with `parent_id` and the `asks` already opened. Batches live in memory: after a restart `GET /ask-many/{id}` is 404, and the asks are waited on by id.
 - The hub closes an open ask, failed and `closed_by: "hub"`, when its recipient's session is replaced under the same name, did not come back within 24 h, or its recipient left with no session to come back for; the asker's copy reads `[failed] <reason>`.
 - `GET /asks/pending?peer_id=` returns open asks for that peer. With an acknowledging WebSocket attached, the inbox is empty here; only WS `recv` retires those copies.
+  - Otherwise, inbox records are returned with a `lease` id, held out of later reads for 60 s (`AMESH_LEASE_SECS`); an empty inbox has `lease: null`. A backlog reserved for an absent session also stays out of this response.
+  - After accepting the records, `POST /asks/pending/settle` with `{"peer_id":"…","lease":"…"}` removes them and releases the lease. An unknown, expired or another peer's lease changes nothing. Leases live in memory; expiry or hub restart permits redelivery, so delivery is at least once.
 - `POST /asks/{id}/wait` waits on that id, and returns early when the recipient stops at a prompt or ends its turn during the wait. While the ask is open the answer also carries `schema_version`, `captured_at`, its `state`, `from_peer_id`, `actions` and `for_secs` (seconds since the ask opened while it awaits pickup, otherwise since the recipient's current activity began; null when gone, offline or unstamped), all read at the final check; a closed ask's answer is unchanged. MCP `amesh_wait` adds the same fields.
 - `POST /ack` with `correlation_id` closes the ask:
   - omitting `message` still closes
@@ -66,6 +68,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `POST /broadcast` goes to every other peer in the sender's circle:
   - a different `circle` needs `cross_circle: true`
   - do not ack a broadcast
+- Sends by ask, ask-many, notify and chat return 429 `inbox full` when they would take a target without known recv support past 50 queued records, including leased ones. Broadcast reports each rejected target in `failed` and continues. Hub-generated replies, jobs and reminders can exceed this cap.
 
 ## Events
 
@@ -105,7 +108,8 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 
 ## WebSocket
 
-- `GET /ws`. The first text frame must be `{"type":"connect","peer_id":"…"}` (or `name`), with optional `auth_token` and `recv`. The hub replies `{"type":"connected","peer_id":"…","name":"…"}`.
+- `GET /ws`. The first text frame must be `{"type":"connect","peer_id":"…"}` (or `name`), with optional `auth_token`, `recv` and `build`. The hub replies `{"type":"connected","peer_id":"…","name":"…"}`.
+- Attachment waits for that peer's pending-read leases to end. Once attached, each outgoing greeting or event has a 30 s write deadline (`AMESH_WS_WRITE_SECS`); a failed write closes the connection and returns undelivered records to the inbox.
 - If `recv` is true, the peer promises `{"type":"recv","id":"…"}` for each event with an id:
   - the hub drops the durable inbox row only on that recv (`acknowledge_event`)
   - each inbox row keeps the time its delivery was first owed (`queued_at`), through replay, requeue, transfer and restart; rows from before this field count from the upgrade
@@ -133,3 +137,4 @@ Same handlers, no extra semantics:
 - `amesh_list_peers(detail=true)` returns a JSON array of the same `PeerView` rows used by the snapshot roster, after the usual peer probe and circle check.
 - Rows are sorted by peer ID. The default response keeps its five tab-separated columns.
 - `running` counts jobs; `queued` counts retained inbox records; `activity: null` means unknown. `push` and `acks` describe the current transport.
+- `build` is the current WebSocket client's reported binary identity, or null. With a live connection and a known hub build, `stale` is true when the client build differs or is missing, false when equal; otherwise null. Reinstalling the same commit can change this identity.
