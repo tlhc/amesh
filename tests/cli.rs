@@ -23,6 +23,9 @@ mod unbound_routing_tests;
 #[path = "cli/knowledge_cli.rs"]
 mod knowledge_cli_tests;
 
+#[path = "cli/strict_flags.rs"]
+mod strict_flags;
+
 /* a claude-code hook inherits CLAUDE_CODE_MESSAGING_SOCKET from whatever launched it and
 injects into that socket without checking which peer owns it, so any spawn that can reach
 the amesh binary must drop the identity and messaging variables of the developer session
@@ -2800,6 +2803,32 @@ fn cli_jobs_dispatch_in_dependency_order() {
         .as_str()
         .unwrap()
         .to_string();
+    let invalid = sandbox.run(
+        &[
+            "peer",
+            "ack",
+            &first,
+            "--failed",
+            "tru",
+            "--from-peer",
+            "worker",
+        ],
+        None,
+    );
+    let pending = sandbox.json(&["peer", "asks", "--peer-id", "worker"], None);
+    assert!(
+        pending["asks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|ask| ask["correlation_id"] == first),
+        "{pending}"
+    );
+    assert_eq!(
+        sandbox.json(&["jobs", "show", &a_id], None)["state"],
+        "running"
+    );
+    assert!(!invalid.status.success(), "{invalid:?}");
     assert_eq!(
         sandbox.json(&["jobs", "show", &b_id], None)["state"],
         "queued"

@@ -261,6 +261,12 @@ impl Args {
             .to_string()
     }
 
+    fn bool_flag(&self, name: &str) -> Result<bool> {
+        self.get(name, "false")
+            .parse()
+            .map_err(|_| format!("--{name} requires true or false").into())
+    }
+
     fn copy(&self, body: &mut Value) {
         for (key, text) in &self.flags {
             body[key.replace('-', "_")] = json!(text);
@@ -1031,12 +1037,8 @@ fn filter_peers(peers: Value, circle: &str) -> Result<Value> {
 }
 
 fn watch_flags(args: &Args, body: &mut Value) -> Result<()> {
-    if let Some(text) = args.flags.get("watch") {
-        body["watch"] = match text.as_str() {
-            "true" => json!(true),
-            "false" => json!(false),
-            _ => return Err("--watch requires true or false".into()),
-        };
+    if args.flags.contains_key("watch") {
+        body["watch"] = json!(args.bool_flag("watch")?);
     }
     if let Some(text) = args.flags.get("deadline-seconds") {
         body["deadline_seconds"] = json!(text
@@ -1116,7 +1118,7 @@ fn peer(raw: &[String]) -> Result<Value> {
             let mut body = json!({"from_peer": caller(&args, false)?, "to_peer": args.pos[0]});
             body[if command == "ask" { "text" } else { "message" }] =
                 json!(args.pos[1..].join(" "));
-            if args.get("cross-circle", "") == "true" {
+            if args.bool_flag("cross-circle")? {
                 body["cross_circle"] = json!(true);
             }
             if command == "ask" {
@@ -1131,7 +1133,7 @@ fn peer(raw: &[String]) -> Result<Value> {
             if let Some(circle) = args.flags.get("circle") {
                 body["circle"] = json!(circle);
             }
-            if args.get("cross-circle", "") == "true" {
+            if args.bool_flag("cross-circle")? {
                 body["cross_circle"] = json!(true);
             }
             request("POST", "/broadcast", Some(body))
@@ -1143,7 +1145,7 @@ fn peer(raw: &[String]) -> Result<Value> {
                 return Err("ask-many target list contains an empty peer".into());
             }
             let mut body = json!({"from_peer": caller(&args, false)?, "to_peers": peers, "text": args.pos[1..].join(" ")});
-            if args.get("cross-circle", "") == "true" {
+            if args.bool_flag("cross-circle")? {
                 body["cross_circle"] = json!(true);
             }
             watch_flags(&args, &mut body)?;
@@ -1191,7 +1193,7 @@ fn peer(raw: &[String]) -> Result<Value> {
             args.count(1, 1)?;
             let mut body = json!({"correlation_id": args.pos[0]});
             args.copy(&mut body);
-            body["failed"] = json!(args.get("failed", "false") == "true");
+            body["failed"] = json!(args.bool_flag("failed")?);
             request("POST", "/ack", Some(body))
         }
         "events" => {
@@ -1349,6 +1351,9 @@ fn jobs(raw: &[String]) -> Result<Value> {
                         .collect()
                 })
                 .unwrap_or_default();
+            if args.flags.contains_key("depends-on") && depends_on.is_empty() {
+                return Err("--depends-on requires at least one job id".into());
+            }
             body["depends_on"] = json!(depends_on);
             watch_flags(&args, &mut body)?;
             request("POST", "/jobs", Some(body))
@@ -1436,7 +1441,7 @@ fn schedule(raw: &[String]) -> Result<Value> {
                     body[key.replace('-', "_")] = json!(number);
                 }
             }
-            body["cross_circle"] = json!(args.get("cross-circle", "") == "true");
+            body["cross_circle"] = json!(args.bool_flag("cross-circle")?);
             request("POST", "/schedules", Some(body))
         }
     }
@@ -1938,11 +1943,8 @@ fn sweep_stale_runtime_files() {
 
 fn gc(args: &Args) -> Result<Value> {
     args.count(0, 0)?;
-    let apply = args.get("apply", "false") == "true";
-    let days = args
-        .flags
-        .get("attachments-days")
-        .and_then(|text| text.parse::<u64>().ok());
+    let apply = args.bool_flag("apply")?;
+    let days = number_flag(args, "attachments-days", 0, u64::MAX)?;
     let home_set = args.flags.contains_key("home");
     let dir = if home_set {
         let root = home(args)?;
@@ -2525,7 +2527,7 @@ fn strip_amesh_hooks(settings: &mut Value) -> Result<bool> {
 
 fn uninstall(args: &Args) -> Result<Value> {
     args.count(0, 1)?;
-    let apply = args.get("apply", "false") == "true";
+    let apply = args.bool_flag("apply")?;
     let runtimes: &[&str] = match args.pos.first().map(String::as_str) {
         None => &["pi", "claude-code", "codex", "opencode"],
         Some("pi") => &["pi"],
