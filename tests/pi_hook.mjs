@@ -2424,6 +2424,45 @@ function readFileSync(path, ...rest) {
     await instance.handlers.get("session_shutdown")({}, state.ctx);
   }
 });
+for (const key of ["result", "mesage"]) {
+  await test(`the ack tool rejects ${key} without closing the ask`, async () => {
+    const ask = JSON.parse((await defs.amesh_ask.execute("ack-validation", {
+      peer_name: peerId, query: "ACK field validation", watch: false,
+    })).content[0].text);
+    try {
+      await assert.rejects(
+        defs.amesh_ack.execute("bad-ack", { correlation_id: ask.correlation_id, [key]: "reply" }),
+        (error) => {
+          assert.match(error.message, new RegExp(`unknown argument "${key}"`));
+          assert.match(error.message, /expected one of correlation_id, message, failed/);
+          return true;
+        },
+      );
+      assert.equal(AskVisible(peerId, ask.correlation_id), true, "rejected ACK leaves the ask open");
+      const message = "完整回复\nsecond line";
+      await defs.amesh_ack.execute("corrected-ack", { correlation_id: ask.correlation_id, message });
+      const closed = JSON.parse(execFileSync(executable,
+        ["peer", "wait", ask.correlation_id, "--timeout-seconds", "1"], { encoding: "utf8" }));
+      assert.deepEqual([closed.open, closed.reply, closed.failed], [false, message, false]);
+    } finally {
+      if (AskVisible(peerId, ask.correlation_id)) {
+        execFileSync(executable, ["peer", "ack", ask.correlation_id]);
+      }
+    }
+  });
+}
+await test("the ack tool keeps bare and failed replies", async () => {
+  for (const params of [{}, { message: "could not finish", failed: true }]) {
+    const ask = JSON.parse((await defs.amesh_ask.execute("ack-compatible", {
+      peer_name: peerId, query: "ACK compatibility", watch: false,
+    })).content[0].text);
+    await defs.amesh_ack.execute("valid-ack", { correlation_id: ask.correlation_id, ...params });
+    const closed = JSON.parse(execFileSync(executable,
+      ["peer", "wait", ask.correlation_id, "--timeout-seconds", "1"], { encoding: "utf8" }));
+    assert.deepEqual([closed.open, closed.reply, closed.failed],
+      [false, params.message ?? null, params.failed ?? false]);
+  }
+});
 } finally {
   await ShutdownAll();
 }
