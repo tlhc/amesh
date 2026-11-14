@@ -1024,13 +1024,13 @@ export default function AmeshHooks(pi) {
       },
       ["peer_name", "query"],
       (params) => {
-        const args = ["peer", "ask", params.peer_name, params.query, ...FromPeer()];
+        const args = ["peer", "ask", ...FromPeer()];
         if (params.cross_circle) args.push("--cross-circle", "true");
         if (params.watch !== undefined) args.push("--watch", String(params.watch));
         if (params.deadline_seconds !== undefined) {
           args.push("--deadline-seconds", String(params.deadline_seconds));
         }
-        return Cli(args);
+        return Cli([...args, "--", params.peer_name, params.query]);
       },
     );
     tool(
@@ -1065,9 +1065,9 @@ export default function AmeshHooks(pi) {
       },
       ["peer_name", "message"],
       (params) => {
-        const args = ["peer", "notify", params.peer_name, params.message, ...FromPeer()];
+        const args = ["peer", "notify", ...FromPeer()];
         if (params.cross_circle) args.push("--cross-circle", "true");
-        return Cli(args);
+        return Cli([...args, "--", params.peer_name, params.message]);
       },
     );
     const extra = [

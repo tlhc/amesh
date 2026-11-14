@@ -445,7 +445,13 @@ fn internal(error: rusqlite::Error) -> Failure {
 }
 
 fn not_found() -> Failure {
-    fail(StatusCode::NOT_FOUND, "unknown knowledge")
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "error": "unknown knowledge",
+            "hint": "Use the full id: kn- followed by 32 lowercase hexadecimal digits. Short ids in messages are abbreviations; copy the complete id from amesh_knowledge_search."
+        })),
+    )
 }
 
 #[cfg(test)]

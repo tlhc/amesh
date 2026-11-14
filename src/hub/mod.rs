@@ -5462,6 +5462,18 @@ async fn mcp_job_scope(app: &App, args: &Value, id: &str) -> Result<(), (StatusC
     Ok(())
 }
 
+fn mcp_bool(args: &Value, key: &str) -> Result<Option<bool>, (StatusCode, Json<Value>)> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_bool().map(Some).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{key} must be a boolean")})),
+            )
+        }),
+    }
+}
+
 fn mcp_u64(args: &Value, key: &str) -> Result<Option<u64>, (StatusCode, Json<Value>)> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -5490,10 +5502,7 @@ fn mcp_scope(hub: &Hub, args: &Value) -> Result<Option<String>, (StatusCode, Jso
         .get("circle")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty());
-    let cross = args
-        .get("cross_circle")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let cross = mcp_bool(args, "cross_circle")?.unwrap_or(false);
     if circle.is_some_and(|c| c != own) && !cross {
         return Err((
             StatusCode::FORBIDDEN,
@@ -5845,16 +5854,17 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             .unwrap_or("amesh anonymous")
             .to_string(),
         "amesh_list_peers" => {
+            let detail = mcp_bool(&args, "detail")?.unwrap_or(false);
             let mut hub = app.inner.lock().await;
-            probe_peers(&mut hub)?;
             let filter = mcp_scope(&hub, &args)?;
+            probe_peers(&mut hub)?;
             let mut peers: Vec<_> = hub
                 .peers
                 .values()
                 .filter(|peer| filter.as_deref().is_none_or(|circle| peer.circle == circle))
                 .collect();
             peers.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-            if args.get("detail").and_then(Value::as_bool).unwrap_or(false) {
+            if detail {
                 let model = derive::ReadModel::new(&hub, now_unix());
                 json!(peers
                     .iter()
@@ -5897,12 +5907,9 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                     to_peer: to.into(),
                     text: query.into(),
                     attachments: None,
-                    cross_circle: args
-                        .get("cross_circle")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    watch: args.get("watch").and_then(Value::as_bool),
-                    deadline_seconds: args.get("deadline_seconds").and_then(Value::as_u64),
+                    cross_circle: mcp_bool(&args, "cross_circle")?.unwrap_or(false),
+                    watch: mcp_bool(&args, "watch")?,
+                    deadline_seconds: mcp_u64(&args, "deadline_seconds")?,
                 }),
             )
             .await?;
@@ -5946,10 +5953,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .map(|s| s.to_string()),
                     to_peer: to.into(),
                     message: message.into(),
-                    cross_circle: args
-                        .get("cross_circle")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    cross_circle: mcp_bool(&args, "cross_circle")?.unwrap_or(false),
                 }),
             )
             .await?;
@@ -5974,10 +5978,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .into(),
-                    cross_circle: args
-                        .get("cross_circle")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    cross_circle: mcp_bool(&args, "cross_circle")?.unwrap_or(false),
                 }),
             )
             .await?;
@@ -6015,8 +6016,8 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .get("from_peer")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    watch: args.get("watch").and_then(Value::as_bool),
-                    deadline_seconds: args.get("deadline_seconds").and_then(Value::as_u64),
+                    watch: mcp_bool(&args, "watch")?,
+                    deadline_seconds: mcp_u64(&args, "deadline_seconds")?,
                     /* a malformed list read as empty would send the job at once */
                     depends_on: match args.get("depends_on") {
                         None | Some(Value::Null) => Vec::new(),
@@ -6035,7 +6036,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
         "amesh_job_list" => {
             let hub = app.inner.lock().await;
             let filter = mcp_scope(&hub, &args)?;
-            let detail = args.get("detail").and_then(Value::as_bool).unwrap_or(false);
+            let detail = mcp_bool(&args, "detail")?.unwrap_or(false);
             let state = match args.get("state") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(wanted)) if wanted.is_empty() => None,
@@ -6151,10 +6152,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                     in_seconds: mcp_u64(&args, "in_seconds")?,
                     fire_at: mcp_u64(&args, "fire_at")?,
                     every_seconds: mcp_u64(&args, "every_seconds")?,
-                    cross_circle: args
-                        .get("cross_circle")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    cross_circle: mcp_bool(&args, "cross_circle")?.unwrap_or(false),
                 }),
             )
             .await?;
@@ -6210,12 +6208,9 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .into(),
-                    cross_circle: args
-                        .get("cross_circle")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    watch: args.get("watch").and_then(Value::as_bool),
-                    deadline_seconds: args.get("deadline_seconds").and_then(Value::as_u64),
+                    cross_circle: mcp_bool(&args, "cross_circle")?.unwrap_or(false),
+                    watch: mcp_bool(&args, "watch")?,
+                    deadline_seconds: mcp_u64(&args, "deadline_seconds")?,
                 }),
             )
             .await?;
@@ -6227,7 +6222,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let timeout = match args.get("timeout_seconds").and_then(Value::as_u64) {
+            let timeout = match mcp_u64(&args, "timeout_seconds")? {
                 Some(secs) => secs,
                 None => {
                     let hub = app.inner.lock().await;
@@ -6254,7 +6249,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 .get("correlation_id")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            let deadline = args.get("deadline_seconds").and_then(Value::as_u64);
+            let deadline = mcp_u64(&args, "deadline_seconds")?;
             let mut hub = app.inner.lock().await;
             register_watch(
                 &mut hub,
@@ -6266,6 +6261,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             .to_string()
         }
         "amesh_events" => {
+            let limit = mcp_u64(&args, "limit")?;
             let mut q = HashMap::new();
             let own = {
                 let hub = app.inner.lock().await;
@@ -6285,10 +6281,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                 .get("circle")
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty());
-            let cross = args
-                .get("cross_circle")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
+            let cross = mcp_bool(&args, "cross_circle")?.unwrap_or(false);
             if circle.is_some_and(|circle| circle != own) && !cross {
                 return Err((
                     StatusCode::FORBIDDEN,
@@ -6319,7 +6312,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                     list.retain(|event| event["at"].as_u64().is_none_or(|at| at >= floor));
                 }
             }
-            trim_events(rows, args.get("limit").and_then(Value::as_u64), from_cursor).to_string()
+            trim_events(rows, limit, from_cursor).to_string()
         }
         _ => {
             return Err((

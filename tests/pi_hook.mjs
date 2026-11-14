@@ -2451,6 +2451,33 @@ for (const key of ["result", "mesage"]) {
     }
   });
 }
+for (const tool of ["ask", "notify_peer"]) {
+  for (const message of ["--help", "-h", "--- summary\n中文正文  "]) {
+    await test(`the ${tool} tool preserves literal body ${JSON.stringify(message)}`, async () => {
+      const state = InboxSessionAt(join(cwd, `literal-${tool}-${++inboxSessionIndex}`));
+      const params = { peer_name: state.id, cross_circle: true };
+      params[tool === "ask" ? "query" : "message"] = message;
+      if (tool === "ask") {
+        params.watch = false;
+        if (message !== "--help") params.deadline_seconds = message === "-h" ? 0 : 60;
+      }
+      const result = JSON.parse((await defs[`amesh_${tool}`].execute("literal-body", params)).content[0].text);
+      assert.equal(result.ok, true);
+      const pending = JSON.parse(execFileSync(executable,
+        ["peer", "asks", "--peer-id", state.id], { encoding: "utf8" }));
+      if (tool === "ask") {
+        const ask = pending.asks.find((ask) => ask.correlation_id === result.correlation_id);
+        assert.equal(ask.text, message);
+        assert.equal(ask.from_peer, peerId);
+        if (params.deadline_seconds === undefined) assert.equal(result.watch_until, null);
+        else assert.ok(result.watch_until > 0);
+        execFileSync(executable, ["peer", "ack", result.correlation_id]);
+      } else {
+        assert.ok(pending.inbox.some((event) => event.message === message && event.from_peer === peerId));
+      }
+    });
+  }
+}
 for (const message of ["--help", "-h", "--- summary\n中文正文"]) {
   await test(`the ack tool preserves literal message ${JSON.stringify(message)}`, async () => {
     const ask = JSON.parse((await defs.amesh_ask.execute("literal-ack", {

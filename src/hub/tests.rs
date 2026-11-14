@@ -16,6 +16,7 @@ mod inbox_cap;
 mod incremental_persistence;
 mod job_dag;
 mod knowledge_api;
+mod mcp_scalar_validation;
 mod mcp_schedule;
 mod mcp_wait_events;
 mod ownership;

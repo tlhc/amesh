@@ -569,6 +569,59 @@ fn get_returns_the_full_row_only_inside_the_circle() {
     );
 }
 
+fn missing_id_hint(action: &str) {
+    let mut db = store();
+    let (mine, other) = (peer("p1", "c1"), peer("p2", "c2"));
+    let id = publish(&mut db, &mine, NOW, entry("t"))["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let args = |id: &str| {
+        let mut args = json!({"id": id});
+        if action == "revoke" {
+            args["reason"] = json!("x");
+        }
+        args
+    };
+    for caller in [&mine, &other] {
+        let (status, body) = call(&mut db, action, args(&id[..11]), caller, NOW).unwrap_err();
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["error"], "unknown knowledge");
+        let hint = body.0["hint"].as_str().unwrap_or("");
+        assert!(hint.contains("32 lowercase hexadecimal"), "{body:?}");
+        assert!(hint.contains("amesh_knowledge_search"), "{body:?}");
+        assert!(!hint.contains(&id));
+    }
+    let (_, foreign) = call(&mut db, action, args(&id), &other, NOW).unwrap_err();
+    let (_, missing) = call(
+        &mut db,
+        action,
+        args("kn-00000000000000000000000000000000"),
+        &mine,
+        NOW,
+    )
+    .unwrap_err();
+    assert_eq!(foreign.0, missing.0);
+    assert_eq!(foreign.0["error"], "unknown knowledge");
+    assert_eq!(rows(&db), 1);
+    assert_eq!(get(&mut db, &mine, NOW, &json!(id))["status"], "active");
+}
+
+#[test]
+fn get_explains_incomplete_ids() {
+    missing_id_hint("get");
+}
+
+#[test]
+fn revoke_explains_incomplete_ids() {
+    missing_id_hint("revoke");
+}
+
+#[test]
+fn delete_explains_incomplete_ids() {
+    missing_id_hint("delete");
+}
+
 #[test]
 fn get_reports_expired_then_revoked_status() {
     let mut db = store();
