@@ -2516,6 +2516,87 @@ fn setup_rejects_invalid_settings_without_overwriting() {
 }
 
 #[test]
+fn cli_ack_preserves_an_explicit_empty_message() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    sandbox.json(
+        &[
+            "peer",
+            "register",
+            "--name",
+            "worker",
+            "--backend",
+            "pi",
+            "--peer-id",
+            "worker",
+        ],
+        None,
+    );
+    for failed in ["false", "true"] {
+        let ask = sandbox.json(
+            &["peer", "ask", "worker", "empty ACK", "--watch", "false"],
+            None,
+        );
+        let cid = ask["correlation_id"].as_str().unwrap();
+        for flag in ["--from-peer=", "--failed="] {
+            assert!(!sandbox
+                .run(&["peer", "ack", cid, flag], None)
+                .status
+                .success());
+            let open = sandbox.json(&["peer", "wait", cid, "--timeout-seconds", "0"], None);
+            assert_eq!(open["open"], true);
+            assert_eq!(open["reply"], Value::Null);
+        }
+        assert_eq!(
+            sandbox.json(
+                &["peer", "ack", cid, "--message=", "--failed", failed],
+                None
+            )["ok"],
+            true
+        );
+        let closed = sandbox.json(&["peer", "wait", cid, "--timeout-seconds", "1"], None);
+        assert_eq!(closed["open"], false);
+        assert_eq!(closed["reply"], "");
+        assert_eq!(closed["failed"], failed == "true");
+    }
+}
+
+#[test]
+fn cli_ack_preserves_inline_option_like_messages() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    sandbox.json(
+        &[
+            "peer",
+            "register",
+            "--name",
+            "worker",
+            "--backend",
+            "pi",
+            "--peer-id",
+            "worker",
+        ],
+        None,
+    );
+    for message in ["--help", "-h", "--- summary\n中文正文"] {
+        let ask = sandbox.json(
+            &["peer", "ask", "worker", "literal ACK", "--watch", "false"],
+            None,
+        );
+        let cid = ask["correlation_id"].as_str().unwrap();
+        let inline = format!("--message={message}");
+        assert_eq!(
+            sandbox.json(&["peer", "ack", cid, &inline], None)["ok"],
+            true
+        );
+        let closed = sandbox.json(&["peer", "wait", cid, "--timeout-seconds", "1"], None);
+        assert_eq!(closed["open"], false, "{message:?}");
+        assert_eq!(closed["reply"], message, "{message:?}");
+        assert_eq!(closed["failed"], false, "{message:?}");
+    }
+}
+
+#[test]
 fn cli_routes_peer_jobs_and_schedule_to_the_daemon() {
     let mut sandbox = Sandbox::new();
     sandbox.start();

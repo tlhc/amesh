@@ -1049,7 +1049,7 @@ export default function AmeshHooks(pi) {
           throw new Error(`unknown argument "${unknown}"; expected one of ${keys.join(", ")}`);
         }
         const args = ["peer", "ack", params.correlation_id];
-        if (params.message) args.push("--message", params.message);
+        if (params.message !== undefined) args.push(`--message=${params.message}`);
         if (params.failed) args.push("--failed", "true");
         args.push(...FromPeer());
         return Cli(args);

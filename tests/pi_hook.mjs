@@ -2451,6 +2451,28 @@ for (const key of ["result", "mesage"]) {
     }
   });
 }
+for (const message of ["--help", "-h", "--- summary\n中文正文"]) {
+  await test(`the ack tool preserves literal message ${JSON.stringify(message)}`, async () => {
+    const ask = JSON.parse((await defs.amesh_ask.execute("literal-ack", {
+      peer_name: peerId, query: "literal ACK message", watch: false,
+    })).content[0].text);
+    await defs.amesh_ack.execute("literal-ack", { correlation_id: ask.correlation_id, message });
+    const closed = JSON.parse(execFileSync(executable,
+      ["peer", "wait", ask.correlation_id, "--timeout-seconds", "1"], { encoding: "utf8" }));
+    assert.deepEqual([closed.open, closed.reply, closed.failed], [false, message, false]);
+  });
+}
+for (const failed of [false, true]) {
+  await test(`the ack tool preserves an empty message with failed=${failed}`, async () => {
+    const ask = JSON.parse((await defs.amesh_ask.execute("empty-ack", {
+      peer_name: peerId, query: "empty ACK message", watch: false,
+    })).content[0].text);
+    await defs.amesh_ack.execute("empty-ack", { correlation_id: ask.correlation_id, message: "", failed });
+    const closed = JSON.parse(execFileSync(executable,
+      ["peer", "wait", ask.correlation_id, "--timeout-seconds", "1"], { encoding: "utf8" }));
+    assert.deepEqual([closed.open, closed.reply, closed.failed], [false, "", failed]);
+  });
+}
 await test("the ack tool keeps bare and failed replies", async () => {
   for (const params of [{}, { message: "could not finish", failed: true }]) {
     const ask = JSON.parse((await defs.amesh_ask.execute("ack-compatible", {

@@ -616,7 +616,7 @@ fn knowledge_round_trip_against_a_real_hub() {
 }
 
 /* a value that starts with -- can only travel inline: the space form cannot tell it from a
-flag. knowledge accepts the inline form verbatim; every other command keeps the guard */
+flag. knowledge accepts the inline form verbatim */
 #[test]
 fn knowledge_publish_accepts_inline_values_that_start_with_dashes() {
     let sandbox = Sandbox::new();
@@ -698,8 +698,7 @@ fn knowledge_publish_keeps_the_space_form_guard() {
     );
 }
 
-/* only knowledge gains the inline literal form: another command must still refuse a value
-that looks like a flag */
+/* commands without inline literal support still refuse values that look like flags */
 #[test]
 fn other_commands_keep_the_inline_literal_guard() {
     fails_with(&["jobs", "create", "t", "--prompt=--y"], "--prompt");

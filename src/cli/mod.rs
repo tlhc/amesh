@@ -70,6 +70,8 @@ mesh
                                    Above 50 the CLI chains hub waits until the ack or N seconds;
                                    an unreachable hub is retried until N seconds pass
   peer ack CORRELATION_ID [--message TEXT] [--failed true] [--from-peer ID]
+                                   Use --message=TEXT for values that begin with -
+                                   --message= sends an empty reply; omit it for a bare ACK
   peer events TEXT [--peer-id ID] [--role ROLE]
   peer attach FILE                  Upload a file using base64
   peer mcp list NAME
@@ -201,8 +203,7 @@ impl Args {
         Self::parse_with(args, allowed, false)
     }
 
-    /* knowledge takes a value that starts with "--" when it is given inline: a body or a
-    query may itself begin with one. Every other command keeps the guard */
+    /* inline values can contain option-like text without being parsed as another flag */
     fn parse_inline(args: &[String], allowed: &[&str]) -> Result<Self> {
         Self::parse_with(args, allowed, true)
     }
@@ -229,7 +230,9 @@ impl Args {
                 let text = inline
                     .or_else(|| iter.next().map(String::as_str))
                     .ok_or_else(|| format!("--{name} requires a value"))?;
-                if text.is_empty() || (!literal && text.starts_with("--")) {
+                if (text.is_empty() && !(literal && name == "message"))
+                    || (!literal && text.starts_with("--"))
+                {
                     return Err(format!("--{name} requires a value").into());
                 }
                 if parsed.flags.insert(name.into(), text.into()).is_some() {
@@ -1065,7 +1068,11 @@ fn peer(raw: &[String]) -> Result<Value> {
         .first()
         .map(String::as_str)
         .ok_or("peer requires a subcommand")?;
-    let args = Args::parse(&raw[1..], peer_allowed(command)?)?;
+    let args = if command == "ack" {
+        Args::parse_inline(&raw[1..], peer_allowed(command)?)?
+    } else {
+        Args::parse(&raw[1..], peer_allowed(command)?)?
+    };
     match command {
         "list" => {
             args.count(0, 0)?;
