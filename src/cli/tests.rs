@@ -1189,3 +1189,13 @@ fn a_spawned_drainer_is_told_which_process_spawned_it() {
     let own = std::process::id().to_string();
     assert_eq!(named, Some(std::ffi::OsStr::new(&own)));
 }
+
+#[test]
+fn ack_reminder_uses_schema_message_field() {
+    let reminder = pending_reminder("worker");
+    assert!(
+        reminder.contains("amesh_ack(correlation_id, message)"),
+        "{reminder}"
+    );
+    assert!(!reminder.contains("correlation_id, result"), "{reminder}");
+}

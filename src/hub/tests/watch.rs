@@ -72,7 +72,17 @@ fn a_watch_pushes_stalled_once_and_nudges_the_recipient() {
     assert_eq!(nudged.len(), 1, "{nudged:?}");
     assert_eq!(nudged[0]["topic"], "ask-1");
     assert_eq!(nudged[0]["correlation_id"], "ask-1");
-    assert!(nudged[0]["message"].as_str().unwrap().contains("amesh_ack"));
+    let nudge = nudged[0]["message"].as_str().unwrap();
+    assert!(nudge.contains("amesh_ack(correlation_id=ask-1)"), "{nudge}");
+    assert!(!nudge.contains("result="), "{nudge}");
+    let tools = mcp_tools();
+    let ack = tools
+        .iter()
+        .find(|tool| tool["name"] == "amesh_ack")
+        .unwrap();
+    for key in ["correlation_id", "message", "failed"] {
+        assert!(ack["inputSchema"]["properties"].get(key).is_some());
+    }
     advance_asks(&mut hub, t0 + 12);
     advance_asks(&mut hub, t0 + 600);
     assert!(

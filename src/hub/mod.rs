@@ -5909,28 +5909,24 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             res.0.to_string()
         }
         "amesh_ack" => {
-            let cid = args
-                .get("correlation_id")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let msg = args
-                .get("message")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let res = ack_ask(
-                State(app.clone()),
-                auth_headers(app),
-                Json(AckReq {
-                    correlation_id: cid.into(),
-                    message: msg,
-                    failed: args.get("failed").and_then(Value::as_bool).unwrap_or(false),
-                    from_peer: args
-                        .get("from_peer")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                }),
-            )
-            .await?;
+            const KEYS: &[&str] = &["correlation_id", "message", "failed", "from_peer"];
+            let object = args.as_object().ok_or_else(|| (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "ACK arguments must be an object with correlation_id, message, failed, from_peer"})),
+            ))?;
+            if let Some(key) = object.keys().find(|key| !KEYS.contains(&key.as_str())) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": format!("unknown argument {key:?}; expected one of {}", KEYS.join(", "))
+                    })),
+                ));
+            }
+            let req = serde_json::from_value::<AckReq>(args).map_err(|error| (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("invalid ACK arguments: {error}; expected correlation_id (string), message (string), failed (boolean), from_peer (string)")})),
+            ))?;
+            let res = ack_ask(State(app.clone()), auth_headers(app), Json(req)).await?;
             res.0.to_string()
         }
         "amesh_notify_peer" => {

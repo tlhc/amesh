@@ -216,3 +216,6 @@ fn test_outbound(event: Value) -> Outbound {
         Outbound::Record(QueuedRecord::new(event, 0))
     }
 }
+
+#[path = "tests/mcp_ack_validation.rs"]
+mod mcp_ack_validation;

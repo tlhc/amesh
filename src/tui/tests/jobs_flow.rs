@@ -711,7 +711,7 @@ fn errors_say_what_went_wrong() {
     app.home = false;
     app.apply(Err(format!(
         "GET /snapshot?circle=project-404abc: {}",
-        crate::cli::DAEMON_UNREACHABLE
+        crate::cli::HUB_CONNECT_FAILED
     )));
     assert_eq!(app.error.as_deref(), Some("hub unreachable"));
     app.apply(Err(
@@ -742,7 +742,7 @@ fn errors_say_what_went_wrong() {
         "other failures are shown as they are"
     );
     app.apply(Ok(s1()));
-    app.apply(Err(crate::cli::DAEMON_UNREACHABLE.to_string()));
+    app.apply(Err(crate::cli::HUB_CONNECT_FAILED.to_string()));
     let text = screen_text(&mut app, 46, 40).join("\n");
     assert!(flat(&text).contains("! hub unreachable · × sec"), "{text}");
 }

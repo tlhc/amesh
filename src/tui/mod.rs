@@ -124,6 +124,14 @@ impl Block {
     }
 }
 
+fn hub_trouble(error: &str) -> &'static str {
+    if error.contains(crate::cli::HUB_RESPONSE_INCOMPLETE) {
+        "hub response incomplete"
+    } else {
+        "hub unreachable"
+    }
+}
+
 impl App {
     fn copy_command(&mut self, index: usize, tmux: bool, out: &mut impl std::io::Write) {
         if self.events || self.knowledge {
@@ -243,8 +251,8 @@ impl App {
             Err(error) if error.contains("returned error: 401") => {
                 self.error = Some("the hub refused the token; check AMESH_TOKEN".into())
             }
-            Err(error) if error.contains(crate::cli::DAEMON_UNREACHABLE) => {
-                self.error = Some("hub unreachable".into())
+            Err(error) if crate::cli::is_transport_error(&error) => {
+                self.error = Some(hub_trouble(&error).into())
             }
             Err(error) => self.error = Some(error),
         }
@@ -1650,9 +1658,10 @@ impl App {
         /* what went wrong with the data on a row of its own: the snapshot read, else the events */
         let trouble = self.error_lead().map(|(text, _)| text).or_else(|| {
             let error = self.ev_error.as_deref()?;
-            Some(match error.contains(crate::cli::DAEMON_UNREACHABLE) {
-                true => "! events: hub unreachable".to_string(),
-                false => format!("! events: {error}"),
+            Some(if crate::cli::is_transport_error(error) {
+                format!("! events: {}", hub_trouble(error))
+            } else {
+                format!("! events: {error}")
             })
         });
         if let Some(text) = &trouble {

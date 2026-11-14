@@ -2965,7 +2965,7 @@ fn cli_peer_wait_gives_up_at_the_deadline_and_on_hub_errors() {
     let unreachable = |output: &Output| {
         assert!(!output.status.success(), "{output:?}");
         assert!(
-            String::from_utf8_lossy(&output.stderr).contains("amesh daemon unreachable"),
+            String::from_utf8_lossy(&output.stderr).contains("amesh hub response incomplete"),
             "the original error is reported: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -9600,3 +9600,6 @@ fn hook_ws_dedupes_a_replayed_id_within_one_connection() {
     assert!(messages[0].contains("dup"), "{messages:?}");
     assert!(messages[1].contains("tail"), "{messages:?}");
 }
+
+#[path = "cli/transport_errors.rs"]
+mod transport_errors;

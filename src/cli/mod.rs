@@ -17,7 +17,12 @@ use toml_edit::{value, DocumentMut};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-pub(crate) const DAEMON_UNREACHABLE: &str = "amesh daemon unreachable";
+pub(crate) const HUB_CONNECT_FAILED: &str = "amesh daemon unreachable";
+pub(crate) const HUB_RESPONSE_INCOMPLETE: &str = "amesh hub response incomplete";
+
+pub(crate) fn is_transport_error(error: &str) -> bool {
+    error.contains(HUB_CONNECT_FAILED) || error.contains(HUB_RESPONSE_INCOMPLETE)
+}
 const AMESH_OPENCODE_HOOK_MARK: &str = "/* amesh-plugin:opencode:v1 */";
 const AMESH_PI_HOOK_MARK: &str = "export default function AmeshHooks";
 const AMESH_HOOK_EVENTS: &[(&str, &str)] = &[
@@ -158,7 +163,7 @@ fn dispatch(args: &[String]) -> Result<()> {
         "knowledge" => knowledge(&args[1..])?,
         "hook" => {
             return match hook(&args[1..]) {
-                Err(error) if error.to_string().starts_with(DAEMON_UNREACHABLE) => Ok(()),
+                Err(error) if is_transport_error(&error.to_string()) => Ok(()),
                 result => result,
             }
         }
@@ -340,11 +345,17 @@ pub(crate) fn request(method: &str, path: &str, body: Option<Value>) -> Result<V
             String::from_utf8_lossy(&output.stderr).trim(),
             String::from_utf8_lossy(&output.stdout).trim()
         );
-        /* 6 dns, 7 refused, 28 timeout, 52 empty, 55 send, 56 recv: no daemon to talk to */
-        if matches!(output.status.code(), Some(6 | 7 | 28 | 52 | 55 | 56)) {
+        /* 6 dns, 7 refused: no daemon was reached */
+        if matches!(output.status.code(), Some(6 | 7)) {
             return Err(
-                format!("{DAEMON_UNREACHABLE} at {bind}, run `amesh doctor`: {detail}").into(),
+                format!("{HUB_CONNECT_FAILED} at {bind}, run `amesh doctor`: {detail}").into(),
             );
+        }
+        /* 18 partial, 28 timeout, 52 empty, 55 send, 56 recv: outcome unknown */
+        if matches!(output.status.code(), Some(18 | 28 | 52 | 55 | 56)) {
+            return Err(format!(
+                "{HUB_RESPONSE_INCOMPLETE} at {bind}; outcome unknown, the hub may have applied the request; check state before retrying anything with side effects: {detail}"
+            ).into());
         }
         return Err(detail.into());
     }
@@ -1154,7 +1165,7 @@ fn peer(raw: &[String]) -> Result<Value> {
                 ) {
                     /* a restarting hub drops the connection while the ask survives in its
                     state file, so the wait resumes once the hub listens again */
-                    Err(error) if error.to_string().starts_with(DAEMON_UNREACHABLE) => {
+                    Err(error) if is_transport_error(&error.to_string()) => {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         std::thread::sleep(remaining.min(Duration::from_secs(2)));
                         if Instant::now() >= deadline {
@@ -4055,7 +4066,7 @@ fn circle_roster(peer_id: &str, circle: &str) -> String {
 /* repeated on every prompt and stop while an ask is pending, so it stays one line; the
 full primer went out at SessionStart */
 fn pending_reminder(peer_id: &str) -> String {
-    format!("amesh: you are {peer_id}. Close each pending ask below with amesh_ack(correlation_id, result) when permitted; otherwise leave it open.")
+    format!("amesh: you are {peer_id}. Close each pending ask below with amesh_ack(correlation_id, message) when permitted; otherwise leave it open.")
 }
 
 fn mesh_primer(peer_id: &str, backend: &str, circle: &str) -> String {
@@ -4333,10 +4344,14 @@ fn hook(raw: &[String]) -> Result<()> {
                 && backend != "pi"
                 && backend != "opencode"
                 && bind_addr().is_ok_and(local_spawn_bind)
-                && error.to_string().starts_with(DAEMON_UNREACHABLE) =>
+                && is_transport_error(&error.to_string()) =>
         {
             let bind = bind_addr().map(|addr| addr.to_string()).unwrap_or_default();
-            let context = format!("amesh: the hub at {bind} did not answer, so this session may not be on the mesh; run `amesh doctor` to see why.");
+            let context = if error.to_string().contains(HUB_RESPONSE_INCOMPLETE) {
+                format!("amesh: the hub at {bind} gave no complete response; this session may already be registered. Check `amesh peer list`; if the peer is missing, run `amesh doctor`.")
+            } else {
+                format!("amesh: the hub at {bind} did not answer, so this session may not be on the mesh; run `amesh doctor` to see why.")
+            };
             println!(
                 "{}",
                 json!({"hookSpecificOutput": {"hookEventName": event, "additionalContext": context}})

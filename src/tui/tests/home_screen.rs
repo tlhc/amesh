@@ -83,7 +83,7 @@ fn home_stale() -> App {
     let mut app = home_app(home_busy());
     app.take_events(Err(format!(
         "GET /events?since=11: {}: connection refused",
-        crate::cli::DAEMON_UNREACHABLE
+        crate::cli::HUB_CONNECT_FAILED
     )));
     app.last_ok = std::time::Instant::now().checked_sub(std::time::Duration::from_millis(11_500));
     app
@@ -944,7 +944,7 @@ fn home_says_what_it_lacks_and_what_went_wrong() {
         screen_text(&mut app, 46, 24)[1],
         "! events: GET /events: timed out"
     );
-    app.apply(Err(crate::cli::DAEMON_UNREACHABLE.to_string()));
+    app.apply(Err(crate::cli::HUB_CONNECT_FAILED.to_string()));
     assert_eq!(
         screen_text(&mut app, 46, 24)[1],
         "! hub unreachable",
@@ -958,7 +958,7 @@ fn home_says_what_it_lacks_and_what_went_wrong() {
         keys,
         "waiting, HOME still names its keys"
     );
-    none.apply(Err(crate::cli::DAEMON_UNREACHABLE.to_string()));
+    none.apply(Err(crate::cli::HUB_CONNECT_FAILED.to_string()));
     let lines = screen_text(&mut none, 46, 24);
     assert_eq!(
         (lines[1].as_str(), lines[23].as_str()),
@@ -988,4 +988,20 @@ fn home_walks_the_arrow_of_an_ask_at_work() {
         row(&mut app, 2).contains("claude-code──▸pi-2"),
         "the arrow steps toward the recipient"
     );
+}
+
+#[test]
+fn incomplete_transport_response_keeps_distinct_tui_diagnostic() {
+    let mut app = home_app(home_busy());
+    let error = "amesh hub response incomplete: outcome unknown".to_string();
+    app.apply(Err(error.clone()));
+    assert_eq!(app.error.as_deref(), Some("hub response incomplete"));
+    app.error = None;
+    app.take_events(Err(error));
+    let screen = screen_text(&mut app, 80, 30).join("\n");
+    assert!(
+        screen.contains("! events: hub response incomplete"),
+        "{screen}"
+    );
+    assert!(!screen.contains("outcome unknown"), "{screen}");
 }
