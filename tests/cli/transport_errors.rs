@@ -10,6 +10,7 @@ enum ResponseLoss {
 
 struct LostResponse {
     bind: String,
+    accepted: Arc<AtomicUsize>,
     writes: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -20,9 +21,11 @@ impl LostResponse {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let bind = listener.local_addr().unwrap().to_string();
         listener.set_nonblocking(true).unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
         let writes = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread = std::thread::spawn({
+            let accepted = accepted.clone();
             let writes = writes.clone();
             let stop = stop.clone();
             move || {
@@ -35,6 +38,8 @@ impl LostResponse {
                         }
                         Err(e) => panic!("{e}"),
                     };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
@@ -93,6 +98,7 @@ impl LostResponse {
         });
         Self {
             bind,
+            accepted,
             writes,
             stop,
             thread: Some(thread),
@@ -102,7 +108,61 @@ impl LostResponse {
 impl Drop for LostResponse {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        self.thread.take().unwrap().join().unwrap();
+        if let Err(error) = self.thread.take().unwrap().join() {
+            if !std::thread::panicking() {
+                std::panic::resume_unwind(error);
+            }
+        }
+    }
+}
+
+#[test]
+fn lost_response_reads_a_request_after_accepting_the_connection() {
+    let hub = LostResponse::start(ResponseLoss::Truncated);
+    let mut client = TcpStream::connect(&hub.bind).unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while hub.accepted.load(Ordering::SeqCst) == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "fixture must accept the connection"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    client
+        .write_all(b"POST /ack HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")
+        .unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.ends_with("\r\n\r\n{}"), "{response:?}");
+    assert_eq!(hub.writes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn lost_response_reports_worker_failure_and_preserves_an_existing_panic() {
+    for already_panicking in [false, true] {
+        let result = std::panic::catch_unwind(|| {
+            let _hub = LostResponse {
+                bind: String::new(),
+                accepted: Arc::new(AtomicUsize::new(0)),
+                writes: Arc::new(AtomicUsize::new(0)),
+                stop: Arc::new(AtomicBool::new(false)),
+                thread: Some(std::thread::spawn(|| panic!("injected worker failure"))),
+            };
+            if already_panicking {
+                panic!("original test failure");
+            }
+        });
+        let error = result.expect_err("worker failures must remain visible");
+        let expected = if already_panicking {
+            "original test failure"
+        } else {
+            "injected worker failure"
+        };
+        assert_eq!(error.downcast_ref::<&str>(), Some(&expected));
+        eprintln!("worker panic reported; existing panic={already_panicking}");
     }
 }
 
