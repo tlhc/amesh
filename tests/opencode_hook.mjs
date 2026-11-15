@@ -212,6 +212,10 @@ const Details = async () =>
   JSON.parse(Text(await Invoke("amesh_list_peers", "ses_a", { detail: true })));
 let cleanup;
 await test("OpenCode plugin contracts against an isolated hub", async (t) => {
+  t.afterEach(() => {
+    failAdmit = false;
+    admissionError = undefined;
+  });
   try {
     cleanup = await plugin.setup(ctx);
     await t.test("catalog is directly visible with JSON schemas", () => {
@@ -366,6 +370,7 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
           await Until(
             () => reconnected().length >= 2,
             "the drainer must retry admission",
+            30000,
           );
           assert.equal(admitted.length, 0);
           await Until(
@@ -527,9 +532,13 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
         /./,
       );
     });
-    await t.test("recv waits for durable admission", async () => {
+    await t.test("recv waits for durable admission", async (t) => {
       let release;
       admissionGate = new Promise((done) => (release = done));
+      t.after(() => {
+        release();
+        admissionGate = undefined;
+      });
       const socket = sockets.find(
         (socket) =>
           socket.readyState === 1 &&
