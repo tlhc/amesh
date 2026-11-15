@@ -5486,6 +5486,11 @@ fn mcp_u64(args: &Value, key: &str) -> Result<Option<u64>, (StatusCode, Json<Val
     }
 }
 
+fn mcp_invalid_argument(mut error: Value) -> Value {
+    error["code"] = json!("INVALID_ARGUMENT");
+    json!({"isError": true, "content": [{"type": "text", "text": error.to_string()}]})
+}
+
 fn mcp_scope(hub: &Hub, args: &Value) -> Result<Option<String>, (StatusCode, Json<Value>)> {
     let own = args
         .get("from_peer")
@@ -5610,7 +5615,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
                     "prompt": {"type": "string"},
                     "path": {"type": "string"},
                     "backend": {"type": "string", "description": "optional runtime label; empty when not given, dispatch does not use it"},
-                    "assigned_peer": {"type": "string"},
+                    "assigned_peer": {"type": "string", "description": "Peer id string; omit or use null for an unassigned job. Invalid types return INVALID_ARGUMENT and create no job."},
                     "depends_on": {"type": "array", "items": {"type": "string"}},
                     "watch": {"type": "boolean"},
                     "deadline_seconds": {"type": "integer"}
@@ -5724,7 +5729,7 @@ pub(crate) fn mcp_tools() -> Vec<Value> {
             let mut t = obj(
                 "Ask many peers; each ask arms a watch by default (watch and deadline_seconds as in amesh_ask).",
                 json!({
-                    "to_peers": {"type": "array", "items": {"type": "string"}},
+                    "to_peers": {"type": "array", "items": {"type": "string"}, "description": "Peer id strings. Invalid types return INVALID_ARGUMENT with all invalid_indices (zero-based) and open no asks."},
                     "text": {"type": "string"},
                     "from_peer": {"type": "string"},
                     "cross_circle": {"type": "boolean"},
@@ -5985,6 +5990,17 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             res.0.to_string()
         }
         "amesh_job_create" => {
+            let assigned_peer = match args.get("assigned_peer") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(peer)) => Some(peer.clone()),
+                Some(_) => {
+                    return Ok(mcp_invalid_argument(json!({
+                        "error": "assigned_peer must be a string containing a peer id",
+                        "field": "assigned_peer",
+                        "hint": "Use the intended peer id as a string and resubmit; no job was created."
+                    })));
+                }
+            };
             let res = create_job(
                 State(app.clone()),
                 auth_headers(app),
@@ -6008,10 +6024,7 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         .get("backend")
                         .and_then(Value::as_str)
                         .map(str::to_string),
-                    assigned_peer: args
-                        .get("assigned_peer")
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
+                    assigned_peer,
                     from_peer: args
                         .get("from_peer")
                         .and_then(Value::as_str)
@@ -6184,15 +6197,35 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             res.0.to_string()
         }
         "amesh_ask_many" => {
-            let tos = args
-                .get("to_peers")
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let mut tos = Vec::new();
+            match args.get("to_peers") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(values)) => {
+                    let mut invalid_indices = Vec::new();
+                    for (index, value) in values.iter().enumerate() {
+                        if let Some(peer) = value.as_str() {
+                            tos.push(peer.to_string());
+                        } else {
+                            invalid_indices.push(index);
+                        }
+                    }
+                    if !invalid_indices.is_empty() {
+                        return Ok(mcp_invalid_argument(json!({
+                            "error": "to_peers must be an array of peer id strings",
+                            "field": "to_peers",
+                            "invalid_indices": invalid_indices,
+                            "hint": "Replace every indexed item with the intended peer id string and resubmit; no ask was opened."
+                        })));
+                    }
+                }
+                Some(_) => {
+                    return Ok(mcp_invalid_argument(json!({
+                        "error": "to_peers must be an array of peer id strings",
+                        "field": "to_peers",
+                        "hint": "Put the intended peer id strings in an array and resubmit; no ask was opened."
+                    })));
+                }
+            }
             let res = ask_many(
                 State(app.clone()),
                 auth_headers(app),

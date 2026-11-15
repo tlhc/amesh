@@ -453,6 +453,10 @@ export default function AmeshHooks(pi) {
             reject(new Error(reply.error.message || JSON.stringify(reply.error)));
             return;
           }
+          if (reply.result?.isError) {
+            reject(new Error(reply.result.content?.[0]?.text ?? "amesh tool failed"));
+            return;
+          }
           resolve(reply.result?.content?.[0]?.text ?? "");
         } catch (error) {
           reject(error);
@@ -1076,7 +1080,7 @@ export default function AmeshHooks(pi) {
         prompt: { type: "string" },
         path: { type: "string" },
         backend: { type: "string", description: "optional runtime label; empty when not given, dispatch does not use it" },
-        assigned_peer: { type: "string" },
+        assigned_peer: { type: "string", description: "Peer id string; omit or use null for an unassigned job. Invalid types return INVALID_ARGUMENT and create no job." },
         depends_on: { type: "array", items: { type: "string" } },
         watch: { type: "boolean" },
         deadline_seconds: { type: "integer" },
@@ -1117,7 +1121,7 @@ export default function AmeshHooks(pi) {
       }, []],
       ["schedule_delete", "Delete a schedule", { schedule_id: { type: "string" } }, ["schedule_id"]],
       ["ask_many", "Ask many peers; each ask arms a watch by default (watch and deadline_seconds as in amesh_ask).", {
-        to_peers: { type: "array", items: { type: "string" } },
+        to_peers: { type: "array", items: { type: "string" }, description: "Peer id strings. Invalid types return INVALID_ARGUMENT with all invalid_indices (zero-based) and open no asks." },
         text: { type: "string" },
         cross_circle: { type: "boolean" },
         watch: { type: "boolean" },

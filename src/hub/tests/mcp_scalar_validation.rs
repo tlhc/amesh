@@ -81,6 +81,103 @@ rejects!(jobs_cross, "amesh_job_list", "cross_circle");
 rejects!(jobs_detail, "amesh_job_list", "detail");
 rejects!(schedules_cross, "amesh_schedule_list", "cross_circle");
 
+async fn rejects_target(tool: &str, field: &str, value: Value, indices: Option<Value>) {
+    let (app, inner, _state) = test_app_with_hub();
+    register(app.clone(), "boss", "codex", "one").await;
+    register(app.clone(), "worker", "pi", "one").await;
+    let mut args = json!({
+        "from_peer":"boss", "title":"job", "prompt":"question",
+        "to_peers":["worker"], "text":"question", "watch":false
+    });
+    args[field] = value;
+    let before = business_state(&*inner.lock().await);
+    let (status, body) = mcp_tool(app, tool, args).await;
+    assert_eq!(business_state(&*inner.lock().await), before, "{body}");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let error: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(error["code"], "INVALID_ARGUMENT");
+    assert_eq!(error["field"], field);
+    assert!(
+        error["error"].as_str().unwrap().contains("string"),
+        "{error}"
+    );
+    let hint = error["hint"].as_str().unwrap();
+    assert!(hint.contains("resubmit"), "{error}");
+    assert!(
+        hint.contains(if field == "assigned_peer" {
+            "no job was created"
+        } else {
+            "no ask was opened"
+        }),
+        "{error}"
+    );
+    assert_eq!(error.get("invalid_indices"), indices.as_ref());
+}
+
+#[tokio::test]
+async fn assigned_peer_type_error_is_actionable() {
+    rejects_target("amesh_job_create", "assigned_peer", json!(42), None).await;
+}
+
+#[tokio::test]
+async fn recipient_type_error_lists_every_invalid_index() {
+    rejects_target(
+        "amesh_ask_many",
+        "to_peers",
+        json!(["worker", 42, false, null, {}, [], 1.5, -1, 0]),
+        Some(json!([1, 2, 3, 4, 5, 6, 7, 8])),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn recipient_list_type_error_is_actionable() {
+    rejects_target("amesh_ask_many", "to_peers", json!("worker"), None).await;
+}
+
+#[tokio::test]
+async fn target_arguments_keep_defaults_and_valid_values() {
+    let (app, inner, _state) = test_app_with_hub();
+    register(app.clone(), "boss", "codex", "one").await;
+    register(app.clone(), "worker", "pi", "one").await;
+    for value in [None, Some(Value::Null), Some(json!("worker"))] {
+        let mut args = json!({"from_peer":"boss", "title":"job", "watch":false});
+        if let Some(value) = value {
+            args["assigned_peer"] = value;
+        }
+        let (status, body) = mcp_tool(app.clone(), "amesh_job_create", args.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["result"]["isError"], true, "{body}");
+        let job: Value =
+            serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(job["assigned_peer"], args["assigned_peer"]);
+    }
+    for value in [
+        None,
+        Some(Value::Null),
+        Some(json!([])),
+        Some(json!(["worker"])),
+    ] {
+        let mut args = json!({"from_peer":"boss", "text":"q", "watch":false});
+        if let Some(value) = value {
+            args["to_peers"] = value;
+        }
+        let before = inner.lock().await.asks.len();
+        let (status, body) = mcp_tool(app.clone(), "amesh_ask_many", args.clone()).await;
+        if args["to_peers"] == json!(["worker"]) {
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_ne!(body["result"]["isError"], true, "{body}");
+            assert_eq!(inner.lock().await.asks.len(), before + 1);
+        } else {
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "to_peers required");
+            assert_eq!(inner.lock().await.asks.len(), before);
+        }
+    }
+}
+
 #[tokio::test]
 async fn optional_scalar_values_keep_their_meaning() {
     for args in [json!({}), json!({"value":null})] {

@@ -2512,6 +2512,36 @@ await test("the ack tool keeps bare and failed replies", async () => {
       [false, params.message ?? null, params.failed ?? false]);
   }
 });
+await test("MCP target errors reject without creating jobs and allow one corrected call", async () => {
+  const Jobs = async () => JSON.parse((await defs.amesh_job_list.execute("jobs", {})).content[0].text);
+  const before = await Jobs();
+  let job;
+  try {
+    await assert.rejects(
+      defs.amesh_job_create.execute("bad-target", { title: "target validation", assigned_peer: 42, watch: false }),
+      (error) => {
+        const detail = JSON.parse(error.message);
+        assert.equal(detail.code, "INVALID_ARGUMENT");
+        assert.equal(detail.field, "assigned_peer");
+        assert.match(detail.hint, /no job was created/);
+        assert.match(detail.hint, /resubmit/);
+        return true;
+      },
+    );
+    assert.deepEqual(await Jobs(), before);
+    job = JSON.parse((await defs.amesh_job_create.execute("corrected-target", {
+      title: "target validation", assigned_peer: peerId, watch: false,
+    })).content[0].text);
+    assert.equal(job.assigned_peer, peerId);
+    assert.ok(job.ask_id);
+    assert.equal((await Jobs()).length, before.length + 1);
+  } finally {
+    if (job) {
+      execFileSync(executable, ["jobs", "cancel", job.job_id]);
+      execFileSync(executable, ["jobs", "delete", job.job_id]);
+    }
+  }
+});
 } finally {
   await ShutdownAll();
 }
