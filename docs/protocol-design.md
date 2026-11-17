@@ -70,6 +70,12 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - do not ack a broadcast
 - Sends by ask, ask-many, notify and chat return 429 `inbox full` when they would take a target without known recv support past 50 queued records, including leased ones. Broadcast reports each rejected target in `failed` and continues. Hub-generated replies, jobs and reminders can exceed this cap.
 
+## Knowledge IDs
+
+- `POST /knowledge/get` takes `from_peer` and `id`: a full `kn-` ID (32 lowercase hex digits) or a unique prefix with 4-31 digits after `kn-`. It matches retained entries in the caller's circle, including expired/revoked ones, and returns the full `knowledge.id` and status.
+- No match: 404 `unknown knowledge`. Ambiguous: 409 with `code: "AMBIGUOUS_ID"`; supply more digits or a full ID from search.
+- `revoke`, `delete` and `replaces` require full IDs.
+
 ## Events
 
 - `GET /events` is the in-memory ring (last 500, cleared on restart). Each entry carries `seq` (rising by one per entry, starting at the clock in microseconds, so a restart on a clock that moves forward starts above every earlier entry), `at` (unix seconds) and, when it concerns an ask or a job, `topic` (that id):
