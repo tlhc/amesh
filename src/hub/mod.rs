@@ -6002,6 +6002,18 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
             res.0.to_string()
         }
         "amesh_job_create" => {
+            for field in ["backend", "path"] {
+                if args
+                    .get(field)
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                {
+                    return Ok(mcp_invalid_argument(json!({
+                        "error": format!("{field} must be a string"),
+                        "field": field,
+                        "hint": "Use a string and resubmit; no job was created."
+                    })));
+                }
+            }
             let assigned_peer = match args.get("assigned_peer") {
                 None | Some(Value::Null) => None,
                 Some(Value::String(peer)) => Some(peer.clone()),

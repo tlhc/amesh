@@ -134,7 +134,7 @@ async fn rejects_target(tool: &str, field: &str, value: Value, indices: Option<V
     let hint = error["hint"].as_str().unwrap();
     assert!(hint.contains("resubmit"), "{error}");
     assert!(
-        hint.contains(if field == "assigned_peer" {
+        hint.contains(if tool == "amesh_job_create" {
             "no job was created"
         } else {
             "no ask was opened"
@@ -142,6 +142,51 @@ async fn rejects_target(tool: &str, field: &str, value: Value, indices: Option<V
         "{error}"
     );
     assert_eq!(error.get("invalid_indices"), indices.as_ref());
+}
+
+#[tokio::test]
+async fn backend_type_error_is_actionable() {
+    for value in [json!(42), json!(false), json!([]), json!({})] {
+        rejects_target("amesh_job_create", "backend", value, None).await;
+    }
+}
+
+#[tokio::test]
+async fn path_type_error_is_actionable() {
+    for value in [json!(42), json!(false), json!([]), json!({})] {
+        rejects_target("amesh_job_create", "path", value, None).await;
+    }
+}
+
+#[tokio::test]
+async fn job_metadata_keeps_defaults_and_strings() {
+    let (app, inner, _state) = test_app_with_hub();
+    for value in [
+        None,
+        Some(Value::Null),
+        Some(json!("")),
+        Some(json!("codex")),
+    ] {
+        let mut args = json!({"title":"metadata", "watch":false});
+        if let Some(value) = value {
+            args["backend"] = value.clone();
+            args["path"] = value;
+        }
+        let (status, body) = mcp_tool(app.clone(), "amesh_job_create", args.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_ne!(body["result"]["isError"], true, "{body}");
+        let job = tool_json(&body);
+        assert_eq!(
+            job["backend"],
+            args["backend"].as_str().unwrap_or(""),
+            "{job}"
+        );
+        assert_eq!(job["path"], args["path"].as_str().unwrap_or(""), "{job}");
+        let hub = inner.lock().await;
+        let stored = &hub.jobs[job["job_id"].as_str().unwrap()];
+        assert_eq!(stored.backend, args["backend"].as_str().unwrap_or(""));
+        assert_eq!(stored.path, args["path"].as_str().unwrap_or(""));
+    }
 }
 
 #[tokio::test]
