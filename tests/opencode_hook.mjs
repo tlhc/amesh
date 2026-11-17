@@ -532,6 +532,18 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
         /./,
       );
     });
+    await t.test("tool validation errors expose the JSON payload", async () => {
+      await assert.rejects(
+        Invoke("amesh_job_create", "ses_a", { title: "invalid", assigned_peer: 42 }),
+        (error) => {
+          const detail = JSON.parse(error.message);
+          assert.equal(detail.code, "INVALID_ARGUMENT");
+          assert.equal(detail.field, "assigned_peer");
+          assert.equal(typeof detail.hint, "string");
+          return true;
+        },
+      );
+    });
     await t.test("recv waits for durable admission", async (t) => {
       let release;
       admissionGate = new Promise((done) => (release = done));

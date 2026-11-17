@@ -856,37 +856,52 @@ async fn http_rejects_every_seconds_zero() {
 #[tokio::test]
 async fn mcp_rejects_negative_fire_at() {
     let (app, _state) = schedule_worker_app().await;
-    let (st, _) = mcp_tool(
+    let (st, body) = mcp_tool(
         app,
         "amesh_schedule_create",
         json!({"to_peer": "worker", "text": "wake", "fire_at": -1}),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let error = tool_json(&body);
+    assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+    assert_eq!(error["field"], "fire_at", "{error}");
+    assert_eq!(error["error"], "fire_at must be an unsigned integer");
 }
 
 #[tokio::test]
 async fn mcp_rejects_negative_in_seconds() {
     let (app, _state) = schedule_worker_app().await;
-    let (st, _) = mcp_tool(
+    let (st, body) = mcp_tool(
         app,
         "amesh_schedule_create",
         json!({"to_peer": "worker", "text": "wake", "in_seconds": -1}),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let error = tool_json(&body);
+    assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+    assert_eq!(error["field"], "in_seconds", "{error}");
+    assert_eq!(error["error"], "in_seconds must be an unsigned integer");
 }
 
 #[tokio::test]
 async fn mcp_rejects_negative_every_seconds() {
     let (app, _state) = schedule_worker_app().await;
-    let (st, _) = mcp_tool(
+    let (st, body) = mcp_tool(
         app,
         "amesh_schedule_create",
         json!({"to_peer": "worker", "text": "wake", "in_seconds": 60, "every_seconds": -5}),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let error = tool_json(&body);
+    assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+    assert_eq!(error["field"], "every_seconds", "{error}");
+    assert_eq!(error["error"], "every_seconds must be an unsigned integer");
 }
 
 #[tokio::test]
@@ -954,13 +969,18 @@ async fn schedule_range_recurring_next_fire_round_trips() {
 #[tokio::test]
 async fn mcp_rejects_non_integer_fire_at() {
     let (app, _state) = schedule_worker_app().await;
-    let (st, _) = mcp_tool(
+    let (st, body) = mcp_tool(
         app,
         "amesh_schedule_create",
         json!({"to_peer": "worker", "text": "wake", "fire_at": 1.5}),
     )
     .await;
-    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert_eq!(st, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let error = tool_json(&body);
+    assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+    assert_eq!(error["field"], "fire_at", "{error}");
+    assert_eq!(error["error"], "fire_at must be an unsigned integer");
 }
 
 #[tokio::test]

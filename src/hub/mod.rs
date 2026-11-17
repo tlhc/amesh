@@ -5421,7 +5421,15 @@ async fn mcp(
             "capabilities": {"tools": {}}
         }),
         "tools/list" => json!({"tools": mcp_tools()}),
-        "tools/call" => mcp_call(&app, req.params).await?,
+        "tools/call" => match mcp_call(&app, req.params).await {
+            Err((StatusCode::BAD_REQUEST, Json(mut error)))
+                if error["code"] == "INVALID_ARGUMENT" =>
+            {
+                error["hint"] = json!("Use the required JSON type and resubmit.");
+                mcp_invalid_argument(error)
+            }
+            result => result?,
+        },
         "notifications/initialized" => {
             return Ok(Json(
                 json!({"jsonrpc": req.jsonrpc, "id": id, "result": null}),
@@ -5468,7 +5476,8 @@ fn mcp_bool(args: &Value, key: &str) -> Result<Option<bool>, (StatusCode, Json<V
         Some(v) => v.as_bool().map(Some).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("{key} must be a boolean")})),
+                Json(json!({"error": format!("{key} must be a boolean"),
+                    "code": "INVALID_ARGUMENT", "field": key})),
             )
         }),
     }
@@ -5480,7 +5489,10 @@ fn mcp_u64(args: &Value, key: &str) -> Result<Option<u64>, (StatusCode, Json<Val
         Some(v) => v.as_u64().map(Some).ok_or_else(|| {
             (
                 StatusCode::BAD_REQUEST,
-                Json(json!({"error": format!("{key} must be an unsigned integer")})),
+                Json(
+                    json!({"error": format!("{key} must be an unsigned integer"),
+                    "code": "INVALID_ARGUMENT", "field": key}),
+                ),
             )
         }),
     }
@@ -6037,7 +6049,8 @@ async fn mcp_call(app: &App, params: Value) -> Result<Value, (StatusCode, Json<V
                         Some(ids) => serde_json::from_value(ids.clone()).map_err(|_| {
                             (
                                 StatusCode::BAD_REQUEST,
-                                Json(json!({"error": "depends_on must be a list of job ids"})),
+                                Json(json!({"error": "depends_on must be a list of job ids",
+                                    "code": "INVALID_ARGUMENT", "field": "depends_on"})),
                             )
                         })?,
                     },

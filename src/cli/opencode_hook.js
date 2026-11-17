@@ -642,7 +642,7 @@ export default {
                 if (reply.error || reply.result?.isError)
                   throw new Error(
                     reply.error?.message ??
-                      JSON.stringify(reply.result.content),
+                      reply.result?.content?.[0]?.text ?? "amesh tool failed",
                   );
                 if (!Array.isArray(reply.result?.content))
                   throw new Error(

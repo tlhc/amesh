@@ -1744,13 +1744,25 @@ async fn mcp_job_create_rejects_malformed_dependencies() {
     let a = f.job(json!({"title": "a", "from_peer": "boss"})).await;
     for depends_on in [json!(a), json!([a, 7]), json!({"id": a})] {
         let (status, reply) = f
-            .tool(
-                "amesh_job_create",
-                json!({"title": "b", "assigned_peer": "w1", "from_peer": "boss",
-                       "depends_on": depends_on}),
+            .request(
+                "POST",
+                "/mcp",
+                json!({"jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":"amesh_job_create", "arguments":{
+                        "title":"b", "assigned_peer":"w1", "from_peer":"boss",
+                        "depends_on":depends_on}}}),
             )
             .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{depends_on} -> {reply}");
+        assert_eq!(status, StatusCode::OK, "{depends_on} -> {reply}");
+        assert_eq!(reply["result"]["isError"], true, "{reply}");
+        let error = tool_json(&reply);
+        assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+        assert_eq!(error["field"], "depends_on", "{error}");
+        assert_eq!(error["error"], "depends_on must be a list of job ids");
+        assert!(
+            error["hint"].as_str().unwrap().contains("resubmit"),
+            "{error}"
+        );
     }
     assert_eq!(f.0.inner.lock().await.jobs.len(), 1, "nothing was written");
 }

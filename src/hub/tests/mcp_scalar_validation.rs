@@ -47,8 +47,18 @@ async fn rejects_scalar(tool: &str, field: &str) {
         before,
         "{tool}/{field}: {body}"
     );
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{tool}/{field}: {body}");
-    assert!(body.to_string().contains(field), "{body}");
+    assert_eq!(status, StatusCode::OK, "{tool}/{field}: {body}");
+    assert_eq!(body["jsonrpc"], "2.0", "{body}");
+    assert_eq!(body["id"], 1, "{body}");
+    assert_eq!(body["result"]["isError"], true, "{body}");
+    let error = tool_json(&body);
+    assert_eq!(error["code"], "INVALID_ARGUMENT", "{error}");
+    assert_eq!(error["field"], field, "{error}");
+    assert!(error["error"].as_str().unwrap().contains(field), "{error}");
+    assert!(
+        error["hint"].as_str().unwrap().contains("resubmit"),
+        "{error}"
+    );
 }
 
 macro_rules! rejects {
@@ -80,6 +90,24 @@ rejects!(peers_detail, "amesh_list_peers", "detail");
 rejects!(jobs_cross, "amesh_job_list", "cross_circle");
 rejects!(jobs_detail, "amesh_job_list", "detail");
 rejects!(schedules_cross, "amesh_schedule_list", "cross_circle");
+
+#[tokio::test]
+async fn unmarked_errors_keep_their_http_status() {
+    let (app, _state) = test_app();
+    for (name, args, message) in [
+        ("unknown_tool", json!({}), "unknown tool"),
+        (
+            "amesh_ask_many",
+            json!({"to_peers":[]}),
+            "to_peers required",
+        ),
+    ] {
+        let (status, body) = mcp_tool(app.clone(), name, args).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"], message, "{body}");
+        assert!(body.get("result").is_none(), "{body}");
+    }
+}
 
 async fn rejects_target(tool: &str, field: &str, value: Value, indices: Option<Value>) {
     let (app, inner, _state) = test_app_with_hub();
