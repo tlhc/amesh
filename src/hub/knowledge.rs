@@ -94,7 +94,7 @@ pub(super) fn call(
         "search" => search(db, parse(args)?, peer, now),
         "get" => {
             let args: IdArgs = parse(args)?;
-            Ok(json!({"knowledge": load(db, &args.id, &peer.circle, now)?}))
+            Ok(json!({"knowledge": read(db, &args.id, &peer.circle, now)?}))
         }
         "revoke" => {
             let args: RevokeArgs = parse(args)?;
@@ -290,6 +290,42 @@ fn mark_revoked(
     } else {
         not_found()
     })
+}
+
+fn read(db: &Connection, id: &str, circle: &str, now: u64) -> Result<Value, Failure> {
+    let prefix = id.strip_prefix("kn-").is_some_and(|suffix| {
+        (4..32).contains(&suffix.len())
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    });
+    if !prefix {
+        return load(db, id, circle, now);
+    }
+    let mut query = db
+        .prepare("SELECT id FROM knowledge WHERE circle = ?1 AND id GLOB ?2 LIMIT 2")
+        .map_err(internal)?;
+    let mut matches = query
+        .query_map(params![circle, format!("{id}*")], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(internal)?;
+    let full_id = matches
+        .next()
+        .transpose()
+        .map_err(internal)?
+        .ok_or_else(not_found)?;
+    if matches.next().transpose().map_err(internal)?.is_some() {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "ambiguous knowledge id",
+                "code": "AMBIGUOUS_ID",
+                "hint": "Use a longer prefix or the full id from amesh_knowledge_search."
+            })),
+        ));
+    }
+    load(db, &full_id, circle, now)
 }
 
 fn load(db: &Connection, id: &str, circle: &str, now: u64) -> Result<Value, Failure> {

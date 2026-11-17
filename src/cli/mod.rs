@@ -100,7 +100,8 @@ knowledge
   knowledge search QUERY [--limit N]  Literal AND over title, body and applies-to; query at
                                      most 256 UTF-8 bytes and 8 words, limit 1..5 (default 5).
                                      Read applies-to and evidence before relying on a hit.
-  knowledge get ID                   One entry, expired or revoked status included
+  knowledge get ID                   Full id or unique kn- prefix (at least 4 hex digits); ambiguity is 409
+                                     Expired or revoked status included; revoke/delete/replaces need full ids
   knowledge revoke ID --reason TEXT  Withdraw an entry; the reason is required
   knowledge delete ID                Delete one entry; the hub then tries to move the body out of its
                                      database file and WAL (see compacted). Irreversible, one id per

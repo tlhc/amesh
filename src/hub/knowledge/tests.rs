@@ -61,6 +61,17 @@ fn get(db: &mut Connection, caller: &Peer, now: u64, id: &Value) -> Value {
     ok(db, "get", json!({"id": id}), caller, now)["knowledge"].clone()
 }
 
+fn publish_id(db: &mut Connection, caller: &Peer, id: &str) -> Value {
+    let mut row = publish(db, caller, NOW, entry(id));
+    db.execute(
+        "UPDATE knowledge SET id = ?1 WHERE id = ?2",
+        params![id, row["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    row["id"] = json!(id);
+    row
+}
+
 fn search(db: &mut Connection, caller: &Peer, now: u64, args: Value) -> Vec<Value> {
     ok(db, "search", args, caller, now)["items"]
         .as_array()
@@ -569,6 +580,124 @@ fn get_returns_the_full_row_only_inside_the_circle() {
     );
 }
 
+#[test]
+fn get_resolves_unique_prefixes_only_inside_the_circle() {
+    let mut db = store();
+    let (mine, other) = (peer("p1", "c1"), peer("p2", "c2"));
+    let id = "kn-abcd1234000000000000000000000000";
+    let row = publish_id(&mut db, &mine, id);
+    publish_id(&mut db, &other, "kn-abcd1234000000000000000000000001");
+    publish_id(&mut db, &other, "kn-ffff0000000000000000000000000000");
+    for length in 4..=32 {
+        assert_eq!(get(&mut db, &mine, NOW, &json!(&id[..3 + length])), row);
+    }
+    let (_, foreign) = call(&mut db, "get", json!({"id":"kn-ffff"}), &mine, NOW).unwrap_err();
+    let (_, missing) = call(&mut db, "get", json!({"id":"kn-eeee"}), &mine, NOW).unwrap_err();
+    assert_eq!(foreign.0, missing.0);
+    assert_eq!(foreign.0["error"], "unknown knowledge");
+}
+
+#[test]
+fn get_requires_a_longer_prefix_when_ambiguous() {
+    let mut db = store();
+    let author = peer("p1", "c1");
+    let first = publish_id(&mut db, &author, "kn-abcd1234000000000000000000000000");
+    let second = publish_id(&mut db, &author, "kn-abcd1234100000000000000000000000");
+    for prefix in ["kn-abcd", "kn-abcd1234"] {
+        let (status, body) = call(&mut db, "get", json!({"id":prefix}), &author, NOW).unwrap_err();
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["code"], "AMBIGUOUS_ID");
+        assert!(body.0["hint"].as_str().unwrap().contains("longer prefix"));
+    }
+    for row in [first, second] {
+        let id = row["id"].as_str().unwrap();
+        assert_eq!(get(&mut db, &author, NOW, &json!(&id[..12])), row);
+        assert_eq!(get(&mut db, &author, NOW, &json!(id)), row);
+    }
+}
+
+#[test]
+fn get_prefixes_include_expired_and_revoked_entries() {
+    let mut db = store();
+    let author = peer("p1", "c1");
+    let expired = publish_id(&mut db, &author, "kn-abcd1234000000000000000000000000");
+    let revoked = publish_id(&mut db, &author, "kn-abcd1234100000000000000000000000");
+    publish_id(&mut db, &author, "kn-abcd1234200000000000000000000000");
+    db.execute(
+        "UPDATE knowledge SET expires_at = ?1 WHERE id = ?2",
+        params![(NOW + 1) as i64, expired["id"].as_str().unwrap()],
+    )
+    .unwrap();
+    ok(
+        &mut db,
+        "revoke",
+        json!({"id":revoked["id"],"reason":"old"}),
+        &author,
+        NOW,
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "get",
+            json!({"id":"kn-abcd1234"}),
+            &author,
+            NOW + 2
+        ),
+        StatusCode::CONFLICT
+    );
+    for (row, status) in [(expired, "expired"), (revoked, "revoked")] {
+        let id = row["id"].as_str().unwrap();
+        let got = get(&mut db, &author, NOW + 2, &json!(&id[..12]));
+        assert_eq!(got["id"], id);
+        assert_eq!(got["status"], status);
+    }
+}
+
+#[test]
+fn get_prefixes_require_four_lowercase_hex_digits() {
+    let mut db = store();
+    let author = peer("p1", "c1");
+    publish_id(&mut db, &author, "kn-abcd1234000000000000000000000000");
+    for id in [
+        "",
+        "kn-",
+        "kn-abc",
+        "kn-ABCD",
+        "kn-abcd*",
+        "kn-abcd%",
+        "kn-abcd_",
+        "kn-abcd?",
+        "kn-abcd[0-9]",
+        "kn-超abcd",
+    ] {
+        assert_eq!(
+            err(&mut db, "get", json!({"id":id}), &author, NOW),
+            StatusCode::NOT_FOUND,
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn prefixes_cannot_revoke_delete_or_replace_entries() {
+    let mut db = store();
+    let author = peer("p1", "c1");
+    let row = publish_id(&mut db, &author, "kn-abcd1234000000000000000000000000");
+    for action in ["revoke", "delete", "publish"] {
+        let args = match action {
+            "revoke" => json!({"id":"kn-abcd1234","reason":"old"}),
+            "delete" => json!({"id":"kn-abcd1234"}),
+            _ => with(entry("replacement"), "replaces", json!("kn-abcd1234")),
+        };
+        assert_eq!(
+            err(&mut db, action, args, &author, NOW),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(rows(&db), 1);
+        assert_eq!(get(&mut db, &author, NOW, &row["id"]), row);
+    }
+}
+
 fn missing_id_hint(action: &str) {
     let mut db = store();
     let (mine, other) = (peer("p1", "c1"), peer("p2", "c2"));
@@ -584,7 +713,9 @@ fn missing_id_hint(action: &str) {
         args
     };
     for caller in [&mine, &other] {
-        let (status, body) = call(&mut db, action, args(&id[..11]), caller, NOW).unwrap_err();
+        let prefix_len = if action == "get" { 6 } else { 11 };
+        let (status, body) =
+            call(&mut db, action, args(&id[..prefix_len]), caller, NOW).unwrap_err();
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body.0["error"], "unknown knowledge");
         let hint = body.0["hint"].as_str().unwrap_or("");

@@ -74,10 +74,11 @@ async fn knowledge_http_round_trip_and_same_circle_revoke() {
     let (status, body) = request(
         router(app.clone()),
         "/knowledge/get",
-        json!({"from_peer":"reader","id":id}),
+        json!({"from_peer":"reader","id":&id[..11]}),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["knowledge"]["id"], id);
     assert_eq!(body["knowledge"]["publisher_session"], "session-author");
     let (status, _) = request(
         router(app.clone()),
@@ -299,7 +300,7 @@ async fn knowledge_mcp_calls_use_the_same_store() {
     let id = &entry["knowledge"]["id"];
     for (action, args) in [
         ("search", json!({"query":"ACK"})),
-        ("get", json!({"id":id})),
+        ("get", json!({"id":&id.as_str().unwrap()[..11]})),
         ("revoke", json!({"id":id,"reason":"reviewed"})),
         ("delete", json!({"id":id})),
     ] {
@@ -316,6 +317,9 @@ async fn knowledge_mcp_calls_use_the_same_store() {
         let data: Value =
             serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
         assert!(!data.is_null());
+        if action == "get" {
+            assert_eq!(&data["knowledge"]["id"], id);
+        }
     }
 }
 

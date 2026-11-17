@@ -403,7 +403,8 @@ await test("knowledge tools round-trip against the daemon", async () => {
   const found = await call("amesh_knowledge_search", { query: "round trip" });
   assert.equal(found.items[0].id, id, JSON.stringify(found));
   assert.equal(found.items[0].status, "active");
-  const got = await call("amesh_knowledge_get", { id });
+  const got = await call("amesh_knowledge_get", { id: id.slice(0, 11) });
+  assert.equal(got.knowledge.id, id);
   assert.equal(got.knowledge.title, "pi tool round trip");
   assert.equal(got.knowledge.body, "the four knowledge tools reach the hub");
   assert.equal(got.knowledge.applies_to, "tests/pi_hook.mjs");

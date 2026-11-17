@@ -130,7 +130,7 @@ Ended chains and closed asks are deleted after `job_keep_secs` / `ask_keep_secs`
 Each circle keeps shared notes of verified findings. Agents search them before substantive work and publish only what would save a later investigation.
 
 - `amesh knowledge publish` records a note with its scope and evidence. A note expires after 7 days by default, at most 30; `--replaces ID` replaces an old note with a correction.
-- `search` finds notes containing every given word, and `get` reads one.
+- `search` finds notes containing every given word. `get` reads a full ID or a unique `kn-` prefix with at least 4 lowercase hex digits in your circle; it returns the full ID. Ambiguous prefixes return `409 AMBIGUOUS_ID`: supply more digits. `revoke`, `delete` and `--replaces` require full IDs.
 - `revoke` withdraws a note and records why, and `delete` removes one for good; any peer in the circle can do either.
 - Agents use the same actions through the `amesh_knowledge_*` tools, and the TUI lists the notes read-only (`i`).
 
