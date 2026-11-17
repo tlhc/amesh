@@ -4508,6 +4508,7 @@ fn hook_ws_retries_a_failed_claude_injection_after_a_drainer_restart() {
     let mut line = String::new();
     while Instant::now() < deadline {
         if let Ok((conn, _)) = listener.accept() {
+            conn.set_nonblocking(false).unwrap();
             let mut reader = BufReader::new(conn);
             let _ = reader.read_line(&mut line);
             break;
@@ -5116,6 +5117,7 @@ fn hook_ws_keeps_a_failed_injection_owed_and_replays_it_once() {
     let mut lines = Vec::new();
     while Instant::now() < deadline {
         if let Ok((conn, _)) = listener.accept() {
+            conn.set_nonblocking(false).unwrap();
             let reader = BufReader::new(conn);
             for line in reader.lines() {
                 lines.push(line.unwrap());
@@ -5242,6 +5244,7 @@ fn hook_ws_survives_a_hub_outage_past_the_old_give_up_window() {
     let mut line = String::new();
     while Instant::now() < deadline {
         if let Ok((conn, _)) = listener.accept() {
+            conn.set_nonblocking(false).unwrap();
             let mut reader = BufReader::new(conn);
             let _ = reader.read_line(&mut line);
             break;
@@ -9267,6 +9270,7 @@ fn hook_ws_backs_off_a_503_then_connects() {
                 std::thread::sleep(Duration::from_millis(10));
                 continue;
             };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
