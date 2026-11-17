@@ -125,7 +125,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 
 `POST /mcp` is JSON-RPC (`initialize`, `tools/list`, `tools/call`). `amesh mcp` is a stdio shim onto that HTTP route (`src/cli/mod.rs` `mcp()`).
 
-Target argument type errors (`assigned_peer`, `to_peers`), invalid booleans or unsigned integers, and malformed `depends_on` return HTTP 200 with `result.isError: true`. The text content is a JSON object with `code: "INVALID_ARGUMENT"`, `field`, `error`, and a correction `hint`. Other errors retain their existing HTTP status; omitted and null optional values keep their defaults.
+Target argument type errors (`assigned_peer`, `to_peers`), type errors from the shared MCP boolean/integer readers, and malformed `depends_on` return HTTP 200 with `result.isError: true`. The text content is a JSON object with `code: "INVALID_ARGUMENT"`, `field`, `error`, and a correction `hint`. Whole-object validation in `amesh_ack` and `amesh_job_update` keeps HTTP 400. Other errors retain their existing HTTP status; omitted and null optional values keep their defaults.
 
 ## Aliases
 
