@@ -12,12 +12,18 @@ fn the_state_file_gives_back_what_a_sweep_deletes() {
     let mut hub = Hub::open(&path).unwrap();
     let baseline = pragma(&hub, "page_count");
     let baseline_bytes = baseline as u64 * pragma(&hub, "page_size") as u64;
-    let ended = now_unix() - JOB_KEEP_SECS - 60;
+    let now = now_unix();
+    let ended = now - JOB_KEEP_SECS - 60;
     for n in 0..200 {
         let id = format!("job-{n}");
+        let finished_at = if n == 0 {
+            now - job_history::KEEP_SECS - 60
+        } else {
+            ended
+        };
         let job: Job = serde_json::from_value(json!({"job_id": id, "title": "t",
             "prompt": format!("gone-{n} {}", "x".repeat(4000)), "path": "/tmp",
-            "backend": "pi", "state": "done", "finished_at": ended}))
+            "backend": "pi", "state": "done", "finished_at": finished_at}))
         .unwrap();
         hub.jobs.insert(id, job);
     }
@@ -29,6 +35,14 @@ fn the_state_file_gives_back_what_a_sweep_deletes() {
     let size = fs::metadata(&path).unwrap().len();
     advance_jobs(&mut hub);
     assert!(hub.jobs.is_empty(), "the sweep deleted the ended jobs");
+    assert!(
+        job_history::read(&hub.db, "job-0", None).is_err(),
+        "expired history survived the sweep"
+    );
+    assert!(
+        job_history::read(&hub.db, "job-1", None).is_ok(),
+        "the sweep deleted unexpired history"
+    );
     let left = pragma(&hub, "page_count");
     assert!(
         pragma(&hub, "freelist_count") == 0 && (left - baseline) * 10 < full - baseline,
