@@ -533,6 +533,7 @@ fn cut_back_log(db: &Connection) -> Result<(), String> {
     }
 }
 
+#[cfg(test)]
 fn write_snapshot(db: &mut Connection, disk: &DiskState) -> Result<(), String> {
     write_snapshot_with(db, disk, false, |_| Ok(()))
 }
@@ -1063,6 +1064,55 @@ fn migrate_inbox_queued_at(db: &Connection, now: u64) -> Result<(), String> {
     tx.commit().map_err(|e| e.to_string())
 }
 
+const LEGACY_JSON_MIGRATION: i64 = 1;
+
+fn load_disk(db: &mut Connection, path: &Path, now: u64) -> Result<DiskState, String> {
+    let disk = read_snapshot(db)?;
+    let json_path = path.with_extension("json");
+    if !json_path.is_file() {
+        return Ok(disk);
+    }
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|e| e.to_string())?;
+    if version >= LEGACY_JSON_MIGRATION {
+        return Ok(disk);
+    }
+    /* SQLite state takes precedence on upgrade, even with no registered peers. */
+    let has_archive = db
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM job_history UNION ALL SELECT 1 FROM knowledge)",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|e| e.to_string())?;
+    if has_archive
+        || !disk.peers.is_empty()
+        || !disk.asks.is_empty()
+        || !disk.jobs.is_empty()
+        || !disk.schedules.is_empty()
+        || !disk.inbox.is_empty()
+        || !disk.mcp_servers.is_empty()
+        || !disk.recv_peers.is_empty()
+        || !disk.owed.is_empty()
+    {
+        db.pragma_update(None, "user_version", LEGACY_JSON_MIGRATION)
+            .map_err(|e| e.to_string())?;
+        return Ok(disk);
+    }
+    let Some(legacy) = fs::read(json_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<LegacyDiskState>(&bytes).ok())
+    else {
+        return Ok(disk);
+    };
+    let disk = legacy.into_disk(now);
+    write_snapshot_with(db, &disk, false, |tx| {
+        tx.pragma_update(None, "user_version", LEGACY_JSON_MIGRATION)
+    })?;
+    read_snapshot(db)
+}
+
 impl Hub {
     fn open(path: &Path) -> Result<Self, String> {
         Self::open_at(path, now_unix())
@@ -1070,20 +1120,7 @@ impl Hub {
 
     fn open_at(path: &Path, now: u64) -> Result<Self, String> {
         let mut db = open_db(path, now)?;
-        let count: i64 = db
-            .query_row("SELECT COUNT(*) FROM peers", [], |r| r.get(0))
-            .unwrap_or(0);
-        if count == 0 {
-            let json_path = path.with_extension("json");
-            if json_path.is_file() {
-                if let Ok(bytes) = fs::read(&json_path) {
-                    if let Ok(disk) = serde_json::from_slice::<LegacyDiskState>(&bytes) {
-                        write_snapshot(&mut db, &disk.into_disk(now))?;
-                    }
-                }
-            }
-        }
-        let disk = read_snapshot(&db)?;
+        let disk = load_disk(&mut db, path, now)?;
         job_history::backfill(&mut db, &disk).map_err(|e| e.to_string())?;
         /* pings refresh last_seen in memory only, so the persisted value is as old as the
         last mutation; without a fresh stamp the first read after a restart would prune
@@ -2561,11 +2598,8 @@ async fn list_peers(
                 row["stale"] = json!(view.stale);
                 row["delivery"] = json!(view.delivery);
                 row["queued"] = json!(view.queued);
-                if view.push
-                    && peer.backend == "codex"
-                    && hub.unloaded_threads.contains(&peer.peer_id)
-                {
-                    row["delivery_issue"] = json!("codex_thread_not_loaded");
+                if let Some(issue) = view.delivery_issue {
+                    row["delivery_issue"] = json!(issue);
                 }
             }
             row

@@ -188,6 +188,14 @@ pub(crate) enum DeliveryCondition {
     Unknown,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DeliveryIssue {
+    CodexThreadNotLoaded,
+    #[serde(other)]
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Delivery {
     pub condition: DeliveryCondition,
@@ -287,6 +295,8 @@ pub(crate) struct PeerView {
     pub queued: usize,
     pub liveness: Option<Liveness>,
     pub delivery: Option<Delivery>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivery_issue: Option<DeliveryIssue>,
     pub build: Option<String>,
     pub stale: Option<bool>,
 }

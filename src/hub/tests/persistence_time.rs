@@ -444,3 +444,49 @@ async fn register_copy_uses_merged_time() {
     assert_eq!(copy.queued_at(), 17);
     assert_eq!(app.inner.lock().await.inbox.records("worker"), &[copy]);
 }
+
+fn write_legacy_job(path: &Path, id: &str) {
+    let job = json!({"job_id":id,"title":"old","prompt":"","path":"","backend":"",
+                     "assigned_peer":null,"state":"queued","result_summary":null});
+    let disk = json!({"peers":{},"asks":{},"jobs":{(id):job},"schedules":{},"inbox":{}});
+    fs::write(path.with_extension("json"), disk.to_string()).unwrap();
+}
+
+#[test]
+fn legacy_json_is_imported_once_even_after_all_live_rows_are_gone() {
+    let path = temp_state("legacy-once");
+    write_legacy_job(&path, "old");
+    let mut hub = Hub::open_at(&path, 100).unwrap();
+    assert!(hub.jobs.contains_key("old"), "first-time import");
+    hub.jobs.clear();
+    persist(&mut hub).unwrap();
+    hub.db.execute("DELETE FROM job_history", []).unwrap();
+    drop(hub);
+    let hub = Hub::open_at(&path, 200).unwrap();
+    assert!(hub.jobs.is_empty(), "the old JSON must not reappear");
+    assert!(
+        path.with_extension("json").is_file(),
+        "keep the migration source"
+    );
+}
+
+#[test]
+fn legacy_json_beside_an_existing_database_keeps_its_jobs_without_peers() {
+    let path = temp_state("legacy-existing");
+    let db = open_db(&path, 100).unwrap();
+    db.execute(
+        "INSERT INTO jobs(job_id,title,prompt,path,backend,state)
+                VALUES ('live','New task','','','','queued')",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    write_legacy_job(&path, "old");
+    let hub = Hub::open_at(&path, 200).unwrap();
+    assert!(hub.peers.is_empty());
+    assert!(
+        hub.jobs.contains_key("live"),
+        "existing SQLite job survives"
+    );
+    assert!(!hub.jobs.contains_key("old"), "ignore the old JSON");
+}

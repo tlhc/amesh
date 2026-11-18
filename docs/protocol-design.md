@@ -19,7 +19,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - an omitted `name` keeps the stored one, else defaults to `peer_id`
   - supported backends are `pi`, `codex`, `claude-code` (alias `claude`) and `opencode`
 - `GET /peers` probes sockets, then drops peers with no live WebSocket and `last_seen` older than 30s (`PEER_ONLINE_SECS`), and may persist.
-- `GET /peers?detail=true` adds `build`, `stale`, `delivery` and `queued`. A Codex drainer can also report `delivery_issue: "codex_thread_not_loaded"` for the currently registered session.
+- `GET /peers?detail=true` adds `build`, `stale`, `delivery` and `queued`. HTTP and MCP peer details and the `/snapshot` roster include `delivery_issue: "codex_thread_not_loaded"` when the active Codex drainer reports that its registered thread is unloaded.
 
 ## Ask
 
@@ -64,6 +64,8 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - a closed ask is deleted once it has been closed `ask_keep_secs` and no job refers to it
   - copies of closed or deleted asks are never delivered
 - `POST /gc`: `{"apply": false}` lists what would go; `{"apply": true}` cleans up now.
+
+A legacy `state.json` is imported only into an empty SQLite state. The database records the import in the same transaction and retains the JSON as a backup. Existing SQLite data takes precedence when both are present.
 
 ## Notify and broadcast
 

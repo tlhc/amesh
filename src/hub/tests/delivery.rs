@@ -907,3 +907,136 @@ async fn the_snapshot_says_how_each_peer_is_reached() {
     assert_eq!(quiet["acks"], false);
     assert_eq!(quiet["queued"], 0, "an empty inbox counts nothing");
 }
+
+#[tokio::test]
+async fn health_reports_the_embedded_revision() {
+    let (app, _path) = test_app();
+    let (status, body) = json_req(app, "GET", "/health", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        body.get("revision"),
+        Some(&json!(option_env!("AMESH_GIT_REVISION")))
+    );
+}
+
+#[tokio::test]
+async fn thread_readiness_reaches_all_peer_views_and_follows_the_session_and_socket() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as WsMsg};
+
+    let (http, hub, _path) = test_app_with_hub();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = http.clone();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let register = |session| {
+        json_req(
+            http.clone(),
+            "POST",
+            "/peers",
+            json!({"peer_id":"worker", "backend":"codex", "session_id":session}),
+        )
+    };
+    let connect = || async {
+        let (mut socket, _) = connect_async(format!("ws://{addr}/ws")).await.unwrap();
+        socket
+            .send(WsMsg::Text(
+                json!({"type":"connect","peer_id":"worker","recv":true})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let frame = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&frame).unwrap()["type"],
+            "connected"
+        );
+        socket
+    };
+    assert_eq!(register("session-1").await.0, StatusCode::OK);
+    let mut first = connect().await;
+
+    macro_rules! report {
+        ($socket:expr, $session:expr) => {{
+            $socket
+                .send(WsMsg::Text(json!({"type":"ping","unloaded_thread":$session}).to_string().into()))
+                .await
+                .unwrap();
+            /* The WebSocket pong follows processing the preceding application ping. */
+            $socket.send(WsMsg::Ping(vec![1].into())).await.unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(3), $socket.next())
+                .await.unwrap().unwrap().unwrap();
+            assert_eq!(pong, WsMsg::Pong(vec![1].into()));
+        }};
+    }
+
+    report!(first, "unrelated");
+    assert!(!hub.lock().await.unloaded_threads.contains("worker"));
+    report!(first, "session-1");
+    assert!(
+        hub.lock().await.unloaded_threads.contains("worker"),
+        "matching ping records the issue"
+    );
+    let field = Some(&json!("codex_thread_not_loaded"));
+    let (_, detail) = json_req(http.clone(), "GET", "/peers?detail=true", Value::Null).await;
+    assert_eq!(detail[0].get("delivery_issue"), field, "HTTP detail");
+    let (status, mcp) = mcp_tool(
+        http.clone(),
+        "amesh_list_peers",
+        json!({"detail":true, "from_peer":"worker"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{mcp}");
+    let peers: Value =
+        serde_json::from_str(mcp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(peers[0].get("delivery_issue"), field, "MCP detail");
+    let (_, snapshot) = json_req(http.clone(), "GET", "/snapshot", Value::Null).await;
+    assert_eq!(
+        snapshot["roster"][0].get("delivery_issue"),
+        field,
+        "snapshot roster"
+    );
+    let (_, brief) = json_req(http.clone(), "GET", "/peers", Value::Null).await;
+    assert_eq!(brief[0].get("delivery_issue"), None, "brief HTTP roster");
+
+    report!(first, Value::Null);
+    assert!(
+        !hub.lock().await.unloaded_threads.contains("worker"),
+        "loaded report clears the issue"
+    );
+    report!(first, "session-1");
+    assert_eq!(register("session-2").await.0, StatusCode::OK);
+    assert!(
+        !hub.lock().await.unloaded_threads.contains("worker"),
+        "session change clears the issue"
+    );
+
+    let mut second = connect().await;
+    report!(second, "session-2");
+    let mut current = connect().await;
+    assert!(
+        !hub.lock().await.unloaded_threads.contains("worker"),
+        "socket replacement clears the issue"
+    );
+    report!(current, "session-2");
+    current.close(None).await.unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let state = hub.lock().await;
+        if !state.sockets.contains_key("worker") {
+            assert!(
+                !state.unloaded_threads.contains("worker"),
+                "socket close clears the issue"
+            );
+            break;
+        }
+        drop(state);
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "socket close processed"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}

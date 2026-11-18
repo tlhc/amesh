@@ -384,7 +384,11 @@ pub(crate) fn delivery(snap: &Frame, peer: &Peer) -> Row {
     let mut out: Row = Vec::new();
     match delivery.condition {
         DeliveryCondition::NoPush => out.push(("no push".into(), Tone::Dim)),
-        DeliveryCondition::Push => {}
+        DeliveryCondition::Push => {
+            if peer.delivery_issue == Some(crate::wire::DeliveryIssue::CodexThreadNotLoaded) {
+                out.push(("thread-not-loaded".into(), Tone::Warn));
+            }
+        }
         DeliveryCondition::Offline | DeliveryCondition::Unknown => return Vec::new(),
     }
     if let Some(stuck) = delivery.stuck.as_ref() {

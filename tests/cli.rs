@@ -9717,3 +9717,32 @@ fn hook_ws_dedupes_a_replayed_id_within_one_connection() {
 
 #[path = "cli/transport_errors.rs"]
 mod transport_errors;
+
+#[test]
+fn codex_drainer_reports_an_unloaded_thread_in_status() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let worker = sandbox.id("not-loaded");
+    bind_session(&sandbox, "codex", worker, "th1");
+    let codex_home = sandbox.root.join("c");
+    let _turns = app_server_capture_threads(&codex_home, &["another-thread"], &[]);
+    let _drainer = start_codex_drainer(&sandbox, worker, &codex_home);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = sandbox.json(&["status"], None);
+        let peer = status["peers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|peer| peer["peer_id"] == worker);
+        if peer.is_some_and(|peer| peer["delivery_issue"] == "codex_thread_not_loaded") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "drainer must report its unloaded registered thread: {peer:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

@@ -387,3 +387,17 @@ fn a_malformed_v2_snapshot_keeps_the_last_frame_end_to_end() {
         app.error
     );
 }
+
+#[test]
+fn delivery_labels_an_unloaded_codex_thread() {
+    let peer: Peer = serde_json::from_value(serde_json::json!({
+        "backend":"codex", "status":"online", "delivery":{"condition":"push"},
+        "delivery_issue":"codex_thread_not_loaded"
+    }))
+    .unwrap();
+    let frame = as_frame(&Snapshot::default());
+    assert_eq!(
+        joined(&layout::delivery(&frame, &peer)),
+        "thread-not-loaded"
+    );
+}

@@ -253,6 +253,10 @@ impl<'a> ReadModel<'a> {
             queued: self.hub.inbox.count(&peer.peer_id),
             liveness: Some(liveness(self.hub, peer)),
             delivery: Some(delivery(self.hub, peer, self.now)),
+            delivery_issue: (connected
+                && peer.backend == "codex"
+                && self.hub.unloaded_threads.contains(&peer.peer_id))
+            .then_some(DeliveryIssue::CodexThreadNotLoaded),
             build,
             stale,
         }
