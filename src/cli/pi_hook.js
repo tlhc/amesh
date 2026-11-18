@@ -1084,6 +1084,7 @@ export default function AmeshHooks(pi) {
         depends_on: { type: "array", items: { type: "string" } },
         watch: { type: "boolean" },
         deadline_seconds: { type: "integer" },
+        request_key: { type: "string", description: "Reuse the same key and parameters to retry creation from the same session" },
       }, []],
       ["job_list", "List jobs in your circle; cross_circle without circle lists all. Each job comes as a summary: job_id, title, state, assigned_peer, from_peer, ask_id, depends_on, circle, created_at, finished_at; detail=true returns whole jobs with prompt and result_summary; state (queued, running, done, failed or cancelled) lists only jobs in that state", {
         circle: { type: "string" },
@@ -1227,6 +1228,13 @@ export default function AmeshHooks(pi) {
       },
       ["correlation_id"],
       (params) => Mcp("watch", params),
+    );
+    tool(
+      "job_history",
+      "Show a job's dispatch attempts and session IDs, retained for seven days after completion",
+      { job_id: { type: "string" }, cross_circle: { type: "boolean" } },
+      ["job_id"],
+      (params) => Mcp("job_history", params),
     );
   }
 

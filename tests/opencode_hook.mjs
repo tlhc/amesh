@@ -219,7 +219,8 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
   try {
     cleanup = await plugin.setup(ctx);
     await t.test("catalog is directly visible with JSON schemas", () => {
-      assert.equal(tools.size, 24);
+      assert.equal(tools.size, 25);
+      assert.deepEqual(tools.get("amesh_job_history").input.required, ["job_id"]);
       for (const action of ["publish", "search", "get", "revoke", "delete"]) {
         assert(tools.has(`amesh_knowledge_${action}`));
       }

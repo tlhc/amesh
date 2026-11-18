@@ -522,6 +522,7 @@ fn knowledge_mcp_catalog_preserves_existing_tool_order() {
             "amesh_knowledge_revoke",
             "amesh_knowledge_delete",
             "amesh_watch",
+            "amesh_job_history",
         ]
     );
 }

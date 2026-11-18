@@ -119,11 +119,15 @@ Send progress and extra context with notify. Pi hands a running task one deliver
 
 ```bash
 amesh jobs create audit --prompt "list stale docs" --assigned-peer amesh-codex --from-peer amesh-claude-code
-amesh jobs create fix --prompt "fix them" --assigned-peer amesh-pi --depends-on job-1a2b3c4d --from-peer amesh-claude-code
-amesh peer ack ask-5e6f7a8b --message "no fixture" --failed true --from-peer amesh-pi
+amesh jobs create fix --prompt "fix them" --assigned-peer amesh-pi --depends-on "$JOB_ID" --from-peer amesh-claude-code
+amesh peer ack "$ASK_ID" --message "no fixture" --failed true --from-peer amesh-pi
 ```
 
 Ended chains and closed asks are deleted after `job_keep_secs` / `ask_keep_secs` (default 24 h), so take results from the ack; `amesh gc --apply true` cleans up now.
+
+`amesh jobs history ID` and `amesh_job_history` show a job's dispatch attempts, including the ask ID, recipient, session known at dispatch and how the ask closed. The hub keeps this record across restarts for at least seven days after the job ends. A session unknown at dispatch or on upgrade is shown as null.
+
+For a creation call you may need to retry, give `amesh_job_create` a unique `request_key` or pass `--request-key KEY --from-peer ID` to `amesh jobs create`. Retry with the same parameters, key and registered caller session to recover the existing job. After cleanup, the conflict response includes the archived job ID.
 
 ## Knowledge
 
@@ -186,7 +190,7 @@ amesh status
 tail -f ~/.amesh/serve.log   # or $AMESH_STATE's directory
 ```
 
-Port in use: `amesh status`. Wrong `AMESH_TOKEN` returns HTTP 401.
+`amesh status` shows the running Hub's version and Git revision when available, plus peer build freshness, delivery state and queue counts. For Codex, `thread-not-loaded` means the drainer checked App Server and found the registered thread absent. Wrong `AMESH_TOKEN` returns HTTP 401.
 
 ## Related
 

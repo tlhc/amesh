@@ -633,6 +633,183 @@ async fn job_dispatch_sends_ask() {
 }
 
 #[tokio::test]
+async fn job_create_retry_after_response_loss_reuses_existing_job() {
+    let state = temp_state("job-retry");
+    let f = Fixture::open(state.to_path_buf());
+    f.peer_in_session("boss", "one", "session-a").await;
+    f.peer("worker", "one").await;
+    let body = json!({"title":"audit", "from_peer":"boss", "assigned_peer":"worker", "request_key":"review-1"});
+    assert_eq!(
+        f.request("POST", "/jobs", body.clone()).await.0,
+        StatusCode::OK
+    );
+    let (status, jobs) = f.request("GET", "/jobs", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let original = jobs[0].clone();
+    drop(f);
+
+    let reopened = Fixture::open(state.to_path_buf());
+    let (status, retry) = reopened.request("POST", "/jobs", body.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["job_id"], original["job_id"]);
+    assert_eq!(retry["ask_id"], original["ask_id"]);
+    assert_eq!(
+        reopened
+            .inbox("worker")
+            .await
+            .iter()
+            .filter(|e| e["type"] == "ask")
+            .count(),
+        1
+    );
+    let mut conflict = body;
+    conflict["title"] = json!("different work");
+    assert_eq!(
+        reopened.request("POST", "/jobs", conflict).await.0,
+        StatusCode::CONFLICT
+    );
+}
+
+#[tokio::test]
+async fn task_history_keeps_both_attempts_after_sweep_and_restart() {
+    let state = temp_state("job-history");
+    let f = Fixture::open(state.to_path_buf());
+    f.peer_in_session("boss", "one", "boss-session").await;
+    f.peer_in_session("w1", "one", "session-1").await;
+    f.peer_in_session("w2", "one", "session-2").await;
+    let body = json!({"title":"audit", "from_peer":"boss", "assigned_peer":"w1", "request_key":"archive-test"});
+    let id = f.job(body.clone()).await;
+    let first = f.ask_id(&id).await;
+    assert_eq!(
+        f.set_state(&id, json!({"state":"queued", "assigned_peer":"w2"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    let second = f.ask_id(&id).await;
+    assert_ne!(first, second);
+    assert_eq!(
+        f.ack(&second, json!({"from_peer":"w2", "message":"finished"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    f.advance().await;
+    let finished = f.row(&id).await.finished_at.unwrap();
+    assert_eq!(
+        f.sweep(finished + JOB_KEEP_SECS).await.jobs,
+        vec![id.clone()]
+    );
+    persist(&mut *f.0.inner.lock().await).unwrap();
+    drop(f);
+
+    let reopened = Fixture::open(state.to_path_buf());
+    let (status, history) = reopened
+        .request("GET", &format!("/jobs/{id}/history"), Value::Null)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["state"], "done");
+    let attempts = history["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0]["ask_id"], first);
+    assert_eq!(attempts[0]["session_id"], "session-1");
+    assert_eq!(attempts[0]["failed"], true);
+    assert_eq!(attempts[1]["ask_id"], second);
+    assert_eq!(attempts[1]["session_id"], "session-2");
+    assert_eq!(attempts[1]["closed_by"], "recipient");
+    assert_eq!(attempts[1]["failed"], false);
+
+    let (status, replay) = reopened.request("POST", "/jobs", body).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
+    assert_eq!(replay["job_id"], id);
+    let hub = reopened.0.inner.lock().await;
+    let expires = finished + job_history::KEEP_SECS;
+    assert!(!job_history::purge(&hub.db, expires - 1).unwrap());
+    assert!(job_history::purge(&hub.db, expires).unwrap());
+    assert!(job_history::read(&hub.db, &id, None).is_err());
+    assert_eq!(
+        hub.db
+            .query_row("SELECT count(*) FROM job_attempts", [], |r| r
+                .get::<_, u32>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn failing_to_store_the_request_key_rolls_back_dispatch() {
+    let f = team("one", &["boss", "worker"]).await;
+    f.peer_in_session("boss", "one", "boss-session").await;
+    let body = json!({"title":"audit", "from_peer":"boss", "assigned_peer":"worker", "request_key":"atomic"});
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .execute_batch(
+            "CREATE TEMP TRIGGER reject_key BEFORE UPDATE OF request_scope ON job_history
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+        )
+        .unwrap();
+    let (status, error) = f.request("POST", "/jobs", body.clone()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{error}");
+    assert!(f.inbox("worker").await.is_empty());
+    {
+        let hub = f.0.inner.lock().await;
+        assert!(hub.jobs.is_empty());
+        assert!(hub.asks.is_empty());
+        assert_eq!(
+            hub.db
+                .query_row("SELECT count(*) FROM job_history", [], |r| r
+                    .get::<_, u32>(0))
+                .unwrap(),
+            0
+        );
+        hub.db.execute_batch("DROP TRIGGER reject_key").unwrap();
+    }
+    let original = f.job(body.clone()).await;
+    assert_eq!(f.job(body).await, original);
+}
+
+#[tokio::test]
+async fn legacy_job_import_does_not_guess_the_dispatch_session() {
+    let state = temp_state("legacy-history");
+    let legacy = json!({
+        "peers": {"worker": {"peer_id":"worker","name":"worker","path":"/tmp","backend":"pi",
+            "circle":"one","status":"online","description":"","session_id":"session-at-import"}},
+        "asks": {"ask-old": {"correlation_id":"ask-old","from_peer":"boss","to_peer":"worker",
+            "to_peer_id":"worker","text":"t","open":false,"reply":"r","failed":false}},
+        "jobs": {"job-old": {"job_id":"job-old","title":"t","prompt":"","path":"","backend":"",
+            "assigned_peer":"worker","state":"done","result_summary":null,"circle":"one",
+            "ask_id":"ask-old","from_peer":"boss","dispatch":true}},
+        "schedules": {}, "inbox": {}
+    });
+    fs::write(state.with_extension("json"), legacy.to_string()).unwrap();
+    let f = Fixture::open(state.to_path_buf());
+    let (status, history) = f.request("GET", "/jobs/job-old/history", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["attempts"][0]["ask_id"], "ask-old");
+    assert_eq!(history["attempts"][0]["session_id"], Value::Null);
+}
+
+#[tokio::test]
+async fn orphaned_job_history_expires_even_without_a_finished_at() {
+    let f = team("one", &["boss", "worker"]).await;
+    let id = f
+        .job(json!({"from_peer":"boss", "assigned_peer":"worker"}))
+        .await;
+    let job = f.row(&id).await;
+    assert!(job.finished_at.is_none());
+    let hub = f.0.inner.lock().await;
+    hub.db
+        .execute("DELETE FROM jobs WHERE job_id=?1", [&id])
+        .unwrap();
+    let expires = job.created_at.unwrap() + job_history::KEEP_SECS;
+    assert!(!job_history::purge(&hub.db, expires - 1).unwrap());
+    assert!(job_history::purge(&hub.db, expires).unwrap());
+    assert!(job_history::read(&hub.db, &id, None).is_err());
+}
+
+#[tokio::test]
 async fn job_waits_for_dependencies() {
     let f = team("one", &["boss", "w1", "w2"]).await;
     let a = f
@@ -1608,6 +1785,7 @@ async fn job_tools_enforce_circle() {
     for (tool, args) in [
         ("amesh_job_update", json!({"job_id": a, "state": "done"})),
         ("amesh_job_status", json!({"job_id": a})),
+        ("amesh_job_history", json!({"job_id": a})),
         ("amesh_job_cancel", json!({"job_id": a})),
         ("amesh_job_delete", json!({"job_id": a})),
     ] {

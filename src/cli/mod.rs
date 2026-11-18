@@ -81,7 +81,8 @@ mesh
 jobs
   jobs create TITLE [--prompt TEXT] [--path PATH] [--backend BACKEND] [--assigned-peer ID]
               [--depends-on ID,ID] [--from-peer ID] [--watch true|false] [--deadline-seconds N]
-  jobs list|show ID|cancel ID|delete ID
+              [--request-key KEY]
+  jobs list|show ID|history ID|cancel ID|delete ID
   jobs update ID --state queued|running|done|failed|cancelled [--result-summary TEXT]
               [--assigned-peer ID] [--prompt TEXT] [--watch true|false] [--deadline-seconds N]
   jobs update ID --coordinator ID   later acks, reminders and dispatches of the job go there
@@ -1310,6 +1311,7 @@ fn jobs_allowed(command: &str) -> Result<&'static [&'static str]> {
             "assigned-peer",
             "depends-on",
             "from-peer",
+            "request-key",
             "watch",
             "deadline-seconds",
         ],
@@ -1322,7 +1324,7 @@ fn jobs_allowed(command: &str) -> Result<&'static [&'static str]> {
             "watch",
             "deadline-seconds",
         ],
-        "list" | "show" | "cancel" | "delete" => &[],
+        "list" | "show" | "history" | "cancel" | "delete" => &[],
         _ => return Err(format!("unknown jobs command: {command}").into()),
     })
 }
@@ -1364,6 +1366,7 @@ fn jobs(raw: &[String]) -> Result<Value> {
             let path = format!("/jobs/{}", escaped(&args.pos[0]));
             match command {
                 "show" => request("GET", &path, None),
+                "history" => request("GET", &format!("{path}/history"), None),
                 "cancel" => request("POST", &format!("{path}/cancel"), Some(json!({}))),
                 "delete" => request("DELETE", &path, None),
                 _ => {
@@ -1569,7 +1572,7 @@ fn knowledge(raw: &[String]) -> Result<Value> {
 fn status() -> Result<Value> {
     Ok(json!({
         "daemon": request("GET", "/health", None)?,
-        "peers": request("GET", "/peers", None)?,
+        "peers": request("GET", "/peers?detail=true", None)?,
     }))
 }
 
@@ -1582,12 +1585,20 @@ fn render(output: &Value, args: &[String], tty: bool) -> Result<String> {
             daemon["name"].as_str().unwrap_or("amesh"),
             if ok { "ok" } else { "down" }
         );
+        if let Some(version) = daemon["version"].as_str() {
+            out.push_str(&format!("Hub {version}"));
+            if let Some(revision) = daemon["revision"].as_str() {
+                let short = revision.get(..12).unwrap_or(revision);
+                out.push_str(&format!(" ({short})"));
+            }
+            out.push('\n');
+        }
         let empty: [Value; 0] = [];
         let peers = output["peers"]
             .as_array()
             .map(Vec::as_slice)
             .unwrap_or(&empty);
-        out.push_str(&format_peers(peers));
+        out.push_str(&format_peers_with_delivery(peers, true));
         return Ok(out);
     }
     if tty
@@ -1603,23 +1614,50 @@ fn render(output: &Value, args: &[String], tty: bool) -> Result<String> {
 }
 
 fn format_peers(peers: &[Value]) -> String {
+    format_peers_with_delivery(peers, false)
+}
+
+fn format_peers_with_delivery(peers: &[Value], detail: bool) -> String {
     let mut out = format!("{} peers\n", peers.len());
     if peers.is_empty() {
         return out;
     }
     out.push_str(&format!(
-        "{:<34} {:<10} {:<12} {:<22} PATH\n",
+        "{:<34} {:<10} {:<12} {:<22}",
         "PEER", "STATUS", "BACKEND", "CIRCLE"
     ));
+    if detail {
+        out.push_str(" BUILD    DELIVERY          QUEUED");
+    }
+    out.push_str(" PATH\n");
     for peer in peers {
         out.push_str(&format!(
-            "{:<34} {:<10} {:<12} {:<22} {}\n",
+            "{:<34} {:<10} {:<12} {:<22}",
             peer["peer_id"].as_str().unwrap_or("-"),
             peer["status"].as_str().unwrap_or("-"),
             peer["backend"].as_str().unwrap_or("-"),
             peer["circle"].as_str().unwrap_or("-"),
-            peer["path"].as_str().unwrap_or("-"),
         ));
+        if detail {
+            let build = match peer["stale"].as_bool() {
+                Some(true) => "stale",
+                Some(false) => "current",
+                None => "-",
+            };
+            let delivery = &peer["delivery"];
+            let condition = if peer["delivery_issue"] == "codex_thread_not_loaded" {
+                "thread-not-loaded"
+            } else if delivery["stuck"].is_object() {
+                "stuck"
+            } else {
+                delivery["condition"].as_str().unwrap_or("-")
+            };
+            let queued = peer["queued"]
+                .as_u64()
+                .map_or_else(|| "-".into(), |count| count.to_string());
+            out.push_str(&format!(" {build:<8} {condition:<17} {queued:>6}"));
+        }
+        out.push_str(&format!(" {}\n", peer["path"].as_str().unwrap_or("-")));
     }
     out
 }
@@ -2899,7 +2937,12 @@ async fn app_open() -> Option<(AppWs, u64)> {
     Some((ws, 2))
 }
 
-async fn app_connect(peer_id: &str, stream: Option<&str>) -> Option<AppSink> {
+async fn app_connect(
+    peer_id: &str,
+    stream: Option<&str>,
+    unloaded_thread: &mut Option<String>,
+) -> Option<AppSink> {
+    *unloaded_thread = None;
     /* the session the stream names holds the name for every frame after it. Without one,
     from a hub that does not send it or a row that has none, the row's session decides, and
     CODEX_THREAD_ID only stands in for a row that names none or a hub that cannot be asked,
@@ -2963,7 +3006,12 @@ async fn app_connect(peer_id: &str, stream: Option<&str>) -> Option<AppSink> {
         },
     };
     let thread_id = match select_app_thread(&mut ws, &mut rpc_id, Some(&trusted_id)).await {
-        Ok(id) => id,
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            eprintln!("amesh hook ws: trusted thread {trusted_id} is not loaded");
+            *unloaded_thread = Some(trusted_id);
+            return None;
+        }
         Err(error) => {
             eprintln!("amesh hook ws: cannot select App Server thread: {error}");
             return None;
@@ -2981,15 +3029,15 @@ async fn select_app_thread(
     ws: &mut AppWs,
     rpc_id: &mut u64,
     trusted_id: Option<&str>,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let id = trusted_id
         .filter(|id| !id.is_empty())
         .ok_or("waiting for session binding")?;
     let ids = loaded_app_threads(ws, rpc_id).await?;
-    ids.iter()
+    Ok(ids
+        .iter()
         .any(|candidate| candidate == id)
-        .then(|| id.to_string())
-        .ok_or_else(|| format!("trusted thread {id} is not loaded").into())
+        .then(|| id.to_string()))
 }
 
 async fn loaded_app_threads(ws: &mut AppWs, rpc_id: &mut u64) -> Result<Vec<String>> {
@@ -3586,6 +3634,7 @@ async fn hook_ws_once(
     looked up on the first frame after connected rather than here */
     let mut app: Option<AppSink> = None;
     let mut owner: Option<String> = None;
+    let mut unloaded_thread = None;
     /* until connected names the session, nothing queued from an earlier connection may
     be flushed: the heartbeat's first tick is ready before any frame */
     let mut warned = false;
@@ -3619,6 +3668,7 @@ async fn hook_ws_once(
                     }
                     greeted = true;
                     app = None;
+                    unloaded_thread = None;
                     retry.owned_by(owner.as_deref(), Instant::now());
                     beat.reset_immediately();
                     if backend == "claude-code" {
@@ -3705,7 +3755,7 @@ async fn hook_ws_once(
                 let tag = owner.clone().filter(|id| !id.is_empty());
                 enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
                 if uses_app_server && app.is_none() && retry.due(Instant::now()) {
-                    app = app_connect(peer_id, owner.as_deref()).await;
+                    app = app_connect(peer_id, owner.as_deref(), &mut unloaded_thread).await;
                     if app.is_none() {
                         retry.failed(Instant::now());
                     }
@@ -3770,11 +3820,12 @@ async fn hook_ws_once(
                         return Ok((false, greeted));
                     }
                 }
-                if ws.send(Message::Text(json!({"type": "ping"}).to_string().into())).await.is_err() {
+                let ping = json!({"type": "ping", "unloaded_thread": unloaded_thread});
+                if ws.send(Message::Text(ping.to_string().into())).await.is_err() {
                     return Ok((false, greeted));
                 }
                 if uses_app_server && app.is_none() && retry.due(Instant::now()) {
-                    app = app_connect(peer_id, owner.as_deref()).await;
+                    app = app_connect(peer_id, owner.as_deref(), &mut unloaded_thread).await;
                     warned = false;
                     if app.is_none() {
                         retry.failed(Instant::now());

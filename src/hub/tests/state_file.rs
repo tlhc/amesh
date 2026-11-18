@@ -10,6 +10,8 @@ fn pragma(hub: &Hub, name: &str) -> i64 {
 fn the_state_file_gives_back_what_a_sweep_deletes() {
     let path = temp_state("vacuum");
     let mut hub = Hub::open(&path).unwrap();
+    let baseline = pragma(&hub, "page_count");
+    let baseline_bytes = baseline as u64 * pragma(&hub, "page_size") as u64;
     let ended = now_unix() - JOB_KEEP_SECS - 60;
     for n in 0..200 {
         let id = format!("job-{n}");
@@ -29,12 +31,12 @@ fn the_state_file_gives_back_what_a_sweep_deletes() {
     assert!(hub.jobs.is_empty(), "the sweep deleted the ended jobs");
     let left = pragma(&hub, "page_count");
     assert!(
-        pragma(&hub, "freelist_count") == 0 && left * 10 < full,
+        pragma(&hub, "freelist_count") == 0 && (left - baseline) * 10 < full - baseline,
         "{left} of {full} pages kept after the sweep"
     );
     let now = fs::metadata(&path).unwrap().len();
     assert!(
-        now * 10 < size,
+        now.saturating_sub(baseline_bytes) * 10 < size - baseline_bytes,
         "the file itself shrinks: {now} of {size} bytes"
     );
     let text = fs::read(&path).unwrap();
@@ -78,7 +80,12 @@ fn an_older_state_file_is_compacted_once() {
     let before = fs::metadata(&path).unwrap().len();
     let hub = Hub::open(&path).unwrap();
     let after = fs::metadata(&path).unwrap().len();
-    assert!(after * 10 < before, "{after} of {before} bytes");
+    let empty = Hub::open(&temp_state("empty")).unwrap();
+    let baseline = (pragma(&empty, "page_count") + 1) as u64 * pragma(&empty, "page_size") as u64;
+    assert!(
+        after.saturating_sub(baseline) * 10 < before - baseline,
+        "{after} of {before} bytes, {baseline} bytes for empty tables and the junk table"
+    );
     let wal = fs::metadata(path.with_extension("db-wal")).map_or(0, |meta| meta.len());
     assert_eq!(wal, 0, "the log is cut back after the compaction");
     let text = fs::read(&path).unwrap();

@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use super::Peer;
+use super::{database_error as internal, Peer};
 
 pub(super) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS knowledge (
@@ -474,10 +474,6 @@ fn secs(value: u64) -> i64 {
 
 fn fail(status: StatusCode, error: impl std::fmt::Display) -> Failure {
     (status, Json(json!({"error": error.to_string()})))
-}
-
-fn internal(error: rusqlite::Error) -> Failure {
-    fail(StatusCode::INTERNAL_SERVER_ERROR, error)
 }
 
 fn not_found() -> Failure {

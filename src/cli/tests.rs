@@ -499,6 +499,32 @@ fn render_status_tty_keeps_daemon_prefix() {
 }
 
 #[test]
+fn status_shows_revision_and_delivery() {
+    let output = json!({
+        "daemon": {"name": "amesh", "ok": true, "version": "0.1.0", "revision": "deadc0de"},
+        "peers": [
+            {"peer_id":"old", "stale":true, "queued":2, "delivery":{"condition":"push", "stuck":{"count":2,"since":1}}},
+            {"peer_id":"new", "stale":false, "queued":0, "delivery":{"condition":"push"}},
+            {"peer_id":"unloaded", "queued":1, "delivery_issue":"codex_thread_not_loaded", "delivery":{"condition":"push"}}
+        ]
+    });
+    let table = render(&output, &[String::from("status")], true).unwrap();
+    assert!(table.contains("0.1.0 (deadc0de)"), "{table}");
+    let old = table.lines().find(|row| row.starts_with("old")).unwrap();
+    assert!(
+        old.contains("stale") && old.contains("stuck") && old.contains('2'),
+        "{old}"
+    );
+    let new = table.lines().find(|row| row.starts_with("new")).unwrap();
+    assert!(new.contains("current") && new.contains("push"), "{new}");
+    let unloaded = table
+        .lines()
+        .find(|row| row.starts_with("unloaded"))
+        .unwrap();
+    assert!(unloaded.contains("thread-not-loaded"), "{unloaded}");
+}
+
+#[test]
 fn render_jobs_list_tty_stays_json() {
     let jobs = json!([{"id": "job-1"}]);
     let args = ["jobs", "list"].map(String::from);
@@ -721,7 +747,10 @@ mod thread_routing {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::{protocol::Role, Message};
 
-    async fn select(pages: Vec<Value>, trusted: Option<&str>) -> (Result<String>, Vec<Value>) {
+    async fn select(
+        pages: Vec<Value>,
+        trusted: Option<&str>,
+    ) -> (Result<Option<String>>, Vec<Value>) {
         let (a, b) = tokio::net::UnixStream::pair().unwrap();
         let mut client = AppWs::from_raw_socket(a, Role::Client, None).await;
         let mut server = AppWs::from_raw_socket(b, Role::Server, None).await;
@@ -770,7 +799,7 @@ mod thread_routing {
             Some("target"),
         )
         .await;
-        assert_eq!(result.unwrap(), "target");
+        assert_eq!(result.unwrap().as_deref(), Some("target"));
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[1]["params"]["cursor"], "p2");
         assert!(requests.iter().all(|r| r["method"] == "thread/loaded/list"));
@@ -779,10 +808,7 @@ mod thread_routing {
     #[tokio::test]
     async fn routing_missing_trusted_id_does_not_select_same_cwd() {
         let (result, _) = select(vec![json!({"result":{"data":["other"]}})], Some("target")).await;
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("trusted thread target is not loaded"));
+        assert_eq!(result.unwrap(), None);
     }
 
     #[tokio::test]
@@ -834,7 +860,7 @@ mod thread_routing {
         .await;
         assert!(first.is_err());
         let (second, _) = select(vec![json!({"result":{"data":["target"]}})], Some("target")).await;
-        assert_eq!(second.unwrap(), "target");
+        assert_eq!(second.unwrap().as_deref(), Some("target"));
     }
 
     #[test]
@@ -949,9 +975,13 @@ mod thread_routing {
                 }
             });
             let stream = (case == "stream").then_some("target");
-            let outcome = tokio::time::timeout(Duration::from_secs(3), app_connect("own", stream))
-                .await
-                .unwrap();
+            let mut unloaded_thread = None;
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(3),
+                app_connect("own", stream, &mut unloaded_thread),
+            )
+            .await
+            .unwrap();
             server.abort();
             outcome.map(|sink| sink.thread_id)
         });

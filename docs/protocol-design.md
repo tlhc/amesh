@@ -10,7 +10,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - If `AMESH_TOKEN` is set at `serve` start, HTTP needs `Authorization: Bearer <token>` (`check_auth`):
   - a mismatch is 401
   - an empty token means no check
-- `GET /health` is always open: `{"ok":true,"name":"amesh","version":"0.1.0","build":"…"}`. `build` identifies the running hub binary (`dev:ino:size:mtime` on Unix), or is null when unavailable.
+- `GET /health` is always open. `version` is the package version and `revision` is the Git commit available at compile time, or null for builds without Git metadata. `build` identifies the running hub binary (`dev:ino:size:mtime` on Unix), or is null when unavailable.
 
 ## Roster
 
@@ -19,6 +19,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - an omitted `name` keeps the stored one, else defaults to `peer_id`
   - supported backends are `pi`, `codex`, `claude-code` (alias `claude`) and `opencode`
 - `GET /peers` probes sockets, then drops peers with no live WebSocket and `last_seen` older than 30s (`PEER_ONLINE_SECS`), and may persist.
+- `GET /peers?detail=true` adds `build`, `stale`, `delivery` and `queued`. A Codex drainer can also report `delivery_issue: "codex_thread_not_loaded"` for the currently registered session.
 
 ## Ask
 
@@ -41,6 +42,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `POST /jobs` with `assigned_peer` creates a dispatched job:
   - the assignee must resolve (404) and share the job's circle (403)
   - every id in `depends_on` must exist in the same circle (400)
+- Optional `request_key` uses 1-128 characters from `A-Z a-z 0-9 . _ -` and requires a registered `from_peer` with a session ID. The key is scoped to that peer, session and circle. Repeat identical creation parameters to return the current job. Reusing the key with other parameters or after the live job was swept returns 409 with the original `job_id`.
 - Once a second the hub:
   - settles running jobs whose ask closed: `done`, or `failed` when the ask is failed
   - sends each queued job whose dependencies are all `done` as an ask from its creator
@@ -53,7 +55,8 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - moving a running job elsewhere closes its still-open ask
   - `assigned_peer` reassigns and `prompt` rewrites the next attempt; both are refused (409) while the new state is `running`
   - a dispatched job enters `running` only by being sent (409 otherwise)
-- `DELETE /jobs/{id}` is 409 while a queued or running job depends on it.
+- `GET /jobs/{id}/history` returns job metadata and dispatch attempts in order, with `ask_id`, `peer_id`, `session_id`, `opened_at`, `closed_at`, `closed_by` and `failed`. The session is the registered session at dispatch, when known. An upgrade can only backfill attempts still referenced by live jobs. History and request keys expire after the job has both left the live list and ended at least seven days ago.
+- `DELETE /jobs/{id}` is 409 while a queued or running job depends on it. Deleting a live job also removes its history and request key.
 - Jobs record `created_at` and asks `opened_at` and `closed_by` (`recipient`, `hand` or `hub`: who closed it); rows written before these fields existed leave them empty. A binary from before them rewrites the tables without them, so after a downgrade the times read as empty again. Asks also store `from_circle` and `to_circle`; a row without `to_circle`, written by an older binary or rewritten by one after a downgrade, takes both from the stored peers and jobs when the hub starts.
 - MCP job tools that name a caller act only on jobs in the caller's circle unless `cross_circle` is set.
 - Cleanup, with both periods set in `config.toml` (default 24 hours):

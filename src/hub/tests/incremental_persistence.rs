@@ -103,6 +103,9 @@ fn removing_inbox_head_preserves_order_and_age() {
 
 macro_rules! changed_table {
     ($name:ident, $sql:literal) => {
+        changed_table!($name, $sql, 1, 1);
+    };
+    ($name:ident, $sql:literal, $forward_writes:expr, $reverse_writes:expr) => {
         #[test]
         fn $name() {
             let (mut db, original) = fixture();
@@ -127,11 +130,11 @@ macro_rules! changed_table {
             write_snapshot(&mut db, &original).unwrap();
             let before = db.total_changes();
             write_snapshot(&mut db, &changed).unwrap();
-            assert_eq!(db.total_changes() - before, 1);
+            assert_eq!(db.total_changes() - before, $forward_writes);
             assert_eq!(rows(&db), changed_rows);
             let before = db.total_changes();
             write_snapshot(&mut db, &original).unwrap();
-            assert_eq!(db.total_changes() - before, 1);
+            assert_eq!(db.total_changes() - before, $reverse_writes);
             assert_eq!(rows(&db), original_rows);
             let before = db.total_changes();
             write_snapshot(&mut db, &original).unwrap();
@@ -142,7 +145,8 @@ macro_rules! changed_table {
 
 changed_table!(changing_peer_fields, "UPDATE peers SET name = 'other', path = '/other', backend = 'pi', circle = 'd', status = 'offline', description = 'changed', last_seen = 200");
 changed_table!(changing_nullable_ask, "UPDATE asks SET from_peer = 'other', to_peer = 'other', to_peer_id = 'other', text = 'changed', from_circle = 'd', to_circle = 'd', reply = 'answer', closed_at = 200, opened_at = 100, closed_by = 'p', open = 0, failed = 1");
-changed_table!(changing_nullable_job, "UPDATE jobs SET title = 'changed', prompt = 'changed', path = '/other', backend = 'pi', state = 'done', circle = 'd', assigned_peer = 'p', result_summary = 'done', ask_id = 'a', from_peer = 'p', nudge_at = 110, finished_at = 120, created_at = 100, handoff = 'next', depends_on = '[\"other\"]', dispatch = 1");
+// The new ask reference adds a history attempt. Both directions update archived job metadata.
+changed_table!(changing_nullable_job, "UPDATE jobs SET title = 'changed', prompt = 'changed', path = '/other', backend = 'pi', state = 'done', circle = 'd', assigned_peer = 'p', result_summary = 'done', ask_id = 'a', from_peer = 'p', nudge_at = 110, finished_at = 120, created_at = 100, handoff = 'next', depends_on = '[\"other\"]', dispatch = 1", 3, 2);
 changed_table!(changing_nullable_schedule, "UPDATE schedules SET from_peer = 'other', to_peer = 'other', text = 'changed', kind = 'ask', fire_at = 300, circle = 'd', every_seconds = 60");
 changed_table!(
     changing_owed_owner,

@@ -13,6 +13,7 @@ fn hub() -> Hub {
         recv_live: Default::default(),
         recv_known: Default::default(),
         builds: HashMap::new(),
+        unloaded_threads: Default::default(),
         owed: HashMap::new(),
         inbox: Inbox::default(),
         conn_gen: 0,

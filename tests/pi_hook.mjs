@@ -149,6 +149,7 @@ assert.deepEqual(registrationOrder.slice(18), [
   "amesh_knowledge_revoke",
   "amesh_knowledge_delete",
   "amesh_watch",
+  "amesh_job_history",
 ]);
 assert.deepEqual(tools.sort(), [
   "amesh_ack",
@@ -159,6 +160,7 @@ assert.deepEqual(tools.sort(), [
   "amesh_job_cancel",
   "amesh_job_create",
   "amesh_job_delete",
+  "amesh_job_history",
   "amesh_job_list",
   "amesh_job_status",
   "amesh_job_update",
@@ -196,6 +198,8 @@ assert.equal(schemas.amesh_events.properties.cross_circle.type, "boolean");
 assert.equal(schemas.amesh_events.properties.limit.type, "integer");
 assert.equal(schemas.amesh_ack.properties.failed.type, "boolean");
 assert.equal(schemas.amesh_job_create.properties.depends_on.type, "array");
+assert.equal(schemas.amesh_job_create.properties.request_key.type, "string");
+assert.deepEqual(schemas.amesh_job_history.required, ["job_id"]);
 assert.equal(schemas.amesh_job_update.properties.assigned_peer.type, "string");
 assert.equal(schemas.amesh_job_update.properties.coordinator.type, "string");
 assert.deepEqual(schemas.amesh_job_update.required, ["job_id"]);
