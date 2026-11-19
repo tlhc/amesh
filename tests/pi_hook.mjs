@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { test as nodeTest } from "node:test";
@@ -2548,6 +2548,178 @@ await test("MCP target errors reject without creating jobs and allow one correct
     }
   }
 });
+
+/* ---- confirmation by session entry: Esc loss fix ---- */
+function VerifyInstance(state) {
+  const handlers = new Map();
+  const users = [];
+  const sockets = [];
+  socketSink = sockets;
+  AmeshHooks({
+    on(event, handler) { handlers.set(event, handler); },
+    sendMessage() {},
+    sendUserMessage(content, options) { users.push({ content, options }); },
+    registerTool() {},
+  });
+  return { handlers, users, sockets };
+}
+
+let verifySessionIndex = 0;
+function VerifySession() {
+  const history = [];
+  const flags = { pending: false };
+  const sessionId = `pi-verify-${++verifySessionIndex}`;
+  const ctx = {
+    cwd,
+    sessionManager: {
+      getSessionId: () => sessionId,
+      getEntries: () => history,
+      buildContextEntries: () => history,
+    },
+    hasPendingMessages: () => flags.pending,
+    isIdle: () => true,
+  };
+  return { ctx, history, flags };
+}
+
+async function verifyStarted(state, instance) {
+  await instance.handlers.get("session_start")({}, state.ctx);
+  await waitCount(instance.sockets, 1, 4000);
+  fire(instance.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
+}
+
+function deliver(state, text) {
+  state.history.push({ type: "message", message: { role: "user", content: [{ type: "text", text }] } });
+}
+
+await test("an Esc-cleared steer is reinjected and enters the session exactly once", async () => {
+  const state = VerifySession();
+  const instance = VerifyInstance(state);
+  try {
+    await verifyStarted(state, instance);
+    fire(instance.sockets[0], { type: "notify", message: "esc loses me", id: "rec-esc-1", from_peer: "amesh-codex" });
+    assert.equal(instance.users.length, 1);
+    assert.match(instance.users[0].content, /record-id="rec-esc-1"/);
+    /* Esc: the queue was cleared, so pi holds nothing and nothing lands in the tree */
+    await instance.handlers.get("agent_settled")({ aborted: true }, state.ctx);
+    assert.equal(instance.users.length, 2, "the cleared steer is reinjected");
+    assert.match(instance.users[1].content, /record-id="rec-esc-1"/);
+    /* the reinjection lands as an appended entry; the marker confirms it */
+    deliver(state, instance.users[1].content);
+    await instance.handlers.get("message_end")({}, state.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 2, "a confirmed entry never reinjects");
+    fire(instance.sockets[0], { type: "notify", message: "esc loses me", id: "rec-esc-1", from_peer: "amesh-codex" });
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 2, "a replay of a confirmed record is acknowledged, not injected");
+    assert.equal(state.history.filter((entry) => EntryTextFor(entry).includes('record-id="rec-esc-1"')).length, 1,
+      "the session holds the message exactly once");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("an abort that keeps the queue waiting is not reinjected", async () => {
+  const state = VerifySession();
+  const instance = VerifyInstance(state);
+  try {
+    await verifyStarted(state, instance);
+    fire(instance.sockets[0], { type: "notify", message: "plain abort keeps me", id: "rec-abort-1", from_peer: "amesh-codex" });
+    assert.equal(instance.users.length, 1);
+    /* a plain abort leaves the text queued inside pi: it delivers in the next run */
+    state.flags.pending = true;
+    await instance.handlers.get("agent_settled")({ aborted: true }, state.ctx);
+    assert.equal(instance.users.length, 1, "no reinjection while pi's own queue holds the text");
+    state.flags.pending = false;
+    deliver(state, instance.users[0].content);
+    await instance.handlers.get("message_end")({}, state.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 1, "delivery out of pi's queue confirms the record");
+    fire(instance.sockets[0], { type: "notify", message: "plain abort keeps me", id: "rec-abort-1", from_peer: "amesh-codex" });
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 1, "a replay of the confirmed record injects nothing");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("a rewritten marker leaves the record unconfirmed", async () => {
+  const state = VerifySession();
+  const instance = VerifyInstance(state);
+  try {
+    await verifyStarted(state, instance);
+    fire(instance.sockets[0], { type: "notify", message: "rewrite drops my marker", id: "rec-miss-1", from_peer: "amesh-codex" });
+    assert.equal(instance.users.length, 1);
+    /* an input extension delivered the text but the marker is gone: the entry cannot confirm it */
+    deliver(state, instance.users[0].content.replace(/ record-id="rec-miss-1"/, ""));
+    await instance.handlers.get("message_end")({}, state.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    assert.equal(instance.users.length, 2, "an unconfirmed record is reinjected");
+    fire(instance.sockets[0], { type: "notify", message: "rewrite drops my marker", id: "rec-miss-1", from_peer: "amesh-codex" });
+    assert.equal(instance.users.length, 2, "the replay is acknowledged without a second injection");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+await test("reinjection stops after three attempts and other messages still deliver", async () => {
+  const state = VerifySession();
+  const instance = VerifyInstance(state);
+  const logsBefore = ameshLogs.length;
+  try {
+    await verifyStarted(state, instance);
+    fire(instance.sockets[0], { type: "notify", message: "never lands", id: "rec-cap-1", from_peer: "amesh-codex" });
+    assert.equal(instance.users.length, 1);
+    for (let round = 0; round < 5; round++) {
+      await instance.handlers.get("agent_settled")({ aborted: true }, state.ctx);
+    }
+    assert.equal(instance.users.length, 4, "one send plus exactly three reinjections");
+    const warns = ameshLogs.slice(logsBefore).filter((line) => line.includes("rec-cap-1 was never confirmed"));
+    assert.equal(warns.length, 1, "the exhausted record warns once");
+    fire(instance.sockets[0], { type: "notify", message: "still flows", id: "rec-cap-2", from_peer: "amesh-codex" });
+    assert.equal(instance.users.length, 5, "other messages keep delivering");
+    assert.match(instance.users[4].content, /record-id="rec-cap-2"/);
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
+
+function EntryTextFor(entry) {
+  const content = entry?.message?.content;
+  if (typeof content === "string") {
+    return content;
+  }
+  if (Array.isArray(content)) {
+    return content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("");
+  }
+  return "";
+}
+
+await test("the confirmation fix adds no local database files", async () => {
+  const stateDirectory = dirname(process.env.AMESH_STATE);
+  const state = VerifySession();
+  const instance = VerifyInstance(state);
+  const before = readdirSync(stateDirectory).filter((name) => /\.(db|sqlite|sqlite3)$/i.test(name));
+  try {
+    await verifyStarted(state, instance);
+    fire(instance.sockets[0], { type: "notify", message: "no db files", id: "rec-nodb-1", from_peer: "amesh-codex" });
+    assert.equal(instance.users.length, 1);
+    await instance.handlers.get("agent_settled")({ aborted: true }, state.ctx);
+    deliver(state, instance.users[1].content);
+    await instance.handlers.get("message_end")({}, state.ctx);
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    await instance.handlers.get("agent_settled")({}, state.ctx);
+    const after = readdirSync(stateDirectory).filter((name) => /\.(db|sqlite|sqlite3)$/i.test(name));
+    assert.deepEqual(after, before, "the fix must not add *.db or *.sqlite files");
+  } finally {
+    await instance.handlers.get("session_shutdown")({}, state.ctx);
+  }
+});
+
 } finally {
   await ShutdownAll();
 }

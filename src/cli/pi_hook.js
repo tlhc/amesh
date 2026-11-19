@@ -425,6 +425,93 @@ export default function AmeshHooks(pi) {
     retry.unref?.();
   }
 
+  /* entries the batch carried that no session entry has confirmed yet; Esc leaves them
+  nowhere in pi, while an abort without Esc keeps them queued inside pi until a later run */
+  let inflightBatch = null;
+  let awaitingQueue = [];
+  let verifyTimer = null;
+  const REINJECT_MAX = 3;
+
+  function ScheduleVerify(delay) {
+    clearTimeout(verifyTimer);
+    verifyTimer = setTimeout(() => {
+      verifyTimer = null;
+      Verify(lastCtx);
+    }, delay ?? 25);
+    verifyTimer.unref?.();
+  }
+
+  function EntryText(entry) {
+    const content = entry?.message?.content;
+    if (typeof content === "string") {
+      return content;
+    }
+    if (Array.isArray(content)) {
+      return content.map((part) => (typeof part?.text === "string" ? part.text : "")).join("");
+    }
+    return "";
+  }
+
+  function MarkerIn(entries, id) {
+    const marker = `record-id="${id}"`;
+    for (let i = entries.length - 1; i >= 0 && i >= entries.length - 400; i--) {
+      if (entries[i]?.type === "message" && EntryText(entries[i]).includes(marker)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function Verify(ctx) {
+    const entries = ctx?.sessionManager?.getEntries?.();
+    if (!Array.isArray(entries)) {
+      return;
+    }
+    const landed = (item) => !item.id || MarkerIn(entries, item.id);
+    const batch = inflightBatch ? inflightBatch.filter(landed) : [];
+    const waiting = awaitingQueue.filter(landed);
+    if (batch.length) {
+      Complete(batch);
+      inflightBatch = inflightBatch.filter((item) => !batch.includes(item));
+      if (!inflightBatch.length) {
+        inflightBatch = null;
+      }
+    }
+    if (waiting.length) {
+      Complete(waiting);
+      awaitingQueue = awaitingQueue.filter((item) => !waiting.includes(item));
+    }
+  }
+
+  function SettleUnverified(batch, ctx) {
+    /* pi's own queue may still hold the text an abort left there; it delivers in the next
+    run, so a reinjection now would enter the session twice */
+    const queueHeld = ctx?.hasPendingMessages?.() === true;
+    for (const item of batch) {
+      if (!item.id) {
+        continue;
+      }
+      if (queueHeld) {
+        awaitingQueue.push(item);
+        continue;
+      }
+      const held = accepted.get(item.id);
+      const attempts = held?.entry?.attempts ?? 0;
+      if (attempts >= REINJECT_MAX) {
+        if (held && !held.warned) {
+          held.warned = true;
+          console.error(`[amesh] ${item.id} was never confirmed in the session after ${REINJECT_MAX} reinjections; left unconfirmed`);
+        }
+        continue;
+      }
+      if (held) {
+        held.entry.attempts = attempts + 1;
+      }
+      pending.push(item);
+    }
+    Rewrite();
+  }
+
   function Cli(args) {
     return new Promise((resolve, reject) => {
       execFile(executable, args, { timeout: 15000 }, (error, stdout, stderr) => {
@@ -484,6 +571,12 @@ export default function AmeshHooks(pi) {
       localSession = session;
       inflight = false;
       inflightText = null;
+      /* a batch sent to the previous session can no longer be read from this tree; keep it
+      recoverable for the next settle instead of dropping it */
+      if (inflightBatch) {
+        awaitingQueue.push(...inflightBatch);
+        inflightBatch = null;
+      }
       reminded = false;
       pendingSeen = false;
     }
@@ -508,8 +601,11 @@ export default function AmeshHooks(pi) {
   function Drop() {
     dead = true;
     clearTimeout(idleCheck);
+    clearTimeout(verifyTimer);
     inflight = false;
     inflightText = null;
+    inflightBatch = null;
+    awaitingQueue = [];
     reminded = false;
     pendingSeen = false;
     warned = false;
@@ -574,7 +670,17 @@ export default function AmeshHooks(pi) {
         pending.splice(at, 1);
       }
     }
-    Complete(batch);
+    /* a session tree we can read turns the send into a two-step handoff: the marker lands in
+    an appended entry before the record is done. without a readable tree the old contract
+    stands, and the send itself retires the record */
+    const readable = !!lastCtx?.sessionManager && typeof lastCtx.sessionManager.getEntries === "function";
+    const verifiable = batch.filter((item) => item.id && readable);
+    const immediate = batch.filter((item) => !item.id || !readable);
+    if (immediate.length) {
+      Complete(immediate);
+    }
+    inflightBatch = verifiable.length ? verifiable : null;
+    ScheduleVerify(25);
   }
 
   function Rows(map) {
@@ -950,7 +1056,7 @@ export default function AmeshHooks(pi) {
     const text = body.text || body.message || "";
     return Accept({
       id: body.id,
-      text: FormatPeer(body.from_peer || "unknown", body.type, text, body.correlation_id),
+      text: FormatPeer(body.from_peer || "unknown", body.type, text, body.correlation_id, body.id),
       type: body.type,
       session,
       cid: body.correlation_id,
@@ -985,9 +1091,10 @@ export default function AmeshHooks(pi) {
     }
   }
 
-  function FormatPeer(from, type, text, correlationId) {
+  function FormatPeer(from, type, text, correlationId, recordId) {
     const corr = correlationId ? ` correlation-id="${EscapeAttr(correlationId)}"` : "";
-    return `<peer-message from="@${EscapeAttr(from)}" to="@${EscapeAttr(selfId || "")}" type="${EscapeAttr(type)}"${corr}>\n${EscapeBody(text)}\n</peer-message>`;
+    const mark = recordId ? ` record-id="${EscapeAttr(recordId)}"` : "";
+    return `<peer-message from="@${EscapeAttr(from)}" to="@${EscapeAttr(selfId || "")}" type="${EscapeAttr(type)}"${corr}${mark}>\n${EscapeBody(text)}\n</peer-message>`;
   }
 
   function RegisterTools() {
@@ -1478,6 +1585,7 @@ export default function AmeshHooks(pi) {
   next batch out inside the same run. A text rewrite by another extension's input handler
   keeps it from matching, and the batch then waits for agent_settled, as it does today */
   pi.on("message_start", (event) => {
+    ScheduleVerify(25);
     if (inflightText === null) {
       return;
     }
@@ -1542,7 +1650,25 @@ export default function AmeshHooks(pi) {
     };
   });
 
+  /* the appended entry follows this event, so the check runs one tick later */
+  pi.on("message_end", (_event, ctx) => {
+    if (ctx) {
+      lastCtx = ctx;
+    }
+    ScheduleVerify(25);
+  });
+
   pi.on("agent_settled", (_event, ctx) => {
+    if (ctx) {
+      lastCtx = ctx;
+    }
+    Verify(ctx);
+    const unresolved = [...(inflightBatch ?? []), ...awaitingQueue];
+    inflightBatch = null;
+    awaitingQueue = [];
+    if (unresolved.length) {
+      SettleUnverified(unresolved, ctx);
+    }
     inflight = false;
     inflightText = null;
     Flush();
