@@ -70,10 +70,36 @@ impl Inbox {
         self.records(peer).len()
     }
 
-    pub(super) fn stuck(&self, peer: &str, now: u64) -> Option<(usize, u64)> {
+    pub(super) fn delivery_stats(
+        &self,
+        peer: &str,
+        now: u64,
+        awaiting: Option<&HashSet<String>>,
+    ) -> (Option<(usize, u64)>, usize) {
         let records = self.records(peer);
-        let oldest = records.iter().map(QueuedRecord::queued_at).min()?;
-        (now.saturating_sub(oldest) >= STUCK_SECS).then_some((records.len(), oldest))
+        let mut waiting = 0;
+        let mut oldest = None::<u64>;
+        for record in records {
+            let held = record.event()["id"]
+                .as_str()
+                .is_some_and(|id| awaiting.is_some_and(|ids| ids.contains(id)));
+            if held {
+                waiting += 1;
+            } else {
+                oldest = Some(
+                    oldest.map_or(record.queued_at(), |oldest| oldest.min(record.queued_at())),
+                );
+            }
+        }
+        let stuck = oldest
+            .filter(|since| now.saturating_sub(*since) >= STUCK_SECS)
+            .map(|since| (records.len() - waiting, since));
+        (stuck, waiting)
+    }
+
+    #[cfg(test)]
+    pub(super) fn stuck(&self, peer: &str, now: u64) -> Option<(usize, u64)> {
+        self.delivery_stats(peer, now, None).0
     }
 
     pub(super) fn enqueue(

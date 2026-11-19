@@ -486,7 +486,21 @@ pub(super) fn liveness(hub: &Hub, peer: &Peer) -> Liveness {
 }
 
 pub(super) fn delivery(hub: &Hub, peer: &Peer, now: u64) -> Delivery {
+    let awaiting = hub
+        .awaiting_confirmation
+        .get(&peer.peer_id)
+        .filter(|report| {
+            report.session == peer.session_id
+                && hub
+                    .sockets
+                    .get(&peer.peer_id)
+                    .is_some_and(|(generation, _)| *generation == report.generation)
+        });
+    let (stuck, awaiting_confirmation) =
+        hub.inbox
+            .delivery_stats(&peer.peer_id, now, awaiting.map(|report| &report.ids));
     Delivery {
+        awaiting_confirmation,
         condition: if peer.status != "online" {
             DeliveryCondition::Offline
         } else if hub.sockets.contains_key(&peer.peer_id) {
@@ -494,10 +508,7 @@ pub(super) fn delivery(hub: &Hub, peer: &Peer, now: u64) -> Delivery {
         } else {
             DeliveryCondition::NoPush
         },
-        stuck: hub
-            .inbox
-            .stuck(&peer.peer_id, now)
-            .map(|(count, since)| Stuck { count, since }),
+        stuck: stuck.map(|(count, since)| Stuck { count, since }),
     }
 }
 

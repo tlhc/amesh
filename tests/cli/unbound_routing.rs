@@ -77,14 +77,21 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
                         let cwd = cwd.clone();
                         clients.spawn(async move {
                             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                            let mut stored = Vec::new();
                             while let Some(Ok(AppMessage::Text(text))) = ws.next().await {
                                 let request: Value = serde_json::from_str(&text).unwrap();
                                 if request.get("id").is_none() { continue; }
                                 let result = match request["method"].as_str().unwrap() {
                                     "initialize" => json!({}),
                                     "thread/loaded/list" => json!({"data":["target","newer"]}),
-                                    "thread/read" => json!({"thread":{"cwd":cwd,"threadSource":"user","updatedAt":if request["params"]["threadId"] == "newer" { 20 } else { 10 },"status":{"type":"idle"}}}),
-                                    "turn/start" | "turn/steer" => json!({"turn":{"id":"turn"}}),
+                                    "thread/turns/list" => json!({"data":[{"id":"turn","status":"completed"}],"nextCursor":null}),
+                                    "thread/items/list" => json!({"data":stored,"nextCursor":null}),
+                                    "thread/read" => json!({"thread":{"cwd":cwd,"threadSource":"user","updatedAt":if request["params"]["threadId"] == "newer" { 20 } else { 10 },"status":{"type":"idle"},"historyMode":"paginated"}}),
+                                    "turn/start" | "turn/steer" => {
+                                        let client = &request["params"]["clientUserMessageId"];
+                                        stored.push(json!({"turnId":"turn","item":{"type":"userMessage","id":client,"clientId":client}}));
+                                        json!({"turn":{"id":"turn"}})
+                                    },
                                     method => panic!("unexpected method {method}"),
                                 };
                                 requests.send(request.clone()).unwrap();
@@ -96,7 +103,7 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
                 }
             }
         });
-        let (log_tx, mut logs) = unbounded_channel();
+        let (log_tx, _logs) = unbounded_channel();
         let mut readers = Vec::new();
         let mut spawn = || {
             let mut child = sandbox.command().args(["hook","ws","--peer-id",worker,"--backend","codex"])
@@ -129,7 +136,6 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
             assert_eq!(turn["params"]["threadId"], "target");
             assert!(turn["params"]["input"][0]["text"].as_str().unwrap().contains(&format!("\n{text}\n")), "FIFO order: {turn}");
         }
-        while !next(&mut logs).await.contains("flushed, queued=0") {}
         let mut child = first.0.take().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();
@@ -144,7 +150,6 @@ fn hook_ws_waits_for_identity_then_flushes_fifo_and_restarts_with_new_binding() 
                 break;
             }
         }
-        while !next(&mut logs).await.contains("flushed, queued=0") {}
         let mut child = second.0.take().unwrap();
         child.kill().unwrap();
         child.wait().unwrap();

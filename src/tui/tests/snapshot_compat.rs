@@ -3,6 +3,7 @@ use super::*;
 fn row(condition: crate::wire::DeliveryCondition, stuck: Option<(usize, u64)>) -> String {
     let mut peer = peer("pi", "online", None);
     peer.delivery = Some(crate::wire::Delivery {
+        awaiting_confirmation: 0,
         condition,
         stuck: stuck.map(|(count, since)| crate::wire::Stuck { count, since }),
     });
@@ -238,6 +239,7 @@ fn job_card_delivery_follows_the_fixed_worker() {
     let mut old = peer("old", "online", None);
     old.liveness = Some(Liveness::Online);
     old.delivery = Some(Delivery {
+        awaiting_confirmation: 0,
         condition: DeliveryCondition::NoPush,
         stuck: Some(Stuck {
             count: 7,
@@ -248,6 +250,7 @@ fn job_card_delivery_follows_the_fixed_worker() {
     new.name = "codex".into();
     new.liveness = Some(Liveness::Online);
     new.delivery = Some(Delivery {
+        awaiting_confirmation: 0,
         condition: DeliveryCondition::Push,
         stuck: None,
     });
@@ -400,4 +403,12 @@ fn delivery_labels_an_unloaded_codex_thread() {
         joined(&layout::delivery(&frame, &peer)),
         "thread-not-loaded"
     );
+}
+
+#[test]
+fn delivery_labels_pending_confirmation_separately() {
+    let mut peer = marked("codex", crate::wire::DeliveryCondition::Push, None);
+    peer.delivery.as_mut().unwrap().awaiting_confirmation = 2;
+    let row = layout::delivery(&as_frame(&Snapshot::default()), &peer);
+    assert_eq!(joined(&row), "2 awaiting confirmation");
 }

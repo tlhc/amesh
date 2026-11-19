@@ -239,6 +239,7 @@ fn the_job_card_says_why_its_open_ask_may_go_unseen() {
     }
     let w1 = snap.peers.iter_mut().find(|p| p.peer_id == "w1").unwrap();
     w1.delivery = Some(crate::wire::Delivery {
+        awaiting_confirmation: 0,
         condition: crate::wire::DeliveryCondition::NoPush,
         stuck: Some(crate::wire::Stuck {
             count: 2,
@@ -277,6 +278,7 @@ fn the_ask_card_says_why_an_open_ask_may_go_unseen() {
     for p in snap.peers.iter_mut().chain(snap.roster.iter_mut()) {
         if p.peer_id == PI2 {
             p.delivery = Some(crate::wire::Delivery {
+                awaiting_confirmation: 0,
                 condition: crate::wire::DeliveryCondition::NoPush,
                 stuck: Some(crate::wire::Stuck {
                     count: 1,

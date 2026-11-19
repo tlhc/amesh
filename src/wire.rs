@@ -205,7 +205,13 @@ pub(crate) enum DeliveryIssue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Delivery {
     pub condition: DeliveryCondition,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub awaiting_confirmation: usize,
     pub stuck: Option<Stuck>,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

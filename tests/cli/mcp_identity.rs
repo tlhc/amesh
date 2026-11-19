@@ -65,7 +65,9 @@ fn identity_probe_case(case: &str, target: Option<&str>) {
                                 };
                                 json!({"content":[{"type":"text","text":identity}]})
                             }
-                            "thread/read" => json!({"thread":{"status":{"type":"idle"}}}),
+                            "thread/turns/list" => json!({"data":[{"id":"turn","status":"completed"}],"nextCursor":null}),
+                            "thread/items/list" => json!({"data":[],"nextCursor":null}),
+                            "thread/read" => json!({"thread":{"status":{"type":"idle"},"historyMode":"paginated"}}),
                             "turn/start" => json!({"turn":{"id":"turn"}}),
                             method => panic!("unexpected method {method}"),
                         };

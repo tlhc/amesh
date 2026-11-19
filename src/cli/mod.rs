@@ -1630,7 +1630,7 @@ fn format_peers_with_delivery(peers: &[Value], detail: bool) -> String {
         "PEER", "STATUS", "BACKEND", "CIRCLE"
     ));
     if detail {
-        out.push_str(" BUILD    DELIVERY          QUEUED");
+        out.push_str(" BUILD    DELIVERY          QUEUED PENDING");
     }
     out.push_str(" PATH\n");
     for peer in peers {
@@ -1664,7 +1664,12 @@ fn format_peers_with_delivery(peers: &[Value], detail: bool) -> String {
             let queued = peer["queued"]
                 .as_u64()
                 .map_or_else(|| "-".into(), |count| count.to_string());
-            out.push_str(&format!(" {build:<8} {condition:<17} {queued:>6}"));
+            let pending = peer["delivery"]["awaiting_confirmation"]
+                .as_u64()
+                .unwrap_or(0);
+            out.push_str(&format!(
+                " {build:<8} {condition:<17} {queued:>6} {pending:>7}"
+            ));
         }
         out.push_str(&format!(" {}\n", peer["path"].as_str().unwrap_or("-")));
     }
@@ -2851,6 +2856,9 @@ fn drainable_backend(backend: &str) -> bool {
     backend == "claude-code" || backend == "codex"
 }
 
+mod codex_delivery;
+use codex_delivery::CodexDelivery;
+
 type AppWs = tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>;
 
 struct AppSink {
@@ -2858,7 +2866,22 @@ struct AppSink {
     rpc_id: u64,
     thread_id: String,
     active_turn: Option<String>,
+    paginated_history: Option<bool>,
 }
+
+#[derive(Debug)]
+struct AppRejected {
+    method: String,
+    error: Value,
+}
+
+impl std::fmt::Display for AppRejected {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "{}: {}", self.method, self.error)
+    }
+}
+
+impl Error for AppRejected {}
 
 async fn app_rpc(ws: &mut AppWs, id: u64, method: &str, params: Value) -> Result<Value> {
     use futures_util::{SinkExt, StreamExt};
@@ -2885,7 +2908,11 @@ async fn app_rpc(ws: &mut AppWs, id: u64, method: &str, params: Value) -> Result
             continue;
         }
         if let Some(error) = msg.get("error").filter(|error| !error.is_null()) {
-            return Err(format!("{method}: {error}").into());
+            return Err(AppRejected {
+                method: method.to_string(),
+                error: error.clone(),
+            }
+            .into());
         }
         return Ok(msg);
     }
@@ -2930,8 +2957,7 @@ async fn app_open() -> Option<(AppWs, u64)> {
         1,
         "initialize",
         json!({
-            "clientInfo": {"name": "amesh", "title": "amesh", "version": "0.1.0"},
-            "capabilities": {"experimentalApi": true}
+            "clientInfo": {"name": "amesh", "title": "amesh", "version": "0.1.0"}
         }),
     )
     .await
@@ -3031,6 +3057,7 @@ async fn app_connect(
         rpc_id,
         thread_id,
         active_turn: None,
+        paginated_history: None,
     })
 }
 
@@ -3169,55 +3196,6 @@ async fn discover_app_thread(
     .map_err(|_| "MCP identity verification timed out")?
 }
 
-async fn app_inject(sink: &mut AppSink, text: &str) -> Result<()> {
-    let read = app_rpc(
-        &mut sink.ws,
-        sink.rpc_id,
-        "thread/read",
-        json!({"threadId": sink.thread_id}),
-    )
-    .await?;
-    sink.rpc_id += 1;
-    if read.pointer("/result/thread/canAcceptDirectInput") == Some(&Value::Bool(false)) {
-        return Err(NO_DIRECT_INPUT.into());
-    }
-    /* a turn the server failed leaves the thread in systemError; the next message may start
-    a turn there, as after an idle one */
-    if crate::bridge::turn_is_over(&read) {
-        sink.active_turn = None;
-    } else if sink.active_turn.is_none() {
-        let turns = app_rpc(
-            &mut sink.ws,
-            sink.rpc_id,
-            "thread/turns/list",
-            json!({"threadId": sink.thread_id, "limit": 1, "itemsView": "notLoaded"}),
-        )
-        .await?;
-        sink.rpc_id += 1;
-        sink.active_turn = turns
-            .pointer("/result/data/0")
-            .filter(|turn| turn["status"] == "inProgress")
-            .and_then(|turn| turn["id"].as_str())
-            .filter(|id| !id.is_empty())
-            .map(str::to_string);
-        if sink.active_turn.is_none() {
-            return Err("thread busy".into());
-        }
-    }
-    let method = crate::bridge::inject_method(sink.active_turn.as_deref());
-    let params = crate::bridge::inject_params(&sink.thread_id, text, sink.active_turn.as_deref());
-    let msg = app_rpc(&mut sink.ws, sink.rpc_id, method, params).await?;
-    sink.rpc_id += 1;
-    if let Some(id) = msg
-        .pointer("/result/turn/id")
-        .and_then(Value::as_str)
-        .filter(|id| !id.is_empty())
-    {
-        sink.active_turn = Some(id.to_string());
-    }
-    Ok(())
-}
-
 fn hook_ws(raw: &[String]) -> Result<()> {
     /* taken first, so a binary replaced before the first connect is not the one named, and a
     parent that dies before the drainer parks is still told apart from the one that started it */
@@ -3265,8 +3243,7 @@ pub(crate) fn env_secs(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/* a queued inbound frame, the session it was received for, and the record id the hub
-retires once the injection has succeeded */
+/* a queued inbound frame, the session it was received for, and the durable record id */
 type Queued = (Option<String>, String, Option<String>);
 
 /* what was queued for another session goes, and what the unbound name queued becomes this
@@ -3289,7 +3266,7 @@ fn enqueue_hook_inbound<T>(queued: &mut VecDeque<T>, item: T, warned: &mut bool)
     }
 }
 
-/* the same order and stop as flush_app_sink, against the session the stream named: a hub
+/* Send in queue order against the session the stream named: a hub
 too old to name one leaves an earlier connection's frames waiting. Ids of the records whose
 injection succeeded come back, and the caller acknowledges them on the socket */
 fn flush_claude_inbox(
@@ -3324,58 +3301,6 @@ fn flush_claude_inbox(
         }
     }
     acked
-}
-
-/* nothing while nobody owns the name; otherwise sends in queue order up to the first frame
-queued for another session, which a sink picked from the row or CODEX_THREAD_ID for a hub
-too old to name the owner must not take. False once the sink is unusable. Ids of the records
-whose injection succeeded come back, and the caller acknowledges them on the socket */
-async fn flush_app_sink(
-    sink: &mut AppSink,
-    queued: &mut VecDeque<Queued>,
-    owner: Option<&str>,
-) -> (SinkState, Vec<String>) {
-    let mut acked = Vec::new();
-    if owner == Some("") {
-        return (SinkState::Usable, acked);
-    }
-    let before = queued.len();
-    let mut state = SinkState::Usable;
-    while let Some((session, text, record)) = queued.pop_front() {
-        if session
-            .as_deref()
-            .is_some_and(|session| session != sink.thread_id)
-        {
-            queued.push_front((session, text, record));
-            break;
-        }
-        match app_inject(sink, &text).await {
-            Ok(()) => {
-                if let Some(id) = record {
-                    acked.push(id);
-                }
-            }
-            Err(error) => {
-                queued.push_front((session, text, record));
-                let error = error.to_string();
-                if error == "thread busy" {
-                    eprintln!("amesh hook ws: thread busy, queued={}", queued.len());
-                } else {
-                    eprintln!("amesh hook ws: App Server inject failed: {error}");
-                    state = if error.contains(NO_DIRECT_INPUT) {
-                        SinkState::NoDirectInput
-                    } else {
-                        SinkState::Failed
-                    };
-                }
-                break;
-            }
-        }
-    }
-    if queued.len() < before {
-        eprintln!("amesh hook ws: flushed, queued={}", queued.len());
-    }
-    (state, acked)
 }
 
 /* Codex's answer to turn input on a multi-agent v2 sub-agent, which thread/read also
@@ -3512,6 +3437,7 @@ pub(crate) async fn hook_ws_loop_with(
     let mut depth_warned = false;
     let mut accepted = VecDeque::new();
     let mut retry = AppRetry::new(None, Instant::now());
+    let mut delivery = CodexDelivery::new(&peer_id);
     loop {
         match hook_ws_once(
             &peer_id,
@@ -3519,7 +3445,7 @@ pub(crate) async fn hook_ws_loop_with(
             &mut queued,
             &mut depth_warned,
             &mut accepted,
-            &mut retry,
+            (&mut retry, &mut delivery),
             registration.as_ref(),
         )
         .await
@@ -3583,6 +3509,7 @@ async fn hook_ws_recv(
     >,
     accepted: &mut VecDeque<String>,
     ids: Vec<String>,
+    session: Option<&str>,
 ) -> bool {
     use futures_util::SinkExt;
     use tokio_tungstenite::tungstenite::Message;
@@ -3592,8 +3519,16 @@ async fn hook_ws_recv(
         remember_hook_inbound(accepted, id);
     }
     for id in ids {
-        let frame = json!({"type": "recv", "id": id}).to_string();
-        if ws.send(Message::Text(frame.into())).await.is_err() {
+        let mut frame = json!({"type": "recv", "id": id});
+        if let Some(session) = session {
+            frame["session_id"] = json!(session);
+            frame["confirm"] = json!(true);
+        }
+        if ws
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .is_err()
+        {
             return false;
         }
     }
@@ -3606,7 +3541,7 @@ async fn hook_ws_once(
     queued: &mut VecDeque<Queued>,
     depth_warned: &mut bool,
     accepted: &mut VecDeque<String>,
-    retry: &mut AppRetry,
+    (retry, delivery): (&mut AppRetry, &mut CodexDelivery),
     registration: Option<&Value>,
 ) -> Result<(bool, bool)> {
     use futures_util::{SinkExt, StreamExt};
@@ -3649,6 +3584,9 @@ async fn hook_ws_once(
     /* until connected names the session, nothing queued from an earlier connection may
     be flushed: the heartbeat's first tick is ready before any frame */
     let mut warned = false;
+    let mut drive = false;
+    let mut check_idle = false;
+    let mut last_ping = Value::Null;
     let mut beat = tokio::time::interval(Duration::from_secs(env_secs("AMESH_WS_BEAT_SECS", 10)));
     loop {
         let wake = retry.wake_at(Instant::now());
@@ -3677,6 +3615,11 @@ async fn hook_ws_once(
                     } else if let Some(id) = owner.as_deref().filter(|id| !id.is_empty()) {
                         keep_for_thread(queued, id);
                     }
+                    if uses_app_server
+                        && owner.as_deref().filter(|id| !id.is_empty()).is_some_and(|id| delivery.bind(id))
+                    {
+                        accepted.clear();
+                    }
                     greeted = true;
                     app = None;
                     unloaded_thread = None;
@@ -3687,6 +3630,12 @@ async fn hook_ws_once(
                     }
                     continue;
                 }
+                if kind == "recv_confirmed" && uses_app_server && event["session_id"].as_str() == owner.as_deref() {
+                    if let (Some(thread), Some(id)) = (owner.as_deref(), event["id"].as_str()) {
+                        delivery.retired(thread, id);
+                    }
+                    continue;
+                }
                 if !crate::bridge::is_inbound(kind) {
                     continue;
                 }
@@ -3694,7 +3643,7 @@ async fn hook_ws_once(
                 /* a replay of a record still queued is not enqueued again and stays
                 unacknowledged, because its injection has not succeeded yet */
                 if let Some(frame_id) = id {
-                    if queued
+                    if delivery.holds(owner.as_deref(), frame_id) || queued
                         .iter()
                         .any(|(_, _, held)| held.as_deref() == Some(frame_id))
                     {
@@ -3702,7 +3651,7 @@ async fn hook_ws_once(
                     }
                 }
                 if let Some(id) = id.filter(|id| accepted.iter().any(|known| known == id)) {
-                    if !hook_ws_recv(&mut ws, accepted, vec![id.to_string()]).await {
+                    if !hook_ws_recv(&mut ws, accepted, vec![id.to_string()], owner.as_deref().filter(|_| uses_app_server)).await {
                         return Ok((false, greeted));
                     }
                     continue;
@@ -3725,7 +3674,7 @@ async fn hook_ws_once(
                     };
                     if stale {
                         let ids = id.map(str::to_string).into_iter().collect();
-                        if !hook_ws_recv(&mut ws, accepted, ids).await {
+                        if !hook_ws_recv(&mut ws, accepted, ids, owner.as_deref().filter(|_| uses_app_server)).await {
                             return Ok((false, greeted));
                         }
                         continue;
@@ -3758,49 +3707,14 @@ async fn hook_ws_once(
                     enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
                     let acked =
                         flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
-                    if !hook_ws_recv(&mut ws, accepted, acked).await {
+                    if !hook_ws_recv(&mut ws, accepted, acked, None).await {
                         return Ok((false, greeted));
                     }
                     continue;
                 }
                 let tag = owner.clone().filter(|id| !id.is_empty());
                 enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
-                if uses_app_server && app.is_none() && retry.due(Instant::now()) {
-                    app = app_connect(peer_id, owner.as_deref(), &mut unloaded_thread).await;
-                    if app.is_none() {
-                        retry.failed(Instant::now());
-                    }
-                }
-                /* recv follows the inject: a drainer that dies inside it leaves the frame
-                with the hub, which sends it to the next one */
-                if let Some(sink) = app.as_mut() {
-                    let (state, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
-                    if !acked.is_empty() {
-                        retry.landed();
-                    }
-                    if !hook_ws_recv(&mut ws, accepted, acked).await {
-                        return Ok((false, greeted));
-                    }
-                    match state {
-                        SinkState::Usable => {}
-                        SinkState::Failed => {
-                            app = None;
-                            retry.failed(Instant::now());
-                        }
-                        SinkState::NoDirectInput => {
-                            let served = owner
-                                .clone()
-                                .filter(|session| !session.is_empty())
-                                .unwrap_or_else(|| sink.thread_id.clone());
-                            let _ = ws.close(None).await;
-                            park_drainer(peer_id, &served).await;
-                            return Ok((true, greeted));
-                        }
-                    }
-                } else if !warned {
-                    eprintln!("amesh hook ws: no verified App Server thread for inject, queued={}", queued.len());
-                    warned = true;
-                }
+                drive = uses_app_server;
             }
             /* the beat runs the retry, so a wait that ends between beats ticks it at once rather
             than leaving the retry to the next beat */
@@ -3827,31 +3741,50 @@ async fn hook_ws_once(
                     let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok();
                     let acked =
                         flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
-                    if !hook_ws_recv(&mut ws, accepted, acked).await {
+                    if !hook_ws_recv(&mut ws, accepted, acked, None).await {
                         return Ok((false, greeted));
                     }
                 }
-                let ping = json!({"type": "ping", "unloaded_thread": unloaded_thread});
-                if ws.send(Message::Text(ping.to_string().into())).await.is_err() {
+                last_ping = hook_ping(unloaded_thread.as_deref(), owner.as_deref(), delivery);
+                if ws.send(Message::Text(last_ping.to_string().into())).await.is_err() {
                     return Ok((false, greeted));
                 }
-                if uses_app_server && app.is_none() && retry.due(Instant::now()) {
+                drive = uses_app_server;
+                check_idle = true;
+            }
+            _ = std::future::ready(()), if drive && greeted => {
+                drive = false;
+                let check_idle = std::mem::take(&mut check_idle);
+                if app.is_none() && retry.due(Instant::now()) {
                     app = app_connect(peer_id, owner.as_deref(), &mut unloaded_thread).await;
-                    warned = false;
                     if app.is_none() {
                         retry.failed(Instant::now());
                     }
                 }
                 if let Some(sink) = app.as_mut() {
-                    let (state, acked) = flush_app_sink(sink, queued, owner.as_deref()).await;
+                    if owner.as_deref() == Some("") {
+                        continue;
+                    }
+                    if delivery.bind(&sink.thread_id) {
+                        accepted.clear();
+                    }
+                    let (state, acked, more) = delivery.flush(sink, queued, check_idle).await;
+                    drive = more;
                     if !acked.is_empty() {
                         retry.landed();
                     }
-                    if !hook_ws_recv(&mut ws, accepted, acked).await {
+                    if !hook_ws_recv(&mut ws, accepted, acked, owner.as_deref()).await {
                         return Ok((false, greeted));
                     }
+                    let ping = hook_ping(unloaded_thread.as_deref(), owner.as_deref(), delivery);
+                    if ping != last_ping {
+                        last_ping = ping;
+                        if ws.send(Message::Text(last_ping.to_string().into())).await.is_err() {
+                            return Ok((false, greeted));
+                        }
+                    }
                     match state {
-                        SinkState::Usable if queued.is_empty() => {
+                        SinkState::Usable if check_idle && queued.is_empty() => {
                             check_turn(sink, peer_id, owner.as_deref()).await;
                         }
                         SinkState::Usable => {}
@@ -3869,24 +3802,29 @@ async fn hook_ws_once(
                             return Ok((true, greeted));
                         }
                     }
+                } else if !warned && !queued.is_empty() {
+                    eprintln!("amesh hook ws: no verified App Server thread for inject, queued={}", queued.len());
+                    warned = true;
                 }
             }
         }
     }
 }
 
+fn hook_ping(unloaded: Option<&str>, owner: Option<&str>, delivery: &CodexDelivery) -> Value {
+    json!({
+        "type": "ping",
+        "unloaded_thread": unloaded,
+        "session_id": owner,
+        "awaiting_confirmation": delivery.awaiting_confirmation(owner)
+    })
+}
+
 /* Codex runs no Stop hook for a turn that fails or is interrupted, so the drainer reads its
 thread on every beat and reports an idle one as a check; the hub lets a check yield to a
 turn that reported work within its grace. A thread that cannot be read reports nothing */
 async fn check_turn(sink: &mut AppSink, peer_id: &str, owner: Option<&str>) {
-    let read = app_rpc(
-        &mut sink.ws,
-        sink.rpc_id,
-        "thread/read",
-        json!({"threadId": sink.thread_id}),
-    )
-    .await;
-    sink.rpc_id += 1;
+    let read = sink.read().await;
     if !read.as_ref().is_ok_and(crate::bridge::turn_is_over) {
         return;
     }

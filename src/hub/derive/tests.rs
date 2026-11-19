@@ -14,6 +14,7 @@ fn hub() -> Hub {
         recv_known: Default::default(),
         builds: HashMap::new(),
         unloaded_threads: Default::default(),
+        awaiting_confirmation: Default::default(),
         owed: HashMap::new(),
         inbox: Inbox::default(),
         conn_gen: 0,

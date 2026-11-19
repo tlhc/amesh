@@ -1017,6 +1017,7 @@ fn marked(
     let mut peer = reached(id, true, 0);
     peer.liveness = Some(crate::wire::Liveness::Idle { since: 0 });
     peer.delivery = Some(crate::wire::Delivery {
+        awaiting_confirmation: 0,
         condition,
         stuck: stuck.map(|(count, since)| crate::wire::Stuck { count, since }),
     });

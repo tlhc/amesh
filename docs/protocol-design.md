@@ -122,9 +122,13 @@ A legacy `state.json` is imported only into an empty SQLite state. The database 
 - `GET /ws`. The first text frame must be `{"type":"connect","peer_id":"…"}` (or `name`), with optional `auth_token`, `recv` and `build`. The hub replies `{"type":"connected","peer_id":"…","name":"…"}`.
 - Attachment waits for that peer's pending-read leases to end. Once attached, each outgoing greeting or event has a 30 s write deadline (`AMESH_WS_WRITE_SECS`); a failed write closes the connection and returns undelivered records to the inbox.
 - If `recv` is true, the peer promises `{"type":"recv","id":"…"}` for each event with an id:
-  - the hub drops the durable inbox row only on that recv (`acknowledge_event`)
+  - the hub drops the durable inbox row on a recv from the active socket (`acknowledge_event`). A recv with `session_id` must match the current owner.
   - each inbox row keeps the time its delivery was first owed (`queued_at`), through replay, requeue, transfer and restart; rows from before this field count from the upgrade
-  - the CLI `amesh hook ws` sends it once it has tried to hand the frame to the runtime, so a drainer that dies mid-inject leaves the record owed; what the runtime could not take waits in a process-local FIFO, which restarting that process drops
+  - The Claude Code drainer sends `recv` after writing the runtime inbox. The Codex drainer confirms only a persisted `userMessage` with `clientId` equal to `amesh:<record ID>`. This requires indexed (`paginated`) thread history and the App Server history API in Codex 0.170.0. Other threads keep their messages queued.
+  - Before first submission the drainer records one Codex tail anchor in `codex-delivery.db` beside its A Mesh state. Keep that database across drainer replacements. It stores IDs and cursors only. An optional `confirm:true` on `recv` requests `recv_confirmed` after the hub durably retires that ID, at which point the drainer removes the checkpoint. Older hubs ignore the flag.
+  - Directed and broadcast messages use the same path. A receipt poll examines at most eight turn headers and four scoped item pages at a time and advances from saved item cursors. If the origin falls outside that window, the drainer checks the original turn for a positive receipt and keeps the message owed when the relevant range cannot be verified.
+  - After an interrupted or failed turn closes and its related receipt range is complete, the drainer can retry into a running successor. Completed turns and uncertain submissions also require an idle check over a stable recent range. Three automatic retries are allowed per drainer. Retries can reorder deliveries. A failure between acceptance and persistence can result in repeated input under the same ID.
+  - Codex pings may include `session_id` and `awaiting_confirmation` (record IDs accepted by App Server). The hub uses the matching session and current acknowledging socket. Detailed HTTP, MCP, and snapshots expose a nonzero count at `delivery.awaiting_confirmation`, which status and TUI also show. `queued` still counts all records. Only IDs awaiting confirmation are excluded from the stuck count and age.
 
 ## MCP
 

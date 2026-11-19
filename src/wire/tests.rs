@@ -126,6 +126,7 @@ fn peer_facts_have_pinned_json() {
     );
     pinned(
         &Delivery {
+            awaiting_confirmation: 0,
             condition: DeliveryCondition::NoPush,
             stuck: Some(Stuck {
                 count: 2,

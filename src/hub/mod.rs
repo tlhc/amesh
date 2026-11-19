@@ -36,6 +36,12 @@ struct App {
     state_path: PathBuf,
 }
 
+struct AwaitingConfirmation {
+    generation: u64,
+    session: String,
+    ids: HashSet<String>,
+}
+
 struct Hub {
     db: Connection,
     /* the state a failed write left only in memory, for changes no request can take back: a
@@ -56,6 +62,7 @@ struct Hub {
     /* the build each live socket named when it connected; memory only, like the sockets */
     builds: HashMap<String, String>,
     unloaded_threads: HashSet<String>,
+    awaiting_confirmation: HashMap<String, AwaitingConfirmation>,
     owed: HashMap<String, Owed>,
     inbox: Inbox,
     conn_gen: u64,
@@ -1142,6 +1149,7 @@ impl Hub {
             recv_live: HashSet::new(),
             builds: HashMap::new(),
             unloaded_threads: HashSet::new(),
+            awaiting_confirmation: HashMap::new(),
             recv_known: disk.recv_peers,
             owed: disk.owed,
             conn_gen: 0,
@@ -1433,6 +1441,7 @@ fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Outbound>) 
             let stranded = std::iter::once(record).chain(owed);
             hub.inbox.enqueue(peer_id, stranded);
             hub.sockets.remove(peer_id);
+            hub.awaiting_confirmation.remove(peer_id);
             return true;
         }
     }
@@ -1491,6 +1500,7 @@ fn persist_then_deliver(
             return Ok(());
         }
         hub.sockets.remove(&key);
+        hub.awaiting_confirmation.remove(&key);
     }
     hub.inbox.enqueue(&key, [record]);
     persist_ok(hub)?;
@@ -1569,6 +1579,7 @@ fn deliver_queued(hub: &mut Hub, records: Vec<(String, QueuedRecord)>) {
         };
         if tx.send(outbound).is_err() {
             hub.sockets.remove(&target);
+            hub.awaiting_confirmation.remove(&target);
             continue;
         }
         if !acknowledging {
@@ -2430,6 +2441,7 @@ async fn register_peer(
     }
     if replaced || binding {
         hub.unloaded_threads.remove(&peer_id);
+        hub.awaiting_confirmation.remove(&peer_id);
         if let Some((_, tx)) = hub.sockets.get(&peer_id) {
             let kind = if replaced { REPLACED } else { "bound" };
             let _ = tx.send(Outbound::Control(
@@ -2462,6 +2474,7 @@ fn refresh_peers(hub: &mut Hub) -> (bool, Vec<(String, QueuedRecord)>) {
         .collect();
     for id in &closed {
         hub.sockets.remove(id);
+        hub.awaiting_confirmation.remove(id);
         hub.activity.remove(id);
         changed = true;
     }
@@ -6791,6 +6804,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
         }
         hub.sockets.insert(peer.peer_id.clone(), (gen, tx));
         hub.unloaded_threads.remove(&peer.peer_id);
+        hub.awaiting_confirmation.remove(&peer.peer_id);
         if recv {
             hub.recv_live.insert(peer.peer_id.clone());
         } else {
@@ -6846,18 +6860,34 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                                 peer.backend == "codex" && !peer.session_id.is_empty()
                                     && frame["unloaded_thread"].as_str() == Some(peer.session_id.as_str())
                             });
+                            if recv {
+                                record_awaiting_confirmation(&mut hub, &peer_id, gen, &frame);
+                            }
                             if unloaded {
                                 hub.unloaded_threads.insert(peer_id.clone());
                             } else {
                                 hub.unloaded_threads.remove(&peer_id);
                             }
-                        } else if recv && frame["type"] == "recv" {
+                        } else if recv && frame["type"] == "recv"
+                            && hub.sockets.get(&peer_id).is_some_and(|(current, _)| *current == gen)
+                            && frame.get("session_id").is_none_or(|session| {
+                                hub.peers.get(&peer_id).is_some_and(|peer| session.as_str() == Some(peer.session_id.as_str()))
+                            })
+                        {
                             if let Some(id) = frame["id"].as_str() {
                                 /* persist_ok rolls back when the write fails, so a recv that
                                    could not be recorded leaves the record owed */
                                 if acknowledge_event(&mut hub, &peer_id, id) {
                                     if let Err((_, Json(err))) = persist_ok(&mut hub) {
                                         eprintln!("amesh persist: {err}");
+                                        continue;
+                                    }
+                                }
+                                if frame["confirm"] == true {
+                                    if let (Some((_, tx)), Some(peer)) = (hub.sockets.get(&peer_id), hub.peers.get(&peer_id)) {
+                                        let _ = tx.send(Outbound::Control(json!({
+                                            "type": "recv_confirmed", "id": id, "session_id": peer.session_id
+                                        })));
                                     }
                                 }
                             }
@@ -6896,6 +6926,41 @@ fn acknowledge_event(hub: &mut Hub, peer_id: &str, id: &str) -> bool {
     hub.inbox.acknowledge(peer_id, id)
 }
 
+fn record_awaiting_confirmation(hub: &mut Hub, peer_id: &str, generation: u64, frame: &Value) {
+    let Some(ids) = frame["awaiting_confirmation"].as_array() else {
+        hub.awaiting_confirmation.remove(peer_id);
+        return;
+    };
+    let Some(peer) = hub.peers.get(peer_id).filter(|peer| {
+        peer.backend == "codex"
+            && !peer.session_id.is_empty()
+            && frame["session_id"].as_str() == Some(peer.session_id.as_str())
+    }) else {
+        return;
+    };
+    let reported: HashSet<_> = ids.iter().filter_map(Value::as_str).collect();
+    let ids: HashSet<_> = hub
+        .inbox
+        .records(peer_id)
+        .iter()
+        .filter_map(|record| record.event()["id"].as_str())
+        .filter(|id| reported.contains(id))
+        .map(str::to_string)
+        .collect();
+    if ids.is_empty() {
+        hub.awaiting_confirmation.remove(peer_id);
+        return;
+    }
+    hub.awaiting_confirmation.insert(
+        peer_id.to_string(),
+        AwaitingConfirmation {
+            generation,
+            session: peer.session_id.clone(),
+            ids,
+        },
+    );
+}
+
 /* Unhook this connection before looking for anywhere to put what it owes: while the map
 still points at our own sender, handing the events back would post them into the channel
 we are about to drop and lose them where a plain disconnect is the common case. Nobody
@@ -6915,6 +6980,7 @@ async fn close_connection(
         hub.recv_live.remove(peer_id);
         hub.builds.remove(peer_id);
         hub.unloaded_threads.remove(peer_id);
+        hub.awaiting_confirmation.remove(peer_id);
         if let Some(peer) = hub.peers.get_mut(peer_id) {
             peer.status = "offline".into();
         }

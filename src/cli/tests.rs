@@ -537,7 +537,7 @@ fn status_omits_queue_warning_for_offline_peers() {
     let row = table.lines().find(|row| row.starts_with("away")).unwrap();
     assert_eq!(
         row.split_whitespace().collect::<Vec<_>>(),
-        ["away", "offline", "-", "-", "-", "-", "2", "-"]
+        ["away", "offline", "-", "-", "-", "-", "2", "0", "-"]
     );
 }
 

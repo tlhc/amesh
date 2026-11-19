@@ -394,6 +394,15 @@ pub(crate) fn delivery(snap: &Frame, peer: &Peer) -> Row {
         let age = ago(snap.captured_at, Some(stuck.since));
         out.push((format!("{} queued for {age}", stuck.count), Tone::Warn));
     }
+    if delivery.awaiting_confirmation != 0 {
+        if !out.is_empty() {
+            out.push((" · ".into(), Tone::Dim));
+        }
+        out.push((
+            format!("{} awaiting confirmation", delivery.awaiting_confirmation),
+            Tone::Dim,
+        ));
+    }
     out
 }
 

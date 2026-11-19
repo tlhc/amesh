@@ -1,3 +1,6 @@
+#[path = "cli/codex_receipts.rs"]
+mod codex_receipts_tests;
+
 #[path = "cli/opencode.rs"]
 mod opencode_tests;
 
@@ -8,7 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[path = "cli/mcp_identity.rs"]
@@ -4381,6 +4384,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
     }
     let received = Arc::new(Mutex::new(Vec::<String>::new()));
     let server_received = received.clone();
+    let stored = Arc::new(Mutex::new(Vec::new()));
     let server_cwd = cwd.clone();
     let server_sock = sock.clone();
     std::thread::spawn(move || {
@@ -4393,6 +4397,7 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
+                let stored = stored.clone();
                 let received = server_received.clone();
                 let cwd = server_cwd.clone();
                 tokio::spawn(async move {
@@ -4416,16 +4421,31 @@ fn hook_ws_replays_queued_inbound_once_after_hub_reconnect() {
                                         "ephemeral": false,
                                         "threadSource": "user",
                                         "recencyAt": 1,
-                                        "status": {"type": "idle"}
+                                        "status": {"type": "idle"},
+                                        "historyMode": "paginated"
                                     }
                                 }
                             }),
+                            "thread/turns/list" => json!({"id":id, "result":{"data":[{"id":"t1","status":"completed"}],"nextCursor":null}}),
+                            "thread/items/list" => {
+                                let stored = stored.lock().unwrap();
+                                let data = if msg["params"]["limit"] == 1 {
+                                    stored.last().cloned().into_iter().collect()
+                                } else {
+                                    stored.clone()
+                                };
+                                json!({"id":id, "result":{"data": data, "nextCursor":null}})
+                            },
                             "turn/start" | "turn/steer" => {
                                 if let Some(body) =
                                     msg.pointer("/params/input/0/text").and_then(Value::as_str)
                                 {
                                     received.lock().unwrap().push(body.to_string());
                                 }
+                                let client = &msg["params"]["clientUserMessageId"];
+                                stored.lock().unwrap().push(json!({"turnId":"t1","item":{
+                                    "id":client,"type":"userMessage","clientId":client
+                                }}));
                                 json!({"id": id, "result": {"turn": {"id": "t1"}}})
                             }
                             _ => continue,
@@ -4761,7 +4781,7 @@ fn codex_drainer_refreshes_a_rejected_turn_id_before_retrying() {
     let codex_home = sandbox.root.join("codex");
     let busy = Arc::new(std::sync::Mutex::new(Vec::new()));
     let injected = app_server_capture_with(&codex_home, &["th1"], busy.clone(), None, None);
-    let _drainer = start_codex_drainer(&sandbox, worker, &codex_home);
+    let _drainer = start_codex_drainer_beating(&sandbox, worker, &codex_home, "10");
     let notify = |body| {
         sandbox.json(
             &["peer", "notify", worker, body, "--from-peer", "boss"],
@@ -5394,6 +5414,7 @@ fn bridge_reconnects_and_delivers_an_unacknowledged_frame_once() {
         .join("app-server-control.sock");
     let received = Arc::new(Mutex::new(Vec::<String>::new()));
     let server_received = received.clone();
+    let stored = Arc::new(Mutex::new(Vec::new()));
     let cwd = sandbox.root.clone();
     let server_sock = sock.clone();
     std::thread::spawn(move || {
@@ -5405,6 +5426,7 @@ fn bridge_reconnects_and_delivers_an_unacknowledged_frame_once() {
                 let Ok((stream, _)) = listener.accept().await else {
                     continue;
                 };
+                let stored = stored.clone();
                 let received = server_received.clone();
                 let cwd = cwd.clone();
                 tokio::spawn(async move {
@@ -5422,7 +5444,17 @@ fn bridge_reconnects_and_delivers_an_unacknowledged_frame_once() {
                             "thread/loaded/list" => json!({"id": id, "result": {"data": ["th1"]}}),
                             "thread/read" => json!({"id": id, "result": {"thread": {
                                 "cwd": cwd, "ephemeral": false, "threadSource": "user",
-                                "recencyAt": 1, "status": {"type": "idle"}}}}),
+                                "recencyAt": 1, "status": {"type": "idle"}, "historyMode": "paginated"}}}),
+                            "thread/turns/list" => json!({"id":id, "result":{"data":[{"id":"t1","status":"completed"}],"nextCursor":null}}),
+                            "thread/items/list" => {
+                                let stored = stored.lock().unwrap();
+                                let data = if msg["params"]["limit"] == 1 {
+                                    stored.last().cloned().into_iter().collect()
+                                } else {
+                                    stored.clone()
+                                };
+                                json!({"id":id, "result":{"data": data, "nextCursor":null}})
+                            },
                             "turn/start" | "turn/steer" => {
                                 if let Some(body) =
                                     msg.pointer("/params/input/0/text").and_then(Value::as_str)
@@ -5431,6 +5463,10 @@ fn bridge_reconnects_and_delivers_an_unacknowledged_frame_once() {
                                 }
                                 /* the reply is late, so the hub dies before the bridge can ack */
                                 tokio::time::sleep(Duration::from_millis(1200)).await;
+                                let client = &msg["params"]["clientUserMessageId"];
+                                stored.lock().unwrap().push(json!({"turnId":"t1","item":{
+                                    "id":client,"type":"userMessage","clientId":client
+                                }}));
                                 json!({"id": id, "result": {"turn": {"id": "t1"}}})
                             }
                             _ => continue,
@@ -5651,7 +5687,7 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> (Vec<Value>, usize) {
             .route(
                 "/ws",
                 get(
-                    |ws: WebSocketUpgrade,
+                    move |ws: WebSocketUpgrade,
                      State((tx, frame)): State<(
                         tokio::sync::mpsc::UnboundedSender<Vec<Value>>,
                         String,
@@ -5661,6 +5697,8 @@ fn hook_receipt_probe(kind: &str, inbox: &str) -> (Vec<Value>, usize) {
                             if let Some(Ok(Message::Text(raw))) = socket.recv().await {
                                 seen.push(serde_json::from_str(&raw).unwrap());
                             }
+                            let greeting = json!({"type":"connected","peer_id":worker,"session_id":"fixture-thread"});
+                            let _ = socket.send(Message::Text(greeting.to_string().into())).await;
                             let _ = socket.send(Message::Text(frame.into())).await;
                             let until = tokio::time::Instant::now() + Duration::from_secs(2);
                             while let Ok(Some(Ok(Message::Text(raw)))) =
@@ -6490,7 +6528,14 @@ fn pruned_while_away(
     beat inject it, so the record is acknowledged before the name changes hands */
     std::thread::sleep(Duration::from_millis(600));
     busy.lock().unwrap().clear();
-    std::thread::sleep(Duration::from_millis(1200));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while inbox_count(&sandbox, pinprune) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "A's oldest delivery was confirmed before pruning"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     let pid = drainer.0.as_ref().unwrap().id().to_string();
     signal(&pid, "-STOP");
     if let Some(mut hub) = sandbox.daemon.take() {
@@ -8072,6 +8117,19 @@ fn app_server_capture_with(
     reads: Option<Arc<AtomicUsize>>,
     starts: Option<Arc<std::sync::Mutex<Vec<Instant>>>>,
 ) -> std::sync::mpsc::Receiver<String> {
+    app_server_capture_driver(home, loaded, busy, reads, starts, None)
+}
+
+type AppDriver = Arc<dyn Fn(&Value) -> Option<Value> + Send + Sync>;
+
+fn app_server_capture_driver(
+    home: &Path,
+    loaded: &[&str],
+    busy: Arc<Mutex<Vec<String>>>,
+    reads: Option<Arc<AtomicUsize>>,
+    starts: Option<Arc<Mutex<Vec<Instant>>>>,
+    driver: Option<AppDriver>,
+) -> std::sync::mpsc::Receiver<String> {
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message as AppMessage;
     let path = home.join("app-server-control/app-server-control.sock");
@@ -8082,6 +8140,7 @@ fn app_server_capture_with(
     let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
     listener.set_nonblocking(true).unwrap();
     let loaded: Vec<String> = loaded.iter().map(|id| id.to_string()).collect();
+    let stored = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
@@ -8095,6 +8154,7 @@ fn app_server_capture_with(
                     reads.clone(),
                     starts.clone(),
                 );
+                let (driver, stored) = (driver.clone(), stored.clone());
                 tokio::spawn(async move {
                     let Ok(mut ws) = tokio_tungstenite::accept_async(stream).await else {
                         return;
@@ -8116,6 +8176,19 @@ fn app_server_capture_with(
                                 .iter()
                                 .any(|id| id.strip_prefix(mark) == Some(thread))
                         };
+                        if let Some(mut reply) = driver.as_ref().and_then(|driver| driver(&req)) {
+                            if matches!(req["method"].as_str(), Some("turn/start" | "turn/steer")) {
+                                let _ = tx.send(raw.to_string());
+                            }
+                            if reply.is_null() {
+                                return;
+                            }
+                            reply["id"] = id;
+                            if ws.send(AppMessage::Text(reply.to_string().into())).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         let mut error = None;
                         let result = match req["method"].as_str().unwrap_or("") {
                             /* select_app_thread only accepts a thread reported as loaded */
@@ -8139,17 +8212,35 @@ fn app_server_capture_with(
                                     "idle"
                                 };
                                 drop(busy);
-                                let mut read = json!({"thread": {"status": {"type": state}}});
+                                let mut read = json!({"thread": {"status": {"type": state}, "historyMode":"paginated"}});
                                 if marked('-') {
                                     read["thread"]["canAcceptDirectInput"] = json!(false);
                                 }
                                 read
                             }
+                            "thread/items/list" => {
+                                let stored = stored.lock().unwrap();
+                                let turn = req["params"]["turnId"].as_str();
+                                let cursor = req["params"]["cursor"]["itemId"].as_str();
+                                let mut data: Vec<&Value> = stored.iter().filter_map(|(owner, item)| {
+                                    (owner == thread && turn.is_none_or(|turn| item["turnId"] == turn)).then_some(item)
+                                }).collect();
+                                if let Some(index) = cursor.and_then(|id| data.iter().position(|item| item["item"]["id"] == id)) {
+                                    data.drain(..=index);
+                                }
+                                if req["params"]["sortDirection"] == "desc" {
+                                    data.reverse();
+                                }
+                                if let Some(limit) = req["params"]["limit"].as_u64() {
+                                    data.truncate(limit as usize);
+                                }
+                                json!({"data": data, "nextCursor": null})
+                            }
                             "thread/turns/list" => {
                                 if marked('+') {
-                                    json!({"data": [{"id": "user-turn", "status": "inProgress"}]})
+                                    json!({"data": [{"id": "user-turn", "status": "inProgress"}], "nextCursor":null})
                                 } else {
-                                    json!({"data": [{"id": "finished-turn", "status": "completed"}]})
+                                    json!({"data": [{"id": "finished-turn", "status": "completed"}], "nextCursor":null})
                                 }
                             }
                             "turn/start" | "turn/steer" => {
@@ -8177,9 +8268,9 @@ fn app_server_capture_with(
                                     && marked('+')
                                     && req["params"]["expectedTurnId"] != "user-turn"
                                 {
-                                    error = Some(json!({"code": -32600, "message": "expected turn changed"}));
+                                    error = Some(json!({"code": -32600, "message": "expected active turn id `turn-1` but found `user-turn`"}));
                                 } else if marked('?') {
-                                    error = Some(json!({"code": -32603, "message": "turn failed"}));
+                                    error = Some(json!({"code": -32600, "message": "turn refused before submission"}));
                                 }
                                 if req["method"] == "turn/steer" {
                                     json!({"turnId": req["params"]["expectedTurnId"]})
@@ -8191,7 +8282,15 @@ fn app_server_capture_with(
                         };
                         let reply = match error {
                             Some(error) => json!({"id": id, "error": error}),
-                            None => json!({"id": id, "result": result}),
+                            None => {
+                                if let Some(client_id) = req["params"]["clientUserMessageId"].as_str() {
+                                    let turn = result.pointer("/turn/id").or_else(|| result.get("turnId")).unwrap();
+                                    stored.lock().unwrap().push((thread.to_string(), json!({
+                                        "turnId": turn, "item":{"type":"userMessage","id":client_id,"clientId":client_id}
+                                    })));
+                                }
+                                json!({"id": id, "result": result})
+                            }
                         };
                         if ws
                             .send(AppMessage::Text(reply.to_string().into()))
@@ -9748,10 +9847,12 @@ fn hook_ws_retries_a_failed_codex_turn_start() {
     let can_inject = retrying.clone();
     let (attempt_tx, attempt_rx) = std::sync::mpsc::channel();
     let cwd = sandbox.root.clone();
+    let stored = Arc::new(Mutex::new(Vec::new()));
     rt.spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let retrying = can_inject.clone();
             let attempts = attempt_tx.clone();
+            let stored = stored.clone();
             let cwd = cwd.clone();
             tokio::spawn(async move {
                 let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -9763,7 +9864,9 @@ fn hook_ws_retries_a_failed_codex_turn_start() {
                         "initialize" => json!({}),
                         "thread/loaded/list" => json!({"data":["th1"]}),
                         "thread/read" => json!({"thread":{"cwd":cwd,"ephemeral":false,
-                            "threadSource":"user","recencyAt":1,"status":{"type":"idle"}}}),
+                            "threadSource":"user","recencyAt":1,"status":{"type":"idle"},"historyMode":"paginated"}}),
+                        "thread/turns/list" => json!({"data": [], "nextCursor": null}),
+                        "thread/items/list" => json!({"data": *stored.lock().unwrap(), "nextCursor": null}),
                         "turn/start" | "turn/steer" => {
                             let allowed = retrying.load(Ordering::SeqCst);
                             attempted = Some((allowed, msg["params"]["input"][0]["text"].clone()));
@@ -9778,6 +9881,10 @@ fn hook_ws_retries_a_failed_codex_turn_start() {
                                 attempts.send(attempted.unwrap()).unwrap();
                                 continue;
                             }
+                            let client = &msg["params"]["clientUserMessageId"];
+                                stored.lock().unwrap().push(json!({"turnId":"t1","item":{
+                                    "id":client,"type":"userMessage","clientId":client
+                                }}));
                             json!({"turn":{"id":"t1"}})
                         }
                         _ => continue,
