@@ -188,6 +188,12 @@ pub(crate) enum DeliveryCondition {
     Unknown,
 }
 
+impl DeliveryCondition {
+    pub(crate) fn is_online(self) -> bool {
+        matches!(self, Self::Push | Self::NoPush)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum DeliveryIssue {

@@ -378,18 +378,14 @@ fn tail(peer: &Peer) -> String {
 }
 
 pub(crate) fn delivery(snap: &Frame, peer: &Peer) -> Row {
-    let Some(delivery) = peer.delivery.as_ref() else {
+    let Some(delivery) = peer.delivery.as_ref().filter(|d| d.condition.is_online()) else {
         return Vec::new();
     };
     let mut out: Row = Vec::new();
-    match delivery.condition {
-        DeliveryCondition::NoPush => out.push(("no push".into(), Tone::Dim)),
-        DeliveryCondition::Push => {
-            if peer.delivery_issue == Some(crate::wire::DeliveryIssue::CodexThreadNotLoaded) {
-                out.push(("thread-not-loaded".into(), Tone::Warn));
-            }
-        }
-        DeliveryCondition::Offline | DeliveryCondition::Unknown => return Vec::new(),
+    if delivery.condition == DeliveryCondition::NoPush {
+        out.push(("no push".into(), Tone::Dim));
+    } else if peer.delivery_issue == Some(crate::wire::DeliveryIssue::CodexThreadNotLoaded) {
+        out.push(("thread-not-loaded".into(), Tone::Warn));
     }
     if let Some(stuck) = delivery.stuck.as_ref() {
         if !out.is_empty() {

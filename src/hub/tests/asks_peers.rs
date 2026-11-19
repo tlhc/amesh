@@ -1,6 +1,82 @@
 use super::*;
 
 #[tokio::test]
+async fn peers_detail_accepts_boolean_spellings() {
+    let (app, _state) = test_app();
+    let (status, _) = json_req(
+        app.clone(),
+        "POST",
+        "/peers",
+        json!({
+            "peer_id": "worker", "name": "worker", "backend": "pi", "circle": "one"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    for (query, detailed) in [
+        ("?detail=1", true),
+        ("?detail=TRUE", true),
+        ("?detail=yes", true),
+        ("?detail", true),
+        ("?detail=ON", true),
+        ("?detail=false", false),
+        ("?detail=0", false),
+        ("?detail=no", false),
+        ("?detail=off", false),
+        ("", false),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/peers{query}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{query}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let peers: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            peers[0]["delivery"].is_object(),
+            detailed,
+            "{query}: {peers}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn peers_detail_auth_precedes_query_errors() {
+    let state = temp_state("peers-detail-auth");
+    let app = router(App {
+        inner: Arc::new(Mutex::new(Hub::open(&state).unwrap())),
+        token: Some("private-test-token".into()),
+        state_path: state.to_path_buf(),
+    });
+    for query in ["?detail=bad", "?detail=true&detail=false"] {
+        let request = || Request::builder().uri(format!("/peers{query}"));
+        let anonymous = app
+            .clone()
+            .oneshot(request().body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED, "{query}");
+        let authorized = app
+            .clone()
+            .oneshot(
+                request()
+                    .header("authorization", "Bearer private-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::BAD_REQUEST, "{query}");
+    }
+}
+
+#[tokio::test]
 async fn a_sessionless_reregister_keeps_the_bound_session() {
     let (app, _state) = test_app();
     let (_, bound) = json_req(

@@ -525,6 +525,23 @@ fn status_shows_revision_and_delivery() {
 }
 
 #[test]
+fn status_omits_queue_warning_for_offline_peers() {
+    let output = json!({
+        "daemon": {"ok": true},
+        "peers": [{
+            "peer_id":"away", "status":"offline", "queued":2,
+            "delivery":{"condition":"offline", "stuck":{"count":2,"since":1}}
+        }]
+    });
+    let table = render(&output, &[String::from("status")], true).unwrap();
+    let row = table.lines().find(|row| row.starts_with("away")).unwrap();
+    assert_eq!(
+        row.split_whitespace().collect::<Vec<_>>(),
+        ["away", "offline", "-", "-", "-", "-", "2", "-"]
+    );
+}
+
+#[test]
 fn render_jobs_list_tty_stays_json() {
     let jobs = json!([{"id": "job-1"}]);
     let args = ["jobs", "list"].map(String::from);

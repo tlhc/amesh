@@ -1314,6 +1314,47 @@ fn a_stale_snapshot_holds_the_spinners_and_the_walking_arrow_still() {
 }
 
 #[test]
+fn job_titles_fit_events_and_home_previews_at_80_columns() {
+    let id = "job-59961baa43994415a83fad30ffd76a16";
+    let title = "audit docs";
+    let events = vec![
+        ev(
+            1,
+            "ask",
+            "amesh-claude-code",
+            "amesh-codex",
+            &format!("job {id}: {title}"),
+        ),
+        ev(
+            2,
+            "notify",
+            "amesh",
+            "amesh-codex",
+            &format!("job {id} {title} is running"),
+        ),
+    ];
+    let mut events_screen = events_app(events.clone());
+    let mut home = home_app((home_busy().0, events.clone()));
+    let mut missing = Vec::new();
+    for (name, app) in [("events", &mut events_screen), ("HOME", &mut home)] {
+        let lines = screen_text(app, 80, 40);
+        for preview in [
+            format!("job job-59961baa: {title}"),
+            format!("job job-59961baa {title}"),
+        ] {
+            if !lines.iter().any(|line| line.contains(&preview)) {
+                missing.push(format!("{name}: {preview}"));
+            }
+        }
+    }
+    assert!(missing.is_empty(), "missing previews: {missing:?}");
+    let held = held_from(events);
+    let items = super::feed::items(&held);
+    let card = super::feed::card(&items[0], 80, Fit::Whole, None);
+    assert!(card.text().contains(id), "{}", card.text());
+}
+
+#[test]
 fn event_rows_fit_the_pane_whatever_the_kind() {
     for kind in ["ask", "ack", "notify", "broadcast", "chat", "未来事件"] {
         for at in [None, Some(1001)] {

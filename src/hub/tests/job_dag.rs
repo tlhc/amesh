@@ -671,6 +671,81 @@ async fn job_create_retry_after_response_loss_reuses_existing_job() {
 }
 
 #[tokio::test]
+async fn job_create_retry_accepts_explicit_defaults() {
+    let f = team("one", &[]).await;
+    f.peer_in_session("boss", "one", "session-a").await;
+    let body =
+        json!({"title":"audit", "prompt":"inspect", "from_peer":"boss", "request_key":"review"});
+    let id = f.job(body.clone()).await;
+    let mut spelled_out = body;
+    spelled_out["watch"] = json!(true);
+    spelled_out["backend"] = json!("");
+    let (status, retry) = f.request("POST", "/jobs", spelled_out.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["job_id"], id);
+
+    spelled_out["prompt"] = json!("different work");
+    let (status, conflict) = f.request("POST", "/jobs", spelled_out).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+    assert_eq!(conflict["job_id"], id);
+}
+
+#[tokio::test]
+async fn job_create_retry_accepts_legacy_exact_hash() {
+    let f = team("one", &[]).await;
+    f.peer_in_session("boss", "one", "session-a").await;
+    let body = json!({
+        "title":"audit", "from_peer":"boss", "request_key":"legacy", "backend":"claude"
+    });
+    let id = f.job(body.clone()).await;
+    let raw: JobCreateReq = serde_json::from_value(body.clone()).unwrap();
+    let legacy_hash = format!("{:x}", Sha256::digest(json!(raw).to_string()));
+    f.0.inner
+        .lock()
+        .await
+        .db
+        .execute(
+            "UPDATE job_history SET request_hash = ?1 WHERE job_id = ?2",
+            params![legacy_hash, id],
+        )
+        .unwrap();
+
+    let (status, retry) = f.request("POST", "/jobs", body).await;
+    assert_eq!(status, StatusCode::OK, "{retry}");
+    assert_eq!(retry["job_id"], id);
+}
+
+#[tokio::test]
+async fn rejected_job_update_leaves_settlement_for_the_next_write() {
+    let f = team("one", &["boss", "worker"]).await;
+    let id = f
+        .job(json!({"title":"audit","from_peer":"boss","assigned_peer":"worker"}))
+        .await;
+    let cid = f.ask_id(&id).await;
+    assert_eq!(
+        f.ack(&cid, json!({"from_peer":"worker","message":"complete"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+
+    let (status, reply) = f.set_state(&id, json!({"state":"running"})).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{reply}");
+    {
+        let hub = f.0.inner.lock().await;
+        let disk = read_snapshot(&hub.db).unwrap();
+        assert_eq!(hub.jobs[&id].state, disk.jobs[&id].state);
+        assert_eq!(hub.jobs[&id].state, "running");
+    }
+    f.advance().await;
+    let hub = f.0.inner.lock().await;
+    let disk = read_snapshot(&hub.db).unwrap();
+    assert_eq!(hub.jobs[&id].state, "done");
+    assert_eq!(disk.jobs[&id].state, "done");
+    assert_eq!(disk.jobs[&id].result_summary.as_deref(), Some("complete"));
+}
+
+#[tokio::test]
 async fn task_history_keeps_both_attempts_after_sweep_and_restart() {
     let state = temp_state("job-history");
     let f = Fixture::open(state.to_path_buf());

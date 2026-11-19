@@ -19,7 +19,7 @@ use axum::extract::{
 };
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -2573,16 +2573,32 @@ fn probe_peers(hub: &mut Hub) -> Result<(), (StatusCode, Json<Value>)> {
 
 #[derive(Deserialize)]
 struct PeerListQuery {
-    #[serde(default)]
-    detail: bool,
+    detail: Option<String>,
 }
 
 async fn list_peers(
     State(app): State<App>,
     headers: HeaderMap,
-    Query(query): Query<PeerListQuery>,
+    uri: Uri,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     check_auth(&app, &headers)?;
+    let Query(query) = Query::<PeerListQuery>::try_from_uri(&uri)
+        .map_err(|err| (err.status(), Json(json!({"error": err.body_text()}))))?;
+    let detail = match query
+        .detail
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("" | "1" | "true" | "yes" | "on") => true,
+        None | Some("0" | "false" | "no" | "off") => false,
+        Some(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "detail must be a boolean"})),
+            ));
+        }
+    };
     let mut hub = app.inner.lock().await;
     probe_peers(&mut hub)?;
     let model = derive::ReadModel::new(&hub, now_unix());
@@ -2592,7 +2608,7 @@ async fn list_peers(
         .into_iter()
         .map(|peer| {
             let mut row = json!(peer);
-            if query.detail {
+            if detail {
                 let view = model.peer(peer);
                 row["build"] = json!(view.build);
                 row["stale"] = json!(view.stale);
@@ -4157,6 +4173,9 @@ async fn create_job(
             )
         })?,
     };
+    let assigned_peer = req.assigned_peer.as_deref().filter(|id| !id.is_empty());
+    let watch = req.watch.unwrap_or(true) || req.deadline_seconds.is_some();
+    let deadline_seconds = req.deadline_seconds.map(|v| v.min(WATCH_MAX_SECS));
     let mut hub = app.inner.lock().await;
     let request = if let Some(key) = req.request_key.take() {
         if !valid_peer_id(&key) {
@@ -4187,11 +4206,19 @@ async fn create_job(
                 json!([creator.circle, creator.peer_id, creator.session_id, key]).to_string()
             )
         );
-        let hash = format!("{:x}", Sha256::digest(json!(req).to_string()));
+        let mut normalized = json!(req);
+        /* keep the old fingerprint for omitted defaults */
+        normalized["backend"] = json!(Some(backend).filter(|name| !name.is_empty()));
+        normalized["assigned_peer"] = json!(assigned_peer);
+        normalized["watch"] = json!((!watch).then_some(false));
+        normalized["deadline_seconds"] = json!(deadline_seconds);
+        let hash = format!("{:x}", Sha256::digest(normalized.to_string()));
         if let Some((id, prior_hash)) =
             job_history::request(&hub.db, &scope).map_err(database_error)?
         {
-            if hash != prior_hash {
+            if hash != prior_hash
+                && format!("{:x}", Sha256::digest(json!(req).to_string())) != prior_hash
+            {
                 return Err((
                     StatusCode::CONFLICT,
                     Json(json!({
@@ -4214,11 +4241,11 @@ async fn create_job(
         None
     };
     let job_id = format!("job-{}", Uuid::new_v4().simple());
-    let circle = stamp_job_circle(&hub, req.from_peer.as_deref(), req.assigned_peer.as_deref())?;
-    let assigned_peer = req.assigned_peer.filter(|id| !id.is_empty());
-    if let Some(to) = assigned_peer.as_deref() {
+    let circle = stamp_job_circle(&hub, req.from_peer.as_deref(), assigned_peer)?;
+    if let Some(to) = assigned_peer {
         check_job_assignee(&hub, req.from_peer.as_deref(), to, &circle)?;
     }
+    let assigned_peer = req.assigned_peer.filter(|id| !id.is_empty());
     let depends_on = job_dependencies(&hub, &req.depends_on, &circle)?;
     let job = Job {
         job_id: job_id.clone(),
@@ -4238,8 +4265,8 @@ async fn create_job(
         finished_at: None,
         created_at: Some(now_unix()),
         handoff: None,
-        watch: req.watch.unwrap_or(true) || req.deadline_seconds.is_some(),
-        deadline_seconds: req.deadline_seconds.map(|v| v.min(WATCH_MAX_SECS)),
+        watch,
+        deadline_seconds,
     };
     hub.jobs.insert(job_id.clone(), job);
     let now = now_unix();
@@ -4433,13 +4460,13 @@ async fn update_job(
     }
     let mut hub = app.inner.lock().await;
     let now = now_unix();
-    settle_job(&mut hub, &id);
-    let Some(current) = hub.jobs.get(&id).cloned() else {
+    let Some(mut job) = hub.jobs.get(&id).cloned() else {
         return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
     };
+    settle_job_from_ask(&mut job, &hub.asks);
     /* running means the hub holds an ask for the job; set by hand, the loop would neither
     settle it, dispatch it nor remind anyone about it */
-    if current.dispatch && state == "running" && current.state != "running" {
+    if job.dispatch && state == "running" && job.state != "running" {
         return Err((
             StatusCode::CONFLICT,
             Json(json!({"error": "the hub starts a dispatched job; set state queued"})),
@@ -4455,8 +4482,8 @@ async fn update_job(
                 Json(json!({"error": "set state queued to reassign a job"})),
             ));
         }
-        let creator = Some(current.from_peer.as_str()).filter(|peer| !peer.is_empty());
-        check_job_assignee(&hub, creator, to, &current.circle)?;
+        let creator = Some(job.from_peer.as_str()).filter(|peer| !peer.is_empty());
+        check_job_assignee(&hub, creator, to, &job.circle)?;
     }
     /* a new prompt is for the next attempt; the running one already has its ask */
     if req.prompt.is_some() && state == "running" {
@@ -4466,17 +4493,15 @@ async fn update_job(
         ));
     }
     let mut events = Vec::new();
-    if current.state == "running" && state != "running" {
+    if job.state == "running" && state != "running" {
         let reply = match &req.result_summary {
             Some(summary) => format!("amesh: job {id} set to {state}: {summary}"),
             None => format!("amesh: job {id} set to {state}"),
         };
-        events.extend(close_job_ask(&mut hub, &current, reply, state != "done"));
+        events.extend(close_job_ask(&mut hub, &job, reply, state != "done"));
     }
-    let Some(job) = hub.jobs.get_mut(&id) else {
-        return Err((StatusCode::NOT_FOUND, Json(json!({"error": "unknown job"}))));
-    };
-    set_job_state(job, &state, now_unix());
+    let previous_holder = job_holder(&hub, &job);
+    set_job_state(&mut job, &state, now_unix());
     if req.result_summary.is_some() {
         job.result_summary = req.result_summary;
     }
@@ -4506,7 +4531,6 @@ async fn update_job(
     if state == "queued" {
         job.ask_id = None;
     }
-    let job = job.clone();
     /* the peer that held the job hears about the change, including where it went */
     let notice = match moved_to {
         Some(to) => format!(
@@ -4515,7 +4539,7 @@ async fn update_job(
         ),
         None => format!("job {} {} {}", job.job_id, job.title, job.state),
     };
-    if let Some(to) = job_holder(&hub, &current).or_else(|| job_holder(&hub, &job)) {
+    if let Some(to) = previous_holder.or_else(|| job_holder(&hub, &job)) {
         events.push(json!({
             "type": "notify",
             "id": format!("notif-{}", &Uuid::new_v4().simple().to_string()[..8]),
@@ -4524,6 +4548,7 @@ async fn update_job(
             "message": notice,
         }));
     }
+    hub.jobs.insert(id.clone(), job);
     dispatch_job(&mut hub, &id, now, &mut events);
     let queued = queue_replies(&mut hub, events, now);
     persist_ok(&mut hub)?;
@@ -5149,21 +5174,19 @@ async fn gc_state(
 /* a running job whose ask has closed takes the ask's outcome. A manual update settles
 first as well, so an ack that lands between passes still becomes the job's result */
 fn settle_job(hub: &mut Hub, id: &str) -> bool {
-    let Some(cid) = hub
-        .jobs
-        .get(id)
-        .filter(|job| job.state == "running")
-        .and_then(|job| job.ask_id.clone())
-    else {
+    hub.jobs
+        .get_mut(id)
+        .is_some_and(|job| settle_job_from_ask(job, &hub.asks))
+}
+
+fn settle_job_from_ask(job: &mut Job, asks: &HashMap<String, Ask>) -> bool {
+    let Some(cid) = job.ask_id.as_deref().filter(|_| job.state == "running") else {
         return false;
     };
-    let (failed, reply) = match hub.asks.get(&cid) {
+    let (failed, reply) = match asks.get(cid) {
         Some(ask) if ask.open => return false,
         Some(ask) => (ask.failed, ask.reply.clone()),
         None => (true, Some(format!("amesh: ask {cid} is missing"))),
-    };
-    let Some(job) = hub.jobs.get_mut(id) else {
-        return false;
     };
     set_job_state(job, if failed { "failed" } else { "done" }, now_unix());
     job.result_summary = reply;

@@ -132,6 +132,14 @@ fn route(group: &[&Event], prefix: &str) -> String {
     }
 }
 
+fn shorten_job_preview(line: &str) -> Option<String> {
+    let rest = line.strip_prefix("job job-")?;
+    let id = rest.get(..32)?;
+    let suffix = rest.get(32..)?;
+    (id.bytes().all(|byte| byte.is_ascii_hexdigit()) && suffix.starts_with([':', ' ']))
+        .then(|| format!("job job-{}{suffix}", &id[..8]))
+}
+
 /* one row per item: the time, to the second in a wide pane, the kind, who to whom in a column
 as wide as the widest route, and the text's first line where asks::PREVIEW_MIN columns are left
 for it. HOME's calm rows give the kind words no colour of their own */
@@ -160,7 +168,12 @@ pub(crate) fn rows(items: &[Item], cols: usize, prefix: &str, calm: bool) -> Vec
             let rest = cols.saturating_sub(used + 2);
             let first = text.lines().next().unwrap_or("");
             if rest >= asks::PREVIEW_MIN && !first.is_empty() {
-                row.push((format!("  {}", fit(first, rest)), Tone::Plain));
+                let shortened = match kind(e) {
+                    "ask" | "hub" => shorten_job_preview(first),
+                    _ => None,
+                };
+                let preview = shortened.as_deref().unwrap_or(first);
+                row.push((format!("  {}", fit(preview, rest)), Tone::Plain));
             }
             row
         })

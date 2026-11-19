@@ -3246,6 +3246,7 @@ fn hooks_emit_ask_completion_instructions() {
         "An empty receipt ack also closes the ask",
         "A no-reply instruction on a notify, ack, or broadcast applies to that message",
         "Keep asks open when user instructions prohibit a reply or defer the work.",
+        "When permitted, use amesh_notify_peer to give the asker the reason and correlation_id once per deferred ask.",
         "Stop is a reminder within existing authorization.",
     ];
     let mut missing = Vec::new();
@@ -3306,6 +3307,11 @@ fn codex_stop_blocks_when_ask_is_open() {
         .as_str()
         .unwrap()
         .contains(ask["correlation_id"].as_str().unwrap()));
+    let reason = stop["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("When permitted, use amesh_notify_peer to give the asker the reason and correlation_id once per deferred ask."),
+        "{reason}"
+    );
     let mut repeated = payload;
     repeated["stop_hook_active"] = json!(true);
     assert!(sandbox

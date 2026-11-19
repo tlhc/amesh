@@ -19,7 +19,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
   - an omitted `name` keeps the stored one, else defaults to `peer_id`
   - supported backends are `pi`, `codex`, `claude-code` (alias `claude`) and `opencode`
 - `GET /peers` probes sockets, then drops peers with no live WebSocket and `last_seen` older than 30s (`PEER_ONLINE_SECS`), and may persist.
-- `GET /peers?detail=true` adds `build`, `stale`, `delivery` and `queued`. HTTP and MCP peer details and the `/snapshot` roster include `delivery_issue: "codex_thread_not_loaded"` when the active Codex drainer reports that its registered thread is unloaded.
+- `GET /peers?detail=true` adds `build`, `stale`, `delivery` and `queued`. HTTP also accepts a bare `detail` or `1`, `yes`, and `on` as true, and `0`, `no`, and `off` as false. Values are case-insensitive and authentication precedes query validation. HTTP and MCP peer details and the `/snapshot` roster include `delivery_issue: "codex_thread_not_loaded"` when the active Codex drainer reports that its registered thread is unloaded.
 
 ## Ask
 
@@ -42,7 +42,7 @@ One-page snapshot of the hub in `src/hub/mod.rs`. CLI flags: `amesh --help`. MCP
 - `POST /jobs` with `assigned_peer` creates a dispatched job:
   - the assignee must resolve (404) and share the job's circle (403)
   - every id in `depends_on` must exist in the same circle (400)
-- Optional `request_key` uses 1-128 characters from `A-Z a-z 0-9 . _ -` and requires a registered `from_peer` with a session ID. The key is scoped to that peer, session and circle. Repeat identical creation parameters to return the current job. Reusing the key with other parameters or after the live job was swept returns 409 with the original `job_id`.
+- Optional `request_key` uses 1-128 characters from `A-Z a-z 0-9 . _ -` and requires a registered `from_peer` with a session ID. The key is scoped to that peer, session and circle. Repeat equivalent creation parameters to return the current job. Explicit defaults and backend aliases are canonicalized. Keys recorded before normalization still accept an exact retry of the original parameters. Reusing the key with other parameters or after the live job was swept returns 409 with the original `job_id`.
 - Once a second the hub:
   - settles running jobs whose ask closed: `done`, or `failed` when the ask is failed
   - sends each queued job whose dependencies are all `done` as an ask from its creator
