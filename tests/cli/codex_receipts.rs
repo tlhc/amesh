@@ -785,3 +785,149 @@ async fn codex_pending_report_is_scoped_to_inbox_socket_and_session() {
         "old recv shape remains valid"
     );
 }
+
+fn replay_after_first_beat(
+    beat_secs: &str,
+    driver: AppDriver,
+    run: impl FnOnce(tokio::sync::mpsc::UnboundedSender<Value>, mpsc::Receiver<String>),
+) {
+    use axum::{
+        extract::ws::{Message, WebSocketUpgrade},
+        routing::{get, post},
+        Router,
+    };
+
+    let sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    let home = sandbox.root.join("replay");
+    let submissions =
+        app_server_capture_driver(&home, &["th1"], Arc::default(), None, None, Some(driver));
+    let (frames, queued) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let queued = Arc::new(Mutex::new(Some(queued)));
+    let (ping, first_beat) = mpsc::channel();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let app = Router::new()
+            .route(
+                "/peers",
+                post(move || async move { axum::Json(json!({"peer_id":worker})) }),
+            )
+            .route(
+                "/ws",
+                get(move |ws: WebSocketUpgrade| {
+                    let queued = queued.lock().unwrap().take().unwrap();
+                    let ping = ping.clone();
+                    async move {
+                        ws.on_upgrade(move |mut socket| async move {
+                            let mut queued = queued;
+                            let Some(Ok(Message::Text(connect))) = socket.recv().await else {
+                                return;
+                            };
+                            let connect: Value = serde_json::from_str(&connect).unwrap();
+                            assert_eq!(connect["mark_replay"], true);
+                            let greeting = json!({"type":"connected","session_id":"th1"});
+                            socket
+                                .send(Message::Text(greeting.to_string().into()))
+                                .await
+                                .unwrap();
+                            while let Some(Ok(Message::Text(raw))) = socket.recv().await {
+                                let value: Value = serde_json::from_str(&raw).unwrap();
+                                if value["type"] == "ping" {
+                                    ping.send(()).unwrap();
+                                    break;
+                                }
+                            }
+                            loop {
+                                tokio::select! {
+                                    frame = queued.recv() => {
+                                        let Some(frame) = frame else { break };
+                                        if socket.send(Message::Text(frame.to_string().into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    incoming = socket.recv() => {
+                                        if !matches!(incoming, Some(Ok(_))) {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        })
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind(&sandbox.bind).await.unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() }).abort_handle()
+    });
+    let _drainer = KillChild(Some(
+        sandbox
+            .command()
+            .args(["hook", "ws", "--peer-id", worker, "--backend", "codex"])
+            .env("CODEX_HOME", home)
+            .env("AMESH_WS_BEAT_SECS", beat_secs)
+            .spawn()
+            .unwrap(),
+    ));
+    first_beat.recv_timeout(Duration::from_secs(5)).unwrap();
+    run(frames, submissions);
+    server.abort();
+}
+
+fn replay_frame(id: &str, replay: bool) -> Value {
+    json!({"type":"notify","id":id,"message":id,"replay":replay})
+}
+
+#[test]
+fn cold_replay_starts_lookup_after_the_first_beat() {
+    let (scoped, lookup) = mpsc::channel();
+    let driver = Arc::new(move |req: &Value| {
+        if req["method"] == "thread/items/list" && req["params"]["turnId"] == "finished-turn" {
+            scoped.send(()).unwrap();
+        }
+        None
+    });
+    replay_after_first_beat("60", driver, |frames, submissions| {
+        frames.send(replay_frame("older", true)).unwrap();
+        lookup
+            .recv_timeout(Duration::from_secs(5))
+            .expect("replay should look up its receipt before the next beat");
+        let raw = submissions.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(turn_text(&raw).contains("older"), "{raw}");
+    });
+}
+
+#[test]
+fn cold_replay_keeps_new_messages_behind_an_incomplete_lookup() {
+    let (scoped, lookup) = mpsc::channel();
+    let retry = Arc::new(AtomicBool::new(false));
+    let state = retry.clone();
+    let driver = Arc::new(move |req: &Value| {
+        if req["method"] == "thread/items/list"
+            && req["params"]["turnId"] == "finished-turn"
+            && !state.load(Ordering::SeqCst)
+        {
+            scoped.send(()).unwrap();
+            return Some(json!({
+                "error":{"code":-32603,"message":"item page temporarily unavailable"}
+            }));
+        }
+        None
+    });
+    replay_after_first_beat("1", driver, |frames, submissions| {
+        frames.send(replay_frame("older", true)).unwrap();
+        frames.send(replay_frame("newer", false)).unwrap();
+        assert!(
+            submissions
+                .recv_timeout(Duration::from_millis(800))
+                .is_err(),
+            "new frame passed the replay waiting for its item page"
+        );
+        lookup.recv_timeout(Duration::from_secs(5)).unwrap();
+        retry.store(true, Ordering::SeqCst);
+        frames.send(replay_frame("last", false)).unwrap();
+        for expected in ["older", "newer", "last"] {
+            let raw = submissions.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(turn_text(&raw).contains(expected), "{raw}");
+        }
+    });
+}

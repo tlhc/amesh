@@ -12,6 +12,7 @@ const SEND_BUDGET: usize = 8;
 pub(super) struct CodexDelivery {
     thread: Option<String>,
     pending: HashMap<String, Pending>,
+    replay: Option<(String, ReceiptScan)>,
     retries: HashMap<String, u8>,
     sequence: u64,
     last_polled: Option<u64>,
@@ -26,10 +27,15 @@ struct Anchor {
 struct Pending {
     sequence: u64,
     record: Queued,
+    scan: ReceiptScan,
+    exhausted: bool,
+}
+
+#[derive(Default)]
+struct ReceiptScan {
     anchor: Option<Anchor>,
     turn: Option<String>,
     progress: HashMap<String, Progress>,
-    exhausted: bool,
 }
 
 #[derive(Default)]
@@ -51,6 +57,7 @@ impl CodexDelivery {
         }
         self.thread = Some(thread.to_string());
         self.pending.clear();
+        self.replay = None;
         self.retries.clear();
         self.sequence = 0;
         self.last_polled = None;
@@ -69,7 +76,7 @@ impl CodexDelivery {
         let mut ids: Vec<_> = self
             .pending
             .iter()
-            .filter(|(_, item)| item.turn.is_some() && !item.exhausted)
+            .filter(|(_, item)| item.scan.turn.is_some() && !item.exhausted)
             .map(|(id, _)| id.as_str())
             .collect();
         ids.sort_unstable();
@@ -91,9 +98,11 @@ impl CodexDelivery {
             Pending {
                 sequence: self.sequence,
                 record,
-                anchor,
-                turn,
-                progress: HashMap::new(),
+                scan: ReceiptScan {
+                    anchor,
+                    turn,
+                    ..ReceiptScan::default()
+                },
                 exhausted: false,
             },
         );
@@ -104,13 +113,14 @@ impl CodexDelivery {
         sink: &mut AppSink,
         queued: &mut VecDeque<Queued>,
         acked: &mut Vec<String>,
+        mut budget: usize,
     ) -> Result<bool> {
         let mut ids: Vec<_> = self
             .pending
             .iter()
             .map(|(id, item)| (item.sequence, id.clone()))
             .collect();
-        if ids.is_empty() {
+        if ids.is_empty() || budget == 0 {
             return Ok(false);
         }
         ids.sort_unstable();
@@ -125,7 +135,6 @@ impl CodexDelivery {
             sink.active_turn = None;
         }
         let can_be_idle = turns.iter().all(terminal_turn);
-        let mut budget = PAGE_BUDGET;
         let mut ready = false;
         for (sequence, id) in ids {
             if budget == 0 {
@@ -135,6 +144,7 @@ impl CodexDelivery {
             let item = self.pending.get_mut(&id).unwrap();
             let mut remaining = budget;
             let result = item
+                .scan
                 .receipt(sink, &id, turns, next.is_none(), &mut remaining)
                 .await?;
             budget = remaining.min(budget - 1);
@@ -144,14 +154,8 @@ impl CodexDelivery {
                     self.retries.remove(&id);
                     acked.push(id);
                 }
-                Receipt::Missing if item.anchor.is_none() => {
-                    let mut record = self.pending.remove(&id).unwrap().record;
-                    record.replay = false;
-                    queued.push_back(record);
-                    ready = true;
-                }
                 Receipt::Missing if !item.exhausted => {
-                    let interrupted = item.turn.as_deref().is_some_and(|id| {
+                    let interrupted = item.scan.turn.as_deref().is_some_and(|id| {
                         turns.iter().any(|turn| {
                             turn_id(turn) == Some(id)
                                 && matches!(turn["status"].as_str(), Some("interrupted" | "failed"))
@@ -185,17 +189,44 @@ impl CodexDelivery {
         Ok(ready)
     }
 
-    async fn send(&mut self, sink: &mut AppSink, queued: &mut VecDeque<Queued>) -> Result<bool> {
+    async fn send(
+        &mut self,
+        sink: &mut AppSink,
+        queued: &mut VecDeque<Queued>,
+        acked: &mut Vec<String>,
+        budget: &mut usize,
+    ) -> Result<bool> {
         for _ in 0..SEND_BUDGET {
-            let Some(record) = queued.front() else {
+            let Some(record) = queued.front_mut() else {
                 return Ok(false);
             };
             if !matches_thread(&record.owner, &sink.thread_id) {
                 return Ok(false);
             }
-            if record.replay && record.id.is_some() {
-                self.hold(queued.pop_front().unwrap(), None, None, &sink.thread_id);
-                continue;
+            if let Some(id) = record.id.as_ref().filter(|_| record.replay) {
+                if *budget == 0 {
+                    return Ok(true);
+                }
+                /* Keep the scan at the queue head until history accounts for this ID. */
+                let result = self.scan_replay(sink, id, budget).await;
+                match result {
+                    Ok(Receipt::Found) => {
+                        acked.push(id.clone());
+                        queued.pop_front();
+                        self.replay = None;
+                        continue;
+                    }
+                    Ok(Receipt::Missing) => {
+                        record.replay = false;
+                        self.replay = None;
+                    }
+                    Ok(Receipt::Waiting) => return Ok(true),
+                    Err(error) if error.is::<AppRejected>() => {
+                        eprintln!("amesh hook ws: Codex replay check failed: {error}");
+                        return Ok(false);
+                    }
+                    Err(error) => return Err(error),
+                }
             }
             let anchor = if record.id.is_some() {
                 Some(sink.tail_anchor().await?)
@@ -221,6 +252,29 @@ impl CodexDelivery {
         Ok(queued
             .front()
             .is_some_and(|record| matches_thread(&record.owner, &sink.thread_id)))
+    }
+
+    async fn scan_replay(
+        &mut self,
+        sink: &mut AppSink,
+        id: &str,
+        budget: &mut usize,
+    ) -> Result<Receipt> {
+        if self
+            .replay
+            .as_ref()
+            .is_none_or(|(current, _)| current != id)
+        {
+            self.replay = Some((id.to_string(), ReceiptScan::default()));
+        }
+        let snapshot = sink.recent_turns(RECENT_TURNS).await?;
+        let (turns, next) = page(&snapshot)?;
+        self.replay
+            .as_mut()
+            .unwrap()
+            .1
+            .receipt(sink, id, turns, next.is_none(), budget)
+            .await
     }
 
     pub(super) async fn flush(
@@ -257,17 +311,18 @@ impl CodexDelivery {
                 return (SinkState::Usable, Vec::new(), false);
             }
         }
-        let more = match self.send(sink, queued).await {
+        let mut acked = Vec::new();
+        let mut budget = PAGE_BUDGET;
+        let more = match self.send(sink, queued, &mut acked, &mut budget).await {
             Ok(more) => more,
             Err(error) => {
                 eprintln!("amesh hook ws: App Server inject failed: {error}");
-                return (failure(error.as_ref()), Vec::new(), false);
+                return (failure(error.as_ref()), acked, false);
             }
         };
-        let mut acked = Vec::new();
         let mut ready = false;
         if poll {
-            match self.receipts(sink, queued, &mut acked).await {
+            match self.receipts(sink, queued, &mut acked, budget).await {
                 Ok(requeued) => ready = requeued,
                 Err(error) => {
                     eprintln!("amesh hook ws: Codex receipt check failed: {error}");
@@ -281,7 +336,7 @@ impl CodexDelivery {
     }
 }
 
-impl Pending {
+impl ReceiptScan {
     async fn receipt(
         &mut self,
         sink: &mut AppSink,
