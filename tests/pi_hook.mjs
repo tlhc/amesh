@@ -607,7 +607,7 @@ assert.match(userMsgs[1].content, /k1/);
 assert.doesNotMatch(userMsgs[1].content, /type="broadcast"/);
 await handlers.get("agent_settled")({}, context);
 assert.equal(userMsgs.length, 3);
-assert.deepEqual(userMsgs[2].options, { deliverAs: "followUp" });
+assert.deepEqual(userMsgs[2].options, { deliverAs: "steer" });
 assert.match(userMsgs[2].content, /b1/);
 await handlers.get("agent_settled")({}, context);
 fire(sockets[0], {
@@ -1178,7 +1178,7 @@ await test("HTTP Inbox batches preserve notify-before-broadcast priority", async
     await instance.handlers.get("agent_settled")({}, state.ctx);
     assert.equal(instance.users.length, 2);
     assert.match(instance.users[1].content, /inbox-broadcast/);
-    assert.deepEqual(instance.users[1].options, { deliverAs: "followUp" });
+    assert.deepEqual(instance.users[1].options, { deliverAs: "steer" });
   } finally {
     await instance.handlers.get("session_shutdown")({}, state.ctx);
   }
@@ -1375,7 +1375,7 @@ await test("a tool child that exits before reading its input rejects, never thro
   await assert.rejects(call, /mcp-refused/);
 });
 
-await test("a consumed steer lets the next batch out inside the same run", async () => {
+await test("a consumed steer lets a broadcast into the same run", async () => {
   const state = InboxSession();
   wsFailRemaining = 0;
   const instance = InboxInstance(state);
@@ -1387,7 +1387,7 @@ await test("a consumed steer lets the next batch out inside the same run", async
     fire(instance.sockets[0], { type: "connected", session_id: state.ctx.sessionManager.getSessionId() });
     fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-one", id: "m1-e1" });
     assert.equal(instance.users.length, 1, "the first batch goes out at once");
-    fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-two", id: "m1-e2" });
+    fire(instance.sockets[0], { type: "broadcast", from_peer: "amesh-codex", message: "m1-two", id: "m1-e2" });
     assert.equal(instance.users.length, 1, "the second batch waits while the first is in flight");
     const first = instance.users[0].content;
     await delivered(first, "assistant");
@@ -1397,6 +1397,7 @@ await test("a consumed steer lets the next batch out inside the same run", async
     await delivered([{ type: "text", text: first }]);
     assert.equal(instance.users.length, 2, "the consumed batch opens the gate inside the run");
     assert.match(instance.users[1].content, /m1-two/);
+    assert.deepEqual(instance.users[1].options, { deliverAs: "steer" });
     await delivered([{ type: "text", text: first }]);
     assert.equal(instance.users.length, 2, "one batch opens the gate once");
     fire(instance.sockets[0], { type: "notify", from_peer: "amesh-codex", message: "m1-three", id: "m1-e3" });

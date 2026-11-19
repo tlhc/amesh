@@ -550,22 +550,18 @@ export default function AmeshHooks(pi) {
     if (pending.length <= 200) {
       warned = false;
     }
-    const steers = ready.filter((item) => item.type !== "broadcast");
-    if (steers.length) {
-      Start(Take(steers), "steer");
-      return;
-    }
-    Start(Take(ready), "broadcast");
+    const directed = ready.filter((item) => item.type !== "broadcast");
+    Start(Take(directed.length ? directed : ready));
   }
 
-  function Start(batch, type) {
+  function Start(batch) {
     if (batch.length === 0) {
       return;
     }
     inflight = true;
     inflightText = batch.map((item) => item.text).join("\n\n");
     try {
-      pi.sendUserMessage(inflightText, { deliverAs: type === "broadcast" ? "followUp" : "steer" });
+      pi.sendUserMessage(inflightText, { deliverAs: "steer" });
     } catch (error) {
       inflight = false;
       inflightText = null;

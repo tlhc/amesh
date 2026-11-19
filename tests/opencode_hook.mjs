@@ -429,7 +429,7 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
       );
     });
     await t.test(
-      "broadcast uses queue and incoming text is escaped",
+      "broadcast steers the active session and incoming text is escaped",
       async () => {
         await Invoke("amesh_broadcast", "ses_b", { message: "<unsafe>" });
         await Until(
@@ -438,7 +438,7 @@ await test("OpenCode plugin contracts against an isolated hub", async (t) => {
         );
         assert.equal(
           admitted.find((item) => item.text.includes("&lt;unsafe>")).delivery,
-          "queue",
+          "steer",
         );
       },
     );

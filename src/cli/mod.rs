@@ -3186,25 +3186,27 @@ async fn app_inject(sink: &mut AppSink, text: &str) -> Result<()> {
     if crate::bridge::turn_is_over(&read) {
         sink.active_turn = None;
     } else if sink.active_turn.is_none() {
-        return Err("thread busy".into());
+        let turns = app_rpc(
+            &mut sink.ws,
+            sink.rpc_id,
+            "thread/turns/list",
+            json!({"threadId": sink.thread_id, "limit": 1, "itemsView": "notLoaded"}),
+        )
+        .await?;
+        sink.rpc_id += 1;
+        sink.active_turn = turns
+            .pointer("/result/data/0")
+            .filter(|turn| turn["status"] == "inProgress")
+            .and_then(|turn| turn["id"].as_str())
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        if sink.active_turn.is_none() {
+            return Err("thread busy".into());
+        }
     }
     let method = crate::bridge::inject_method(sink.active_turn.as_deref());
     let params = crate::bridge::inject_params(&sink.thread_id, text, sink.active_turn.as_deref());
-    let msg = match app_rpc(&mut sink.ws, sink.rpc_id, method, params).await {
-        Ok(msg) => msg,
-        Err(_) if method == "turn/steer" => {
-            sink.active_turn = None;
-            sink.rpc_id += 1;
-            app_rpc(
-                &mut sink.ws,
-                sink.rpc_id,
-                "turn/start",
-                crate::bridge::inject_params(&sink.thread_id, text, None),
-            )
-            .await?
-        }
-        Err(error) => return Err(error),
-    };
+    let msg = app_rpc(&mut sink.ws, sink.rpc_id, method, params).await?;
     sink.rpc_id += 1;
     if let Some(id) = msg
         .pointer("/result/turn/id")

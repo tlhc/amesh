@@ -243,7 +243,7 @@ export default {
                 text: Message(item.event),
                 description: `amesh ${item.event.type} from @${sender}`,
                 metadata: { ameshEventID: item.event.id },
-                delivery: item.event.type === "broadcast" ? "queue" : "steer",
+                delivery: "steer",
                 resume: true,
               });
               if (Valid(root, generation) && socket.readyState === 1) {

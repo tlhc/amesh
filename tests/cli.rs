@@ -4007,13 +4007,14 @@ fn hook_ws_stays_up_after_hub_kill_past_retry_window() {
 }
 
 #[test]
-fn hook_ws_injects_notify_into_claude_socket() {
+fn hook_ws_injects_direct_and_broadcast_into_claude_socket() {
     use std::io::BufRead;
     use std::os::unix::net::UnixListener;
     let mut sandbox = Sandbox::new();
     let worker = sandbox.id("worker");
     sandbox.start();
     register_drain_peer(&sandbox, "claude-code");
+    register_boss(&sandbox);
     let sock = sandbox.root.join("ai.s");
     let listener = UnixListener::bind(&sock).unwrap();
     listener.set_nonblocking(true).unwrap();
@@ -4048,44 +4049,74 @@ fn hook_ws_injects_notify_into_claude_socket() {
         );
     }
     assert_eq!(
-        sandbox.json(&["peer", "notify", worker, "inbox-ping"], None)["ok"],
+        sandbox.json(
+            &[
+                "peer",
+                "notify",
+                worker,
+                "inbox-ping",
+                "--from-peer",
+                "boss"
+            ],
+            None,
+        )["ok"],
         true
     );
-    let mut line = String::new();
-    let accept_deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false).unwrap();
-                std::io::BufReader::new(stream)
-                    .read_line(&mut line)
-                    .unwrap();
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= accept_deadline {
-                    let _ = child.kill();
-                    let out = child.wait_with_output().unwrap();
-                    panic!(
-                        "inbox socket got no frame: stdout={} stderr={}",
-                        String::from_utf8_lossy(&out.stdout),
-                        String::from_utf8_lossy(&out.stderr)
-                    );
+    sandbox.json(
+        &[
+            "peer",
+            "broadcast",
+            "inbox-broadcast",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    let mut frames = Vec::new();
+    for _ in 0..2 {
+        let mut line = String::new();
+        let accept_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    std::io::BufReader::new(stream)
+                        .read_line(&mut line)
+                        .unwrap();
+                    frames.push(line);
+                    break;
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= accept_deadline {
+                        let _ = child.kill();
+                        let out = child.wait_with_output().unwrap();
+                        panic!(
+                            "inbox socket got only {} frames: stdout={} stderr={}",
+                            frames.len(),
+                            String::from_utf8_lossy(&out.stdout),
+                            String::from_utf8_lossy(&out.stderr)
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("{error}"),
             }
-            Err(error) => panic!("{error}"),
         }
     }
     let _ = child.kill();
     let _ = child.wait();
-    let frame: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(frame["type"], "user");
-    assert_eq!(frame["message"]["role"], "user");
-    let content = frame["message"]["content"].as_str().unwrap();
-    assert!(content.contains("<peer-message"), "{content}");
-    assert!(content.contains("inbox-ping"), "{content}");
-    assert!(content.contains("type=\"notify\""), "{content}");
+    for (line, (kind, text)) in frames
+        .iter()
+        .zip([("notify", "inbox-ping"), ("broadcast", "inbox-broadcast")])
+    {
+        let frame: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(frame["type"], "user");
+        assert_eq!(frame["message"]["role"], "user");
+        let content = frame["message"]["content"].as_str().unwrap();
+        assert!(content.contains("<peer-message"), "{content}");
+        assert!(content.contains(text), "{content}");
+        assert!(content.contains(&format!("type=\"{kind}\"")), "{content}");
+    }
 }
 
 #[test]
@@ -4667,6 +4698,90 @@ fn start_codex_drainer_beating(
     }
     assert!(peer_is_online(sandbox, worker), "drainer connects");
     child
+}
+
+#[test]
+fn codex_drainer_delivers_direct_and_broadcast_inside_an_existing_turn() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    sandbox.json(
+        &[
+            "peer",
+            "notify",
+            worker,
+            "queued-direct",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    sandbox.json(
+        &[
+            "peer",
+            "broadcast",
+            "queued-broadcast",
+            "--from-peer",
+            "boss",
+        ],
+        None,
+    );
+    assert_eq!(inbox_count(&sandbox, worker), 2);
+    let codex_home = sandbox.root.join("codex");
+    let injected = app_server_capture_threads(&codex_home, &["th1"], &["+th1"]);
+    let _drainer = start_codex_drainer(&sandbox, worker, &codex_home);
+    for text in ["queued-direct", "queued-broadcast"] {
+        let raw = injected
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("{text} must enter the active turn"));
+        let rpc: Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(rpc["method"], "turn/steer");
+        assert_eq!(rpc["params"]["expectedTurnId"], "user-turn");
+        assert!(turn_text(&raw).contains(text), "{raw}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while inbox_count(&sandbox, worker) != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "both deliveries must be confirmed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn codex_drainer_refreshes_a_rejected_turn_id_before_retrying() {
+    let mut sandbox = Sandbox::new();
+    let worker = sandbox.id("worker");
+    sandbox.start();
+    bind_session(&sandbox, "codex", worker, "th1");
+    register_boss(&sandbox);
+    let codex_home = sandbox.root.join("codex");
+    let busy = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let injected = app_server_capture_with(&codex_home, &["th1"], busy.clone(), None, None);
+    let _drainer = start_codex_drainer(&sandbox, worker, &codex_home);
+    let notify = |body| {
+        sandbox.json(
+            &["peer", "notify", worker, body, "--from-peer", "boss"],
+            None,
+        );
+    };
+    let next = || -> Value {
+        serde_json::from_str(&injected.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap()
+    };
+    notify("start-on-idle");
+    assert_eq!(next()["method"], "turn/start");
+    *busy.lock().unwrap() = vec!["+th1".to_string()];
+    notify("same-input-after-turn-change");
+    let stale = next();
+    assert_eq!(stale["method"], "turn/steer");
+    assert_eq!(stale["params"]["expectedTurnId"], "turn-1");
+    let retried = next();
+    assert_eq!(retried["method"], "turn/steer");
+    assert_eq!(retried["params"]["expectedTurnId"], "user-turn");
+    assert_eq!(retried["params"]["input"], stale["params"]["input"]);
 }
 
 /* the beat is the default ten seconds, so only the retry's own wait brings the tries inside it.
@@ -8012,7 +8127,10 @@ fn app_server_capture_with(
                                 let thread = req["params"]["threadId"].as_str().unwrap_or("");
                                 let busy = busy.lock().unwrap();
                                 /* "!id" is a thread whose last turn the server failed */
-                                let state = if busy.iter().any(|id| id == thread) {
+                                let state = if busy
+                                    .iter()
+                                    .any(|id| id == thread || id.strip_prefix('+') == Some(thread))
+                                {
                                     "active"
                                 } else if busy.iter().any(|id| id.strip_prefix('!') == Some(thread))
                                 {
@@ -8026,6 +8144,13 @@ fn app_server_capture_with(
                                     read["thread"]["canAcceptDirectInput"] = json!(false);
                                 }
                                 read
+                            }
+                            "thread/turns/list" => {
+                                if marked('+') {
+                                    json!({"data": [{"id": "user-turn", "status": "inProgress"}]})
+                                } else {
+                                    json!({"data": [{"id": "finished-turn", "status": "completed"}]})
+                                }
                             }
                             "turn/start" | "turn/steer" => {
                                 if let Some(starts) = &starts {
@@ -8048,10 +8173,19 @@ fn app_server_capture_with(
                                 }
                                 if marked('-') || marked('=') {
                                     error = Some(json!({"code": -32600, "message": "direct app-server input is not allowed for multi-agent v2 sub-agents"}));
+                                } else if req["method"] == "turn/steer"
+                                    && marked('+')
+                                    && req["params"]["expectedTurnId"] != "user-turn"
+                                {
+                                    error = Some(json!({"code": -32600, "message": "expected turn changed"}));
                                 } else if marked('?') {
                                     error = Some(json!({"code": -32603, "message": "turn failed"}));
                                 }
-                                json!({"turn": {"id": "turn-1"}})
+                                if req["method"] == "turn/steer" {
+                                    json!({"turnId": req["params"]["expectedTurnId"]})
+                                } else {
+                                    json!({"turn": {"id": "turn-1"}})
+                                }
                             }
                             _ => json!({}),
                         };
