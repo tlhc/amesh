@@ -9,14 +9,24 @@ use super::with_event_id;
 pub(super) enum Outbound {
     Record(QueuedRecord),
     Copy(QueuedRecord),
+    Replay(QueuedRecord),
     Control(Value),
 }
 
 impl Outbound {
     pub(super) fn event(&self) -> &Value {
         match self {
-            Self::Record(record) | Self::Copy(record) => record.event(),
+            Self::Record(record) | Self::Copy(record) | Self::Replay(record) => record.event(),
             Self::Control(event) => event,
+        }
+    }
+    pub(super) fn wire_text(&self, mark_replay: bool) -> String {
+        if mark_replay && matches!(self, Self::Copy(_) | Self::Replay(_)) {
+            let mut event = self.event().clone();
+            event["replay"] = Value::Bool(matches!(self, Self::Replay(_)));
+            event.to_string()
+        } else {
+            self.event().to_string()
         }
     }
 }

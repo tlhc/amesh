@@ -1397,7 +1397,7 @@ fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Outbound>) 
         .skip(start)
         .filter_map(|event| match event {
             Outbound::Record(record) => Some(record),
-            Outbound::Copy(_) | Outbound::Control(_) => None,
+            Outbound::Copy(_) | Outbound::Replay(_) | Outbound::Control(_) => None,
         })
         .filter(|record| record.event()["type"] != DISPLACED && record.event()["type"] != "bound")
         .filter(|event| deliverable(hub, event.event()))
@@ -1427,7 +1427,7 @@ fn return_undelivered(hub: &mut Hub, peer_id: &str, undelivered: Vec<Outbound>) 
             .collect();
         hub.inbox.enqueue(peer_id, owed.clone());
         for record in owed {
-            let _ = successor.send(Outbound::Copy(record));
+            let _ = successor.send(Outbound::Replay(record));
         }
         return true;
     }
@@ -1561,8 +1561,20 @@ fn queue_replies(hub: &mut Hub, replies: Vec<Value>, now: u64) -> Vec<(String, Q
 /* callers persist the records and their state changes before this records them in the ring
 and sends any copy */
 fn deliver_queued(hub: &mut Hub, records: Vec<(String, QueuedRecord)>) {
+    deliver_queued_with_replays(hub, records, Vec::new());
+}
+
+fn deliver_queued_with_replays(
+    hub: &mut Hub,
+    records: Vec<(String, QueuedRecord)>,
+    replays: Vec<(String, QueuedRecord)>,
+) {
     let mut retired = false;
-    for (target, record) in records {
+    let records = records
+        .into_iter()
+        .map(|record| (record, false))
+        .chain(replays.into_iter().map(|record| (record, true)));
+    for ((target, record), replay) in records {
         let event = record.event();
         push_event(hub, event.clone());
         if hub.owed.contains_key(&target) {
@@ -1572,10 +1584,12 @@ fn deliver_queued(hub: &mut Hub, records: Vec<(String, QueuedRecord)>) {
             continue;
         };
         let acknowledging = hub.recv_live.contains(&target) || hub.recv_known.contains(&target);
-        let outbound = if acknowledging {
-            Outbound::Copy(record.clone())
-        } else {
+        let outbound = if !acknowledging {
             Outbound::Record(record.clone())
+        } else if replay {
+            Outbound::Replay(record.clone())
+        } else {
+            Outbound::Copy(record.clone())
         };
         if tx.send(outbound).is_err() {
             hub.sockets.remove(&target);
@@ -2426,8 +2440,11 @@ async fn register_peer(
     }
     let to_push = hub.inbox.records(&peer_id)[replay_start..].to_vec();
     hub.peers.insert(peer_id.clone(), peer.clone());
-    let mut replies = queue_replies(&mut hub, replies, now);
-    replies.extend(to_push.into_iter().map(|record| (peer_id.clone(), record)));
+    let replies = queue_replies(&mut hub, replies, now);
+    let replays = to_push
+        .into_iter()
+        .map(|record| (peer_id.clone(), record))
+        .collect();
     persist_ok(&mut hub)?;
     /* seen when its registration is on disk: a write that stalls must not age the peer
     toward the PEER_ONLINE_SECS prune */
@@ -2449,7 +2466,7 @@ async fn register_peer(
             ));
         }
     }
-    deliver_queued(&mut hub, replies);
+    deliver_queued_with_replays(&mut hub, replies, replays);
     Ok(Json(json!({
         "ok": true,
         "peer_id": peer.peer_id,
@@ -6648,6 +6665,8 @@ struct ConnectReq {
     recv: bool,
     #[serde(default)]
     build: Option<String>,
+    #[serde(default)]
+    mark_replay: bool,
 }
 
 async fn ws_upgrade(
@@ -6704,6 +6723,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
         return;
     };
     let recv = req.recv;
+    let mark_replay = recv && req.mark_replay;
     let build = req.build;
     let (peer_id, name, session_id, gen, mut rx, drained) = loop {
         let mut hub = app.inner.lock().await;
@@ -6776,7 +6796,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                     .records(&peer.peer_id)
                     .iter()
                     .cloned()
-                    .map(Outbound::Copy)
+                    .map(Outbound::Replay)
                     .collect::<Vec<_>>()
             }
         } else {
@@ -6835,7 +6855,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
     }
     let mut remain = 0;
     while remain < drained.len() {
-        let frame = Message::Text(drained[remain].event().to_string().into());
+        let frame = Message::Text(drained[remain].wire_text(mark_replay).into());
         let sent = tokio::time::timeout(write, socket.send(frame)).await;
         if !matches!(sent, Ok(Ok(()))) {
             close_connection(&app, &peer_id, gen, recv, rx, drained[remain..].to_vec()).await;
@@ -6880,14 +6900,6 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
                                 if acknowledge_event(&mut hub, &peer_id, id) {
                                     if let Err((_, Json(err))) = persist_ok(&mut hub) {
                                         eprintln!("amesh persist: {err}");
-                                        continue;
-                                    }
-                                }
-                                if frame["confirm"] == true {
-                                    if let (Some((_, tx)), Some(peer)) = (hub.sockets.get(&peer_id), hub.peers.get(&peer_id)) {
-                                        let _ = tx.send(Outbound::Control(json!({
-                                            "type": "recv_confirmed", "id": id, "session_id": peer.session_id
-                                        })));
                                     }
                                 }
                             }
@@ -6905,7 +6917,7 @@ async fn ws_loop(app: App, mut socket: WebSocket) {
             event = rx.recv() => {
                 match event {
                     Some(v) => {
-                        let frame = Message::Text(v.event().to_string().into());
+                        let frame = Message::Text(v.wire_text(mark_replay).into());
                         let sent = tokio::time::timeout(write, socket.send(frame)).await;
                         if !matches!(sent, Ok(Ok(()))) {
                             undelivered.push(v);

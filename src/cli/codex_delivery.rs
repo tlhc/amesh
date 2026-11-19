@@ -1,36 +1,32 @@
-use super::{
-    app_rpc, hook_ws_dir, AppRejected, AppSink, Queued, Result, SinkState, NO_DIRECT_INPUT,
-};
+use super::{app_rpc, AppRejected, AppSink, Queued, Result, SinkState, NO_DIRECT_INPUT};
 use crate::bridge::{inject_method, inject_params, turn_is_over};
-use rusqlite::{params, Connection, OptionalExtension};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 
 const MAX_RETRIES: u8 = 3;
 const RECENT_TURNS: usize = 8;
 const PAGE_BUDGET: usize = 4;
 const SEND_BUDGET: usize = 8;
 
+#[derive(Default)]
 pub(super) struct CodexDelivery {
-    peer: String,
-    journal: Option<Connection>,
     thread: Option<String>,
     pending: HashMap<String, Pending>,
     retries: HashMap<String, u8>,
-    ready: HashSet<String>,
-    last_polled: Option<String>,
+    sequence: u64,
+    last_polled: Option<u64>,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Default)]
 struct Anchor {
     turn: Option<String>,
     item: Option<String>,
 }
 
 struct Pending {
+    sequence: u64,
     record: Queued,
-    anchor: Anchor,
+    anchor: Option<Anchor>,
     turn: Option<String>,
     progress: HashMap<String, Progress>,
     exhausted: bool,
@@ -49,19 +45,6 @@ enum Receipt {
 }
 
 impl CodexDelivery {
-    pub(super) fn new(peer: &str) -> Self {
-        let bind = std::env::var("AMESH_BIND").unwrap_or_else(|_| "127.0.0.1:8378".into());
-        Self {
-            peer: serde_json::to_string(&(bind, peer)).expect("string pair serializes"),
-            journal: None,
-            thread: None,
-            pending: HashMap::new(),
-            retries: HashMap::new(),
-            ready: HashSet::new(),
-            last_polled: None,
-        }
-    }
-
     pub(super) fn bind(&mut self, thread: &str) -> bool {
         if self.thread.as_deref() == Some(thread) {
             return false;
@@ -69,36 +52,9 @@ impl CodexDelivery {
         self.thread = Some(thread.to_string());
         self.pending.clear();
         self.retries.clear();
-        self.ready.clear();
+        self.sequence = 0;
         self.last_polled = None;
         true
-    }
-
-    fn open_journal(&mut self) -> Result<()> {
-        if self.journal.is_none() {
-            let path = hook_ws_dir().ok_or("no A Mesh state directory for Codex receipts")?;
-            let db = Connection::open(path.join("codex-delivery.db"))?;
-            db.busy_timeout(std::time::Duration::from_millis(200))?;
-            db.execute_batch(
-                "CREATE TABLE IF NOT EXISTS attempts (
-                    peer TEXT NOT NULL, thread TEXT NOT NULL, id TEXT NOT NULL,
-                    anchor TEXT NOT NULL, PRIMARY KEY (peer, thread, id)
-                ) WITHOUT ROWID;",
-            )?;
-            self.journal = Some(db);
-        }
-        Ok(())
-    }
-
-    pub(super) fn retired(&self, thread: &str, id: &str) {
-        if let Some(db) = &self.journal {
-            if let Err(error) = db.execute(
-                "DELETE FROM attempts WHERE peer = ?1 AND thread = ?2 AND id = ?3",
-                params![self.peer, thread, id],
-            ) {
-                eprintln!("amesh hook ws: could not retire Codex receipt anchor: {error}");
-            }
-        }
     }
 
     pub(super) fn holds(&self, owner: Option<&str>, id: &str) -> bool {
@@ -120,34 +76,20 @@ impl CodexDelivery {
         ids
     }
 
-    fn checkpoint(&mut self, thread: &str, id: &str) -> Result<Option<Anchor>> {
-        self.open_journal()?;
-        let db = self.journal.as_ref().unwrap();
-        let saved: Option<String> = db
-            .query_row(
-                "SELECT anchor FROM attempts WHERE peer = ?1 AND thread = ?2 AND id = ?3",
-                params![self.peer, thread, id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(saved.as_deref().map(serde_json::from_str).transpose()?)
-    }
-
-    fn save_checkpoint(&self, thread: &str, id: &str, anchor: &Anchor) -> Result<bool> {
-        Ok(self.journal.as_ref().unwrap().execute(
-            "INSERT INTO attempts (peer, thread, id, anchor) VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT (peer, thread, id) DO NOTHING",
-            params![self.peer, thread, id, serde_json::to_string(anchor)?],
-        )? != 0)
-    }
-
-    fn hold(&mut self, mut record: Queued, anchor: Anchor, turn: Option<String>, thread: &str) {
-        let id = record.2.clone().unwrap();
-        self.ready.remove(&id);
-        record.0 = Some(thread.to_string());
+    fn hold(
+        &mut self,
+        mut record: Queued,
+        anchor: Option<Anchor>,
+        turn: Option<String>,
+        thread: &str,
+    ) {
+        let id = record.id.clone().unwrap();
+        record.owner = Some(thread.to_string());
+        self.sequence += 1;
         self.pending.insert(
             id,
             Pending {
+                sequence: self.sequence,
                 record,
                 anchor,
                 turn,
@@ -162,14 +104,18 @@ impl CodexDelivery {
         sink: &mut AppSink,
         queued: &mut VecDeque<Queued>,
         acked: &mut Vec<String>,
-    ) -> Result<()> {
-        let mut ids: Vec<_> = self.pending.keys().cloned().collect();
+    ) -> Result<bool> {
+        let mut ids: Vec<_> = self
+            .pending
+            .iter()
+            .map(|(id, item)| (item.sequence, id.clone()))
+            .collect();
         if ids.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         ids.sort_unstable();
-        if let Some(last) = &self.last_polled {
-            let first = ids.partition_point(|id| id <= last) % ids.len();
+        if let Some(last) = self.last_polled {
+            let first = ids.partition_point(|(sequence, _)| *sequence <= last) % ids.len();
             ids.rotate_left(first);
         }
         let snapshot = sink.recent_turns(RECENT_TURNS).await?;
@@ -180,11 +126,12 @@ impl CodexDelivery {
         }
         let can_be_idle = turns.iter().all(terminal_turn);
         let mut budget = PAGE_BUDGET;
-        for id in ids {
+        let mut ready = false;
+        for (sequence, id) in ids {
             if budget == 0 {
                 break;
             }
-            self.last_polled = Some(id.clone());
+            self.last_polled = Some(sequence);
             let item = self.pending.get_mut(&id).unwrap();
             let mut remaining = budget;
             let result = item
@@ -196,6 +143,12 @@ impl CodexDelivery {
                     self.pending.remove(&id);
                     self.retries.remove(&id);
                     acked.push(id);
+                }
+                Receipt::Missing if item.anchor.is_none() => {
+                    let mut record = self.pending.remove(&id).unwrap().record;
+                    record.replay = false;
+                    queued.push_back(record);
+                    ready = true;
                 }
                 Receipt::Missing if !item.exhausted => {
                     let interrupted = item.turn.as_deref().is_some_and(|id| {
@@ -223,54 +176,42 @@ impl CodexDelivery {
                         continue;
                     }
                     *retries += 1;
-                    let item = self.pending.remove(&id).unwrap();
-                    queued.push_back(item.record);
-                    self.ready.insert(id);
+                    queued.push_back(self.pending.remove(&id).unwrap().record);
+                    ready = true;
                 }
                 _ => {}
             }
         }
-        Ok(())
+        Ok(ready)
     }
 
     async fn send(&mut self, sink: &mut AppSink, queued: &mut VecDeque<Queued>) -> Result<bool> {
         for _ in 0..SEND_BUDGET {
-            let Some((owner, text, id)) = queued.front() else {
+            let Some(record) = queued.front() else {
                 return Ok(false);
             };
-            if !matches_thread(owner, &sink.thread_id) {
+            if !matches_thread(&record.owner, &sink.thread_id) {
                 return Ok(false);
             }
-            let anchor = if let Some(id) = id {
-                let saved = self.checkpoint(&sink.thread_id, id)?;
-                if !self.ready.contains(id) {
-                    if let Some(anchor) = saved {
-                        self.hold(queued.pop_front().unwrap(), anchor, None, &sink.thread_id);
-                        continue;
-                    }
-                    /* Commit the lower bound before the first RPC that can inject this ID. */
-                    let anchor = sink.tail_anchor().await?;
-                    if !self.save_checkpoint(&sink.thread_id, id, &anchor)? {
-                        continue;
-                    }
-                    self.ready.insert(id.clone());
-                    anchor
-                } else {
-                    saved.ok_or("missing Codex delivery checkpoint")?
-                }
+            if record.replay && record.id.is_some() {
+                self.hold(queued.pop_front().unwrap(), None, None, &sink.thread_id);
+                continue;
+            }
+            let anchor = if record.id.is_some() {
+                Some(sink.tail_anchor().await?)
             } else {
-                Anchor::default()
+                None
             };
-            match sink.submit(text, id.as_deref()).await {
+            match sink.submit(&record.text, record.id.as_deref()).await {
                 Ok(Submission::Busy) => return Ok(false),
                 Ok(Submission::Accepted(turn)) => {
                     let record = queued.pop_front().unwrap();
-                    if record.2.is_some() {
+                    if record.id.is_some() {
                         self.hold(record, anchor, turn, &sink.thread_id);
                     }
                 }
                 Err((error, uncertain)) => {
-                    if uncertain && id.is_some() {
+                    if uncertain && record.id.is_some() {
                         self.hold(queued.pop_front().unwrap(), anchor, None, &sink.thread_id);
                     }
                     return Err(error);
@@ -279,7 +220,7 @@ impl CodexDelivery {
         }
         Ok(queued
             .front()
-            .is_some_and(|(owner, _, _)| matches_thread(owner, &sink.thread_id)))
+            .is_some_and(|record| matches_thread(&record.owner, &sink.thread_id)))
     }
 
     pub(super) async fn flush(
@@ -289,7 +230,12 @@ impl CodexDelivery {
         poll: bool,
     ) -> (SinkState, Vec<String>, bool) {
         self.bind(&sink.thread_id);
-        queued.retain(|(_, _, id)| id.as_ref().is_none_or(|id| !self.pending.contains_key(id)));
+        queued.retain(|record| {
+            record
+                .id
+                .as_ref()
+                .is_none_or(|id| !self.pending.contains_key(id))
+        });
         if (!queued.is_empty() || !self.pending.is_empty()) && sink.paginated_history != Some(true)
         {
             if sink.paginated_history.is_none() {
@@ -319,23 +265,19 @@ impl CodexDelivery {
             }
         };
         let mut acked = Vec::new();
+        let mut ready = false;
         if poll {
-            if let Err(error) = self.receipts(sink, queued, &mut acked).await {
-                eprintln!("amesh hook ws: Codex receipt check failed: {error}");
-                if !error.is::<AppRejected>() {
-                    return (failure(error.as_ref()), acked, false);
+            match self.receipts(sink, queued, &mut acked).await {
+                Ok(requeued) => ready = requeued,
+                Err(error) => {
+                    eprintln!("amesh hook ws: Codex receipt check failed: {error}");
+                    if !error.is::<AppRejected>() {
+                        return (failure(error.as_ref()), acked, false);
+                    }
                 }
             }
         }
-        (
-            SinkState::Usable,
-            acked,
-            more || (poll
-                && queued.front().is_some_and(|(_, _, id)| {
-                    id.as_ref()
-                        .is_some_and(|id| self.retries.contains_key(id) && self.ready.contains(id))
-                })),
-        )
+        (SinkState::Usable, acked, more || ready)
     }
 }
 
@@ -348,7 +290,12 @@ impl Pending {
         complete: bool,
         budget: &mut usize,
     ) -> Result<Receipt> {
-        let floor = self.turn.as_deref().or(self.anchor.turn.as_deref());
+        let replay = self.anchor.is_none();
+        let floor = self.turn.as_deref().or_else(|| {
+            self.anchor
+                .as_ref()
+                .and_then(|anchor| anchor.turn.as_deref())
+        });
         let mut scope: Vec<_> = recent
             .iter()
             .map(|turn| {
@@ -371,21 +318,27 @@ impl Pending {
                     false
                 }
             },
-            None => complete,
+            None => replay || complete,
+        };
+        let direction = if replay {
+            "desc"
+        } else {
+            scope.reverse();
+            "asc"
         };
 
         let client = format!("amesh:{id}");
-        for (turn, terminal) in scope.into_iter().rev() {
+        for (turn, terminal) in scope {
             let progress = self
                 .progress
                 .entry(turn.to_string())
                 .or_insert_with(|| Progress {
                     cursor: self
                         .anchor
-                        .item
                         .as_ref()
-                        .filter(|_| self.anchor.turn.as_deref() == Some(turn))
-                        .map(|item| item_cursor(item)),
+                        .filter(|anchor| anchor.turn.as_deref() == Some(turn))
+                        .and_then(|anchor| anchor.item.as_deref())
+                        .map(item_cursor),
                     closed: false,
                 });
             if progress.closed {
@@ -397,7 +350,7 @@ impl Pending {
                 }
                 *budget -= 1;
                 let reply = sink.rpc("thread/items/list", json!({
-                    "threadId": sink.thread_id, "turnId": turn, "limit": 32, "sortDirection": "asc",
+                    "threadId": sink.thread_id, "turnId": turn, "limit": 32, "sortDirection": direction,
                     "cursor": progress.cursor
                 })).await?;
                 let (items, next) = page(&reply)?;
@@ -428,7 +381,7 @@ impl Pending {
                 if let Some(last) = last {
                     progress.cursor = Some(item_cursor(last));
                 }
-                progress.closed = terminal;
+                progress.closed = replay || terminal;
                 break;
             }
         }

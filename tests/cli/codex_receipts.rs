@@ -316,7 +316,7 @@ fn persisted_delivery_is_deduplicated_on_drainer_cutover() {
         .iter()
         .any(|req| req["method"] == "thread/items/list"
             && req["params"]["turnId"] == "user-turn"
-            && req["params"]["cursor"]["itemId"] == "tail"));
+            && req["params"]["cursor"].is_null()));
     assert!(h
         .calls
         .iter()
@@ -370,34 +370,81 @@ fn legacy_history_stays_queued_without_a_history_query() {
 }
 
 #[test]
-fn replay_with_an_out_of_window_checkpoint_stays_queued() {
-    let mut p = Probe::new(accepted);
-    {
-        let mut h = p.history.lock().unwrap();
-        h.long_history = true;
-        h.status = Some("inProgress");
-    }
+fn retained_attempt_outside_the_recent_window_stays_queued() {
+    let p = Probe::with_history(
+        History {
+            long_history: true,
+            status: Some("inProgress"),
+            ..History::default()
+        },
+        accepted,
+    );
     p.send(
         "notify",
-        "original turn later falls outside the verification window",
+        "the originating turn leaves the window during delivery",
     );
     p.next();
-    p._drainer.stop();
     {
         let mut h = p.history.lock().unwrap();
         h.hide_floor = true;
         h.status = Some("completed");
         h.calls.clear();
     }
-    p._drainer = start_codex_drainer(&p.sandbox, p.sandbox.id("worker"), &p.home);
     p.quiet();
     assert_eq!(p.queued(), 1);
     let h = p.history.lock().unwrap();
     assert!(h
         .calls
         .iter()
-        .all(|req| req["params"]["cursor"] != "old-turns"
-            && (req["method"] != "thread/items/list" || req["params"]["turnId"] == "user-turn")));
+        .any(|req| req["params"]["turnId"] == "user-turn"));
+    assert!(h
+        .calls
+        .iter()
+        .all(|req| req["params"]["cursor"] != "old-turns"));
+}
+
+#[test]
+fn replay_without_a_receipt_in_the_recent_window_submits_once() {
+    let mut p = Probe::with_history(
+        History {
+            long_history: true,
+            status: Some("inProgress"),
+            ..History::default()
+        },
+        accepted,
+    );
+    p.send("notify", "unconfirmed before the drainer exited");
+    let first = p.next();
+    p._drainer.stop();
+    {
+        let mut h = p.history.lock().unwrap();
+        h.hide_floor = true;
+        h.status = Some("completed");
+        h.hidden_page = true;
+        h.client_ids.push(client_id(&first));
+        h.calls.clear();
+    }
+    p._drainer = start_codex_drainer(&p.sandbox, p.sandbox.id("worker"), &p.home);
+    p.quiet();
+    assert_eq!(p.queued(), 1, "an incomplete replay scan cannot submit");
+    p.history.lock().unwrap().hidden_page = false;
+    let second = p.next();
+    assert_eq!(client_id(&second), client_id(&first));
+    {
+        let mut h = p.history.lock().unwrap();
+        assert!(h
+            .calls
+            .iter()
+            .any(|req| req["params"]["turnId"] == "unrelated-head"));
+        assert!(h
+            .calls
+            .iter()
+            .all(|req| req["params"]["cursor"] != "old-turns"));
+        h.hide_floor = false;
+        h.status = Some("inProgress");
+    }
+    p.until_queued(0);
+    p.quiet();
 }
 
 #[test]
@@ -461,34 +508,28 @@ fn completed_turn_can_be_confirmed_from_a_successor() {
 }
 
 #[test]
-fn confirmed_hub_receipt_retires_the_local_checkpoint() {
+fn codex_delivery_creates_no_database_file() {
     let p = Probe::new(accepted);
-    p.history.lock().unwrap().status = Some("inProgress");
-    p.send("broadcast", "checkpoint is retained until the Hub receipt");
-    let first = p.next();
-    let db = rusqlite::Connection::open_with_flags(
-        p.sandbox.root.join("codex-delivery.db"),
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .unwrap();
-    let rows = || {
-        db.query_row("SELECT count(*) FROM attempts", [], |row| {
-            row.get::<_, u32>(0)
-        })
-        .unwrap()
+    let databases = || {
+        std::fs::read_dir(&p.sandbox.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| {
+                matches!(
+                    Path::new(name).extension().and_then(|ext| ext.to_str()),
+                    Some("db" | "sqlite" | "sqlite3")
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>()
     };
-    assert_eq!(rows(), 1);
-    assert_eq!(p.queued(), 1);
+    let before = databases();
+    assert_eq!(before, ["state.db".into()].into_iter().collect());
+    p.history.lock().unwrap().status = Some("inProgress");
+    p.send("broadcast", "deliver without a local database");
+    let first = p.next();
     p.history.lock().unwrap().client_ids.push(client_id(&first));
     p.until_queued(0);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while rows() != 0 {
-        assert!(
-            Instant::now() < deadline,
-            "checkpoint survived durably confirmed recv"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    assert_eq!(databases(), before);
 }
 
 #[test]
@@ -593,7 +634,7 @@ fn a_pending_receipt_does_not_follow_a_replaced_owner() {
     p.quiet();
     p.send(
         "broadcast",
-        "an earlier owner's checkpoint cannot block the next message",
+        "an earlier owner's pending receipt cannot block the next message",
     );
     let later = p.next();
     assert_eq!(later["params"]["threadId"], "th2");
@@ -695,6 +736,10 @@ async fn codex_pending_report_is_scoped_to_inbox_socket_and_session() {
             $socket.send(Message::Ping(vec![7].into())).await.unwrap();
             tokio::time::timeout(Duration::from_secs(3), async {
                 while let Some(Ok(frame)) = $socket.next().await {
+                    if let Message::Text(ref text) = frame {
+                        let value: Value = serde_json::from_str(text).unwrap();
+                        assert_ne!(value["type"], "recv_confirmed");
+                    }
                     if frame == Message::Pong(vec![7].into()) {
                         return;
                     }
@@ -725,4 +770,18 @@ async fn codex_pending_report_is_scoped_to_inbox_socket_and_session() {
     assert_eq!(count(), 1, "current generation");
     send_report!(second, json!({"type":"ping"}));
     assert_eq!(count(), 0, "old ping shape remains valid");
+    send_report!(
+        second,
+        json!({"type":"recv","id":id,"session_id":"th1","confirm":true})
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(250), second.next())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        inbox_count(&sandbox, worker),
+        0,
+        "old recv shape remains valid"
+    );
 }

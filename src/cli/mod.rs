@@ -3243,14 +3243,22 @@ pub(crate) fn env_secs(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-/* a queued inbound frame, the session it was received for, and the durable record id */
-type Queued = (Option<String>, String, Option<String>);
+struct Queued {
+    owner: Option<String>,
+    text: String,
+    id: Option<String>,
+    replay: bool,
+}
 
 /* what was queued for another session goes, and what the unbound name queued becomes this
 session's, so a later owner of the name never gets it */
 fn keep_for_thread(queued: &mut VecDeque<Queued>, thread: &str) {
-    queued.retain_mut(|(held, _, _)| {
-        held.get_or_insert_with(|| thread.to_string()).as_str() == thread
+    queued.retain_mut(|record| {
+        record
+            .owner
+            .get_or_insert_with(|| thread.to_string())
+            .as_str()
+            == thread
     });
 }
 
@@ -3280,20 +3288,20 @@ fn flush_claude_inbox(
     if owner == Some("") {
         return acked;
     }
-    while let Some((session, text, record)) = queued.pop_front() {
-        if session.is_some() && session.as_deref() != owner {
-            queued.push_front((session, text, record));
+    while let Some(record) = queued.pop_front() {
+        if record.owner.is_some() && record.owner.as_deref() != owner {
+            queued.push_front(record);
             return acked;
         }
-        match inject_claude_inbox(socket, token, &text) {
+        match inject_claude_inbox(socket, token, &record.text) {
             Ok(()) => {
                 *inbox_fail = 0;
-                if let Some(id) = record {
+                if let Some(id) = record.id {
                     acked.push(id);
                 }
             }
             Err(error) => {
-                queued.push_front((session, text, record));
+                queued.push_front(record);
                 *inbox_fail = inbox_fail.saturating_add(1);
                 eprintln!("amesh hook ws: inbox inject failed ({inbox_fail}): {error}");
                 return acked;
@@ -3437,7 +3445,7 @@ pub(crate) async fn hook_ws_loop_with(
     let mut depth_warned = false;
     let mut accepted = VecDeque::new();
     let mut retry = AppRetry::new(None, Instant::now());
-    let mut delivery = CodexDelivery::new(&peer_id);
+    let mut delivery = CodexDelivery::default();
     loop {
         match hook_ws_once(
             &peer_id,
@@ -3522,7 +3530,6 @@ async fn hook_ws_recv(
         let mut frame = json!({"type": "recv", "id": id});
         if let Some(session) = session {
             frame["session_id"] = json!(session);
-            frame["confirm"] = json!(true);
         }
         if ws
             .send(Message::Text(frame.to_string().into()))
@@ -3559,6 +3566,10 @@ async fn hook_ws_once(
     let url = format!("ws://{bind}/ws");
     let (mut ws, _) = tokio_tungstenite::connect_async(&url).await?;
     let mut connect = json!({"type": "connect", "peer_id": peer_id, "recv": true, "build": crate::hub::own_build()});
+    let uses_app_server = app_server_backend(backend);
+    if uses_app_server {
+        connect["mark_replay"] = json!(true);
+    }
     if let Ok(token) = std::env::var("AMESH_TOKEN") {
         if !token.is_empty() {
             connect["auth_token"] = json!(token);
@@ -3575,7 +3586,6 @@ async fn hook_ws_once(
         record_inbox_socket(peer_id);
     }
     let mut inbox_fail = 0u8;
-    let uses_app_server = app_server_backend(backend);
     /* the session the stream names owns what is queued from here on, and its thread is
     looked up on the first frame after connected rather than here */
     let mut app: Option<AppSink> = None;
@@ -3630,12 +3640,6 @@ async fn hook_ws_once(
                     }
                     continue;
                 }
-                if kind == "recv_confirmed" && uses_app_server && event["session_id"].as_str() == owner.as_deref() {
-                    if let (Some(thread), Some(id)) = (owner.as_deref(), event["id"].as_str()) {
-                        delivery.retired(thread, id);
-                    }
-                    continue;
-                }
                 if !crate::bridge::is_inbound(kind) {
                     continue;
                 }
@@ -3645,7 +3649,7 @@ async fn hook_ws_once(
                 if let Some(frame_id) = id {
                     if delivery.holds(owner.as_deref(), frame_id) || queued
                         .iter()
-                        .any(|(_, _, held)| held.as_deref() == Some(frame_id))
+                        .any(|record| record.id.as_deref() == Some(frame_id))
                     {
                         continue;
                     }
@@ -3696,6 +3700,12 @@ async fn hook_ws_once(
                     cid,
                     body,
                 );
+                let record = Queued {
+                    owner: owner.clone().filter(|id| !id.is_empty()),
+                    text: wrapped,
+                    id: id.map(str::to_string),
+                    replay: event["replay"] != false,
+                };
                 if let Some(socket) = claude_backend_socket(backend) {
                     let gone = claude_inbox_path().map(|path| !path.exists()).unwrap_or(true);
                     let token = std::env::var("CLAUDE_CODE_MESSAGING_TOKEN").ok();
@@ -3703,8 +3713,7 @@ async fn hook_ws_once(
                         eprintln!("amesh hook ws: inbox socket gone, yield");
                         return Ok((true, greeted));
                     }
-                    let tag = owner.clone().filter(|id| !id.is_empty());
-                    enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
+                    enqueue_hook_inbound(queued, record, depth_warned);
                     let acked =
                         flush_claude_inbox(&socket, token.as_deref(), queued, owner.as_deref(), &mut inbox_fail);
                     if !hook_ws_recv(&mut ws, accepted, acked, None).await {
@@ -3712,8 +3721,7 @@ async fn hook_ws_once(
                     }
                     continue;
                 }
-                let tag = owner.clone().filter(|id| !id.is_empty());
-                enqueue_hook_inbound(queued, (tag, wrapped, id.map(str::to_string)), depth_warned);
+                enqueue_hook_inbound(queued, record, depth_warned);
                 drive = uses_app_server;
             }
             /* the beat runs the retry, so a wait that ends between beats ticks it at once rather

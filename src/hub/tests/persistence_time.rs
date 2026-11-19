@@ -437,7 +437,7 @@ async fn register_copy_uses_merged_time() {
     let (status, _) = json_req(router(app.clone()), "POST", "/peers", json!({"peer_id":"worker", "name":"worker", "backend":"pi", "path":"/tmp", "session_id":"session"})).await;
     assert_eq!(status, StatusCode::OK);
     let copy = loop {
-        if let Outbound::Copy(record) = rx.try_recv().unwrap() {
+        if let Outbound::Replay(record) = rx.try_recv().unwrap() {
             break record;
         }
     };
