@@ -13,6 +13,9 @@ struct History {
     unindexed_items: bool,
     unmaterialized: bool,
     replay_item_error: Option<Value>,
+    replay_pages: usize,
+    read_count: usize,
+    replay_page_reads: Vec<usize>,
     ephemeral: bool,
     hide_floor: bool,
     successor: bool,
@@ -67,11 +70,14 @@ impl Probe {
                         opened.fetch_add(1, Ordering::SeqCst);
                         None
                     }
-                    "thread/read" => Some(json!({"result":{"thread":{"status":{"type":
-                        if history.successor || history.status == Some("inProgress") { "active" } else { "idle" }
-                    },"historyMode": if history.legacy { "legacy" } else { "paginated" },
-                    "ephemeral": history.ephemeral, "preview": if history.unindexed_turns { "" } else { "existing thread" }
-                    }}})),
+                    "thread/read" => {
+                        history.read_count += 1;
+                        Some(json!({"result":{"thread":{"status":{"type":
+                            if history.successor || history.status == Some("inProgress") { "active" } else { "idle" }
+                        },"historyMode": if history.legacy { "legacy" } else { "paginated" },
+                        "ephemeral": history.ephemeral, "preview": if history.unindexed_turns { "" } else { "existing thread" }
+                        }}}))
+                    }
                     "thread/turns/list" => {
                         if history.unindexed_turns && history.unmaterialized {
                             return Some(json!({"error":{"code":-32600,"message":format!(
@@ -113,6 +119,20 @@ impl Probe {
                             params["sortDirection"] == "desc" && params["turnId"].is_string();
                         if let (true, Some(error)) = (scoped_replay, &history.replay_item_error) {
                             return Some(json!({"error": error}));
+                        }
+                        if scoped_replay && history.replay_pages > 0 {
+                            let reads = history.read_count;
+                            history.replay_page_reads.push(reads);
+                            let page = params["cursor"]
+                                .as_str()
+                                .unwrap_or("0")
+                                .parse::<usize>()
+                                .unwrap();
+                            if page + 1 < history.replay_pages {
+                                return Some(
+                                    json!({"result":{"data":[],"nextCursor":(page + 1).to_string()}}),
+                                );
+                            }
                         }
                         let matches = params["turnId"].is_null() || params["turnId"] == "user-turn";
                         let bounded_tail =
@@ -1241,4 +1261,180 @@ fn cold_replay_ignores_a_repeat_of_a_parked_record() {
         assert!(turn_text(&raw).contains("newer"), "{raw}");
         assert!(lookups.try_recv().is_err(), "the repeat triggered a lookup");
     });
+}
+
+fn parked_recovery_probe() -> Probe {
+    let mut probe = Probe::with_history(
+        History {
+            replay_item_error: Some(
+                json!({"code":-32603,"message":"failed to list thread items: database is locked"}),
+            ),
+            ..History::default()
+        },
+        accepted,
+    );
+    probe._drainer.stop();
+    probe
+}
+
+fn let_a_new_message_pass_parked_replay(probe: &mut Probe) {
+    probe._drainer = start_codex_drainer(&probe.sandbox, probe.sandbox.id("worker"), &probe.home);
+    probe.send("notify", "newer message before receipt recovery");
+    let submitted = probe.next();
+    assert!(submitted["params"]["input"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("newer message before receipt recovery"));
+    probe
+        .history
+        .lock()
+        .unwrap()
+        .client_ids
+        .push(client_id(&submitted));
+    probe.until_queued(1);
+}
+
+#[test]
+fn parked_replay_confirms_a_recovered_receipt_without_submitting() {
+    let mut probe = parked_recovery_probe();
+    let older = probe.send("notify", "already submitted before restart");
+    let_a_new_message_pass_parked_replay(&mut probe);
+    {
+        let mut history = probe.history.lock().unwrap();
+        history
+            .client_ids
+            .push(format!("amesh:{}", older["id"].as_str().unwrap()));
+        history.replay_item_error = None;
+        history.status = Some("completed");
+    }
+    probe.until_queued(0);
+    probe.quiet();
+}
+
+#[test]
+fn parked_replay_submits_once_after_a_complete_miss() {
+    let mut probe = parked_recovery_probe();
+    let older = probe.send("notify", "not yet submitted before restart");
+    let_a_new_message_pass_parked_replay(&mut probe);
+    let_recheck_see_an_active_turn(&probe);
+    probe.history.lock().unwrap().status = Some("completed");
+    let recovered = probe.next();
+    let id = client_id(&recovered);
+    assert_eq!(id, format!("amesh:{}", older["id"].as_str().unwrap()));
+    probe.history.lock().unwrap().client_ids.push(id);
+    probe.until_queued(0);
+    probe.quiet();
+}
+
+#[test]
+fn parked_replay_retires_an_ask_closed_during_the_backoff() {
+    let mut probe = parked_recovery_probe();
+    let older = probe.sandbox.json(
+        &[
+            "peer",
+            "ask",
+            probe.sandbox.id("worker"),
+            "closed before recovery",
+            "--from-peer",
+            "boss",
+            "--watch",
+            "false",
+        ],
+        None,
+    );
+    let_a_new_message_pass_parked_replay(&mut probe);
+    let cid = older["correlation_id"].as_str().unwrap();
+    assert_eq!(
+        probe.sandbox.json(
+            &["peer", "ack", cid, "--message", "handled elsewhere"],
+            None
+        )["ok"],
+        true
+    );
+    assert_eq!(probe.queued(), 1, "closed ask is still in the inbox");
+    {
+        let mut history = probe.history.lock().unwrap();
+        history.replay_item_error = None;
+        history.status = Some("completed");
+    }
+    probe.until_queued(0);
+    probe.quiet();
+}
+
+fn let_recheck_see_an_active_turn(probe: &Probe) {
+    {
+        let mut history = probe.history.lock().unwrap();
+        history.calls.clear();
+        history.replay_item_error = None;
+        history.status = Some("inProgress");
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !probe
+        .history
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .any(|req| req["method"] == "thread/turns/list" && req["params"]["limit"] == 8)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "expected background receipt check"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    probe.quiet();
+}
+
+#[test]
+fn parked_replay_finds_a_receipt_that_arrives_after_an_active_turn() {
+    let mut probe = parked_recovery_probe();
+    let older = probe.send("notify", "receipt still pending in the active turn");
+    let_a_new_message_pass_parked_replay(&mut probe);
+    let_recheck_see_an_active_turn(&probe);
+    {
+        let mut history = probe.history.lock().unwrap();
+        history
+            .client_ids
+            .push(format!("amesh:{}", older["id"].as_str().unwrap()));
+        history.status = Some("completed");
+    }
+    probe.until_queued(0);
+    probe.quiet();
+}
+
+#[test]
+fn parked_replay_continues_a_partial_scan_on_the_next_beat() {
+    let mut probe = parked_recovery_probe();
+    let older = probe.send("notify", "receipt on the second scan slice");
+    let_a_new_message_pass_parked_replay(&mut probe);
+    {
+        let mut history = probe.history.lock().unwrap();
+        history
+            .client_ids
+            .push(format!("amesh:{}", older["id"].as_str().unwrap()));
+        history.status = Some("completed");
+        history.replay_pages = 5;
+        history.replay_item_error = None;
+    }
+    let deadline = Instant::now() + Duration::from_secs(14);
+    loop {
+        if probe.queued() == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "recheck should find the fifth page"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let history = probe.history.lock().unwrap();
+    let reads = &history.replay_page_reads;
+    assert_eq!(reads.len(), 5);
+    assert_eq!(reads[..4], [reads[0]; 4], "first heartbeat uses four pages");
+    assert_eq!(
+        reads[4],
+        reads[0] + 1,
+        "partial scan resumes on the next beat"
+    );
 }

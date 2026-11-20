@@ -3260,6 +3260,7 @@ struct Queued {
     text: String,
     id: Option<String>,
     replay: bool,
+    ask_id: Option<String>,
 }
 
 /* what was queued for another session goes, and what the unbound name queued becomes this
@@ -3523,6 +3524,20 @@ fn refused_handshake(error: &(dyn std::error::Error + 'static)) -> bool {
         })
 }
 
+fn ask_open(cid: &str) -> Option<bool> {
+    match request(
+        "POST",
+        &format!("/asks/{cid}/wait"),
+        Some(json!({"timeout_seconds": 0})),
+    ) {
+        Ok(ask) => ask["open"].as_bool(),
+        Err(error) => {
+            let text = error.to_string();
+            (text.contains("returned error: 404") && text.contains("unknown ask")).then_some(false)
+        }
+    }
+}
+
 async fn hook_ws_recv(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -3676,25 +3691,13 @@ async fn hook_ws_once(
                     .get("correlation_id")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                if kind == "ask" && !cid.is_empty() {
-                    let stale = match request(
-                        "POST",
-                        &format!("/asks/{cid}/wait"),
-                        Some(json!({"timeout_seconds": 0})),
-                    ) {
-                        Ok(ask) => ask.get("open") == Some(&json!(false)),
-                        Err(error) => {
-                            let error = error.to_string();
-                            error.contains("returned error: 404") && error.contains("unknown ask")
-                        }
-                    };
-                    if stale {
-                        let ids = id.map(str::to_string).into_iter().collect();
-                        if !hook_ws_recv(&mut ws, accepted, ids, owner.as_deref().filter(|_| uses_app_server)).await {
-                            return Ok((false, greeted));
-                        }
-                        continue;
+                let ask_id = (kind == "ask" && !cid.is_empty()).then_some(cid);
+                if ask_id.and_then(ask_open) == Some(false) {
+                    let ids = id.map(str::to_string).into_iter().collect();
+                    if !hook_ws_recv(&mut ws, accepted, ids, owner.as_deref().filter(|_| uses_app_server)).await {
+                        return Ok((false, greeted));
                     }
+                    continue;
                 }
                 let body = event
                     .get("text")
@@ -3717,6 +3720,7 @@ async fn hook_ws_once(
                     text: wrapped,
                     id: id.map(str::to_string),
                     replay: event["replay"] != false,
+                    ask_id: ask_id.map(str::to_string),
                 };
                 if let Some(socket) = claude_backend_socket(backend) {
                     let gone = claude_inbox_path().map(|path| !path.exists()).unwrap_or(true);

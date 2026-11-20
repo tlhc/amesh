@@ -1,6 +1,6 @@
 use super::{
-    app_rpc, remember_hook_inbound, AppRejected, AppSink, Queued, Result, SinkState,
-    NO_DIRECT_INPUT,
+    app_rpc, ask_open, env_secs, remember_hook_inbound, AppRejected, AppSink, Queued, Result,
+    SinkState, NO_DIRECT_INPUT,
 };
 use crate::bridge::{inject_method, inject_params, turn_is_over};
 use serde_json::{json, Value};
@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 const MAX_RETRIES: u8 = 3;
 const MAX_REPLAY_REJECTIONS: u8 = 3;
 const REPLAY_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_PARKED_RECORDS: usize = 32;
+const PARKED_RECHECK_CAP: Duration = Duration::from_secs(600);
 const RECENT_TURNS: usize = 8;
 const PAGE_BUDGET: usize = 4;
 const SEND_BUDGET: usize = 8;
@@ -20,6 +22,7 @@ pub(super) struct CodexDelivery {
     pending: HashMap<String, Pending>,
     replay: Option<ReplayLookup>,
     parked_replays: VecDeque<String>,
+    rechecks: VecDeque<ParkedReplay>,
     retries: HashMap<String, u8>,
     sequence: u64,
     last_polled: Option<u64>,
@@ -30,6 +33,30 @@ struct ReplayLookup {
     scan: ReceiptScan,
     rejections: u8,
     retry_at: Instant,
+}
+
+struct ParkedReplay {
+    record: Queued,
+    scan: ReceiptScan,
+    retry_at: Instant,
+    delay: Duration,
+}
+
+impl ParkedReplay {
+    fn new(record: Queued) -> Self {
+        let delay = Duration::from_secs(3 * env_secs("AMESH_WS_BEAT_SECS", 10).min(10));
+        Self {
+            record,
+            scan: ReceiptScan::default(),
+            retry_at: Instant::now() + delay,
+            delay,
+        }
+    }
+
+    fn back_off(&mut self, now: Instant) {
+        self.delay = (self.delay * 2).min(PARKED_RECHECK_CAP);
+        self.retry_at = now + self.delay;
+    }
 }
 
 #[derive(Default)]
@@ -73,6 +100,7 @@ impl CodexDelivery {
         self.pending.clear();
         self.replay = None;
         self.parked_replays.clear();
+        self.rechecks.clear();
         self.retries.clear();
         self.sequence = 0;
         self.last_polled = None;
@@ -82,7 +110,11 @@ impl CodexDelivery {
     pub(super) fn holds(&self, owner: Option<&str>, id: &str) -> bool {
         owner.is_none_or(|owner| self.thread.as_deref() == Some(owner))
             && (self.pending.contains_key(id)
-                || self.parked_replays.iter().any(|known| known == id))
+                || self.parked_replays.iter().any(|known| known == id)
+                || self
+                    .rechecks
+                    .iter()
+                    .any(|item| item.record.id.as_deref() == Some(id)))
     }
 
     pub(super) fn awaiting_confirmation(&self, owner: Option<&str>) -> Vec<&str> {
@@ -131,14 +163,14 @@ impl CodexDelivery {
         sink: &mut AppSink,
         queued: &mut VecDeque<Queued>,
         acked: &mut Vec<String>,
-        mut budget: usize,
+        budget: &mut usize,
     ) -> Result<bool> {
         let mut ids: Vec<_> = self
             .pending
             .iter()
             .map(|(id, item)| (item.sequence, id.clone()))
             .collect();
-        if ids.is_empty() || budget == 0 {
+        if ids.is_empty() || *budget == 0 {
             return Ok(false);
         }
         ids.sort_unstable();
@@ -155,18 +187,18 @@ impl CodexDelivery {
         let can_be_idle = turns.iter().all(terminal_turn);
         let mut ready = false;
         for (sequence, id) in ids {
-            if budget == 0 {
+            if *budget == 0 {
                 break;
             }
             self.last_polled = Some(sequence);
             let item = self.pending.get_mut(&id).unwrap();
-            let mut remaining = budget;
+            let mut remaining = *budget;
             let result = item
                 .scan
                 .receipt(sink, &id, turns, next.is_none(), &mut remaining)
-                .await?;
-            budget = remaining.min(budget - 1);
-            match result {
+                .await;
+            *budget = remaining.min(*budget - 1);
+            match result? {
                 Receipt::Found => {
                     self.pending.remove(&id);
                     self.retries.remove(&id);
@@ -205,6 +237,21 @@ impl CodexDelivery {
             }
         }
         Ok(ready)
+    }
+
+    fn park_replay(&mut self, record: Queued, permanent: bool) {
+        remember_hook_inbound(&mut self.parked_replays, record.id.as_deref().unwrap());
+        if permanent {
+            return;
+        }
+        if self.rechecks.len() == MAX_PARKED_RECORDS {
+            let evicted = self.rechecks.pop_front().unwrap();
+            remember_hook_inbound(
+                &mut self.parked_replays,
+                evicted.record.id.as_deref().unwrap(),
+            );
+        }
+        self.rechecks.push_back(ParkedReplay::new(record));
     }
 
     async fn send(
@@ -262,9 +309,8 @@ impl CodexDelivery {
                         };
                         let lookup = self.replay.as_mut().unwrap();
                         lookup.rejections += 1;
-                        if !permanent_replay_rejection(rejection, &sink.thread_id)
-                            && lookup.rejections < MAX_REPLAY_REJECTIONS
-                        {
+                        let permanent = permanent_replay_rejection(rejection, &sink.thread_id);
+                        if !permanent && lookup.rejections < MAX_REPLAY_REJECTIONS {
                             /* A burst of new frames must give the history store time to recover. */
                             lookup.retry_at = Instant::now() + REPLAY_RETRY_DELAY;
                             eprintln!("amesh hook ws: Codex replay check failed: {error}");
@@ -272,8 +318,7 @@ impl CodexDelivery {
                         }
                         /* A rejected lookup leaves prior delivery unknown. Keep the Hub record. */
                         eprintln!("amesh hook ws: Codex replay {id} left in hub inbox: {error}");
-                        remember_hook_inbound(&mut self.parked_replays, id);
-                        queued.pop_front();
+                        self.park_replay(queued.pop_front().unwrap(), permanent);
                         self.replay = None;
                         continue;
                     }
@@ -314,28 +359,44 @@ impl CodexDelivery {
             } else {
                 (None, false)
             };
-            match sink
-                .submit(&record.text, record.id.as_deref(), bootstrap)
-                .await
-            {
-                Ok(Submission::Busy) => return Ok(false),
-                Ok(Submission::Accepted(turn)) => {
-                    let record = queued.pop_front().unwrap();
-                    if record.id.is_some() {
-                        self.hold(record, anchor, turn, &sink.thread_id);
-                    }
-                }
-                Err((error, uncertain)) => {
-                    if uncertain && record.id.is_some() {
-                        self.hold(queued.pop_front().unwrap(), anchor, None, &sink.thread_id);
-                    }
-                    return Err(error);
-                }
+            let mode = if bootstrap {
+                InputMode::Bootstrap
+            } else {
+                InputMode::Normal
+            };
+            if !self.submit_queued(sink, queued, anchor, mode).await? {
+                return Ok(false);
             }
         }
         Ok(queued
             .front()
             .is_some_and(|record| matches_thread(&record.owner, &sink.thread_id)))
+    }
+
+    async fn submit_queued(
+        &mut self,
+        sink: &mut AppSink,
+        queued: &mut VecDeque<Queued>,
+        anchor: Option<Anchor>,
+        mode: InputMode<'_>,
+    ) -> Result<bool> {
+        let record = queued.front().unwrap();
+        match sink.submit(&record.text, record.id.as_deref(), mode).await {
+            Ok(Submission::Busy) => Ok(false),
+            Ok(Submission::Accepted(turn)) => {
+                let record = queued.pop_front().unwrap();
+                if record.id.is_some() {
+                    self.hold(record, anchor, turn, &sink.thread_id);
+                }
+                Ok(true)
+            }
+            Err((error, uncertain)) => {
+                if uncertain && record.id.is_some() {
+                    self.hold(queued.pop_front().unwrap(), anchor, None, &sink.thread_id);
+                }
+                Err(error)
+            }
+        }
     }
 
     async fn scan_replay(
@@ -352,14 +413,111 @@ impl CodexDelivery {
                 retry_at: Instant::now(),
             });
         }
-        let snapshot = sink.recent_turns(RECENT_TURNS).await?;
-        let (turns, next) = page(&snapshot)?;
         self.replay
             .as_mut()
             .unwrap()
             .scan
-            .receipt(sink, id, turns, next.is_none(), budget)
+            .cold_receipt(sink, id, budget)
             .await
+    }
+
+    async fn recheck_parked(
+        &mut self,
+        sink: &mut AppSink,
+        acked: &mut Vec<String>,
+        budget: &mut usize,
+    ) -> Result<()> {
+        if *budget == 0 {
+            return Ok(());
+        }
+        let now = Instant::now();
+        let Some((index, item)) = self
+            .rechecks
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, item)| item.retry_at <= now)
+            .min_by_key(|(_, item)| item.retry_at)
+        else {
+            return Ok(());
+        };
+        let id = item.record.id.as_ref().unwrap().clone();
+        let receipt: Result<_> = async {
+            let snapshot = sink.recent_turns(RECENT_TURNS).await?;
+            let (turns, next) = page(&snapshot)?;
+            if turns.iter().any(|turn| !terminal_turn(turn)) {
+                return Ok(None);
+            }
+            let receipt = item
+                .scan
+                .receipt(sink, &id, turns, next.is_none(), budget)
+                .await?;
+            let latest = turns.first().and_then(turn_id).map(str::to_string);
+            Ok(Some((receipt, latest)))
+        }
+        .await;
+        if matches!(&receipt, Ok(Some((Receipt::Waiting, _)))) {
+            return Ok(());
+        }
+        item.back_off(Instant::now());
+        item.scan = ReceiptScan::default();
+        match receipt {
+            Ok(None | Some((Receipt::Waiting, _))) => return Ok(()),
+            Ok(Some((Receipt::Found, _))) => {}
+            Ok(Some((Receipt::Missing, latest))) => {
+                let open = if let Some(cid) = item.record.ask_id.clone() {
+                    tokio::task::spawn_blocking(move || ask_open(&cid))
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    Some(true)
+                };
+                match open {
+                    None => return Ok(()),
+                    Some(false) => {}
+                    Some(true) => {
+                        let anchor = sink.tail_anchor().await?;
+                        let mut parked = self.rechecks.remove(index).unwrap();
+                        /* An unsuccessful recovery cannot become the foreground's next head. */
+                        let mut retry = VecDeque::from([parked.record]);
+                        let result = self
+                            .submit_queued(
+                                sink,
+                                &mut retry,
+                                Some(anchor),
+                                InputMode::Recovered(latest.as_deref()),
+                            )
+                            .await;
+                        if let Some(record) = retry.pop_front() {
+                            parked.record = record;
+                            self.rechecks.insert(index, parked);
+                        } else {
+                            self.parked_replays.retain(|known| known != &id);
+                        }
+                        return result.map(|_| ());
+                    }
+                }
+            }
+            Err(error) => {
+                let Some(rejection) = error.downcast_ref::<AppRejected>() else {
+                    return Err(error);
+                };
+                if permanent_replay_rejection(rejection, &sink.thread_id)
+                    && !history_unindexed(rejection, "thread/turns/list", &sink.thread_id)
+                {
+                    self.rechecks.remove(index);
+                    remember_hook_inbound(&mut self.parked_replays, &id);
+                    eprintln!(
+                        "amesh hook ws: Codex replay {id} permanently left in hub inbox: {error}"
+                    );
+                }
+                return Ok(());
+            }
+        }
+        self.rechecks.remove(index);
+        self.parked_replays.retain(|known| known != &id);
+        acked.push(id);
+        Ok(())
     }
 
     pub(super) async fn flush(
@@ -375,7 +533,8 @@ impl CodexDelivery {
                 .as_ref()
                 .is_none_or(|id| !self.pending.contains_key(id))
         });
-        if (!queued.is_empty() || !self.pending.is_empty()) && sink.paginated_history != Some(true)
+        if (!queued.is_empty() || !self.pending.is_empty() || (poll && !self.rechecks.is_empty()))
+            && sink.paginated_history != Some(true)
         {
             if sink.paginated_history.is_none() {
                 match sink.read().await {
@@ -407,10 +566,17 @@ impl CodexDelivery {
         };
         let mut ready = false;
         if poll {
-            match self.receipts(sink, queued, &mut acked, budget).await {
+            match self.receipts(sink, queued, &mut acked, &mut budget).await {
                 Ok(requeued) => ready = requeued,
                 Err(error) => {
                     eprintln!("amesh hook ws: Codex receipt check failed: {error}");
+                    if !error.is::<AppRejected>() {
+                        return (failure(error.as_ref()), acked, false);
+                    }
+                }
+            }
+            if queued.is_empty() {
+                if let Err(error) = self.recheck_parked(sink, &mut acked, &mut budget).await {
                     if !error.is::<AppRejected>() {
                         return (failure(error.as_ref()), acked, false);
                     }
@@ -422,6 +588,17 @@ impl CodexDelivery {
 }
 
 impl ReceiptScan {
+    async fn cold_receipt(
+        &mut self,
+        sink: &mut AppSink,
+        id: &str,
+        budget: &mut usize,
+    ) -> Result<Receipt> {
+        let snapshot = sink.recent_turns(RECENT_TURNS).await?;
+        let (turns, next) = page(&snapshot)?;
+        self.receipt(sink, id, turns, next.is_none(), budget).await
+    }
+
     async fn receipt(
         &mut self,
         sink: &mut AppSink,
@@ -431,6 +608,10 @@ impl ReceiptScan {
         budget: &mut usize,
     ) -> Result<Receipt> {
         let replay = self.anchor.is_none();
+        if replay {
+            self.progress
+                .retain(|id, _| recent.iter().any(|turn| turn_id(turn) == Some(id)));
+        }
         let floor = self.turn.as_deref().or_else(|| {
             self.anchor
                 .as_ref()
@@ -619,6 +800,13 @@ fn failure(error: &(dyn std::error::Error + 'static)) -> SinkState {
     }
 }
 
+#[derive(Clone, Copy)]
+enum InputMode<'a> {
+    Normal,
+    Bootstrap,
+    Recovered(Option<&'a str>),
+}
+
 enum Submission {
     Busy,
     Accepted(Option<String>),
@@ -691,21 +879,36 @@ impl AppSink {
         &mut self,
         text: &str,
         record: Option<&str>,
-        bootstrap: bool,
+        mode: InputMode<'_>,
     ) -> std::result::Result<Submission, (Box<dyn std::error::Error>, bool)> {
         for attempt in 0..2 {
             let read = self.read().await.map_err(|error| (error, false))?;
             if read.pointer("/result/thread/canAcceptDirectInput") == Some(&Value::Bool(false)) {
                 return Err((NO_DIRECT_INPUT.into(), false));
             }
-            if bootstrap {
-                let thread = &read["result"]["thread"];
-                if self.paginated_history != Some(true)
-                    || !thread_idle(&read)
-                    || thread["ephemeral"] != false
-                    || thread["preview"] != ""
-                {
-                    return Ok(Submission::Busy);
+            match mode {
+                InputMode::Normal => {}
+                InputMode::Bootstrap => {
+                    let thread = &read["result"]["thread"];
+                    if self.paginated_history != Some(true)
+                        || !thread_idle(&read)
+                        || thread["ephemeral"] != false
+                        || thread["preview"] != ""
+                    {
+                        return Ok(Submission::Busy);
+                    }
+                }
+                InputMode::Recovered(latest) => {
+                    if self.paginated_history != Some(true) || !thread_idle(&read) {
+                        return Ok(Submission::Busy);
+                    }
+                    let head = self.recent_turns(1).await.map_err(|error| (error, false))?;
+                    let (turns, _) = page(&head).map_err(|error| (error, false))?;
+                    if turns.first().and_then(turn_id) != latest
+                        || !turns.first().is_none_or(terminal_turn)
+                    {
+                        return Ok(Submission::Busy);
+                    }
                 }
             }
             if turn_is_over(&read) {
@@ -787,3 +990,7 @@ fn turn_mismatch(message: &str) -> bool {
                 && !actual.contains('`')
         })
 }
+
+#[cfg(test)]
+#[path = "../../tests/cli/codex_recovery_policy.rs"]
+mod recovery_tests;
