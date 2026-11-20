@@ -12,6 +12,7 @@ struct History {
     unindexed_turns: bool,
     unindexed_items: bool,
     unmaterialized: bool,
+    replay_item_error: Option<Value>,
     ephemeral: bool,
     hide_floor: bool,
     successor: bool,
@@ -108,6 +109,11 @@ impl Probe {
                             );
                         }
                         let params = &req["params"];
+                        let scoped_replay =
+                            params["sortDirection"] == "desc" && params["turnId"].is_string();
+                        if let (true, Some(error)) = (scoped_replay, &history.replay_item_error) {
+                            return Some(json!({"error": error}));
+                        }
                         let matches = params["turnId"].is_null() || params["turnId"] == "user-turn";
                         let bounded_tail =
                             params["limit"] == 1 && params["sortDirection"] == "desc";
@@ -1125,5 +1131,114 @@ fn cold_replay_keeps_new_messages_behind_an_incomplete_lookup() {
             let raw = submissions.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(turn_text(&raw).contains(expected), "{raw}");
         }
+    });
+}
+
+fn rejected_cold_replay_leaves_the_hub_record(error: Value, rejected: usize) {
+    let mut p = Probe::with_history(
+        History {
+            replay_item_error: Some(error),
+            ..History::default()
+        },
+        accepted,
+    );
+    p._drainer.stop();
+    let notice = p.send("notify", "older replay with an unavailable receipt");
+    assert_eq!(p.queued(), 1);
+    p._drainer = start_codex_drainer(&p.sandbox, p.sandbox.id("worker"), &p.home);
+    p.send("notify", "first new message behind the replay");
+    p.send("broadcast", "second new message behind the replay");
+
+    for expected in ["first new message", "second new message"] {
+        let request = p.next();
+        assert!(
+            request["params"]["input"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(expected),
+            "expected {expected}, got {request}"
+        );
+        assert_ne!(
+            client_id(&request),
+            format!("amesh:{}", notice["id"].as_str().unwrap()),
+            "the rejected replay must not be submitted"
+        );
+        p.history
+            .lock()
+            .unwrap()
+            .client_ids
+            .push(client_id(&request));
+    }
+    p.until_queued(1);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let peer = worker_status(&p.sandbox);
+        if peer["delivery"]["stuck"]["count"] == 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected one stuck record: {peer}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    p.quiet();
+    let h = p.history.lock().unwrap();
+    assert_eq!(
+        h.calls
+            .iter()
+            .filter(|req| {
+                req["method"] == "thread/items/list"
+                    && req["params"]["sortDirection"] == "desc"
+                    && req["params"]["turnId"].is_string()
+            })
+            .count(),
+        rejected,
+        "the parked replay no longer queries history"
+    );
+}
+
+#[test]
+fn cold_replay_parks_a_permanent_request_error_immediately() {
+    rejected_cold_replay_leaves_the_hub_record(
+        json!({"code":-32600,"message":"invalid cursor: stale-page"}),
+        1,
+    );
+}
+
+#[test]
+fn cold_replay_parks_a_persistent_internal_error_after_three_rejections() {
+    rejected_cold_replay_leaves_the_hub_record(
+        json!({"code":-32603,"message":"failed to list thread items: database is locked"}),
+        3,
+    );
+}
+
+#[test]
+fn cold_replay_parks_a_persistent_unindexed_item_page_after_three_rejections() {
+    rejected_cold_replay_leaves_the_hub_record(
+        json!({"code":-32601,"message":"thread/items/list is not supported yet"}),
+        3,
+    );
+}
+
+#[test]
+fn cold_replay_ignores_a_repeat_of_a_parked_record() {
+    let (rejected, lookups) = mpsc::channel();
+    let driver = Arc::new(move |req: &Value| {
+        if req["method"] == "thread/turns/list" {
+            rejected.send(()).unwrap();
+            return Some(json!({"error":{"code":-32601,"message":"Method not found"}}));
+        }
+        None
+    });
+    replay_after_first_beat("60", driver, |frames, submissions| {
+        frames.send(replay_frame("older", true)).unwrap();
+        lookups.recv_timeout(Duration::from_secs(5)).unwrap();
+        frames.send(replay_frame("older", true)).unwrap();
+        frames.send(replay_frame("newer", false)).unwrap();
+        let raw = submissions.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(turn_text(&raw).contains("newer"), "{raw}");
+        assert!(lookups.try_recv().is_err(), "the repeat triggered a lookup");
     });
 }

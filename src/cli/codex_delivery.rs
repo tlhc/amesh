@@ -1,9 +1,15 @@
-use super::{app_rpc, AppRejected, AppSink, Queued, Result, SinkState, NO_DIRECT_INPUT};
+use super::{
+    app_rpc, remember_hook_inbound, AppRejected, AppSink, Queued, Result, SinkState,
+    NO_DIRECT_INPUT,
+};
 use crate::bridge::{inject_method, inject_params, turn_is_over};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 const MAX_RETRIES: u8 = 3;
+const MAX_REPLAY_REJECTIONS: u8 = 3;
+const REPLAY_RETRY_DELAY: Duration = Duration::from_secs(1);
 const RECENT_TURNS: usize = 8;
 const PAGE_BUDGET: usize = 4;
 const SEND_BUDGET: usize = 8;
@@ -12,10 +18,18 @@ const SEND_BUDGET: usize = 8;
 pub(super) struct CodexDelivery {
     thread: Option<String>,
     pending: HashMap<String, Pending>,
-    replay: Option<(String, ReceiptScan)>,
+    replay: Option<ReplayLookup>,
+    parked_replays: VecDeque<String>,
     retries: HashMap<String, u8>,
     sequence: u64,
     last_polled: Option<u64>,
+}
+
+struct ReplayLookup {
+    id: String,
+    scan: ReceiptScan,
+    rejections: u8,
+    retry_at: Instant,
 }
 
 #[derive(Default)]
@@ -58,6 +72,7 @@ impl CodexDelivery {
         self.thread = Some(thread.to_string());
         self.pending.clear();
         self.replay = None;
+        self.parked_replays.clear();
         self.retries.clear();
         self.sequence = 0;
         self.last_polled = None;
@@ -66,7 +81,8 @@ impl CodexDelivery {
 
     pub(super) fn holds(&self, owner: Option<&str>, id: &str) -> bool {
         owner.is_none_or(|owner| self.thread.as_deref() == Some(owner))
-            && self.pending.contains_key(id)
+            && (self.pending.contains_key(id)
+                || self.parked_replays.iter().any(|known| known == id))
     }
 
     pub(super) fn awaiting_confirmation(&self, owner: Option<&str>) -> Vec<&str> {
@@ -207,10 +223,17 @@ impl CodexDelivery {
             }
             let mut replay_unindexed = false;
             if let Some(id) = record.id.as_ref().filter(|_| record.replay) {
+                if self
+                    .replay
+                    .as_ref()
+                    .is_some_and(|lookup| lookup.id == *id && Instant::now() < lookup.retry_at)
+                {
+                    return Ok(false);
+                }
                 if *budget == 0 {
                     return Ok(true);
                 }
-                /* Keep the scan at the queue head until history accounts for this ID. */
+                /* Keep the replay at the queue head while its lookup is still viable. */
                 let result = self.scan_replay(sink, id, budget).await;
                 match result {
                     Ok(Receipt::Found) => {
@@ -233,11 +256,27 @@ impl CodexDelivery {
                     {
                         replay_unindexed = true;
                     }
-                    Err(error) if error.is::<AppRejected>() => {
-                        eprintln!("amesh hook ws: Codex replay check failed: {error}");
-                        return Ok(false);
+                    Err(error) => {
+                        let Some(rejection) = error.downcast_ref::<AppRejected>() else {
+                            return Err(error);
+                        };
+                        let lookup = self.replay.as_mut().unwrap();
+                        lookup.rejections += 1;
+                        if !permanent_replay_rejection(rejection, &sink.thread_id)
+                            && lookup.rejections < MAX_REPLAY_REJECTIONS
+                        {
+                            /* A burst of new frames must give the history store time to recover. */
+                            lookup.retry_at = Instant::now() + REPLAY_RETRY_DELAY;
+                            eprintln!("amesh hook ws: Codex replay check failed: {error}");
+                            return Ok(false);
+                        }
+                        /* A rejected lookup leaves prior delivery unknown. Keep the Hub record. */
+                        eprintln!("amesh hook ws: Codex replay {id} left in hub inbox: {error}");
+                        remember_hook_inbound(&mut self.parked_replays, id);
+                        queued.pop_front();
+                        self.replay = None;
+                        continue;
                     }
-                    Err(error) => return Err(error),
                 }
             }
             let (anchor, bootstrap) = if record.id.is_some() {
@@ -305,19 +344,20 @@ impl CodexDelivery {
         id: &str,
         budget: &mut usize,
     ) -> Result<Receipt> {
-        if self
-            .replay
-            .as_ref()
-            .is_none_or(|(current, _)| current != id)
-        {
-            self.replay = Some((id.to_string(), ReceiptScan::default()));
+        if self.replay.as_ref().is_none_or(|lookup| lookup.id != id) {
+            self.replay = Some(ReplayLookup {
+                id: id.to_string(),
+                scan: ReceiptScan::default(),
+                rejections: 0,
+                retry_at: Instant::now(),
+            });
         }
         let snapshot = sink.recent_turns(RECENT_TURNS).await?;
         let (turns, next) = page(&snapshot)?;
         self.replay
             .as_mut()
             .unwrap()
-            .1
+            .scan
             .receipt(sink, id, turns, next.is_none(), budget)
             .await
     }
@@ -558,6 +598,17 @@ fn history_unindexed(
             }
             _ => false,
         }
+}
+
+fn permanent_replay_rejection(rejection: &AppRejected, thread: &str) -> bool {
+    match rejection.error["code"].as_i64() {
+        Some(-32600) => {
+            rejection.error["message"] != format!("no rollout found for thread id {thread}")
+        }
+        Some(-32601) => !history_unindexed(rejection, "thread/items/list", thread),
+        Some(-32602) => true,
+        _ => false,
+    }
 }
 
 fn failure(error: &(dyn std::error::Error + 'static)) -> SinkState {
