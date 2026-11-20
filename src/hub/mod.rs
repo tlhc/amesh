@@ -1910,6 +1910,16 @@ pub(crate) fn own_build() -> Option<&'static str> {
         .as_deref()
 }
 
+/* a Pi session runs the extension it loaded, not this binary, so it names the template the
+extension was rendered from: a new binary with the same template leaves it current */
+pub(crate) fn pi_extension_build() -> &'static str {
+    static BUILD: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| {
+        let digest = format!("{:x}", Sha256::digest(crate::cli::PI_HOOK_JS));
+        format!("pi-{}", &digest[..16])
+    })
+}
+
 /* size and mtime join the inode the restart watches, so a rewrite in place, which keeps
 the inode, still reads as another build. The device is left out: macOS numbers a volume
 anew on each boot, and a label rendered into the Pi extension would read stale after it */

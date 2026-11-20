@@ -590,7 +590,7 @@ assert.equal(userMsgs.length, 0);
 const opened = (sockets[0].sent || []).map((raw) => JSON.parse(raw));
 assert.equal(opened[0].type, "connect");
 assert.equal(opened[0].recv, true);
-assert.match(opened[0].build, /^\d+:\d+:\d+\.\d{9}$/, "the connect frame names the build that rendered the extension");
+assert.match(opened[0].build, /^pi-[0-9a-f]{16}$/, "the connect frame names the template the extension was rendered from");
 fire(sockets[0], { type: "notify", from_peer: "amesh-codex", message: "n1", id: "evt-n1" });
 fire(sockets[0], { type: "broadcast", from_peer: "amesh-codex", message: "b1" });
 fire(sockets[0], { type: "ask", from_peer: "amesh-codex", message: "a1", correlation_id: "ask-1" });

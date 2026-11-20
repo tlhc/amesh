@@ -226,7 +226,11 @@ impl<'a> ReadModel<'a> {
             .filter(|_| connected)
             .cloned();
         /* a live socket that names no build predates this field, so it is older too */
-        let stale = super::own_build()
+        let expected = match peer.backend.as_str() {
+            "pi" => Some(super::pi_extension_build()),
+            _ => super::own_build(),
+        };
+        let stale = expected
             .filter(|_| connected)
             .map(|own| build.as_deref() != Some(own));
         PeerView {

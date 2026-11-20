@@ -1852,20 +1852,15 @@ fn setup_merges_hooks_and_preserves_existing_settings() {
     assert!(config.contains("AMESH_BACKEND"));
     let extension = fs::read_to_string(sandbox.root.join(".pi/agent/extensions/amesh.ts")).unwrap();
     assert!(extension.contains("const peerId"));
-    #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        let meta = fs::metadata(sandbox.amesh()).unwrap();
-        let build = format!(
-            "const build = \"{}:{}:{}.{:09}\";",
-            meta.ino(),
-            meta.size(),
-            meta.mtime(),
-            meta.mtime_nsec()
-        );
+        use sha2::{Digest, Sha256};
+        let template =
+            fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/src/cli/pi_hook.js")).unwrap();
+        let digest = format!("{:x}", Sha256::digest(&template));
+        let build = format!("const build = \"pi-{}\";", &digest[..16]);
         assert!(
             extension.contains(&build),
-            "the extension names the build that rendered it"
+            "the extension names the template it was rendered from"
         );
     }
     let doctor = sandbox.run(&["doctor", "--home", root], None);

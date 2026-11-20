@@ -28,6 +28,7 @@ pub(crate) fn is_transport_error(error: &str) -> bool {
 }
 const AMESH_OPENCODE_HOOK_MARK: &str = "/* amesh-plugin:opencode:v1 */";
 const AMESH_PI_HOOK_MARK: &str = "export default function AmeshHooks";
+pub(crate) const PI_HOOK_JS: &str = include_str!("pi_hook.js");
 const AMESH_HOOK_EVENTS: &[(&str, &str)] = &[
     ("SessionStart", "session"),
     ("UserPromptSubmit", "prompt"),
@@ -2189,7 +2190,7 @@ fn setup(args: &Args) -> Result<()> {
     }
     for backend in runtimes {
         if *backend == "pi" {
-            let script = include_str!("pi_hook.js")
+            let script = PI_HOOK_JS
                 .replace("__AMESH_EXECUTABLE__", &serde_json::to_string(&executable)?)
                 .replace(
                     "__AMESH_PEER_ID__",
@@ -2197,7 +2198,7 @@ fn setup(args: &Args) -> Result<()> {
                 )
                 .replace(
                     "__AMESH_BUILD__",
-                    &serde_json::to_string(&crate::hub::own_build())?,
+                    &serde_json::to_string(crate::hub::pi_extension_build())?,
                 );
             let pi_dir = pi_agent_dir(args, &root);
             write_atomic(&pi_dir.join("extensions/amesh.ts"), script.as_bytes())?;

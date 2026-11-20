@@ -1624,18 +1624,21 @@ async fn the_roster_names_each_socket_build_and_flags_a_stale_one() {
         axum::serve(listener, serve_app).await.unwrap();
     });
     let own = crate::hub::own_build().expect("a unix binary has a build");
+    let extension = crate::hub::pi_extension_build();
     let mut sockets = Vec::new();
-    for (id, build) in [
-        ("fresh", Some(own)),
-        ("old", Some("0:0")),
-        ("legacy", None),
-        ("away", None),
+    for (id, backend, build) in [
+        ("fresh", "codex", Some(own)),
+        ("old", "codex", Some("0:0")),
+        ("legacy", "codex", None),
+        ("away", "codex", None),
+        ("pi-current", "pi", Some(extension)),
+        ("pi-binary", "pi", Some(own)),
     ] {
         let _ = json_req(
             router(state.clone()),
             "POST",
             "/peers",
-            json!({"name": id, "backend": "pi", "peer_id": id}),
+            json!({"name": id, "backend": backend, "peer_id": id}),
         )
         .await;
         if id == "away" {
@@ -1692,6 +1695,16 @@ async fn the_roster_names_each_socket_build_and_flags_a_stale_one() {
         "without a socket there is nothing to judge"
     );
     assert!(row("away")["build"].is_null());
+    assert_eq!(
+        row("pi-current")["stale"],
+        false,
+        "a Pi extension rendered from this binary's template is current"
+    );
+    assert_eq!(
+        row("pi-binary")["stale"],
+        true,
+        "a Pi extension that names a binary was rendered before the template label"
+    );
 }
 
 #[cfg(unix)]
