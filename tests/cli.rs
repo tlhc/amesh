@@ -44,6 +44,7 @@ fn isolate_session_env<'a>(command: &'a mut Command, root: &Path) -> &'a mut Com
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CLAUDE_CODE_MESSAGING_SOCKET")
         .env_remove("CLAUDE_CODE_MESSAGING_TOKEN")
+        .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("PI_CODING_AGENT_DIR")
         .env_remove("OPENCODE_CONFIG_DIR")
         .env_remove("XDG_CONFIG_HOME")
@@ -1307,6 +1308,83 @@ fn mcp_whoami_resolves_unique_live_peer_when_derived_name_is_absent() {
     );
     let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(reply["result"]["content"][0]["text"], live);
+}
+
+fn claude_hook(sandbox: &Sandbox, event: &str, session: &str, cwd: &Path, peer_id: Option<&str>) {
+    let mut args = vec!["hook", event, "--backend", "claude-code"];
+    args.extend(peer_id.iter().flat_map(|id| ["--peer-id", *id]));
+    let payload = json!({"session_id": session, "cwd": cwd}).to_string();
+    let output = sandbox.run_text(&args, &payload, &[]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/* whoami and a call that needs a registered caller, from a Claude MCP started in the root */
+fn claude_mcp_identity(sandbox: &Sandbox, session: &str) -> (Value, Value) {
+    let input = [
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"amesh_whoami"}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+            "params":{"name":"amesh_list_peers","arguments":{"detail":true}}}),
+    ]
+    .map(|line| line.to_string())
+    .join("\n");
+    let output = sandbox.run_text(
+        &["mcp"],
+        &input,
+        &[
+            ("AMESH_BACKEND", "claude-code"),
+            ("CLAUDE_CODE_SESSION_ID", session),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let replies: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    (
+        replies[0]["result"]["content"][0]["text"].clone(),
+        replies[1].clone(),
+    )
+}
+
+#[test]
+fn claude_mcp_speaks_for_its_session_after_a_suffixed_session_moves() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let folder = sandbox.root.file_name().unwrap().to_string_lossy();
+    let mine = format!("{folder}-claude-code-2");
+    let moved = sandbox.root.join("sub");
+    fs::create_dir(&moved).unwrap();
+    claude_hook(&sandbox, "session", "mine", &sandbox.root, Some(&mine));
+    claude_hook(&sandbox, "prompt", "mine", &moved, None);
+    let (whoami, listed) = claude_mcp_identity(&sandbox, "mine");
+    assert_eq!(whoami, mine.as_str());
+    assert!(listed["error"].is_null(), "{listed}");
+}
+
+#[test]
+fn claude_mcp_keeps_two_sessions_in_one_folder_apart() {
+    let mut sandbox = Sandbox::new();
+    sandbox.start();
+    let folder = sandbox.root.file_name().unwrap().to_string_lossy();
+    claude_hook(&sandbox, "session", "first", &sandbox.root, None);
+    claude_hook(&sandbox, "session", "second", &sandbox.root, None);
+    assert_eq!(
+        claude_mcp_identity(&sandbox, "second").0,
+        format!("{folder}-claude-code-2").as_str()
+    );
+    assert_eq!(
+        claude_mcp_identity(&sandbox, "first").0,
+        format!("{folder}-claude-code").as_str()
+    );
 }
 
 #[test]

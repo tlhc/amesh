@@ -840,6 +840,18 @@ fn resolve_registered_peer(derived: &str, cwd: &Path, backend: &str) -> String {
     let Some(arr) = peers.as_array() else {
         return derived.into();
     };
+    /* Claude Code hands its MCP servers the session its hooks register; the name and path
+    checks below only guess, and both drift: a taken name gets a suffix, the path follows cd */
+    let session = std::env::var("CLAUDE_CODE_SESSION_ID").unwrap_or_default();
+    if let Some(id) = arr
+        .iter()
+        .filter(|p| {
+            !session.is_empty() && p["backend"] == backend && p["session_id"] == session.as_str()
+        })
+        .find_map(|p| p["peer_id"].as_str())
+    {
+        return id.to_string();
+    }
     if arr
         .iter()
         .any(|p| p["peer_id"] == derived || p["name"] == derived)
