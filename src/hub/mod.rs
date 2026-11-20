@@ -1911,14 +1911,14 @@ pub(crate) fn own_build() -> Option<&'static str> {
 }
 
 /* size and mtime join the inode the restart watches, so a rewrite in place, which keeps
-the inode, still reads as another build */
+the inode, still reads as another build. The device is left out: macOS numbers a volume
+anew on each boot, and a label rendered into the Pi extension would read stale after it */
 #[cfg(unix)]
 fn build_of(path: &Path) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let meta = fs::metadata(path).ok()?;
     Some(format!(
-        "{}:{}:{}:{}.{:09}",
-        meta.dev(),
+        "{}:{}:{}.{:09}",
         meta.ino(),
         meta.size(),
         meta.mtime(),

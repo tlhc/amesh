@@ -1717,6 +1717,26 @@ fn a_build_changes_when_its_file_is_rewritten_in_place() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_build_names_its_file_without_the_device_number() {
+    use std::os::unix::fs::MetadataExt;
+    let path = temp_state("build-dev");
+    fs::write(&*path, b"build").unwrap();
+    let meta = fs::metadata(&*path).unwrap();
+    /* st_dev changes across macOS boots while the file stays the same */
+    assert_eq!(
+        crate::hub::build_of(&path).unwrap(),
+        format!(
+            "{}:{}:{}.{:09}",
+            meta.ino(),
+            meta.size(),
+            meta.mtime(),
+            meta.mtime_nsec()
+        )
+    );
+}
+
 /* how many waiters the hub's change signal has: a connection a lease holds back is one */
 async fn watchers_reach(state: &App, count: usize, failure: &str) {
     tokio::time::timeout(Duration::from_secs(5), async {

@@ -1857,8 +1857,7 @@ fn setup_merges_hooks_and_preserves_existing_settings() {
         use std::os::unix::fs::MetadataExt;
         let meta = fs::metadata(sandbox.amesh()).unwrap();
         let build = format!(
-            "const build = \"{}:{}:{}:{}.{:09}\";",
-            meta.dev(),
+            "const build = \"{}:{}:{}.{:09}\";",
             meta.ino(),
             meta.size(),
             meta.mtime(),
