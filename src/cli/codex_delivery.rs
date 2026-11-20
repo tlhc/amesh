@@ -92,6 +92,8 @@ impl CodexDelivery {
     ) {
         let id = record.id.clone().unwrap();
         record.owner = Some(thread.to_string());
+        record.replay = false;
+        self.replay = None;
         self.sequence += 1;
         self.pending.insert(
             id,
@@ -203,6 +205,7 @@ impl CodexDelivery {
             if !matches_thread(&record.owner, &sink.thread_id) {
                 return Ok(false);
             }
+            let mut replay_unindexed = false;
             if let Some(id) = record.id.as_ref().filter(|_| record.replay) {
                 if *budget == 0 {
                     return Ok(true);
@@ -221,6 +224,15 @@ impl CodexDelivery {
                         self.replay = None;
                     }
                     Ok(Receipt::Waiting) => return Ok(true),
+                    Err(error)
+                        if history_unindexed(
+                            error.as_ref(),
+                            "thread/turns/list",
+                            &sink.thread_id,
+                        ) =>
+                    {
+                        replay_unindexed = true;
+                    }
                     Err(error) if error.is::<AppRejected>() => {
                         eprintln!("amesh hook ws: Codex replay check failed: {error}");
                         return Ok(false);
@@ -228,12 +240,45 @@ impl CodexDelivery {
                     Err(error) => return Err(error),
                 }
             }
-            let anchor = if record.id.is_some() {
-                Some(sink.tail_anchor().await?)
+            let (anchor, bootstrap) = if record.id.is_some() {
+                match sink.tail_anchor().await {
+                    /* The index appeared during replay; check for the receipt on the next beat. */
+                    Ok(_) if replay_unindexed => return Ok(false),
+                    Ok(anchor) => (Some(anchor), false),
+                    Err(error)
+                        if history_unindexed(
+                            error.as_ref(),
+                            "thread/items/list",
+                            &sink.thread_id,
+                        ) =>
+                    {
+                        if !self.pending.is_empty() {
+                            return Ok(false);
+                        }
+                        if !replay_unindexed {
+                            match sink.recent_turns(1).await {
+                                Ok(_) => return Ok(false),
+                                Err(error)
+                                    if history_unindexed(
+                                        error.as_ref(),
+                                        "thread/turns/list",
+                                        &sink.thread_id,
+                                    ) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        /* Codex indexes the thread only when its first turn persists. */
+                        (Some(Anchor::default()), true)
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
-                None
+                (None, false)
             };
-            match sink.submit(&record.text, record.id.as_deref()).await {
+            match sink
+                .submit(&record.text, record.id.as_deref(), bootstrap)
+                .await
+            {
                 Ok(Submission::Busy) => return Ok(false),
                 Ok(Submission::Accepted(turn)) => {
                     let record = queued.pop_front().unwrap();
@@ -486,6 +531,35 @@ fn page(reply: &Value) -> Result<(&[Value], Option<String>)> {
     Ok((rows, next))
 }
 
+fn history_unindexed(
+    error: &(dyn std::error::Error + 'static),
+    method: &str,
+    thread: &str,
+) -> bool {
+    let Some(rejection) = error.downcast_ref::<AppRejected>() else {
+        return false;
+    };
+    let (code, message) = (&rejection.error["code"], &rejection.error["message"]);
+    rejection.method == method
+        && match method {
+            "thread/items/list" => {
+                *code == -32601 && *message == "thread/items/list is not supported yet"
+            }
+            /* -32601 when the store knows the thread but has no row for it yet, -32600 when
+            it finds no rollout and Codex falls back to the legacy reader */
+            "thread/turns/list" => {
+                *code == -32601 && *message == "list_turns is not supported yet"
+                    || *code == -32600
+                        && *message
+                            == format!(
+                                "thread {thread} is not materialized yet; \
+                                 thread/turns/list is unavailable before first user message"
+                            )
+            }
+            _ => false,
+        }
+}
+
 fn failure(error: &(dyn std::error::Error + 'static)) -> SinkState {
     if error.to_string().contains(NO_DIRECT_INPUT) {
         SinkState::NoDirectInput
@@ -566,11 +640,22 @@ impl AppSink {
         &mut self,
         text: &str,
         record: Option<&str>,
+        bootstrap: bool,
     ) -> std::result::Result<Submission, (Box<dyn std::error::Error>, bool)> {
         for attempt in 0..2 {
             let read = self.read().await.map_err(|error| (error, false))?;
             if read.pointer("/result/thread/canAcceptDirectInput") == Some(&Value::Bool(false)) {
                 return Err((NO_DIRECT_INPUT.into(), false));
+            }
+            if bootstrap {
+                let thread = &read["result"]["thread"];
+                if self.paginated_history != Some(true)
+                    || !thread_idle(&read)
+                    || thread["ephemeral"] != false
+                    || thread["preview"] != ""
+                {
+                    return Ok(Submission::Busy);
+                }
             }
             if turn_is_over(&read) {
                 self.active_turn = None;

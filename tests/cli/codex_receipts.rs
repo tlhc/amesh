@@ -9,6 +9,10 @@ struct History {
     failed: bool,
     long_history: bool,
     legacy: bool,
+    unindexed_turns: bool,
+    unindexed_items: bool,
+    unmaterialized: bool,
+    ephemeral: bool,
     hide_floor: bool,
     successor: bool,
     successor_receipt: Option<String>,
@@ -64,8 +68,21 @@ impl Probe {
                     }
                     "thread/read" => Some(json!({"result":{"thread":{"status":{"type":
                         if history.successor || history.status == Some("inProgress") { "active" } else { "idle" }
-                    },"historyMode": if history.legacy { "legacy" } else { "paginated" }}}})),
+                    },"historyMode": if history.legacy { "legacy" } else { "paginated" },
+                    "ephemeral": history.ephemeral, "preview": if history.unindexed_turns { "" } else { "existing thread" }
+                    }}})),
                     "thread/turns/list" => {
+                        if history.unindexed_turns && history.unmaterialized {
+                            return Some(json!({"error":{"code":-32600,"message":format!(
+                                "thread {} is not materialized yet; thread/turns/list is unavailable before first user message",
+                                req["params"]["threadId"].as_str().unwrap_or_default()
+                            )}}));
+                        }
+                        if history.unindexed_turns {
+                            return Some(json!({
+                                "error":{"code":-32601,"message":"list_turns is not supported yet"}
+                            }));
+                        }
                         let mut data = vec![
                             json!({"id":"user-turn","status":history.status.unwrap_or("inProgress")}),
                         ];
@@ -80,6 +97,11 @@ impl Probe {
                         )
                     }
                     "thread/items/list" => {
+                        if history.unindexed_items {
+                            return Some(json!({
+                                "error":{"code":-32601,"message":"thread/items/list is not supported yet"}
+                            }));
+                        }
                         if history.failed {
                             return Some(
                                 json!({"error":{"code":-32603,"message":"history temporarily unavailable"}}),
@@ -134,13 +156,13 @@ impl Probe {
         }
     }
 
-    fn send(&self, kind: &str, text: &str) {
+    fn send(&self, kind: &str, text: &str) -> Value {
         let mut args = vec!["peer", kind];
         if kind == "notify" {
             args.push(self.sandbox.id("worker"));
         }
         args.extend([text, "--from-peer", "boss"]);
-        self.sandbox.json(&args, None);
+        self.sandbox.json(&args, None)
     }
 
     fn next(&self) -> Value {
@@ -183,6 +205,180 @@ fn client_id(req: &Value) -> String {
     let id = req["params"]["clientUserMessageId"].as_str().unwrap_or("");
     assert!(id.starts_with("amesh:") && id.len() > 6, "{req}");
     id.to_string()
+}
+
+fn unindexed_history() -> History {
+    History {
+        unindexed_turns: true,
+        unindexed_items: true,
+        ..History::default()
+    }
+}
+
+/* the -32600 reply is what a live 0.170.0 app-server gives a TUI thread before its first
+prompt; -32601 is what it gives a thread its store already lists */
+fn unmaterialized_history() -> History {
+    History {
+        unmaterialized: true,
+        ..unindexed_history()
+    }
+}
+
+#[test]
+fn unindexed_thread_first_delivery_waits_for_its_receipt() {
+    first_delivery_waits_for_its_receipt(unindexed_history());
+}
+
+#[test]
+fn unmaterialized_thread_first_delivery_waits_for_its_receipt() {
+    first_delivery_waits_for_its_receipt(unmaterialized_history());
+}
+
+fn first_delivery_waits_for_its_receipt(history: History) {
+    let p = Probe::with_history(history, accepted);
+    p.send("notify", "first prompt of a fresh thread");
+    let start = p.next();
+    assert_eq!(start["method"], "turn/start");
+    assert_eq!(p.queued(), 1, "admission alone must not retire the record");
+    {
+        let mut h = p.history.lock().unwrap();
+        h.unindexed_turns = false;
+        h.unindexed_items = false;
+        h.client_ids.push(client_id(&start));
+    }
+    p.until_queued(0);
+}
+
+#[test]
+fn unindexed_thread_cold_replay_starts_its_first_turn() {
+    cold_replay_starts_its_first_turn(unindexed_history());
+}
+
+#[test]
+fn unmaterialized_thread_cold_replay_starts_its_first_turn() {
+    cold_replay_starts_its_first_turn(unmaterialized_history());
+}
+
+fn cold_replay_starts_its_first_turn(history: History) {
+    let mut p = Probe::with_history(history, accepted);
+    p._drainer.stop();
+    p.send(
+        "broadcast",
+        "queued before the fresh-thread drainer restarted",
+    );
+    assert_eq!(p.queued(), 1);
+    p._drainer = start_codex_drainer(&p.sandbox, p.sandbox.id("worker"), &p.home);
+    let start = p.next();
+    assert_eq!(start["method"], "turn/start");
+    let mut h = p.history.lock().unwrap();
+    assert!(
+        h.calls
+            .iter()
+            .any(|req| { req["method"] == "thread/turns/list" && req["params"]["limit"] == 8 }),
+        "cold replay must attempt the receipt lookup before starting a turn"
+    );
+    h.unindexed_turns = false;
+    h.unindexed_items = false;
+    h.client_ids.push(client_id(&start));
+    drop(h);
+    p.until_queued(0);
+}
+
+#[test]
+fn unindexed_thread_receipt_poll_does_not_resubmit_or_start_another_record() {
+    let p = Probe::with_history(unindexed_history(), accepted);
+    p.send("notify", "submission whose history is still unavailable");
+    let first = p.next();
+    let first_id = client_id(&first);
+    p.send(
+        "notify",
+        "keep the second record queued until history opens",
+    );
+    p.quiet();
+    {
+        let mut h = p.history.lock().unwrap();
+        h.unindexed_turns = false;
+        h.status = Some("completed");
+    }
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while p
+        .history
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|req| {
+            req["method"] == "thread/items/list" && req["params"]["turnId"] == "user-turn"
+        })
+        .count()
+        < 4
+    {
+        assert!(
+            Instant::now() < deadline,
+            "expected four failed receipt polls"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        p.requests.try_recv().is_err(),
+        "history errors must not submit again"
+    );
+    assert_eq!(p.queued(), 2);
+    assert_eq!(p.connections.load(Ordering::SeqCst), 1);
+    p.history.lock().unwrap().unindexed_items = false;
+    let second = p.next();
+    let second_id = client_id(&second);
+    assert_ne!(first_id, second_id);
+    p.history.lock().unwrap().client_ids.push(second_id);
+    let retry = p.next();
+    assert_eq!(
+        client_id(&retry),
+        first_id,
+        "failed polls do not spend retry allowance"
+    );
+    p.history.lock().unwrap().client_ids.push(first_id);
+    p.until_queued(0);
+}
+
+#[test]
+fn unindexed_thread_replay_rechecks_when_the_item_index_opens() {
+    let mut p = Probe::with_history(
+        History {
+            unindexed_items: false,
+            ..unindexed_history()
+        },
+        accepted,
+    );
+    p._drainer.stop();
+    let notice = p.send("notify", "replay races index materialization");
+    p.history
+        .lock()
+        .unwrap()
+        .client_ids
+        .push(format!("amesh:{}", notice["id"].as_str().unwrap()));
+    p._drainer = start_codex_drainer(&p.sandbox, p.sandbox.id("worker"), &p.home);
+    p.quiet();
+    assert_eq!(p.queued(), 1, "a tail anchor cannot confirm a replay");
+    p.history.lock().unwrap().unindexed_turns = false;
+    p.until_queued(0);
+    assert!(
+        p.requests.try_recv().is_err(),
+        "already-persisted replay must not submit"
+    );
+}
+
+#[test]
+fn unindexed_thread_does_not_bootstrap_ephemeral_history() {
+    let p = Probe::with_history(
+        History {
+            ephemeral: true,
+            ..unindexed_history()
+        },
+        accepted,
+    );
+    p.send("notify", "ephemeral thread has no persistent receipt");
+    p.quiet();
+    assert_eq!(p.queued(), 1);
 }
 
 #[test]
